@@ -5,9 +5,9 @@ Jarvis is an agentic framework built for local AI desktop assistance. It can hel
 Download the zip file from the releases and extract it into an empty folder or clone the repo inside an empty folder
 ### Step 2:
 Download the python libraries required for the scripts to run using the following command.
-''' Poweshell
+```Poweshell
 pip install ollama pillow ddgs keyboard pymupdf mammoth python-docx rich pytesseract pywin32 uiautomation customtkinter google-genai
-'''
+```
 ### Step 3:
 Download Ollama and download a tooling capable model of your choice (Older models like qwen2.5-coder are also supported)
 ## Jarvis' Capabilities
