@@ -19,7 +19,7 @@ Change the first line of the Modelfile to configure it for the model of your cho
 ### Step 5:
 Apply the provided Modelfile to your model by running the following command **in the folder the Modelfile is located**.
 ```Poweshell
-ollama create jarvis -f ./Modelfile
+ollama create jarvishehe -f ./Modelfile
 ```
 ### Step 6:
 Run main.py once. This creates all the necessary files 
@@ -29,6 +29,9 @@ Download and install Tesseract as it allows for OCR to work. Jarvis is completel
 You can now lauch Jarvis. 
 Run the **gui.py** script if you want to run the Jarvis Control Centre which allows you the full functionality of Jarvis while also allowing you to modify any file (Like skill files, knowledge bases, memory files etc). This is the recommended approach to use Jarvis
 Run the **main.py** script if you prefer the CLI tool instead. This requires an IDE if you want to modify any files (Or you can tell Jarvis to do it.)
+## Models I have tested and am happy with:
+1. qwen2.5-coder:7b
+2. qwen3.5:4b
 ## Jarvis' Capabilities
 Jarvis can do the following things:
 - Read/write files
