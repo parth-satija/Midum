@@ -27,7 +27,23 @@ Run main.py once. This creates all the necessary files
 Download and install Tesseract as it allows for OCR to work. Jarvis is completely functional without OCR.
 ### Step 7:
 You can now lauch Jarvis. 
-Run the **gui.py** script if you want to run the Jarvis Control Centre which allows you the full functionality of Jarvis while also allowing you to modify any file (Like skill files, knowledge bases, memory files etc). This is the recommended approach to use Jarvis
+Run the **gui.py** script if you want to run the Jarvis Control Centre which allows you the full functionality of Jarvis while also allowing you to modify any file (Like skill files, knowledge bases, memory files etc). This is the recommended approach to use Jarvis.
+
+## Browser Support
+
+For reliable browser page navigation and interaction, launch your browser with **Remote Debugging** enabled.
+
+Without Remote Debugging, Jarvis falls back to UI Automation (UIA), which works for many tasks but may be less reliable on complex web pages.
+
+### Example (Chrome/Brave/Edge)
+
+For Windows, use this command (Replace the path with your actual browser executable path):
+```PowerShell
+& "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe" --remote-debugging-port=9222
+```
+
+Jarvis will automatically use the debugging interface when available and fall back to UIA otherwise.
+
 Run the **main.py** script if you prefer the CLI tool instead. This requires an IDE if you want to modify any files (Or you can tell Jarvis to do it.)
 ## Models I have tested and am happy with:
 1. qwen2.5-coder:7b
