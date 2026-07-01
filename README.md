@@ -29,6 +29,8 @@ Download and install Tesseract as it allows for OCR to work. Jarvis is completel
 You can now lauch Jarvis. 
 Run the **gui.py** script if you want to run the Jarvis Control Centre which allows you the full functionality of Jarvis while also allowing you to modify any file (Like skill files, knowledge bases, memory files etc). This is the recommended approach to use Jarvis.
 
+Run the **main.py** script if you prefer the CLI tool instead. This requires an IDE if you want to modify any files (Or you can tell Jarvis to do it.)
+
 ## Browser Support
 
 For reliable browser page navigation and interaction, launch your browser with **Remote Debugging** enabled.
@@ -44,7 +46,7 @@ For Windows, use this command (Replace the path with your actual browser executa
 
 Jarvis will automatically use the debugging interface when available and fall back to UIA otherwise.
 
-Run the **main.py** script if you prefer the CLI tool instead. This requires an IDE if you want to modify any files (Or you can tell Jarvis to do it.)
+
 ## Models I have tested and am happy with:
 1. qwen2.5-coder:7b
 2. qwen3.5:4b
