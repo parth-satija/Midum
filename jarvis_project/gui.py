@@ -32,37 +32,93 @@ if _HERE not in sys.path:
 import main as jarvis
 
 # =============================================================================
-# THEME & PALETTE (Sophisticated Dark Carbon / Cyberpunk Slate)
+# THEME & PALETTE (Refined Dark — Slate Carbon)
 # =============================================================================
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 C = {
-    "bg":         "#08090b",   # Deepest void graphite
-    "panel":      "#0e1117",   # Dark carbon panel
-    "surface":    "#161b22",   # Elevated container surface
-    "border":     "#21262d",   # Sleek structural border
-    "accent":     "#3b82f6",   # Electric Blue (Interactive Highlight)
-    "accent_dim": "#1d4ed8",   # Muted Blue (Secondary Indicators)
-    "accent2":    "#8b5cf6",   # Cyber Purple (Specialized / Gemini)
-    "green":      "#10b981",   # Vibrant Emerald Green (Ready State)
-    "red":        "#ef4444",   # Crimson Red (Alert / Terminal Abort)
-    "yellow":     "#f59e0b",   # Amber Gold (Processing Thread)
-    "text":       "#f8fafc",   # Clean slate white
-    "subtext":    "#64748b",   # Muted cool-grey subheadings
-    "user_msg":   "#1e293b",   # Bubble color for User inputs
-    "jarvis_msg": "#0f172a",   # Deep slate blue background for Jarvis responses
-    "tool_bg":    "#020617",   # Absolute black-blue console terminal
-    "tool_text":  "#38bdf8",   # Tech blue monospaced output
+    # Structure
+    "bg":         "#0a0c0f",   # True background — deepest layer
+    "panel":      "#0f1318",   # Panel / column surface
+    "surface":    "#161c24",   # Inset surface — inputs, boxes
+    "surface2":   "#1c2333",   # Slightly raised surface for hover targets
+    "border":     "#1f2937",   # Structural border, subtle
+    "border2":    "#2d3748",   # Visible border for active / hovered states
+
+    # Brand accent
+    "accent":     "#3b82f6",   # Primary blue — buttons, links, active states
+    "accent_dim": "#1d4ed8",   # Hover state for accent
+    "accent_faint": "#1e3a5f", # Background tint for accent rows
+
+    # Semantic colours
+    "accent2":    "#7c3aed",   # Purple — Gemini / secondary indicator
+    "green":      "#10b981",   # Ready / connected
+    "red":        "#ef4444",   # Error / abort
+    "yellow":     "#f59e0b",   # Processing / warning
+
+    # Text hierarchy
+    "text":       "#e2e8f0",   # Primary text — slightly softer than pure white
+    "subtext":    "#64748b",   # Secondary / labels
+    "muted":      "#374151",   # Disabled / placeholder
+
+    # Chat bubbles
+    "user_msg":   "#1a2744",   # User message bubble
+    "jarvis_msg": "#0f1623",   # Jarvis response bubble
+
+    # Console
+    "tool_bg":    "#050810",   # Terminal / mono background
+    "tool_text":  "#38bdf8",   # Monospaced output colour
 }
 
-FONT_BODY  = ("Segoe UI",        12)
-FONT_BOLD  = ("Segoe UI",        12, "bold")
-FONT_ITALIC = ("Segoe UI",       12, "italic")
-FONT_SMALL = ("Segoe UI",        11)
-FONT_MONO  = ("Cascadia Code",   11)
-FONT_TITLE = ("Segoe UI",        13, "bold")
-FONT_HEAD  = ("Segoe UI",        16, "bold")
+FONT_BODY   = ("Segoe UI",      12)
+FONT_BOLD   = ("Segoe UI",      12, "bold")
+FONT_ITALIC = ("Segoe UI",      12, "italic")
+FONT_SMALL  = ("Segoe UI",      11)
+FONT_TINY   = ("Segoe UI",       9)
+FONT_MONO   = ("Cascadia Code", 11)
+FONT_LABEL  = ("Segoe UI",      10)
+FONT_TITLE  = ("Segoe UI",      13, "bold")
+FONT_HEAD   = ("Segoe UI",      15, "bold")
+# =============================================================================
+# LIVE CHAT MIRRORING — tool events & say() narration
+# =============================================================================
+# Sentinel prefix used to tag say()-tool output pushed through the stdout
+# queue so _poll() can route it to a live chat bubble instead of only the
+# sidebar log. Unlikely to collide with real engine output.
+_SAY_TAG = "\x02JARVIS_SAY\x02"
+
+# Any line whose stripped text starts with one of these emoji is treated as
+# a "major system event" (memory writes, goal changes, skill/instruction/path
+# updates, shutdowns, aborts, etc.) and mirrored into the main chat as a
+# compact grey ticker line using a single shared tool icon.
+_TOOL_LINE_EMOJI = (
+    "🧠", "🎯", "📋", "📌", "📍", "📚", "🗑", "💾", "🔌", "🛑", "🚫", "✅",
+    "⚠️", "🤖", "👁️", "🖥️", "🌐", "⌨️", "🐧", "📁", "🔍", "⚡",
+)
+
+# Substrings (checked case-insensitively) that also mark a line as a
+# tool-call / execution-status event worth mirroring into the main chat.
+_TOOL_LINE_KEYWORDS = (
+    "-> executing:", "requested", "[uia]", "[cdp]", "[terminal]", "[type]",
+    "[click]", "[wait]", "[blueprint]", "[snapshot", "[gemini", "[resolver]",
+    "[legacy parser]", "[ocr", "[grid click]", "[open_url]",
+    "[rule violation]", "[retry cap]", "[tool name error]",
+    "[unknown tool]", "[internal error]", "[tool resolver]",
+    "[max steps reached]", "[response aborted", "[path resolved",
+)
+
+
+def _is_tool_line(raw_line: str) -> bool:
+    """True if a stdout line represents a tool call or major system event."""
+    line = raw_line.strip()
+    if not line:
+        return False
+    if line[0] in _TOOL_LINE_EMOJI:
+        return True
+    low = line.lower()
+    return any(k in low for k in _TOOL_LINE_KEYWORDS)
+
 
 # =============================================================================
 # REDIRECT stdout → GUI log
@@ -129,24 +185,24 @@ class CreateKnowledgeDialog(ctk.CTkToplevel):
         self.configure(fg_color=C["bg"])
         self.on_success = on_success_callback
 
-        main_frame = ctk.CTkFrame(self, fg_color=C["panel"], corner_radius=0, border_width=1, border_color=C["border"])
+        main_frame = ctk.CTkFrame(self, fg_color=C["panel"], corner_radius=20, border_width=1, border_color=C["border"])
         main_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
-        ctk.CTkLabel(main_frame, text="CREATE KNOWLEDGE BASE", font=FONT_TITLE, text_color=C["accent"]).pack(anchor="w", padx=16, pady=(16, 8))
+        ctk.CTkLabel(main_frame, text="New Knowledge Base", font=FONT_TITLE, text_color=C["text"]).pack(anchor="w", padx=16, pady=(16, 8))
 
-        ctk.CTkLabel(main_frame, text="Name (snake_case, e.g. blender_commands):", font=FONT_SMALL, text_color=C["subtext"]).pack(anchor="w", padx=16, pady=(4, 0))
-        self._entry_name = ctk.CTkEntry(main_frame, font=FONT_BODY, fg_color=C["surface"], text_color=C["text"], border_color=C["border"], corner_radius=0, height=32)
-        self._entry_name.pack(fill="x", padx=16, pady=4)
+        ctk.CTkLabel(main_frame, text="Name (snake_case, e.g. blender_commands):", font=FONT_LABEL, text_color=C["subtext"]).pack(anchor="w", padx=16, pady=(4, 0))
+        self._entry_name = ctk.CTkEntry(main_frame, font=FONT_BODY, fg_color=C["surface"], text_color=C["text"], border_color=C["border2"], corner_radius=20, height=34)
+        self._entry_name.pack(fill="x", padx=16, pady=(4, 0))
 
-        ctk.CTkLabel(main_frame, text="One-line Description:", font=FONT_SMALL, text_color=C["subtext"]).pack(anchor="w", padx=16, pady=(4, 0))
-        self._entry_desc = ctk.CTkEntry(main_frame, font=FONT_BODY, fg_color=C["surface"], text_color=C["text"], border_color=C["border"], corner_radius=0, height=32)
-        self._entry_desc.pack(fill="x", padx=16, pady=4)
+        ctk.CTkLabel(main_frame, text="One-line Description:", font=FONT_LABEL, text_color=C["subtext"]).pack(anchor="w", padx=16, pady=(10, 0))
+        self._entry_desc = ctk.CTkEntry(main_frame, font=FONT_BODY, fg_color=C["surface"], text_color=C["text"], border_color=C["border2"], corner_radius=20, height=34)
+        self._entry_desc.pack(fill="x", padx=16, pady=(4, 0))
 
         btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         btn_frame.pack(fill="x", side="bottom", padx=16, pady=16)
 
-        ctk.CTkButton(btn_frame, text="Cancel", width=80, fg_color=C["surface"], hover_color=C["border"], corner_radius=0, command=self.destroy).pack(side="left")
-        ctk.CTkButton(btn_frame, text="Create", width=80, fg_color=C["accent"], hover_color="#1d4ed8", corner_radius=0, command=self._on_submit).pack(side="right")
+        ctk.CTkButton(btn_frame, text="Cancel", width=80, fg_color="transparent", hover_color=C["surface2"], border_width=1, border_color=C["border2"], corner_radius=20, command=self.destroy).pack(side="left")
+        ctk.CTkButton(btn_frame, text="Create", width=80, fg_color=C["accent"], hover_color=C["accent_dim"], corner_radius=20, command=self._on_submit).pack(side="right")
 
         self.lift()
         self.focus_force()
@@ -176,28 +232,28 @@ class CreateSkillDialog(ctk.CTkToplevel):
         self.configure(fg_color=C["bg"])
         self.on_success = on_success_callback
 
-        main_frame = ctk.CTkFrame(self, fg_color=C["panel"], corner_radius=0, border_width=1, border_color=C["border"])
+        main_frame = ctk.CTkFrame(self, fg_color=C["panel"], corner_radius=20, border_width=1, border_color=C["border"])
         main_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
-        ctk.CTkLabel(main_frame, text="CREATE CUSTOM SKILL", font=FONT_TITLE, text_color=C["accent"]).pack(anchor="w", padx=16, pady=(16, 8))
+        ctk.CTkLabel(main_frame, text="New Custom Skill", font=FONT_TITLE, text_color=C["text"]).pack(anchor="w", padx=16, pady=(16, 8))
 
-        ctk.CTkLabel(main_frame, text="Name (snake_case, e.g. render_scene):", font=FONT_SMALL, text_color=C["subtext"]).pack(anchor="w", padx=16, pady=(4, 0))
-        self._entry_name = ctk.CTkEntry(main_frame, font=FONT_BODY, fg_color=C["surface"], text_color=C["text"], border_color=C["border"], corner_radius=0, height=32)
-        self._entry_name.pack(fill="x", padx=16, pady=4)
+        ctk.CTkLabel(main_frame, text="Name (snake_case, e.g. render_scene):", font=FONT_LABEL, text_color=C["subtext"]).pack(anchor="w", padx=16, pady=(4, 0))
+        self._entry_name = ctk.CTkEntry(main_frame, font=FONT_BODY, fg_color=C["surface"], text_color=C["text"], border_color=C["border2"], corner_radius=20, height=34)
+        self._entry_name.pack(fill="x", padx=16, pady=(4, 0))
 
-        ctk.CTkLabel(main_frame, text="Domain (e.g. blender, windows, spotify):", font=FONT_SMALL, text_color=C["subtext"]).pack(anchor="w", padx=16, pady=(4, 0))
-        self._entry_domain = ctk.CTkEntry(main_frame, font=FONT_BODY, fg_color=C["surface"], text_color=C["text"], border_color=C["border"], corner_radius=0, height=32)
-        self._entry_domain.pack(fill="x", padx=16, pady=4)
+        ctk.CTkLabel(main_frame, text="Domain (e.g. blender, windows, spotify):", font=FONT_LABEL, text_color=C["subtext"]).pack(anchor="w", padx=16, pady=(10, 0))
+        self._entry_domain = ctk.CTkEntry(main_frame, font=FONT_BODY, fg_color=C["surface"], text_color=C["text"], border_color=C["border2"], corner_radius=20, height=34)
+        self._entry_domain.pack(fill="x", padx=16, pady=(4, 0))
 
-        ctk.CTkLabel(main_frame, text="One-line Description:", font=FONT_SMALL, text_color=C["subtext"]).pack(anchor="w", padx=16, pady=(4, 0))
-        self._entry_desc = ctk.CTkEntry(main_frame, font=FONT_BODY, fg_color=C["surface"], text_color=C["text"], border_color=C["border"], corner_radius=0, height=32)
-        self._entry_desc.pack(fill="x", padx=16, pady=4)
+        ctk.CTkLabel(main_frame, text="One-line Description:", font=FONT_LABEL, text_color=C["subtext"]).pack(anchor="w", padx=16, pady=(10, 0))
+        self._entry_desc = ctk.CTkEntry(main_frame, font=FONT_BODY, fg_color=C["surface"], text_color=C["text"], border_color=C["border2"], corner_radius=20, height=34)
+        self._entry_desc.pack(fill="x", padx=16, pady=(4, 0))
 
         btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         btn_frame.pack(fill="x", side="bottom", padx=16, pady=16)
 
-        ctk.CTkButton(btn_frame, text="Cancel", width=80, fg_color=C["surface"], hover_color=C["border"], corner_radius=0, command=self.destroy).pack(side="left")
-        ctk.CTkButton(btn_frame, text="Create", width=80, fg_color=C["accent"], hover_color="#1d4ed8", corner_radius=0, command=self._on_submit).pack(side="right")
+        ctk.CTkButton(btn_frame, text="Cancel", width=80, fg_color="transparent", hover_color=C["surface2"], border_width=1, border_color=C["border2"], corner_radius=20, command=self.destroy).pack(side="left")
+        ctk.CTkButton(btn_frame, text="Create", width=80, fg_color=C["accent"], hover_color=C["accent_dim"], corner_radius=20, command=self._on_submit).pack(side="right")
 
         self.lift()
         self.focus_force()
@@ -248,6 +304,19 @@ class JarvisGUI(ctk.CTk):
         self._stdout_redir = _StdoutRedirector(self._log_queue.put)
         sys.stdout = self._stdout_redir
 
+        # ── say() tool compatibility ────────────────────────────────────────
+        # jarvis._print_reply binds a rich Console to sys.stdout at MODULE
+        # IMPORT time (before our redirection above ever runs), so its rich
+        # markdown branch would silently bypass the GUI entirely. We intercept
+        # the function directly instead of relying on stdout capture, and tag
+        # the payload so _poll() can render it as a live message in the main
+        # chat rather than just a log line.
+        def _gui_say_intercept(label: str, text: str):
+            if not text or re.match(r'^[{}\[\]",:\s]*$', text.strip()):
+                return
+            self._log_queue.put(_SAY_TAG + text)
+        jarvis._print_reply = _gui_say_intercept
+
         # Setup base directory trackers
         self._base_work_dir = r"D:\\"
         if not os.path.exists(self._base_work_dir):
@@ -297,279 +366,346 @@ class JarvisGUI(ctk.CTk):
         self._session.initialise(sys_prompt, memories)
 
     # ──────────────────────────────────────────────────────────────────────────
-    # LAYOUT DESIGN WITH DYNAMIC RESIZABLE PANES & FLAT CORNERS
+    # LAYOUT — Slim topbar · resizable left sidebar · full-width chat
     # ──────────────────────────────────────────────────────────────────────────
     def _build_layout(self):
-        # Top Command Control Bar
-        self._topbar = ctk.CTkFrame(self, fg_color=C["panel"], height=60, corner_radius=0, border_width=1, border_color=C["border"])
-        self._topbar.pack(fill="x", side="top")
-        self._topbar.pack_propagate(False)
+        # Outer shell: topbar on top, PanedWindow below
+        self._root_frame = ctk.CTkFrame(self, fg_color=C["bg"], corner_radius=0)
+        self._root_frame.pack(fill="both", expand=True)
 
-        # Visual indicator element container
-        indicator_frame = ctk.CTkFrame(self._topbar, fg_color="transparent")
-        indicator_frame.pack(side="left", padx=20, fill="y")
+        self._build_topbar()
 
-        ctk.CTkLabel(indicator_frame, text="⚡  JARVIS ENGINE",
-                     font=FONT_HEAD, text_color=C["accent"]).pack(side="left")
-
-        # Sharp flat indicator status dot
-        self._status_dot = ctk.CTkFrame(indicator_frame, width=8, height=8, corner_radius=0, fg_color=C["yellow"])
-        self._status_dot.pack(side="left", padx=(15, 5))
-
-        self._status_label = ctk.CTkLabel(indicator_frame, text="Initializing workspace state...",
-                                          font=FONT_SMALL, text_color=C["subtext"])
-        self._status_label.pack(side="left", padx=5)
-
-        # Control triggers aligned right
-        self._abort_btn = ctk.CTkButton(
-            self._topbar, text="⛔ Abort Execution", width=145, height=34,
-            fg_color=C["red"], hover_color="#991b1b", font=FONT_SMALL,
-            corner_radius=0, command=self._abort)
-        self._abort_btn.pack(side="right", padx=15, pady=10)
-
-        ctk.CTkButton(
-            self._topbar, text="🔄 Clear Session", width=130, height=34,
-            fg_color=C["surface"], hover_color=C["border"], font=FONT_SMALL,
-            border_width=1, border_color=C["border"], corner_radius=0,
-            command=self._new_session).pack(side="right", padx=5, pady=10)
-
-        # Outer Layout Container
-        self._main = ctk.CTkFrame(self, fg_color=C["bg"], corner_radius=0)
-        self._main.pack(fill="both", expand=True)
-
-        # Horizontal Paned Window for fully draggable/resizable columns
-        self._paned_container = tk.PanedWindow(
-            self._main, orient=tk.HORIZONTAL, bg=C["bg"], bd=0, 
-            sashwidth=5, sashpad=2, opaqueresize=True
+        # PanedWindow fills all space below the topbar
+        self._paned = tk.PanedWindow(
+            self._root_frame, orient=tk.HORIZONTAL,
+            bg=C["border"],          # sash colour matches divider line
+            bd=0, sashwidth=4, sashpad=0,
+            sashrelief="flat", opaqueresize=True
         )
-        self._paned_container.pack(fill="both", expand=True, padx=4, pady=4)
+        self._paned.pack(fill="both", expand=True)
 
-        # Build Subsections as modular panels
         self._build_sidebar_panel()
-        self._build_chat_panel()
-        self._build_activity_panel()
-        self._build_dashboard_panel()
+        self._build_chat_area()
 
-        # Add panes dynamically with initial target widths
-        self._paned_container.add(self._sidebar, minsize=260)
-        self._paned_container.add(self._chat_panel_frame, minsize=400)
-        self._paned_container.add(self._activity_panel_frame, minsize=300)
-        self._paned_container.add(self._dashboard_panel_frame, minsize=320)
+    # ─────────────────────────────────────────────────────────────────────────
+    # SLIM TOP BAR  (32px — brand + status + abort)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_topbar(self):
+        bar = ctk.CTkFrame(
+            self._root_frame, fg_color=C["panel"],
+            corner_radius=0, border_width=0, height=32
+        )
+        bar.pack(side="top", fill="x")
+        bar.pack_propagate(False)
+        bar.grid_columnconfigure(1, weight=1)
 
-    # ── Sidebar Project Manager (Column 0 Pane) ───────────────────────────────
+        # Brand (left)
+        brand = ctk.CTkFrame(bar, fg_color="transparent")
+        brand.grid(row=0, column=0, sticky="w", padx=(12, 0))
+        ctk.CTkLabel(brand, text="⚡", font=("Segoe UI", 13), text_color=C["accent"]).pack(side="left")
+        ctk.CTkLabel(brand, text="Jarvis", font=("Segoe UI", 12, "bold"), text_color=C["text"]).pack(side="left", padx=(5, 0))
+
+        # Status (center-left)
+        status_row = ctk.CTkFrame(bar, fg_color="transparent")
+        status_row.grid(row=0, column=1, sticky="w", padx=(20, 0))
+        self._status_dot = ctk.CTkFrame(status_row, width=6, height=6, corner_radius=3, fg_color=C["yellow"])
+        self._status_dot.pack(side="left", padx=(0, 5))
+        self._status_label = ctk.CTkLabel(status_row, text="Initializing...", font=("Segoe UI", 10), text_color=C["subtext"])
+        self._status_label.pack(side="left")
+
+        # Abort (right)
+        self._abort_btn = ctk.CTkButton(
+            bar, text="Abort", width=64, height=22,
+            fg_color="transparent", hover_color="#2d1010",
+            text_color=C["red"], border_width=1, border_color="#3f0f0f",
+            font=("Segoe UI", 10), corner_radius=11, command=self._abort
+        )
+        self._abort_btn.grid(row=0, column=2, sticky="e", padx=(0, 10))
+
+        # 1px bottom border
+        ctk.CTkFrame(self._root_frame, fg_color=C["border"], height=1, corner_radius=0
+        ).pack(side="top", fill="x")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # LEFT SIDEBAR  (fixed 280px — workspace + all system tabs)
+    # ─────────────────────────────────────────────────────────────────────────
     def _build_sidebar_panel(self):
-        self._sidebar = ctk.CTkFrame(self._paned_container, fg_color=C["panel"], corner_radius=0, border_width=1, border_color=C["border"])
+        self._sidebar = ctk.CTkFrame(
+            self._paned, fg_color=C["panel"], corner_radius=0, border_width=0
+        )
         self._sidebar.grid_columnconfigure(0, weight=1)
-        self._sidebar.grid_rowconfigure(3, weight=1)
+        self._sidebar.grid_rowconfigure(5, weight=1)  # tabs expand
 
-        ctk.CTkLabel(self._sidebar, text="WORKSPACE EXPLORER", font=FONT_TITLE,
-                     text_color=C["text"]).grid(row=0, column=0, sticky="w", padx=14, pady=(15, 8))
+        # Add to paned window — sets initial width and enforces minimum
+        self._paned.add(self._sidebar, minsize=200, width=280)
 
-        # Project Selection Dropdown Setup
+        # ── New Session ───────────────────────────────────────────────────────
+        ctk.CTkButton(
+            self._sidebar, text="+ New Session", height=30,
+            fg_color=C["surface2"], hover_color=C["border2"],
+            text_color=C["text"], font=FONT_SMALL,
+            corner_radius=20, command=self._new_session
+        ).grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+
+        # ── Workspace label ───────────────────────────────────────────────────
+        ctk.CTkLabel(
+            self._sidebar, text="WORKSPACE", font=("Segoe UI", 9, "bold"),
+            text_color=C["subtext"]
+        ).grid(row=1, column=0, sticky="w", padx=14, pady=(2, 2))
+
+        ws = ctk.CTkFrame(self._sidebar, fg_color="transparent")
+        ws.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
+        ws.grid_columnconfigure(0, weight=1)
+
         self._project_dropdown = ctk.CTkOptionMenu(
-            self._sidebar, values=["Scanning Workspace..."],
+            ws, values=["Scanning..."],
             command=self._on_project_switched,
-            fg_color=C["surface"], button_color=C["border"],
+            fg_color=C["surface"], button_color=C["border2"],
             button_hover_color=C["accent"], dropdown_fg_color=C["surface"],
-            dropdown_hover_color=C["border"], text_color=C["text"], font=FONT_SMALL,
+            dropdown_hover_color=C["surface2"], text_color=C["text"], font=FONT_SMALL,
+            corner_radius=20, anchor="w"
+        )
+        self._project_dropdown.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+
+        proj_btns = ctk.CTkFrame(ws, fg_color="transparent")
+        proj_btns.grid(row=1, column=0, sticky="ew")
+        proj_btns.grid_columnconfigure(0, weight=1)
+        proj_btns.grid_columnconfigure(1, weight=1)
+        proj_btns.grid_columnconfigure(2, weight=1)
+
+        for col, (lbl, cmd) in enumerate([
+            ("+ Project", self._create_project_dialog),
+            ("📂 Scan",   self._change_base_work_directory),
+            ("💻 Code",   self._open_project_in_vscode),
+        ]):
+            ctk.CTkButton(
+                proj_btns, text=lbl, height=24, font=("Segoe UI", 10),
+                fg_color="transparent", hover_color=C["surface2"],
+                border_width=1, border_color=C["border2"], corner_radius=12,
+                command=cmd
+            ).grid(row=0, column=col, sticky="ew", padx=2)
+
+        # ── File list (compact fixed height) ─────────────────────────────────
+        self._file_list_box = ctk.CTkTextbox(
+            self._sidebar, font=("Segoe UI", 9), fg_color="transparent",
+            text_color=C["subtext"], wrap="none", corner_radius=0,
+            state="disabled", border_width=0, height=90
+        )
+        self._file_list_box.grid(row=3, column=0, sticky="ew", padx=14, pady=(2, 0))
+
+        # ── Divider ───────────────────────────────────────────────────────────
+        ctk.CTkFrame(self._sidebar, fg_color=C["border"], height=1, corner_radius=0
+        ).grid(row=4, column=0, sticky="ew", padx=10, pady=(4, 0))
+
+        # ── System tabs (expands) ─────────────────────────────────────────────
+        self._tabs = ctk.CTkTabview(
+            self._sidebar,
+            fg_color=C["surface"],
+            segmented_button_fg_color=C["surface"],
+            segmented_button_selected_color=C["accent"],
+            segmented_button_selected_hover_color=C["accent_dim"],
+            segmented_button_unselected_hover_color=C["surface2"],
             corner_radius=0
         )
-        self._project_dropdown.grid(row=1, column=0, sticky="ew", padx=12, pady=5)
+        self._tabs.grid(row=5, column=0, sticky="nsew", padx=0, pady=0)
 
-        # Project Creation controls
-        actions_frame = ctk.CTkFrame(self._sidebar, fg_color="transparent")
-        actions_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=5)
-        actions_frame.grid_columnconfigure(0, weight=1)
-        actions_frame.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkButton(
-            actions_frame, text="✚ New Project", height=28, font=FONT_SMALL,
-            fg_color=C["surface"], hover_color=C["border"], border_width=1, border_color=C["border"],
-            corner_radius=0, command=self._create_project_dialog
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 2))
-
-        ctk.CTkButton(
-            actions_frame, text="📂 Scan Dir", height=28, font=FONT_SMALL,
-            fg_color=C["surface"], hover_color=C["border"], border_width=1, border_color=C["border"],
-            corner_radius=0, command=self._change_base_work_directory
-        ).grid(row=0, column=1, sticky="ew", padx=(2, 0))
-
-        # File Listing View inside Project
-        self._file_list_box = ctk.CTkTextbox(
-            self._sidebar, font=FONT_MONO, fg_color=C["bg"],
-            text_color=C["subtext"], wrap="none", corner_radius=0, state="disabled",
-            border_width=1, border_color=C["border"]
-        )
-        self._file_list_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=8)
-
-        # Workspace Actions Quick shortcuts & Safe Shutdown Trigger
-        quick_actions = ctk.CTkFrame(self._sidebar, fg_color="transparent")
-        quick_actions.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 15))
-        quick_actions.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkButton(
-            quick_actions, text="💻 Open in VS Code", height=32, font=FONT_SMALL,
-            fg_color=C["accent"], hover_color="#1d4ed8", corner_radius=0,
-            command=self._open_project_in_vscode
-        ).grid(row=0, column=0, sticky="ew", pady=(0, 4))
-
-        ctk.CTkButton(
-            quick_actions, text="🐚 Open Terminal Here", height=32, font=FONT_SMALL,
-            fg_color=C["surface"], hover_color=C["border"], border_width=1, border_color=C["border"],
-            corner_radius=0, command=self._open_project_terminal
-        ).grid(row=1, column=0, sticky="ew", pady=(0, 4))
-
-        # Master AI Core Shutdown safety switch
-        ctk.CTkButton(
-            quick_actions, text="🔌 Shutdown Core Engine", height=34, font=FONT_BOLD,
-            fg_color=C["red"], hover_color="#991b1b", corner_radius=0,
-            command=self._shutdown_engine
-        ).grid(row=2, column=0, sticky="ew", pady=(4, 0))
-
-    # ── Chat Frame (Column 1 Pane) ────────────────────────────────────────────
-    def _build_chat_panel(self):
-        self._chat_panel_frame = ctk.CTkFrame(self._paned_container, fg_color=C["panel"], corner_radius=0, border_width=1, border_color=C["border"])
-        self._chat_panel_frame.grid_rowconfigure(1, weight=1)
-        self._chat_panel_frame.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(self._chat_panel_frame, text="CHAT INTELLIGENCE", font=FONT_TITLE,
-                     text_color=C["text"]).grid(row=0, column=0, sticky="w", padx=14, pady=(15, 8))
-
-        self._chat_scroll = ctk.CTkScrollableFrame(
-            self._chat_panel_frame, fg_color=C["surface"],
-            corner_radius=0, border_width=1, border_color=C["border"])
-        self._chat_scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 6))
-        self._chat_scroll.grid_columnconfigure(0, weight=1)
-
-        input_frame = ctk.CTkFrame(self._chat_panel_frame, fg_color="transparent")
-        input_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
-        input_frame.grid_columnconfigure(0, weight=1)
-
-        self._input = ctk.CTkEntry(
-            input_frame, placeholder_text="Specify objectives to execute...",
-            font=FONT_BODY, fg_color=C["surface"],
-            text_color=C["text"], border_color=C["border"],
-            height=42, corner_radius=0)
-        self._input.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        self._input.bind("<Return>",       self._send)
-
-        self._send_btn = ctk.CTkButton(
-            input_frame, text="SEND", width=85, height=42,
-            fg_color=C["accent"], hover_color="#1d4ed8",
-            font=FONT_BOLD, corner_radius=0, command=self._send)
-        self._send_btn.grid(row=0, column=1)
-
-    # ── Execution Activity Logs (Column 2 Pane) ───────────────────────────────
-    def _build_activity_panel(self):
-        self._activity_panel_frame = ctk.CTkFrame(self._paned_container, fg_color=C["panel"], corner_radius=0, border_width=1, border_color=C["border"])
-        self._activity_panel_frame.grid_rowconfigure(1, weight=1)
-        self._activity_panel_frame.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(self._activity_panel_frame, text="SYSTEM EXECUTION ENGINE", font=FONT_TITLE,
-                     text_color=C["text"]).grid(row=0, column=0, sticky="w", padx=14, pady=(15, 8))
-
-        self._activity_box = ctk.CTkTextbox(
-            self._activity_panel_frame, font=FONT_MONO, fg_color=C["tool_bg"],
-            text_color=C["tool_text"], wrap="word",
-            state="disabled", corner_radius=0, border_width=1, border_color=C["border"])
-        self._activity_box.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 6))
-        self._activity_box._textbox.configure(spacing1=3, spacing2=2, padx=10, pady=10)
-
-        ctk.CTkButton(
-            self._activity_panel_frame, text="Clear Logs", width=90, height=28,
-            fg_color=C["surface"], hover_color=C["border"], border_width=1, border_color=C["border"],
-            font=FONT_SMALL, corner_radius=0,
-            command=lambda: self._clear_box(self._activity_box)
-        ).grid(row=2, column=0, sticky="e", padx=10, pady=(0, 8))
-
-    # ── Dashboard & Memory Tab Frame (Column 3 Pane) ──────────────────────────
-    def _build_dashboard_panel(self):
-        self._dashboard_panel_frame = ctk.CTkFrame(self._paned_container, fg_color=C["panel"], corner_radius=0, border_width=1, border_color=C["border"])
-        self._dashboard_panel_frame.grid_rowconfigure(1, weight=1)
-        self._dashboard_panel_frame.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(self._dashboard_panel_frame, text="SYSTEM DATA CORE", font=FONT_TITLE,
-                     text_color=C["text"]).grid(row=0, column=0, sticky="w", padx=14, pady=(15, 8))
-
-        self._tabs = ctk.CTkTabview(self._dashboard_panel_frame, fg_color=C["surface"],
-                                     segmented_button_fg_color=C["border"],
-                                     segmented_button_selected_color=C["accent"],
-                                     segmented_button_selected_hover_color="#1d4ed8",
-                                     corner_radius=0)
-        self._tabs.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
-
-        for tab in ("Parameters", "System Core", "Knowledge Bases", "Skills", "Manual Tools"):
+        for tab in ("Log", "Parameters", "System Core", "Knowledge", "Skills", "Tools"):
             self._tabs.add(tab)
 
+        self._build_activity_panel()
         self._build_status_tab()
         self._build_system_core_tab()
         self._build_knowledge_bases_tab()
         self._build_skills_tab()
         self._build_manual_tools_tab()
 
-    # ── Status / System Parameters Tab ────────────────────────────────────────
+        # ── Footer ───────────────────────────────────────────────────────────
+        footer = ctk.CTkFrame(self._sidebar, fg_color="transparent")
+        footer.grid(row=6, column=0, sticky="ew", padx=8, pady=(2, 8))
+        footer.grid_columnconfigure(0, weight=1)
+        footer.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkButton(
+            footer, text="🐚 Terminal", height=26, font=("Segoe UI", 10),
+            fg_color="transparent", hover_color=C["surface2"],
+            text_color=C["subtext"], corner_radius=12,
+            command=self._open_project_terminal
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+
+        ctk.CTkButton(
+            footer, text="⏻ Shutdown", height=26, font=("Segoe UI", 10),
+            fg_color="transparent", hover_color="#2d1010",
+            text_color=C["red"], corner_radius=12,
+            command=self._shutdown_engine
+        ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
+
+        # (sash between sidebar and chat is provided by PanedWindow)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CENTER CHAT AREA  (fills all remaining width, content pinned to 760px col)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Shared column width — messages AND input are constrained to this width.
+    _CHAT_COL_W = 760
+
+    def _build_chat_area(self):
+        self._chat_panel_frame = ctk.CTkFrame(
+            self._paned, fg_color=C["bg"], corner_radius=0
+        )
+        self._chat_panel_frame.grid_rowconfigure(0, weight=1)
+        self._chat_panel_frame.grid_columnconfigure(0, weight=1)
+        self._paned.add(self._chat_panel_frame, minsize=400)
+
+        # ── Scrollable message area ───────────────────────────────────────────
+        # Uses the same 3-col centering: spacer | fixed-760 | spacer
+        self._chat_scroll = ctk.CTkScrollableFrame(
+            self._chat_panel_frame, fg_color=C["bg"], corner_radius=0, border_width=0
+        )
+        self._chat_scroll.grid(row=0, column=0, sticky="nsew")
+        # 3-column layout inside the scroll frame
+        self._chat_scroll.grid_columnconfigure(0, weight=1)   # left spacer
+        self._chat_scroll.grid_columnconfigure(1, weight=0)   # fixed content col
+        self._chat_scroll.grid_columnconfigure(2, weight=1)   # right spacer
+        # Invisible fixed-width anchor that enforces the content column width
+        self._chat_col_anchor = ctk.CTkFrame(
+            self._chat_scroll, fg_color="transparent",
+            width=self._CHAT_COL_W, height=1
+        )
+        self._chat_col_anchor.grid(row=0, column=1, sticky="ew")
+        self._chat_col_anchor.grid_propagate(False)
+        # Messages are appended starting at row 1
+        self._chat_row = 1
+
+        # ── Centered input pill ───────────────────────────────────────────────
+        input_outer = ctk.CTkFrame(self._chat_panel_frame, fg_color=C["bg"], corner_radius=0)
+        input_outer.grid(row=1, column=0, sticky="ew", pady=(8, 14))
+        input_outer.grid_columnconfigure(0, weight=1)
+        input_outer.grid_columnconfigure(1, weight=0)
+        input_outer.grid_columnconfigure(2, weight=1)
+
+        input_center = ctk.CTkFrame(input_outer, fg_color="transparent", width=self._CHAT_COL_W)
+        input_center.grid(row=0, column=1, sticky="ew")
+        input_center.grid_propagate(False)
+        input_center.grid_columnconfigure(0, weight=1)
+
+        input_box = ctk.CTkFrame(
+            input_center, fg_color=C["surface"],
+            corner_radius=26, border_width=1, border_color=C["border2"]
+        )
+        input_box.grid(row=0, column=0, sticky="ew")
+        input_box.grid_columnconfigure(0, weight=1)
+
+        self._input = ctk.CTkEntry(
+            input_box, placeholder_text="Message Jarvis...",
+            font=FONT_BODY, fg_color="transparent",
+            text_color=C["text"], border_width=0,
+            height=46, corner_radius=26
+        )
+        self._input.grid(row=0, column=0, sticky="ew", padx=(16, 6), pady=6)
+        self._input.bind("<Return>", self._send)
+
+        self._send_btn = ctk.CTkButton(
+            input_box, text="↑", width=36, height=36,
+            fg_color=C["accent"], hover_color=C["accent_dim"],
+            font=("Segoe UI", 16, "bold"), corner_radius=20, command=self._send
+        )
+        self._send_btn.grid(row=0, column=1, padx=(0, 6), pady=6)
+
+        ctk.CTkLabel(
+            input_center, text="Ctrl+Q to abort  ·  Enter to send",
+            font=("Segoe UI", 9), text_color=C["muted"]
+        ).grid(row=1, column=0, pady=(4, 0))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ACTIVITY LOG  (Log tab in sidebar)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_activity_panel(self):
+        tab = self._tabs.tab("Log")
+        tab.grid_rowconfigure(1, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
+        hdr = ctk.CTkFrame(tab, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(
+            hdr, text="Clear", width=46, height=22, font=FONT_LABEL,
+            fg_color="transparent", hover_color=C["surface2"],
+            border_width=1, border_color=C["border2"], corner_radius=11,
+            command=lambda: self._clear_box(self._activity_box)
+        ).grid(row=0, column=1, sticky="e")
+
+        self._activity_box = ctk.CTkTextbox(
+            tab, font=FONT_MONO, fg_color=C["tool_bg"],
+            text_color=C["tool_text"], wrap="word",
+            state="disabled", corner_radius=8, border_width=1, border_color=C["border"]
+        )
+        self._activity_box.grid(row=1, column=0, sticky="nsew")
+        self._activity_box._textbox.configure(spacing1=3, spacing2=2, padx=6, pady=6)
+
+    # ── Parameters Tab ────────────────────────────────────────────────────────
     def _build_status_tab(self):
         tab = self._tabs.tab("Parameters")
         tab.grid_columnconfigure(0, weight=1)
 
-        def _row(parent, label, row):
-            ctk.CTkLabel(parent, text=label, font=FONT_SMALL,
-                         text_color=C["subtext"]).grid(
-                row=row, column=0, sticky="w", padx=12, pady=(8, 0))
-            val = ctk.CTkLabel(parent, text="—", font=FONT_SMALL,
-                               text_color=C["text"], wraplength=260, justify="left")
-            val.grid(row=row+1, column=0, sticky="w", padx=12, pady=(0, 4))
+        def _stat_row(parent, label, row):
+            row_frame = ctk.CTkFrame(parent, fg_color="transparent")
+            row_frame.grid(row=row, column=0, sticky="ew", padx=4, pady=(5, 0))
+            row_frame.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(row_frame, text=label, font=FONT_LABEL, text_color=C["subtext"]).grid(row=0, column=0, sticky="w")
+            val = ctk.CTkLabel(row_frame, text="—", font=FONT_SMALL, text_color=C["text"], wraplength=320, justify="left")
+            val.grid(row=1, column=0, sticky="w", pady=(1, 3))
+            ctk.CTkFrame(parent, fg_color=C["border"], height=1, corner_radius=0).grid(row=row+1, column=0, sticky="ew", padx=4)
             return val
 
-        self._lbl_model    = _row(tab, "Cognitive Model",         0)
-        self._lbl_goal     = _row(tab, "Active Execution Goal",   2)
-        self._lbl_project  = _row(tab, "Workspace Path Context", 4)
-        self._lbl_gemini   = _row(tab, "Gemini Research Core",   6)
-        self._lbl_ocr      = _row(tab, "Screen OCR Subsystem",    8)
-        self._lbl_uia      = _row(tab, "Windows UI Automation",  10)
-        self._lbl_turns    = _row(tab, "Interaction Turns",      12)
+        self._lbl_model   = _stat_row(tab, "Model",           0)
+        self._lbl_goal    = _stat_row(tab, "Active Goal",      2)
+        self._lbl_project = _stat_row(tab, "Workspace",        4)
+        self._lbl_gemini  = _stat_row(tab, "Gemini Research",  6)
+        self._lbl_ocr     = _stat_row(tab, "Screen OCR",       8)
+        self._lbl_uia     = _stat_row(tab, "UI Automation",   10)
+        self._lbl_turns   = _stat_row(tab, "Turn Count",      12)
 
         ctk.CTkButton(
-            tab, text="↻ Hard Refresh State", height=32, font=FONT_SMALL,
-            fg_color=C["surface"], hover_color=C["border"], border_width=1, border_color=C["border"],
-            corner_radius=0, command=self._refresh_status
-        ).grid(row=14, column=0, padx=12, pady=15, sticky="ew")
+            tab, text="Refresh", height=30, font=FONT_SMALL,
+            fg_color="transparent", hover_color=C["surface2"],
+            border_width=1, border_color=C["border2"],
+            corner_radius=20, command=self._refresh_status
+        ).grid(row=14, column=0, padx=4, pady=12, sticky="ew")
 
-    # ── Unified System Core Tab (All System Files Editable) ───────────────────
+    # ── System Core Tab ───────────────────────────────────────────────────────
     def _build_system_core_tab(self):
         tab = self._tabs.tab("System Core")
         tab.grid_rowconfigure(1, weight=1)
         tab.grid_columnconfigure(0, weight=1)
 
-        control_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        control_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
-        control_frame.grid_columnconfigure(0, weight=1)
+        ctrl = ctk.CTkFrame(tab, fg_color="transparent")
+        ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        ctrl.grid_columnconfigure(0, weight=1)
 
         self._sys_core_dropdown = ctk.CTkOptionMenu(
-            control_frame, values=["Master Memory", "Session Memory", "Instructions", "Paths", "Active Project", "Scratchpad"],
+            ctrl,
+            values=["Master Memory", "Session Memory", "Instructions", "Paths", "Active Project", "Scratchpad"],
             command=self._on_sys_core_selected,
-            fg_color=C["surface"], button_color=C["border"],
+            fg_color=C["surface"], button_color=C["border2"],
             button_hover_color=C["accent"], dropdown_fg_color=C["surface"],
-            dropdown_hover_color=C["border"], text_color=C["text"], font=FONT_SMALL,
-            corner_radius=0
+            dropdown_hover_color=C["surface2"], text_color=C["text"], font=FONT_SMALL,
+            corner_radius=20
         )
-        self._sys_core_dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._sys_core_dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
         ctk.CTkButton(
-            control_frame, text="💾 Save", width=80, height=28, font=FONT_SMALL,
-            fg_color=C["accent"], hover_color="#1d4ed8", corner_radius=0,
+            ctrl, text="Save", width=58, height=28, font=FONT_SMALL,
+            fg_color=C["accent"], hover_color=C["accent_dim"], corner_radius=20,
             command=self._save_sys_core_file
-        ).grid(row=0, column=1, padx=2)
+        ).grid(row=0, column=1)
 
         self._sys_core_box = ctk.CTkTextbox(
             tab, font=FONT_MONO, fg_color=C["tool_bg"],
-            text_color=C["text"], wrap="word", corner_radius=0,
+            text_color=C["text"], wrap="word", corner_radius=10,
             border_width=1, border_color=C["border"]
         )
-        self._sys_core_box.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        self._sys_core_box.grid(row=1, column=0, sticky="nsew")
         self._sys_core_box._textbox.configure(spacing1=3, spacing2=2, padx=8, pady=8)
 
-        # Load master memory as default selected
         self._on_sys_core_selected("Master Memory")
 
     def _get_sys_core_path(self, selection: str) -> str:
@@ -599,44 +735,45 @@ class JarvisGUI(ctk.CTk):
             return
         self._save_box_to_file(self._sys_core_box, self._sys_core_active_file)
 
-    # ── Custom Knowledge Bases Tab (Read, Write & Create) ────────────────────
+    # ── Knowledge Bases Tab ───────────────────────────────────────────────────
     def _build_knowledge_bases_tab(self):
-        tab = self._tabs.tab("Knowledge Bases")
+        tab = self._tabs.tab("Knowledge")
         tab.grid_rowconfigure(1, weight=1)
         tab.grid_columnconfigure(0, weight=1)
 
         control_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        control_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        control_frame.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 4))
         control_frame.grid_columnconfigure(0, weight=1)
 
         self._knowledge_dropdown = ctk.CTkOptionMenu(
             control_frame, values=["Loading..."],
             command=self._on_knowledge_selected,
-            fg_color=C["surface"], button_color=C["border"],
+            fg_color=C["surface"], button_color=C["border2"],
             button_hover_color=C["accent"], dropdown_fg_color=C["surface"],
-            dropdown_hover_color=C["border"], text_color=C["text"], font=FONT_SMALL,
-            corner_radius=0
+            dropdown_hover_color=C["surface2"], text_color=C["text"], font=FONT_SMALL,
+            corner_radius=20
         )
-        self._knowledge_dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._knowledge_dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
         ctk.CTkButton(
-            control_frame, text="💾 Save", width=70, height=28, font=FONT_SMALL,
-            fg_color=C["accent"], hover_color="#1d4ed8", corner_radius=0,
+            control_frame, text="Save", width=54, height=28, font=FONT_SMALL,
+            fg_color=C["accent"], hover_color=C["accent_dim"], corner_radius=20,
             command=self._save_knowledge_file
-        ).grid(row=0, column=1, padx=2)
+        ).grid(row=0, column=1, padx=(0, 4))
 
         ctk.CTkButton(
-            control_frame, text="✚ New", width=70, height=28, font=FONT_SMALL,
-            fg_color=C["surface"], hover_color=C["border"], border_width=1, border_color=C["border"],
-            corner_radius=0, command=self._create_knowledge_dialog
-        ).grid(row=0, column=2, padx=2)
+            control_frame, text="+ New", width=54, height=28, font=FONT_SMALL,
+            fg_color="transparent", hover_color=C["surface2"],
+            border_width=1, border_color=C["border2"],
+            corner_radius=20, command=self._create_knowledge_dialog
+        ).grid(row=0, column=2)
 
         self._knowledge_box = ctk.CTkTextbox(
             tab, font=FONT_MONO, fg_color=C["tool_bg"],
-            text_color=C["text"], wrap="word", corner_radius=0,
+            text_color=C["text"], wrap="word", corner_radius=12,
             border_width=1, border_color=C["border"]
         )
-        self._knowledge_box.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        self._knowledge_box.grid(row=1, column=0, sticky="nsew", padx=0, pady=(4, 0))
         self._knowledge_box._textbox.configure(spacing1=3, spacing2=2, padx=8, pady=8)
 
         self._refresh_knowledge_dropdown()
@@ -699,44 +836,45 @@ class JarvisGUI(ctk.CTk):
         except Exception as e:
             messagebox.showerror("Error", f"Failed creating knowledge base: {e}")
 
-    # ── Custom Skills Tab (Read, Write & Create) ──────────────────────────────
+    # ── Skills Tab ────────────────────────────────────────────────────────────
     def _build_skills_tab(self):
         tab = self._tabs.tab("Skills")
         tab.grid_rowconfigure(1, weight=1)
         tab.grid_columnconfigure(0, weight=1)
 
         control_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        control_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        control_frame.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 4))
         control_frame.grid_columnconfigure(0, weight=1)
 
         self._skills_dropdown = ctk.CTkOptionMenu(
             control_frame, values=["Loading..."],
             command=self._on_skill_selected,
-            fg_color=C["surface"], button_color=C["border"],
+            fg_color=C["surface"], button_color=C["border2"],
             button_hover_color=C["accent"], dropdown_fg_color=C["surface"],
-            dropdown_hover_color=C["border"], text_color=C["text"], font=FONT_SMALL,
-            corner_radius=0
+            dropdown_hover_color=C["surface2"], text_color=C["text"], font=FONT_SMALL,
+            corner_radius=20
         )
-        self._skills_dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._skills_dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
         ctk.CTkButton(
-            control_frame, text="💾 Save", width=70, height=28, font=FONT_SMALL,
-            fg_color=C["accent"], hover_color="#1d4ed8", corner_radius=0,
+            control_frame, text="Save", width=54, height=28, font=FONT_SMALL,
+            fg_color=C["accent"], hover_color=C["accent_dim"], corner_radius=20,
             command=self._save_skill_file
-        ).grid(row=0, column=1, padx=2)
+        ).grid(row=0, column=1, padx=(0, 4))
 
         ctk.CTkButton(
-            control_frame, text="✚ New", width=70, height=28, font=FONT_SMALL,
-            fg_color=C["surface"], hover_color=C["border"], border_width=1, border_color=C["border"],
-            corner_radius=0, command=self._create_skill_dialog
-        ).grid(row=0, column=2, padx=2)
+            control_frame, text="+ New", width=54, height=28, font=FONT_SMALL,
+            fg_color="transparent", hover_color=C["surface2"],
+            border_width=1, border_color=C["border2"],
+            corner_radius=20, command=self._create_skill_dialog
+        ).grid(row=0, column=2)
 
         self._skills_box = ctk.CTkTextbox(
             tab, font=FONT_MONO, fg_color=C["tool_bg"],
-            text_color=C["text"], wrap="word", corner_radius=0,
+            text_color=C["text"], wrap="word", corner_radius=12,
             border_width=1, border_color=C["border"]
         )
-        self._skills_box.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        self._skills_box.grid(row=1, column=0, sticky="nsew", padx=0, pady=(4, 0))
         self._skills_box._textbox.configure(spacing1=3, spacing2=2, padx=8, pady=8)
 
         self._refresh_skills_dropdown()
@@ -804,56 +942,53 @@ class JarvisGUI(ctk.CTk):
         except Exception as e:
             messagebox.showerror("Error", f"Failed creating custom skill: {e}")
 
-    # ── Manual Tools Tab (Execute Sandbox) ────────────────────────────────────
+    # ── Manual Tools Tab ──────────────────────────────────────────────────────
     def _build_manual_tools_tab(self):
-        tab = self._tabs.tab("Manual Tools")
+        tab = self._tabs.tab("Tools")
         tab.grid_rowconfigure(2, weight=1)
         tab.grid_columnconfigure(0, weight=1)
 
         control_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        control_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        control_frame.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 4))
         control_frame.grid_columnconfigure(0, weight=1)
 
-        # Retrieve and sort available tool names directly from Jarvis schema
         tool_names = [t["function"]["name"] for t in jarvis.tools]
         tool_names.sort()
 
         self._manual_tool_dropdown = ctk.CTkOptionMenu(
             control_frame, values=tool_names,
             command=self._on_manual_tool_selected,
-            fg_color=C["surface"], button_color=C["border"],
+            fg_color=C["surface"], button_color=C["border2"],
             button_hover_color=C["accent"], dropdown_fg_color=C["surface"],
-            dropdown_hover_color=C["border"], text_color=C["text"], font=FONT_SMALL,
-            corner_radius=0
+            dropdown_hover_color=C["surface2"], text_color=C["text"], font=FONT_SMALL,
+            corner_radius=20
         )
-        self._manual_tool_dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._manual_tool_dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
         ctk.CTkButton(
-            control_frame, text="▶ Execute Tool", width=120, height=28, font=FONT_SMALL,
-            fg_color=C["accent"], hover_color="#1d4ed8", corner_radius=0,
+            control_frame, text="▶ Run", width=64, height=28, font=FONT_SMALL,
+            fg_color=C["accent"], hover_color=C["accent_dim"], corner_radius=20,
             command=self._execute_manual_tool
-        ).grid(row=0, column=1, padx=2)
+        ).grid(row=0, column=1)
 
-        # Dynamic parameter entries area
+        # Dynamic arg inputs area
         self._manual_args_frame = ctk.CTkScrollableFrame(
-            tab, fg_color=C["surface"], height=140,
-            corner_radius=0, border_width=1, border_color=C["border"]
+            tab, fg_color=C["surface"], height=130,
+            corner_radius=12, border_width=1, border_color=C["border"]
         )
-        self._manual_args_frame.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
+        self._manual_args_frame.grid(row=1, column=0, sticky="ew", padx=0, pady=(0, 4))
         self._manual_args_frame.grid_columnconfigure(1, weight=1)
 
         self._manual_arg_entries = {}
 
-        # Safe execution output sink
         self._manual_output_box = ctk.CTkTextbox(
             tab, font=FONT_MONO, fg_color=C["tool_bg"],
-            text_color=C["tool_text"], wrap="word", corner_radius=0,
+            text_color=C["tool_text"], wrap="word", corner_radius=12,
             border_width=1, border_color=C["border"]
         )
-        self._manual_output_box.grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
+        self._manual_output_box.grid(row=2, column=0, sticky="nsew", padx=0, pady=(0, 0))
         self._manual_output_box._textbox.configure(spacing1=3, spacing2=2, padx=8, pady=8)
 
-        # Initial trigger
         if tool_names:
             self._manual_tool_dropdown.set(tool_names[0])
             self._on_manual_tool_selected(tool_names[0])
@@ -880,7 +1015,7 @@ class JarvisGUI(ctk.CTk):
             lbl = ctk.CTkLabel(self._manual_args_frame, text=f"{arg_name}{req_str}", font=FONT_BOLD, text_color=C["subtext"])
             lbl.grid(row=row, column=0, sticky="ne", padx=(5, 10), pady=(5, 5))
 
-            entry = ctk.CTkEntry(self._manual_args_frame, font=FONT_BODY, fg_color=C["bg"], text_color=C["text"], border_color=C["border"], corner_radius=0)
+            entry = ctk.CTkEntry(self._manual_args_frame, font=FONT_BODY, fg_color=C["surface"], text_color=C["text"], border_color=C["border2"], corner_radius=20)
             entry.grid(row=row, column=1, sticky="ew", padx=(0, 5), pady=(5, 5))
             
             if desc:
@@ -1205,13 +1340,24 @@ class JarvisGUI(ctk.CTk):
     # MAIN THREAD POLLING & DYNAMIC REFRESH LOOP (Every 80 ms)
     # ──────────────────────────────────────────────────────────────────────────
     def _poll(self):
-        # Flush standard output stream lines to UI Activity monitor
+        # Flush standard output stream lines to UI Activity monitor,
+        # mirroring say() narration and major tool/system events live
+        # into the main chat as well.
         while not self._log_queue.empty():
             try:
                 line = self._log_queue.get_nowait()
-                self._activity_append(line)
             except queue.Empty:
                 break
+
+            if line.startswith(_SAY_TAG):
+                say_text = line[len(_SAY_TAG):]
+                self._chat_append_say(say_text)
+                self._activity_append(f"💬 [say]: {say_text}\n")
+                continue
+
+            self._activity_append(line)
+            if _is_tool_line(line):
+                self._chat_append_tool(line.strip())
 
         # Render responses when tool execution finishes
         if not self._reply_queue.empty():
@@ -1366,139 +1512,397 @@ class JarvisGUI(ctk.CTk):
     # ──────────────────────────────────────────────────────────────────────────
     # CORE INTERACTIVE GRAPHICAL HELPERS & RICH MARKDOWN RENDERING
     # ──────────────────────────────────────────────────────────────────────────
-    def _chat_append(self, tag: str, text: str):
-        """Compiles raw markdown blocks and appends them in beautifully sized real message bubbles."""
-        # Ensure scroll container updates geometry
+    # ─────────────────────────────────────────────────────────────────────────
+    # FULL MARKDOWN RENDERER
+    # Supports: H1-H6, bold, italic, bold-italic, strikethrough, inline code,
+    #   fenced code blocks (with lang label), blockquotes, unordered/ordered
+    #   lists (nested), horizontal rules, tables, links, paragraph spacing.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _md_setup_tags(self, tb: tk.Text) -> None:
+        """Register every tag the markdown renderer may use on a tk.Text widget."""
+        bg = tb["background"]
+        tb.tag_config("h1",          font=("Segoe UI", 22, "bold"),   foreground=C["text"])
+        tb.tag_config("h2",          font=("Segoe UI", 18, "bold"),   foreground=C["text"])
+        tb.tag_config("h3",          font=("Segoe UI", 15, "bold"),   foreground=C["text"])
+        tb.tag_config("h4",          font=("Segoe UI", 13, "bold"),   foreground=C["subtext"])
+        tb.tag_config("h5",          font=("Segoe UI", 12, "bold"),   foreground=C["subtext"])
+        tb.tag_config("h6",          font=("Segoe UI", 11, "bold"),   foreground=C["subtext"])
+        tb.tag_config("bold",        font=("Segoe UI", 12, "bold"),   foreground=C["text"])
+        tb.tag_config("italic",      font=("Segoe UI", 12, "italic"), foreground=C["text"])
+        tb.tag_config("bold_italic", font=("Segoe UI", 12, "bold italic"), foreground=C["text"])
+        tb.tag_config("strike",      font=("Segoe UI", 12),           foreground=C["subtext"],
+                      overstrike=True)
+        tb.tag_config("inline_code", font=FONT_MONO,                  foreground=C["tool_text"],
+                      background=C["surface2"])
+        tb.tag_config("code_lang",   font=("Segoe UI", 9, "bold"),    foreground=C["subtext"],
+                      background=C["tool_bg"])
+        tb.tag_config("code_body",   font=FONT_MONO,                  foreground=C["tool_text"],
+                      background=C["tool_bg"])
+        tb.tag_config("code_rule",   font=("Segoe UI", 6),            foreground=C["border2"],
+                      background=C["tool_bg"])
+        tb.tag_config("blockquote",  font=("Segoe UI", 12, "italic"), foreground=C["subtext"],
+                      lmargin1=16, lmargin2=16)
+        tb.tag_config("bq_bar",      background=C["accent"], foreground=C["accent"])
+        tb.tag_config("ul_bullet",   foreground=C["accent"],           font=("Segoe UI", 14, "bold"))
+        tb.tag_config("ol_num",      foreground=C["accent"],           font=("Segoe UI", 12, "bold"))
+        tb.tag_config("list_body",   font=FONT_BODY,                   foreground=C["text"],
+                      lmargin1=8, lmargin2=24)
+        tb.tag_config("hr",          font=("Segoe UI", 4),            foreground=C["border2"],
+                      background=C["border2"])
+        tb.tag_config("th",          font=("Segoe UI", 12, "bold"),   foreground=C["text"],
+                      background=C["surface2"])
+        tb.tag_config("td",          font=FONT_BODY,                   foreground=C["text"])
+        tb.tag_config("td_alt",      font=FONT_BODY,                   foreground=C["text"],
+                      background=C["surface"])
+        tb.tag_config("link",        font=FONT_BODY,                   foreground=C["accent"],
+                      underline=True)
+        tb.tag_config("normal",      font=FONT_BODY,                   foreground=C["text"])
+
+    def _md_inline(self, tb: tk.Text, text: str, base_tag: str = "normal") -> None:
+        """
+        Insert inline-formatted text into tb, handling:
+        ***bold italic***, **bold**, *italic*, ~~strike~~, `code`, [link](url)
+        in a single left-to-right pass.
+        """
+        # Pattern captures each inline token in priority order
+        INLINE = re.compile(
+            r"(\*\*\*(.+?)\*\*\*"          # ***bold italic***
+            r"|\*\*(.+?)\*\*"              # **bold**
+            r"|\*(.+?)\*"                  # *italic*
+            r"|___(.+?)___"                # ___bold italic___
+            r"|__(.+?)__"                  # __bold__
+            r"|_(.+?)_"                    # _italic_
+            r"|~~(.+?)~~"                  # ~~strike~~
+            r"|`(.+?)`"                    # `code`
+            r"|\[([^\]]+)\]\(([^)]+)\)"   # [text](url)
+            r")",
+            re.DOTALL
+        )
+        pos = 0
+        for m in INLINE.finditer(text):
+            # Plain text before this match
+            if m.start() > pos:
+                tb.insert("end", text[pos:m.start()], base_tag)
+            full = m.group(0)
+            if full.startswith("***") or full.startswith("___"):
+                tb.insert("end", m.group(2) or m.group(5), "bold_italic")
+            elif full.startswith("**") or full.startswith("__"):
+                tb.insert("end", m.group(3) or m.group(6), "bold")
+            elif full.startswith("~~"):
+                tb.insert("end", m.group(8), "strike")
+            elif full.startswith("*") or full.startswith("_"):
+                tb.insert("end", m.group(4) or m.group(7), "italic")
+            elif full.startswith("`"):
+                tb.insert("end", m.group(9), "inline_code")
+            elif full.startswith("["):
+                link_text, url = m.group(10), m.group(11)
+                tag_name = f"link_{id(url)}"
+                tb.tag_config(tag_name, font=FONT_BODY, foreground=C["accent"], underline=True)
+                tb.tag_bind(tag_name, "<Button-1>",
+                            lambda e, u=url: __import__("webbrowser").open(u))
+                tb.tag_bind(tag_name, "<Enter>",
+                            lambda e, t=tb, n=tag_name: t.tag_config(n, foreground=C["accent_dim"]))
+                tb.tag_bind(tag_name, "<Leave>",
+                            lambda e, t=tb, n=tag_name: t.tag_config(n, foreground=C["accent"]))
+                tb.insert("end", link_text, (tag_name,))
+            pos = m.end()
+        # Remaining plain text
+        if pos < len(text):
+            tb.insert("end", text[pos:], base_tag)
+
+    def _render_markdown(self, tb: tk.Text, raw: str) -> None:
+        """
+        Full block-level markdown parser → renders into tb.
+        Blocks handled: headings, fenced code, blockquotes, HR, tables,
+        unordered/ordered lists (with nesting), and paragraphs.
+        Each block may contain inline markdown.
+        """
+        self._md_setup_tags(tb)
+
+        lines = raw.splitlines()
+        i = 0
+        n = len(lines)
+
+        def nl(extra: str = "") -> None:
+            tb.insert("end", "\n" + extra)
+
+        while i < n:
+            line = lines[i]
+
+            # ── Blank line → paragraph gap ────────────────────────────────────
+            if line.strip() == "":
+                tb.insert("end", "\n")
+                i += 1
+                continue
+
+            # ── Fenced code block ─────────────────────────────────────────────
+            fence = re.match(r"^(`{3,}|~{3,})(.*)", line)
+            if fence:
+                fence_char, lang = fence.group(1), fence.group(2).strip()
+                i += 1
+                if lang:
+                    tb.insert("end", f" {lang} \n", "code_lang")
+                tb.insert("end", "─" * 62 + "\n", "code_rule")
+                while i < n and not lines[i].startswith(fence_char):
+                    tb.insert("end", lines[i] + "\n", "code_body")
+                    i += 1
+                tb.insert("end", "─" * 62 + "\n", "code_rule")
+                i += 1  # closing fence
+                continue
+
+            # ── Heading (ATX: # … ######) ─────────────────────────────────────
+            m = re.match(r"^(#{1,6})\s+(.*)", line)
+            if m:
+                level = len(m.group(1))
+                htag = f"h{level}"
+                self._md_inline(tb, m.group(2).strip(), htag)
+                nl()
+                i += 1
+                continue
+
+            # ── Setext headings (underline with === or ---) ───────────────────
+            if i + 1 < n:
+                under = lines[i + 1].strip()
+                if re.match(r"^=+$", under):
+                    self._md_inline(tb, line.strip(), "h1")
+                    nl(); i += 2; continue
+                if re.match(r"^-+$", under) and len(under) >= 2:
+                    self._md_inline(tb, line.strip(), "h2")
+                    nl(); i += 2; continue
+
+            # ── Horizontal rule ───────────────────────────────────────────────
+            if re.match(r"^\s*(\*{3,}|-{3,}|_{3,})\s*$", line):
+                tb.insert("end", "\n" + "─" * 64 + "\n\n", "hr")
+                i += 1
+                continue
+
+            # ── Blockquote ────────────────────────────────────────────────────
+            if line.startswith(">"):
+                # Collect all consecutive blockquote lines
+                bq_lines = []
+                while i < n and lines[i].startswith(">"):
+                    bq_lines.append(lines[i].lstrip(">").lstrip(" "))
+                    i += 1
+                tb.insert("end", "▌ ", "bq_bar")
+                self._md_inline(tb, " ".join(bq_lines), "blockquote")
+                nl()
+                continue
+
+            # ── Table (pipe syntax) ───────────────────────────────────────────
+            if "|" in line and i + 1 < n and re.match(r"^\|?[\s\-|:]+\|", lines[i + 1]):
+                # Parse header row
+                header_cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                i += 2  # skip separator row
+                # Calculate equal column width
+                col_w = max(12, 64 // max(len(header_cells), 1))
+                # Header
+                for ci, cell in enumerate(header_cells):
+                    tb.insert("end", f" {cell:<{col_w}} ", "th")
+                    if ci < len(header_cells) - 1:
+                        tb.insert("end", "│", "th")
+                nl()
+                tb.insert("end", "─" * 64 + "\n", "code_rule")
+                # Data rows
+                row_idx = 0
+                while i < n and "|" in lines[i]:
+                    cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                    row_tag = "td" if row_idx % 2 == 0 else "td_alt"
+                    for ci, cell in enumerate(cells):
+                        self._md_inline(tb, f" {cell:<{col_w}} ", row_tag)
+                        if ci < len(cells) - 1:
+                            tb.insert("end", "│", row_tag)
+                    nl()
+                    row_idx += 1
+                    i += 1
+                nl()
+                continue
+
+            # ── Unordered list ────────────────────────────────────────────────
+            ul_m = re.match(r"^(\s*)([-*+])\s+(.*)", line)
+            if ul_m:
+                indent = len(ul_m.group(1))
+                bullet = "•" if indent == 0 else ("◦" if indent <= 4 else "▪")
+                tb.insert("end", "  " * (indent // 2) + f"{bullet} ", "ul_bullet")
+                self._md_inline(tb, ul_m.group(3), "list_body")
+                nl()
+                i += 1
+                continue
+
+            # ── Ordered list ──────────────────────────────────────────────────
+            ol_m = re.match(r"^(\s*)(\d+)[.)]\s+(.*)", line)
+            if ol_m:
+                indent = len(ol_m.group(1))
+                tb.insert("end", "  " * (indent // 2) + f"{ol_m.group(2)}. ", "ol_num")
+                self._md_inline(tb, ol_m.group(3), "list_body")
+                nl()
+                i += 1
+                continue
+
+            # ── Normal paragraph line ─────────────────────────────────────────
+            self._md_inline(tb, line, "normal")
+            # Soft-wrap: if next non-empty line is also a plain paragraph, join
+            if i + 1 < n and lines[i + 1].strip() != "" \
+                    and not re.match(r"^[#>`\-*+|~\d]", lines[i + 1]) \
+                    and not re.match(r"^(`{3}|~{3})", lines[i + 1]):
+                tb.insert("end", " ")
+            else:
+                nl()
+            i += 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # LIVE MIRRORING — tool/system ticker lines & say() narration
+    # ─────────────────────────────────────────────────────────────────────────
+    def _chat_append_tool(self, text: str):
+        """
+        Render a tool-call or major system event as a compact grey ticker
+        line directly in the main chat, using one shared icon for every
+        kind of tool/system event (execution, memory, goals, clicks, etc).
+        """
+        if not text:
+            return
         self._chat_scroll.update_idletasks()
 
+        row = ctk.CTkFrame(self._chat_scroll, fg_color="transparent")
+        row.grid(row=self._chat_row, column=1, sticky="ew", pady=(1, 1))
+        self._chat_row += 1
+
+        inner = ctk.CTkFrame(row, fg_color="transparent")
+        inner.pack(anchor="w", fill="x", padx=2)
+
+        ctk.CTkLabel(
+            inner, text="⚙", font=("Segoe UI", 11), text_color=C["muted"], width=14
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkLabel(
+            inner, text=text, font=("Segoe UI", 10), text_color=C["subtext"],
+            justify="left", anchor="w", wraplength=720,
+        ).pack(side="left", fill="x", expand=True)
+
+        self.after(30, self._scroll_to_bottom)
+
+    def _chat_append_say(self, text: str):
+        """
+        Render a live say()-tool narration from the model as an interim
+        Jarvis message in the main chat, styled like a normal reply but
+        marked with a 💬 icon so it reads as "thinking out loud" rather
+        than the final answer.
+        """
+        if not text:
+            return
+        self._chat_scroll.update_idletasks()
+
+        row_frame = ctk.CTkFrame(self._chat_scroll, fg_color="transparent")
+        row_frame.grid(row=self._chat_row, column=1, sticky="ew", pady=(8, 2))
+        self._chat_row += 1
+        row_frame.grid_columnconfigure(0, weight=1)
+
+        header = ctk.CTkFrame(row_frame, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="w", pady=(0, 3))
+        ctk.CTkLabel(
+            header, text="💬", font=("Segoe UI", 12), text_color=C["accent"]
+        ).pack(side="left", padx=(2, 5))
+        ctk.CTkLabel(
+            header, text="Jarvis", font=FONT_BOLD, text_color=C["accent"]
+        ).pack(side="left")
+
+        tb = tk.Text(
+            row_frame,
+            font=FONT_BODY, bg=C["bg"], fg=C["text"],
+            bd=0, highlightthickness=0, wrap="word",
+            padx=2, pady=2, width=68,
+            insertbackground=C["text"], relief="flat",
+            cursor="arrow",
+        )
+        tb.grid(row=1, column=0, sticky="ew")
+
+        self._render_markdown(tb, text)
+
+        if tb.get("end-2c", "end-1c") == "\n":
+            tb.delete("end-2c", "end-1c")
+        tb.configure(state="disabled")
+
+        tb.update_idletasks()
+        try:
+            lines_count = tb.count("1.0", "end", "displaylines")[0]
+        except Exception:
+            lines_count = int(tb.index("end-1c").split(".")[0])
+        tb.configure(height=max(1, lines_count))
+
+        self.after(30, self._scroll_to_bottom)
+
+    def _chat_append(self, tag: str, text: str):
+        """Append a message into the fixed-width center column of the chat scroll."""
+        self._chat_scroll.update_idletasks()
+
+        # ── System / error notices ────────────────────────────────────────────
         if tag in ("system", "error"):
-            message_frame = ctk.CTkFrame(self._chat_scroll, fg_color="transparent")
-            message_frame.pack(fill="x", padx=12, pady=6)
-            
-            lbl_text = f"── {text} ──" if tag == "system" else f"── [ Engine Error ] ──\n{text}"
+            lbl_text = text if tag == "system" else f"[ Engine Error ]\n{text}"
             color = C["subtext"] if tag == "system" else C["red"]
-            
-            lbl = ctk.CTkLabel(message_frame, text=lbl_text, font=FONT_SMALL, text_color=color, justify="center")
-            lbl.pack(anchor="center")
-            
+            ctk.CTkLabel(
+                self._chat_scroll, text=lbl_text,
+                font=FONT_SMALL, text_color=color, justify="center"
+            ).grid(row=self._chat_row, column=1, sticky="ew", pady=4)
+            self._chat_row += 1
             self.after(50, self._scroll_to_bottom)
             return
 
-        # Prepare individual speaker bubbles
-        message_frame = ctk.CTkFrame(self._chat_scroll, fg_color="transparent")
-        
+        # ── USER bubble — right-aligned rounded card (plain text, no MD) ─────
         if tag == "user":
-            message_frame.pack(fill="x", anchor="e", padx=(60, 10), pady=6)
-            header_text = "You"
-            header_anchor = "e"
-            bubble_bg = C["user_msg"]
-            bubble_anchor = "e"
-        else:
-            message_frame.pack(fill="x", anchor="w", padx=(10, 60), pady=6)
-            header_text = "Jarvis"
-            header_anchor = "w"
-            bubble_bg = C["jarvis_msg"]
-            bubble_anchor = "w"
+            row_frame = ctk.CTkFrame(self._chat_scroll, fg_color="transparent")
+            row_frame.grid(row=self._chat_row, column=1, sticky="ew", pady=(10, 2))
+            self._chat_row += 1
+            row_frame.grid_columnconfigure(0, weight=1)
 
-        # Display speaker header labels
-        header_lbl = ctk.CTkLabel(message_frame, text=header_text, font=FONT_SMALL, text_color=C["subtext"])
-        header_lbl.pack(anchor=header_anchor, padx=12, pady=(0, 2))
+            ctk.CTkLabel(
+                row_frame, text="You", font=FONT_BOLD, text_color=C["subtext"]
+            ).grid(row=0, column=1, sticky="e", padx=(0, 4), pady=(0, 3))
 
-        # Core container bubble frame with modern padding and rounded corners
-        bubble_frame = ctk.CTkFrame(
-            message_frame, 
-            fg_color=bubble_bg, 
-            corner_radius=12, 
-            border_width=1, 
-            border_color=C["border"]
+            bubble = ctk.CTkFrame(row_frame, fg_color=C["user_msg"], corner_radius=18)
+            bubble.grid(row=1, column=1, sticky="e")
+            ctk.CTkLabel(
+                bubble, text=text.strip(), font=FONT_BODY,
+                text_color=C["text"], justify="left",
+                wraplength=380, anchor="w",
+            ).pack(padx=16, pady=10)
+            self.after(50, self._scroll_to_bottom)
+            return
+
+        # ── JARVIS response — full markdown, no bubble ────────────────────────
+        row_frame = ctk.CTkFrame(self._chat_scroll, fg_color="transparent")
+        row_frame.grid(row=self._chat_row, column=1, sticky="ew", pady=(10, 4))
+        self._chat_row += 1
+        row_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            row_frame, text="Jarvis", font=FONT_BOLD, text_color=C["accent"]
+        ).grid(row=0, column=0, sticky="w", padx=(2, 0), pady=(0, 4))
+
+        tb = tk.Text(
+            row_frame,
+            font=FONT_BODY, bg=C["bg"], fg=C["text"],
+            bd=0, highlightthickness=0, wrap="word",
+            padx=2, pady=2, width=68,
+            insertbackground=C["text"], relief="flat",
+            cursor="arrow",
         )
-        bubble_frame.pack(anchor=bubble_anchor)
+        tb.grid(row=1, column=0, sticky="ew")
 
-        # Compute sensible character columns dynamically based on line lengths
-        raw_lines = text.splitlines()
-        max_line_len = max(len(l) for l in raw_lines) if raw_lines else 0
-        optimal_width = min(65, max(25, max_line_len))
+        self._render_markdown(tb, text)
 
-        # Use an embedded select/copy enabled borderless text component
-        text_box = tk.Text(
-            bubble_frame,
-            font=FONT_BODY,
-            bg=bubble_bg,
-            fg=C["text"],
-            bd=0,
-            highlightthickness=0,
-            wrap="word",
-            padx=12,
-            pady=10,
-            width=optimal_width,
-            insertbackground=C["text"]
-        )
-        text_box.pack(fill="both", expand=True)
+        # Trim trailing newline
+        if tb.get("end-2c", "end-1c") == "\n":
+            tb.delete("end-2c", "end-1c")
+        tb.configure(state="disabled")
 
-        # Style compilation selectors
-        text_box.tag_config("md_bold", font=FONT_BOLD, foreground=C["text"])
-        text_box.tag_config("md_italic", font=FONT_ITALIC, foreground=C["text"])
-        text_box.tag_config("md_code_block", font=FONT_MONO, background=C["tool_bg"], foreground=C["tool_text"])
-        text_box.tag_config("md_inline_code", font=FONT_MONO, background=C["surface"], foreground=C["tool_text"])
-        text_box.tag_config("md_header", font=FONT_HEAD, foreground=C["accent"])
-        text_box.tag_config("md_bullet", foreground=C["accent2"])
-
-        in_code_block = False
-        for line in raw_lines:
-            if line.strip().startswith("```"):
-                in_code_block = not in_code_block
-                text_box.insert("end", "─" * (optimal_width - 4) + "\n")
-                continue
-
-            if in_code_block:
-                text_box.insert("end", f"{line}\n", "md_code_block")
-                continue
-
-            if line.startswith("#"):
-                clean_header = line.lstrip("#").strip()
-                text_box.insert("end", f"{clean_header}\n", "md_header")
-                continue
-
-            bullet_prefix = ""
-            if line.strip().startswith("- ") or line.strip().startswith("* "):
-                bullet_prefix = " • "
-                line = line.strip()[2:]
-
-            segments = re.split(r"(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)", line)
-            
-            if bullet_prefix:
-                text_box.insert("end", bullet_prefix, "md_bullet")
-            
-            for segment in segments:
-                if not segment:
-                    continue
-                if segment.startswith("**") and segment.endswith("**"):
-                    text_box.insert("end", segment[2:-2], "md_bold")
-                elif segment.startswith("*") and segment.endswith("*"):
-                    text_box.insert("end", segment[1:-1], "md_italic")
-                elif segment.startswith("`") and segment.endswith("`"):
-                    text_box.insert("end", segment[1:-1], "md_inline_code")
-                else:
-                    text_box.insert("end", segment)
-            
-            text_box.insert("end", "\n")
-
-        # Trim last newline safely
-        if text_box.get("end-2c", "end-1c") == "\n":
-            text_box.delete("end-2c", "end-1c")
-
-        text_box.configure(state="disabled")
-
-        # Set exact widget height based on total displaylines
-        text_box.update_idletasks()
+        # Auto-fit height
+        tb.update_idletasks()
         try:
-            display_lines = text_box.count("1.0", "end", "displaylines")[0]
+            lines_count = tb.count("1.0", "end", "displaylines")[0]
         except Exception:
-            display_lines = int(text_box.index("end-1c").split(".")[0])
-        
-        text_box.configure(height=max(1, display_lines))
+            lines_count = int(tb.index("end-1c").split(".")[0])
+        tb.configure(height=max(1, lines_count))
 
-        # Push the scrollbar automatically down to reveal the newest content block
         self.after(50, self._scroll_to_bottom)
 
     def _scroll_to_bottom(self):
@@ -1512,9 +1916,17 @@ class JarvisGUI(ctk.CTk):
             pass
 
     def _clear_chat(self):
-        """Removes all packed chat bubble frames from the viewport."""
+        """Removes all message widgets and resets the grid row counter."""
         for widget in self._chat_scroll.winfo_children():
             widget.destroy()
+        # Re-insert the invisible width anchor at row 0
+        self._chat_col_anchor = ctk.CTkFrame(
+            self._chat_scroll, fg_color="transparent",
+            width=self._CHAT_COL_W, height=1
+        )
+        self._chat_col_anchor.grid(row=0, column=1, sticky="ew")
+        self._chat_col_anchor.grid_propagate(False)
+        self._chat_row = 1
 
     def _activity_append(self, text: str):
         self._activity_box.configure(state="normal")
@@ -1529,13 +1941,14 @@ class JarvisGUI(ctk.CTk):
 
     def _set_status(self, text: str, colour: str = C["subtext"]):
         self._status_label.configure(text=text, text_color=colour)
-        # Match flat indicator state dot visually (no anti-aliasing notches)
         if colour == C["green"]:
             self._status_dot.configure(fg_color=C["green"])
         elif colour == C["yellow"]:
             self._status_dot.configure(fg_color=C["yellow"])
-        else:
+        elif colour == C["red"]:
             self._status_dot.configure(fg_color=C["red"])
+        else:
+            self._status_dot.configure(fg_color=C["subtext"])
 
     def _bind_keys(self):
         self.bind_all("<Control-q>", lambda e: self._abort())
