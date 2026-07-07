@@ -10,6 +10,8 @@ Download the ZIP file from the releases and extract it into an empty folder or c
 Download the python libraries required for the scripts to run using the following command.
 ```Poweshell
 pip install ollama pillow ddgs keyboard pymupdf mammoth python-docx rich pytesseract pywin32 uiautomation customtkinter google-genai requests
+pip install -U gemini_webapi
+pip install -U browser-cookie3   # optional but recommended
 ```
 ### Step 3:
 Download Ollama and download a tooling capable model of your choice (Older models like qwen2.5-coder are also supported)
