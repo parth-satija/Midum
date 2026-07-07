@@ -6,11 +6,20 @@ import base64
 import datetime
 import subprocess
 import threading
+import asyncio
 import queue as _queue
 import platform as _platform
 import ollama
 from ddgs import DDGS
 import time
+
+# requests is used by OpenRouter (chat completions) and CDP (Chrome tab
+# listing). Imported once at module level; both subsystems degrade
+# gracefully (return a clear "not installed" message) if missing.
+try:
+    import requests
+except ImportError:
+    requests = None
 
 _IS_LINUX   = _platform.system() == "Linux"
 _IS_WINDOWS = _platform.system() == "Windows"
@@ -59,6 +68,16 @@ except ImportError:
     _docx = None
     _DOCX_AVAILABLE = False
 
+# MCP (Model Context Protocol) client SDK — lets Jarvis connect to external
+# MCP servers (stdio subprocesses, or remote HTTP/SSE endpoints) and call
+# their tools. Install with:  pip install mcp
+try:
+    import mcp as _mcp_sdk  # noqa: F401
+    _MCP_SDK_AVAILABLE = True
+except ImportError:
+    _mcp_sdk = None
+    _MCP_SDK_AVAILABLE = False
+
 
 # rich renders Markdown in the terminal (headers, bold, code blocks, tables).
 # Pure formatting — zero effect on model logic or performance.
@@ -87,6 +106,47 @@ def _print_reply(label: str, text: str):
 # =============================================================================
 STARTUP_DIR    = os.getcwd()
 MODEL_NAME     = "jarvishehe"
+
+# ── PRIMARY MODEL PROVIDER ────────────────────────────────────────────────────
+# "ollama"     — use the local Ollama model (MODEL_NAME above) as the primary
+#                execution brain. OpenRouter is available as a frequent
+#                secondary consultant (see OPENROUTER_CONSULT_MODE below).
+# "openrouter" — use OPENROUTER_MODEL as the PRIMARY execution brain instead
+#                of Ollama. Every tool-calling turn is a metered API call.
+#                Use this if you have an OpenRouter key and want a stronger
+#                model driving Jarvis directly instead of qwen2.5-coder.
+#
+# A future GUI will expose this as a dropdown — for now, edit directly.
+MODEL_PROVIDER = "ollama"   # "ollama" | "openrouter"
+
+# ── OpenRouter model selection ────────────────────────────────────────────────
+# Used when MODEL_PROVIDER == "openrouter" (primary), and always used for
+# secondary consultation regardless of MODEL_PROVIDER (see OPENROUTER_CONSULT_MODE).
+#
+# OpenRouter model IDs: https://openrouter.ai/models
+# Free-tier examples (subject to change, check openrouter.ai/models?max_price=0):
+#   "meta-llama/llama-3.1-8b-instruct:free"
+#   "meta-llama/llama-3.3-70b-instruct:free"
+#   "google/gemini-2.0-flash-exp:free"
+#   "deepseek/deepseek-chat-v3.1:free"
+#   "qwen/qwen3-235b-a22b:free"
+# Paid examples (for MODEL_PROVIDER == "openrouter" as a strong primary):
+#   "anthropic/claude-3.7-sonnet"
+#   "openai/gpt-4o"
+#   "google/gemini-2.5-pro"
+OPENROUTER_MODEL          = "meta-llama/llama-3.3-70b-instruct:free"   # primary (if selected) AND consult model
+OPENROUTER_API_BASE       = "https://openrouter.ai/api/v1"
+
+# ── Secondary consultation mode ───────────────────────────────────────────────
+# Controls how often OpenRouter is consulted as a planning brain in addition
+# to (or instead of) Gemini. OpenRouter free models are consulted far more
+# aggressively than Gemini since there's no desktop-app UI-automation cost —
+# it's a direct API call, so it's cheap to call on every non-trivial turn.
+#   "always"    — consult OpenRouter on every non-trivial turn (most reliable,
+#                 more API usage — fine for free-tier models)
+#   "fallback"  — only consult OpenRouter if Gemini (app + API) both fail
+#   "off"       — never consult OpenRouter as a secondary planner
+OPENROUTER_CONSULT_MODE   = "always"
 
 # ── Legacy / weak native-tool-calling models ────────────────────────────────
 LEGACY_TOOLCALL_MODELS = (
@@ -133,6 +193,7 @@ DOMAIN_SKILLS_INDEX = os.path.join(STORAGE_DIR, "domain_skills_index.md")
 MASTER_MEMORY       = os.path.join(STORAGE_DIR, "master_memory.md")
 SESSION_MEMORY      = os.path.join(STORAGE_DIR, "session_memory.md")
 RESPONSE_MEMORY     = os.path.join(STORAGE_DIR, "response_memory.md")
+MCP_SERVERS_FILE    = os.path.join(STORAGE_DIR, "mcp_servers.json")
 LOG_FILE            = os.path.join(TARGET_DIR, "chat_log.md")
 
 GOAL_SECTION_HEADER = "## Current Goal"
@@ -1453,137 +1514,17 @@ if _UIA_AVAILABLE:
                 aggregated_lines.append(" ".join(current_line))
                 
             return "\n".join(aggregated_lines)
-        def query_gemini_app(self, prompt: str) -> str:
+
+        def query_gemini_app(self, prompt: str, wait_for_response: int = 90) -> str:
             """
-            Send a prompt to the Gemini PWA and retrieve the response.
-            Uses clipboard paste instead of SetValue (works reliably in Electron).
-            Requires pyperclip: pip install pyperclip
+            Thin delegator kept ONLY so external dispatchers that call tools
+            as getattr(ui_navigator, tool_name)(**args) (e.g. gui.pyw) keep
+            working. Does NOT use UIA — routes straight to the module-level,
+            CDP/browser-based query_gemini_app(), same as the CLI dispatcher
+            in this file uses directly.
             """
-            if not _UIA_AVAILABLE:
-                return "Error: UIA engine is completely offline."
+            return query_gemini_app(prompt, wait_for_response=wait_for_response)
 
-            try:
-                import pyperclip
-            except ImportError:
-                return (
-                    "Error: pyperclip not installed. "
-                    "Run: pip install pyperclip"
-                )
-
-            window_title = "Gemini"
-
-            # ── Step 1: Ensure Gemini is open ─────────────────────────────────
-            hwnd = self._find_window(window_title)
-            if not hwnd:
-                print("   [Gemini] Launching via desktop shortcut...")
-                desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-                target_lnk   = None
-                for f in os.listdir(desktop_path):
-                    if f.lower().endswith(".lnk") and "gemini" in f.lower():
-                        target_lnk = os.path.join(desktop_path, f)
-                        break
-                if not target_lnk:
-                    return "Error: No Gemini shortcut found on Desktop."
-                os.startfile(target_lnk)
-                for _ in range(20):
-                    time.sleep(1.0)
-                    hwnd = self._find_window(window_title)
-                    if hwnd:
-                        break
-            if not hwnd:
-                return "Error: Gemini window did not appear after launch."
-
-            # ── Step 2: Focus window ──────────────────────────────────────────
-            try:
-                win32gui.ShowWindow(hwnd, 9)
-                win32gui.SetForegroundWindow(hwnd)
-                time.sleep(1.0)
-            except Exception as e:
-                print(f"   [Gemini] Focus warning: {e}")
-
-            # ── Step 3: Click the input area ──────────────────────────────────
-            # Try several known names for Gemini's input box
-            clicked = False
-            for name in ["message input", "Enter a prompt here", "prompt", "chat input", "textarea"]:
-                result = self.find_and_act(window_title, name, action="click")
-                if "Success" in result or "invoked" in result or "clicked" in result:
-                    clicked = True
-                    break
-
-            time.sleep(0.3)
-
-            # Verify we focused Gemini and not Jarvis's own terminal
-            fg_hwnd  = win32gui.GetForegroundWindow()
-            fg_title = win32gui.GetWindowText(fg_hwnd).strip()
-            if "gemini" not in fg_title.lower():
-                return (
-                    f"Error: Could not focus Gemini input — foreground window is '{fg_title}'. "
-                    f"Gemini may not be responding to focus requests."
-                )
-
-            # ── Step 4: Paste prompt via clipboard ────────────────────────────
-            # SetValue never works on Electron contenteditable divs.
-            # Clipboard paste is the only reliable method.
-            pyperclip.copy(prompt)
-            time.sleep(0.1)
-            paste_ps = (
-                "Add-Type -AssemblyName System.Windows.Forms\n"
-                "[System.Windows.Forms.SendKeys]::SendWait('^v')"
-            )
-            execute_terminal_command(paste_ps)
-            time.sleep(0.5)
-
-            # ── Step 5: Submit ────────────────────────────────────────────────
-            submit_ps = (
-                "Add-Type -AssemblyName System.Windows.Forms\n"
-                "[System.Windows.Forms.SendKeys]::SendWait('~')"
-            )
-            execute_terminal_command(submit_ps)
-            print("   [Gemini] Prompt submitted. Waiting for response...")
-
-            # ── Step 6: Wait for generation to finish ─────────────────────────
-            # Poll for the 'Stop generating' button as a proxy for in-progress.
-            # When it disappears, generation is done.
-            time.sleep(3.0)
-            for _ in range(40):   # up to 40 seconds
-                time.sleep(1.0)
-                stop_exists = False
-                try:
-                    root = auto.ControlFromHandle(hwnd)
-                    for el, _ in auto.WalkControl(root, maxDepth=6):
-                        name = (el.Name or "").lower()
-                        if "stop" in name or "generating" in name:
-                            stop_exists = True
-                            break
-                except Exception:
-                    pass
-                if not stop_exists:
-                    break
-
-            time.sleep(1.0)
-
-            # ── Step 7: Copy response via 'Copy response' button ─────────────
-            # Most reliable extraction: use Gemini's own copy button.
-            pyperclip.copy("")   # clear clipboard first
-            copy_result = self.find_and_act(window_title, "Copy response", action="click")
-            time.sleep(0.5)
-
-            response_text = pyperclip.paste().strip()
-            if response_text and response_text != prompt:
-                print(f"   [Gemini] Response captured ({len(response_text)} chars)")
-                return response_text
-
-            # Fallback: try reading whatever text UIA can see
-            fallback = self.read_aggregated_text(window_title)
-            if fallback.strip():
-                return fallback.strip()
-
-            return (
-                "Gemini responded but the response could not be extracted. "
-                "The 'Copy response' button may not have been found, or the "
-                "clipboard was not populated. Try again or use consult_gemini instead."
-            )
-        
         def manage_gemini_chat(self, action: str, chat_name: str = None) -> str:
             window_title = "Gemini"
             hwnd = win32gui.FindWindow(None, window_title)
@@ -2121,107 +2062,15 @@ class AppMapNavigatorLinux:
             return ""
         return "\n".join(" ".join(words) for _, words in sorted(lines_by_y.items()))
 
-    def query_gemini_app(self, prompt: str) -> str:
+    def query_gemini_app(self, prompt: str, wait_for_response: int = 90) -> str:
         """
-        Send a prompt to the Gemini PWA (Chrome app) on Linux using xdotool +
-        xclip for clipboard paste — mirrors AppMapNavigator.query_gemini_app.
-
-        Requires: xdotool, xclip   (sudo apt install xdotool xclip)
+        Thin delegator kept ONLY so external dispatchers that call tools as
+        getattr(ui_navigator, tool_name)(**args) (e.g. gui.pyw) keep working.
+        Does NOT use AT-SPI/xdotool — routes straight to the module-level,
+        CDP/browser-based query_gemini_app(), same as the CLI dispatcher in
+        this file uses directly.
         """
-        window_title = "Gemini"
-
-        # ── Step 1: Ensure Gemini is open ─────────────────────────────────────
-        win_id = self._find_window_id(window_title)
-        if not win_id:
-            print("   [Gemini/Linux] Launching Gemini via xdg-open...")
-            _run(["xdg-open", "https://gemini.google.com"])
-            for _ in range(20):
-                time.sleep(1.0)
-                win_id = self._find_window_id(window_title)
-                if win_id:
-                    break
-        if not win_id:
-            return "Error: Gemini window did not appear after launch."
-
-        # ── Step 2: Focus window ───────────────────────────────────────────────
-        _run(["xdotool", "windowfocus", "--sync", win_id])
-        _run(["xdotool", "windowactivate", "--sync", win_id])
-        time.sleep(1.0)
-
-        # ── Step 3: Click the input area ───────────────────────────────────────
-        clicked = False
-        for name in ["message input", "Enter a prompt here", "prompt", "chat input"]:
-            result = self.find_and_act(window_title, name, action="click")
-            if "Success" in result or "invoked" in result:
-                clicked = True
-                break
-        time.sleep(0.3)
-
-        # Verify focus landed on Gemini
-        focused_stdout, _ = _run(["xdotool", "getactivewindow"])
-        if focused_stdout.strip() != win_id:
-            # Try clicking the center of the window as a fallback
-            geom_out, _ = _run(["xdotool", "getwindowgeometry", win_id])
-            # parse "Position: X,Y\n  Geometry: WxH"
-            pos_m  = re.search(r"Position:\s*(\d+),(\d+)", geom_out)
-            geom_m = re.search(r"Geometry:\s*(\d+)x(\d+)", geom_out)
-            if pos_m and geom_m:
-                cx = int(pos_m.group(1)) + int(geom_m.group(1)) // 2
-                cy = int(pos_m.group(2)) + int(geom_m.group(2)) // 2
-                self._do_click_linux(cx, cy)
-                time.sleep(0.3)
-
-        # ── Step 4: Paste prompt via xclip ─────────────────────────────────────
-        clip_proc = subprocess.run(
-            ["xclip", "-selection", "clipboard"],
-            input=prompt, text=True, capture_output=True
-        )
-        if clip_proc.returncode != 0:
-            # Try xsel as fallback
-            subprocess.run(["xsel", "--clipboard", "--input"], input=prompt, text=True)
-        time.sleep(0.1)
-        _run(["xdotool", "key", "--clearmodifiers", "ctrl+v"])
-        time.sleep(0.5)
-
-        # ── Step 5: Submit ─────────────────────────────────────────────────────
-        _run(["xdotool", "key", "--clearmodifiers", "Return"])
-        print("   [Gemini/Linux] Prompt submitted. Waiting for response...")
-
-        # ── Step 6: Wait for generation to finish ──────────────────────────────
-        time.sleep(3.0)
-        win_atspi = self._find_atspi_window(window_title)
-        for _ in range(40):
-            time.sleep(1.0)
-            stop_found = False
-            if win_atspi:
-                for node, _ in self._walk_atspi(win_atspi, 6):
-                    name = (node.name or "").lower()
-                    if "stop" in name or "generating" in name:
-                        stop_found = True
-                        break
-            if not stop_found:
-                break
-        time.sleep(1.0)
-
-        # ── Step 7: Copy response via keyboard shortcut ─────────────────────────
-        # Clear clipboard, click copy button, read back
-        subprocess.run(["xclip", "-selection", "clipboard"], input="", text=True)
-        self.find_and_act(window_title, "Copy response", action="click")
-        time.sleep(0.5)
-
-        out, _ = _run(["xclip", "-selection", "clipboard", "-o"])
-        if out.strip() and out.strip() != prompt:
-            print(f"   [Gemini/Linux] Response captured ({len(out)} chars)")
-            return out.strip()
-
-        fallback = self.read_aggregated_text(window_title)
-        if fallback.strip():
-            return fallback.strip()
-
-        return (
-            "Gemini responded but the response could not be extracted. "
-            "Try again or use consult_gemini instead."
-        )
+        return query_gemini_app(prompt, wait_for_response=wait_for_response)
 
     def manage_gemini_chat(self, action: str, chat_name: str = None) -> str:
         """Mirrors AppMapNavigator.manage_gemini_chat."""
@@ -2296,7 +2145,18 @@ _GEMINI_AVAILABLE = False
 _gemini_client    = None
 
 def _load_gemini():
-    """Load API key from secrets file and initialise the unified GenAI client."""
+    """
+    Load API key from secrets file and initialise the unified GenAI client.
+
+    NOTE: as of this rewrite, the Gemini API is NOT used by consult_gemini
+    or query_gemini_app anymore — both route exclusively through the free
+    web chat interface (gemini.google.com/app) via browser/CDP automation,
+    since the API's free-tier request/token-per-minute limits are far
+    tighter than the web chat UI's own limits. This loader is kept only
+    so _GEMINI_AVAILABLE can still be reported in the startup banner if a
+    key happens to be configured; nothing in the active code path calls
+    into _gemini_client.
+    """
     global _GEMINI_AVAILABLE, _gemini_client
     try:
         from google import genai
@@ -2323,35 +2183,21 @@ def _load_gemini():
 _gemini_load_ok, _gemini_load_msg = _load_gemini()
 
 
-# Free-tier defense allocation profiles
-_GEMINI_MODELS = {
-    "quick":    ("gemini-2.0-flash", "Fast, high-efficiency tier for quick operations."),
-    "balanced": ("gemini-2.0-flash", "Standard multi-step reasoning tier."),
-    "hard":     ("gemini-2.5-flash", "Enhanced reasoning tier for code logic and architecture review."),
-    "expert":   ("gemini-2.5-flash", "Capped safely to 2.5-flash to protect Free Tier limits from 2.5-pro exhaustion."),
-}
-
-_TASK_TYPE_KEYWORDS = {
-    "quick":    ["summarise", "summarize", "lookup", "define", "translate", "short", "quick", "simple", "what is", "who is"],
-    "hard":     ["analyse", "analyze", "compare", "reason", "plan", "debug", "review", "explain", "complex", "multi-step", "architecture", "design", "evaluate", "research"],
-    "expert":   ["hardest", "expert", "deep", "comprehensive", "full analysis", "detailed review", "best possible"],
-}
-
-def _pick_gemini_model(prompt: str) -> tuple[str, str]:
-    """
-    Choose an appropriate fallback model protecting free credits.
-    """
-    low = prompt.lower()
-    for task_type in ("expert", "hard", "quick"):
-        if any(kw in low for kw in _TASK_TYPE_KEYWORDS[task_type]):
-            m = _GEMINI_MODELS[task_type]
-            return m[0], m[1]
-    return _GEMINI_MODELS["balanced"]
-
-
 def consult_gemini(prompt, task_type="auto", context=""):
     """
-    Send a prompt via the Gemini desktop app (free) or API (fallback).
+    Send a prompt to Gemini via the actual WEB CHAT INTERFACE
+    (https://gemini.google.com/app), using the community `gemini_webapi`
+    library in query_gemini_app() — cookie-based, no browser automation
+    or UIA involved. This intentionally does NOT fall back to the metered
+    Gemini API — the API's free-tier request/token-per-minute limits are
+    far tighter than what the web chat UI itself allows, so a silent
+    fallback would burn through API credits without the caller ever
+    knowing. If the web route fails, this returns a clear error instead
+    so you can retry rather than unknowingly hitting the API.
+
+    task_type is accepted for backward compatibility but has no effect
+    now that there's no model to route between — it's always whatever
+    model gemini.google.com/app is currently serving.
     """
     full_prompt = prompt.strip()
     if context.strip():
@@ -2359,42 +2205,838 @@ def consult_gemini(prompt, task_type="auto", context=""):
             context = context[:30000] + "\n... [TRUNCATED] ...\n" + context[-30000:]
         full_prompt = "[CONTEXT]\n" + context.strip() + "\n\n[TASK]\n" + full_prompt
 
-    # ── Route 1: Gemini desktop app (free) ───────────────────────────────────
-    if _UIA_AVAILABLE and ui_navigator is not None:
-        try:
-            print(f"   [Gemini app] Sending consult request...")
-            result = ui_navigator.query_gemini_app(full_prompt)
-            if result and not result.startswith("Error"):
-                print(f"   [Gemini app] Response received ({len(result)} chars)")
-                return "[Gemini/app]\n" + result
-            else:
-                print(f"   [Gemini app] Error: {result[:80]} — falling back to API")
-        except Exception as e:
-            print(f"   [Gemini app] Failed: {e} — falling back to API")
+    if not _GEMINI_WEBAPI_AVAILABLE:
+        return f"Error: Gemini web chat is unavailable — {_gemini_webapi_load_msg}"
 
-    # ── Route 2: Gemini API (fallback) ───────────────────────────────────────
-    if not _GEMINI_AVAILABLE or _gemini_client is None:
-        return (
-            f"Gemini is not available: {_gemini_load_msg}. "
-            "Ensure the Gemini desktop app is open, or check SECRETS_FILE."
-        )
+    print("   [Gemini web] Sending consult request...")
     try:
-        if task_type == "auto" or task_type not in _GEMINI_MODELS:
-            model_id, rationale = _pick_gemini_model(prompt)
-        else:
-            model_id  = _GEMINI_MODELS[task_type][0]
-            rationale = _GEMINI_MODELS[task_type][1]
-
-        print(f"   [Gemini API] Model: {model_id} — {rationale}")
-        response = _gemini_client.models.generate_content(
-            model=model_id,
-            contents=full_prompt,
-        )
-        result = response.text.strip()
-        print(f"   [Gemini API] Response received ({len(result)} chars)")
-        return f"[Gemini/{model_id}]\n" + result
+        result = query_gemini_app(full_prompt)
     except Exception as e:
-        return f"Gemini error: {str(e)}"
+        return f"Error: Gemini web chat request failed: {e}"
+
+    if result and not result.startswith("Error"):
+        print(f"   [Gemini web] Response received ({len(result)} chars)")
+        return "[Gemini/web]\n" + result
+
+    return f"Error: Gemini web chat failed — {result}"
+
+
+# =============================================================================
+# OPENROUTER SETUP
+# =============================================================================
+#
+# INSTALLATION:
+#   pip install requests   (already required elsewhere in this file)
+#
+# API KEY SETUP (one-time):
+#   1. Get a key at https://openrouter.ai/keys
+#   2. Add it to the SAME secrets file used for Gemini:
+#      { "GEMINI_API_KEY": "...", "OPENROUTER_API_KEY": "sk-or-v1-..." }
+#
+# OpenRouter exposes an OpenAI-compatible /chat/completions endpoint, so this
+# uses plain `requests` rather than a dedicated SDK — one less dependency.
+#
+_OPENROUTER_AVAILABLE = False
+_OPENROUTER_API_KEY   = None
+
+def _load_openrouter():
+    """Load OpenRouter API key from the shared secrets file."""
+    global _OPENROUTER_AVAILABLE, _OPENROUTER_API_KEY
+    try:
+        secrets_path = os.path.abspath(SECRETS_FILE)
+        if not os.path.exists(secrets_path):
+            return False, f"Secrets file not found: {secrets_path}"
+        with open(secrets_path, "r", encoding="utf-8") as f:
+            secrets = json.load(f)
+        key = secrets.get("OPENROUTER_API_KEY", "").strip()
+        if not key:
+            return False, "OPENROUTER_API_KEY is empty in secrets file."
+        _OPENROUTER_API_KEY   = key
+        _OPENROUTER_AVAILABLE = True
+        return True, "OK"
+    except Exception as e:
+        return False, str(e)
+
+
+_openrouter_load_ok, _openrouter_load_msg = _load_openrouter()
+
+
+def _openrouter_chat(messages: list, model: str = None, tools_schema: list = None,
+                      timeout: int = 60, _retries: int = 2) -> dict:
+    """
+    Call OpenRouter's OpenAI-compatible /chat/completions endpoint.
+    Returns a dict normalised to the SAME shape _call_ollama produces:
+        {"message": {"role": "assistant", "content": str, "tool_calls": [...] }}
+    so process_chat_turn can treat Ollama and OpenRouter identically.
+
+    Retries on 429 (rate limit) and 502/503 (upstream overloaded) — both are
+    common on OpenRouter's free-tier models, which is the primary use case
+    for OPENROUTER_CONSULT_MODE="always". Raises RuntimeError with the
+    ACTUAL error message from OpenRouter's response body (not just a generic
+    HTTP status), since that body usually says exactly what went wrong
+    (rate-limited, model overloaded, invalid key, etc).
+    """
+    if not _OPENROUTER_AVAILABLE or not _OPENROUTER_API_KEY:
+        raise RuntimeError(
+            f"OpenRouter not available: {_openrouter_load_msg}. "
+            f"Add OPENROUTER_API_KEY to {SECRETS_FILE}"
+        )
+    if requests is None:
+        raise RuntimeError("requests library not installed: pip install requests")
+
+    model = model or OPENROUTER_MODEL
+
+    payload = {
+        "model": model,
+        "messages": messages,
+    }
+    if tools_schema:
+        payload["tools"] = tools_schema
+
+    headers = {
+        "Authorization": f"Bearer {_OPENROUTER_API_KEY}",
+        "Content-Type":  "application/json",
+        "HTTP-Referer":  "https://github.com/jarvis-local-agent",
+        "X-Title":       "Jarvis Desktop Agent",
+    }
+
+    last_err = None
+    for attempt in range(_retries + 1):
+        try:
+            resp = requests.post(
+                f"{OPENROUTER_API_BASE}/chat/completions",
+                headers=headers, json=payload, timeout=timeout
+            )
+
+            # Pull the response body regardless of status — OpenRouter puts
+            # the real error reason in JSON even on 4xx/5xx responses.
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+
+            if resp.status_code != 200:
+                err_obj = data.get("error", {}) if isinstance(data, dict) else {}
+                err_msg = err_obj.get("message") or resp.text[:200] or f"HTTP {resp.status_code}"
+
+                retryable = resp.status_code in (429, 502, 503, 504)
+                if retryable and attempt < _retries:
+                    wait_s = 1.5 * (attempt + 1)
+                    print(f"   [OpenRouter] {resp.status_code} ({err_msg[:80]}) — "
+                          f"retrying in {wait_s:.1f}s...")
+                    time.sleep(wait_s)
+                    last_err = err_msg
+                    continue
+
+                raise RuntimeError(f"OpenRouter API error ({resp.status_code}): {err_msg}")
+
+            # 200 OK but the API-level payload can still carry an error object
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(f"OpenRouter error: {data['error'].get('message', data['error'])}")
+
+            break   # success
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_err = str(e)
+            if attempt < _retries:
+                wait_s = 1.5 * (attempt + 1)
+                print(f"   [OpenRouter] Connection issue — retrying in {wait_s:.1f}s...")
+                time.sleep(wait_s)
+                continue
+            raise RuntimeError(f"OpenRouter connection failed after {_retries + 1} attempts: {last_err}")
+    else:
+        raise RuntimeError(f"OpenRouter failed after {_retries + 1} attempts: {last_err}")
+
+    choice  = (data.get("choices") or [{}])[0]
+    msg     = choice.get("message", {}) or {}
+    content = msg.get("content") or ""
+    raw_tool_calls = msg.get("tool_calls") or []
+
+    # Normalise tool_calls to the same shape Ollama's client produces:
+    # [{"function": {"name": str, "arguments": dict}}]
+    normalised_calls = []
+    for tc in raw_tool_calls:
+        fn = tc.get("function", {})
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                pass
+        normalised_calls.append({"function": {"name": fn.get("name", ""), "arguments": args}})
+
+    return {
+        "message": {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": normalised_calls,
+        }
+    }
+
+
+def consult_openrouter(prompt: str, context: str = "", model: str = None) -> str:
+    """
+    Send a plain reasoning/planning prompt to OpenRouter (no tool schema —
+    this is for text generation, same role as consult_gemini). Used as the
+    secondary planning brain, consulted far more often than Gemini since
+    it's a direct cheap/free API call with no desktop-app UI cost.
+    """
+    if not _OPENROUTER_AVAILABLE:
+        return f"OpenRouter is not available: {_openrouter_load_msg}"
+
+    full_prompt = prompt.strip()
+    if context.strip():
+        if len(context) > 60000:
+            context = context[:30000] + "\n... [TRUNCATED] ...\n" + context[-30000:]
+        full_prompt = "[CONTEXT]\n" + context.strip() + "\n\n[TASK]\n" + full_prompt
+
+    try:
+        use_model = model or OPENROUTER_MODEL
+        print(f"   [OpenRouter] Model: {use_model}")
+        resp   = _openrouter_chat(
+            [{"role": "user", "content": full_prompt}],
+            model=use_model
+        )
+        result = (resp["message"]["content"] or "").strip()
+        print(f"   [OpenRouter] Response received ({len(result)} chars)")
+        return f"[OpenRouter/{use_model}]\n" + result
+    except Exception as e:
+        return f"OpenRouter error: {str(e)}"
+
+
+def delegate_to_openrouter(task: str, context: str = "", model: str = None,
+                            max_steps: int = 10) -> str:
+    """
+    Turn OpenRouter into an actual coworker instead of just a text consultant.
+    Hands `task` off to a fresh, FULLY TOOL-CAPABLE agent loop running on
+    OpenRouter — it can call UIA, CDP, filesystem, terminal, or any other
+    tool Jarvis has, exactly like the primary loop, then reports back a
+    final summary that gets relayed to the user.
+
+    Architecturally this spins up process_chat_turn on a brand-new isolated
+    conversation seeded with the task, with force_provider="openrouter" so
+    it runs on OpenRouter regardless of the global MODEL_PROVIDER. The outer
+    Jarvis loop and this delegated sub-loop do NOT share conversation
+    history — only the final summary comes back to the caller.
+
+    The shared response-memory scratchpad file is saved and restored around
+    the delegated call, since process_chat_turn wipes it at the start of
+    every invocation (including this nested one) and we don't want a
+    delegated sub-task to clobber the outer task's in-progress notes.
+    """
+    if not _OPENROUTER_AVAILABLE:
+        return f"OpenRouter is not available: {_openrouter_load_msg}"
+
+    use_model = model or OPENROUTER_MODEL
+    print(f"   [Delegate → OpenRouter/{use_model}] Task: {task[:80]}")
+
+    _saved_scratchpad = None
+    try:
+        if os.path.exists(RESPONSE_MEMORY):
+            with open(RESPONSE_MEMORY, "r", encoding="utf-8") as f:
+                _saved_scratchpad = f.read()
+    except Exception:
+        pass
+
+    try:
+        sub_system_prompt = get_system_prompt(
+            effective_provider="openrouter", effective_model=use_model
+        )
+        sub_system_prompt += (
+            "\n\n━━━ DELEGATED TASK MODE ━━━\n"
+            "You have been handed a specific task by Jarvis (the primary agent) to "
+            "complete independently. You have FULL access to every tool listed above — "
+            "act autonomously to complete it, calling tools directly rather than asking "
+            "anyone for permission. When finished, reply with a clear plain-text summary "
+            "of what you did and the result — this summary is relayed directly to the "
+            "user, so make it complete and readable on its own."
+        )
+
+        task_message = task.strip()
+        if context.strip():
+            task_message = f"[CONTEXT FROM JARVIS]\n{context.strip()}\n\n[TASK]\n{task_message}"
+
+        sub_history = [
+            {"role": "system", "content": sub_system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"{task_message}\n\n"
+                    "[SYSTEM]: Act immediately. Execute the first tool call now. "
+                    "Do not explain — just act. Give a final plain-text summary when done."
+                ),
+            },
+        ]
+
+        summary, sub_tool_outputs = process_chat_turn(
+            sub_history,
+            user_request=task,
+            force_provider="openrouter",
+            force_model=use_model,
+            max_steps=max_steps,
+        )
+
+        step_note = f" ({len(sub_tool_outputs)} tool call(s) executed)" if sub_tool_outputs else ""
+        return f"[OpenRouter coworker/{use_model} — task complete{step_note}]\n{summary}"
+
+    except Exception as e:
+        return f"Delegation to OpenRouter failed: {e}"
+
+    finally:
+        # Restore the outer task's scratchpad exactly as it was before we
+        # ran a nested process_chat_turn call that would have wiped it.
+        try:
+            if _saved_scratchpad is not None:
+                with open(RESPONSE_MEMORY, "w", encoding="utf-8") as f:
+                    f.write(_saved_scratchpad)
+        except Exception:
+            pass
+
+
+def set_openrouter_model(model_id: str) -> str:
+    """
+    Switch OPENROUTER_MODEL at runtime — no restart needed. Applies
+    immediately to consult_openrouter, delegate_to_openrouter, and (if
+    MODEL_PROVIDER == "openrouter") the primary execution loop, since all
+    of those read the global fresh on every call rather than caching it.
+    """
+    global OPENROUTER_MODEL
+    old = OPENROUTER_MODEL
+    new = model_id.strip()
+    if not new:
+        return "Error: empty model ID."
+    OPENROUTER_MODEL = new
+    print(f"🔀 [OpenRouter model switched: '{old}' → '{new}']")
+    return (
+        f"OpenRouter model switched: '{old}' → '{new}'. "
+        f"This is in-memory only for the current session — edit OPENROUTER_MODEL "
+        f"in main.py to make it the default on next launch."
+    )
+
+
+def list_openrouter_models(free_only: bool = True) -> str:
+    """
+    Fetch the live list of models available on OpenRouter and return a
+    numbered indexed table. Follow up with set_openrouter_model_by_index(N)
+    to switch — consistent with the choose-over-search pattern used
+    elsewhere (list_paths_indexed, list_skills_indexed, etc).
+    """
+    if requests is None:
+        return "requests library not installed: pip install requests"
+    try:
+        headers = {}
+        if _OPENROUTER_API_KEY:
+            headers["Authorization"] = f"Bearer {_OPENROUTER_API_KEY}"
+        resp = requests.get(f"{OPENROUTER_API_BASE}/models", headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+    except Exception as e:
+        return f"Error fetching OpenRouter model list: {e}"
+
+    items = []
+    for m in data:
+        model_id = m.get("id", "")
+        pricing  = m.get("pricing", {}) or {}
+        is_free  = model_id.endswith(":free") or (
+            str(pricing.get("prompt", "1")) == "0" and str(pricing.get("completion", "1")) == "0"
+        )
+        if free_only and not is_free:
+            continue
+        items.append({
+            "id":      model_id,
+            "name":    m.get("name", model_id),
+            "context": m.get("context_length", "?"),
+            "free":    is_free,
+        })
+
+    if not items:
+        return "No models found matching the filter."
+
+    _store_index("openrouter_models", items)
+
+    lines = [
+        f"OpenRouter models ({len(items)}{' free' if free_only else ''}) — "
+        f"currently active: {OPENROUTER_MODEL}",
+        "Use set_openrouter_model_by_index(index) to switch.",
+        "",
+        f"{'IDX':>4}  {'CTX':>8}  {'FREE':<5}  MODEL ID",
+        "─" * 72,
+    ]
+    for i, m in enumerate(items):
+        lines.append(f"{i:>4}  {str(m['context']):>8}  {'yes' if m['free'] else 'no':<5}  {m['id']}")
+    return "\n".join(lines)
+
+
+def set_openrouter_model_by_index(index: int) -> str:
+    """Switch OPENROUTER_MODEL to the entry at `index` from list_openrouter_models."""
+    entry = _get_indexed("openrouter_models", index)
+    if entry is None:
+        return f"Index {index} not found. Call list_openrouter_models() first."
+    return set_openrouter_model(entry["id"])
+
+
+# =============================================================================
+# MCP (MODEL CONTEXT PROTOCOL) SERVER SUPPORT
+# =============================================================================
+#
+# Lets Jarvis connect to external MCP servers and use their tools WITHOUT
+# dumping every registered tool's JSON schema into Jarvis's context window
+# (which is exactly what would happen if each MCP tool were added directly
+# to the `tools` list below — with several servers connected that can blow
+# past the context budget fast). Instead, Jarvis gets three uniform tools:
+#
+#   list_mcp_servers()                       — which servers are connected (no tool detail)
+#   show_server_tools(server)                — on demand: tools + schemas for ONE server
+#   call_mcp_tool(server, tool_name, args)    — uniform invocation for ANY tool on ANY server
+#
+# plus two management tools to make connecting a server easy:
+#
+#   connect_mcp_server(name, transport, ...) — connect now, and remember it for next time
+#   disconnect_mcp_server(server, forget)    — disconnect, optionally forgetting it too
+#
+# CONFIG FILE (auto-loaded and auto-connected at startup):
+#   storage/mcp_servers.json — a JSON list of server configs, e.g.:
+#   [
+#     {"name": "filesystem", "transport": "stdio", "command": "npx",
+#      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]},
+#     {"name": "weather", "transport": "http", "url": "https://example.com/mcp"}
+#   ]
+#   Editing this file by hand works too — it's just what connect_mcp_server writes to.
+#
+# INSTALL:
+#   pip install mcp
+#
+_MCP_SERVER_ORDER: list = []     # server names, in the order they were connected (gives indices)
+_MCP_SERVERS: dict      = {}     # name -> _MCPServerHandle
+
+
+class _MCPServerHandle:
+    """Everything Jarvis knows about one connected (or attempted) MCP server."""
+    def __init__(self, name: str, config: dict):
+        self.name        = name
+        self.config      = config
+        self.session     = None     # mcp.ClientSession, once connected
+        self.tools       = []       # [{"name","description","input_schema"}, ...]
+        self.exit_stack  = None     # contextlib.AsyncExitStack keeping the transport open
+        self.connected   = False
+        self.error       = None
+
+
+def _load_mcp_config() -> list:
+    """Read storage/mcp_servers.json. Returns [] if missing or invalid."""
+    try:
+        if not os.path.exists(MCP_SERVERS_FILE):
+            return []
+        with open(MCP_SERVERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"⚠️ [MCP] Could not read {MCP_SERVERS_FILE}: {e}")
+        return []
+
+
+def _save_mcp_config(configs: list):
+    """Write the given list of server configs to storage/mcp_servers.json."""
+    try:
+        os.makedirs(os.path.dirname(MCP_SERVERS_FILE), exist_ok=True)
+        with open(MCP_SERVERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(configs, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ [MCP] Could not save {MCP_SERVERS_FILE}: {e}")
+
+
+def _mcp_upsert_config(new_entry: dict):
+    """Add or replace (by name) one server entry in the persisted config file."""
+    configs = _load_mcp_config()
+    configs = [c for c in configs if c.get("name") != new_entry.get("name")]
+    configs.append(new_entry)
+    _save_mcp_config(configs)
+
+
+def _mcp_remove_config(name: str):
+    configs = [c for c in _load_mcp_config() if c.get("name") != name]
+    _save_mcp_config(configs)
+
+
+class _MCPManager:
+    """
+    Owns a single background asyncio event loop that MCP client sessions run
+    on for their whole lifetime (they're async context managers that need to
+    stay entered between calls), and exposes plain synchronous methods so
+    the rest of Jarvis — which is entirely sync/threaded — never has to
+    touch asyncio directly.
+    """
+    def __init__(self):
+        self._loop   = None
+        self._thread = None
+        self._ready  = threading.Event()
+
+    def _ensure_loop(self):
+        if self._loop is not None:
+            return
+        def _runner():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            self._ready.set()
+            loop.run_forever()
+        self._thread = threading.Thread(target=_runner, daemon=True, name="mcp-loop")
+        self._thread.start()
+        self._ready.wait(timeout=5)
+
+    def _run(self, coro, timeout: float = 30):
+        self._ensure_loop()
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return fut.result(timeout=timeout)
+
+    async def _connect_async(self, config: dict):
+        from contextlib import AsyncExitStack
+        from mcp import ClientSession
+
+        transport = (config.get("transport") or "stdio").lower()
+        stack = AsyncExitStack()
+        try:
+            if transport == "stdio":
+                from mcp import StdioServerParameters
+                from mcp.client.stdio import stdio_client
+                env = None
+                if config.get("env"):
+                    env = {**os.environ, **config["env"]}
+                params = StdioServerParameters(
+                    command=config["command"],
+                    args=config.get("args", []),
+                    env=env,
+                )
+                read, write = await stack.enter_async_context(stdio_client(params))
+
+            elif transport in ("http", "streamable_http", "streamable-http"):
+                from mcp.client.streamable_http import streamablehttp_client
+                read, write, _ = await stack.enter_async_context(
+                    streamablehttp_client(config["url"], headers=config.get("headers"))
+                )
+
+            elif transport == "sse":
+                from mcp.client.sse import sse_client
+                read, write = await stack.enter_async_context(
+                    sse_client(config["url"], headers=config.get("headers"))
+                )
+
+            else:
+                raise ValueError(
+                    f"Unknown transport '{transport}'. Use 'stdio', 'http', or 'sse'."
+                )
+
+            session = await stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+            listed = await session.list_tools()
+            tool_list = [
+                {
+                    "name": t.name,
+                    "description": t.description or "",
+                    "input_schema": t.inputSchema or {"type": "object", "properties": {}},
+                }
+                for t in listed.tools
+            ]
+            return stack, session, tool_list
+        except Exception:
+            await stack.aclose()
+            raise
+
+    def connect(self, name: str, config: dict) -> tuple:
+        """Connect (or reconnect) to a server. Returns (ok: bool, message: str)."""
+        if not _MCP_SDK_AVAILABLE:
+            return False, "The 'mcp' package is not installed. Run: pip install mcp"
+
+        # Reconnecting: tear down any existing connection under this name first.
+        existing = _MCP_SERVERS.get(name)
+        if existing and existing.exit_stack:
+            try:
+                self._run(existing.exit_stack.aclose(), timeout=10)
+            except Exception:
+                pass
+
+        handle = _MCPServerHandle(name, config)
+        _MCP_SERVERS[name] = handle
+        if name not in _MCP_SERVER_ORDER:
+            _MCP_SERVER_ORDER.append(name)
+
+        try:
+            stack, session, tool_list = self._run(
+                self._connect_async(config), timeout=config.get("connect_timeout", 30)
+            )
+            handle.exit_stack = stack
+            handle.session    = session
+            handle.tools      = tool_list
+            handle.connected  = True
+            handle.error      = None
+            return True, f"Connected to '{name}' — {len(tool_list)} tool(s) available."
+        except Exception as e:
+            handle.connected = False
+            handle.error     = str(e)
+            return False, f"Failed to connect to '{name}': {e}"
+
+    def disconnect(self, name: str) -> str:
+        handle = _MCP_SERVERS.get(name)
+        if not handle:
+            return f"No connected server named '{name}'."
+        if handle.exit_stack:
+            try:
+                self._run(handle.exit_stack.aclose(), timeout=10)
+            except Exception:
+                pass
+        del _MCP_SERVERS[name]
+        if name in _MCP_SERVER_ORDER:
+            _MCP_SERVER_ORDER.remove(name)
+        return f"Disconnected '{name}'."
+
+    def call_tool(self, name: str, tool_name: str, arguments: dict) -> str:
+        handle = _MCP_SERVERS.get(name)
+        if not handle:
+            return f"Error: no connected server named '{name}'. Call list_mcp_servers() first."
+        if not handle.connected:
+            return f"Error: server '{name}' is not connected ({handle.error})."
+        if not any(t["name"] == tool_name for t in handle.tools):
+            known = ", ".join(t["name"] for t in handle.tools) or "(none)"
+            return (f"Error: '{tool_name}' is not a tool on server '{name}'. "
+                    f"Known tools: {known}. Call show_server_tools() to double-check.")
+
+        async def _call():
+            return await handle.session.call_tool(tool_name, arguments or {})
+
+        try:
+            result = self._run(_call(), timeout=handle.config.get("call_timeout", 60))
+        except Exception as e:
+            return f"Error calling '{tool_name}' on '{name}': {e}"
+
+        parts = []
+        for block in getattr(result, "content", []) or []:
+            if getattr(block, "type", None) == "text":
+                parts.append(block.text)
+            else:
+                parts.append(str(block))
+        text = "\n".join(parts) if parts else "(no output)"
+        if getattr(result, "isError", False):
+            return f"[Tool error from '{tool_name}' on '{name}'] {text}"
+        return text
+
+
+_mcp_manager = _MCPManager()
+
+
+def _mcp_resolve_name(server) -> str:
+    """
+    Accepts either an index (int/numeric string, matching list_mcp_servers
+    order) or a server name directly, and returns the resolved name — or
+    None if it doesn't match anything currently connected.
+    """
+    if server is None:
+        return None
+    server_str = str(server).strip()
+    if server_str.isdigit():
+        idx = int(server_str)
+        if 0 <= idx < len(_MCP_SERVER_ORDER):
+            return _MCP_SERVER_ORDER[idx]
+        return None
+    return server_str if server_str in _MCP_SERVERS else None
+
+
+def _mcp_normalize_name(s: str) -> str:
+    """Lowercase and strip everything but letters/digits — so 'get_weather',
+    'getWeather', 'get-weather', and 'getweather' all compare equal."""
+    return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+
+
+def _mcp_find_tool_matches(name: str) -> list:
+    """
+    Search every connected MCP server's tool list for a tool matching `name`
+    once separators/case are normalized away. Weak local models frequently
+    call an MCP tool directly by its own name (skipping call_mcp_tool) and
+    mangle underscores/hyphens/case while doing it — this is what lets that
+    still resolve. Returns a list of (server_name, real_tool_name) — usually
+    0 or 1 matches, but can be 2+ if the same tool name exists on multiple
+    connected servers (caller should treat that as ambiguous, not pick one).
+    """
+    target = _mcp_normalize_name(name)
+    if not target:
+        return []
+    matches = []
+    for server_name in _MCP_SERVER_ORDER:
+        handle = _MCP_SERVERS.get(server_name)
+        if not handle or not handle.connected:
+            continue
+        for t in handle.tools:
+            if _mcp_normalize_name(t["name"]) == target:
+                matches.append((server_name, t["name"]))
+    return matches
+
+
+def _mcp_autoroute_tool_call(name: str, args):
+    """
+    If `name` isn't a registered top-level tool but matches exactly one
+    tool on exactly one connected MCP server, transparently rewrite the
+    call into the equivalent call_mcp_tool(...) invocation. This is what
+    keeps tool-calling uniform even when a weak model shortcuts straight
+    to calling the MCP tool by its own (possibly underscore-mangled) name
+    instead of going through call_mcp_tool as instructed.
+
+    Returns (name, args) — unchanged if `name` is already a known
+    top-level tool, or if there's no unambiguous MCP match.
+    """
+    if name in _known_tool_names():
+        return name, args
+    matches = _mcp_find_tool_matches(name)
+    if len(matches) == 1:
+        server_name, real_tool_name = matches[0]
+        print(f"   [MCP autoroute] '{name}' → call_mcp_tool("
+              f"server='{server_name}', tool_name='{real_tool_name}')")
+        return "call_mcp_tool", {
+            "server": server_name,
+            "tool_name": real_tool_name,
+            "arguments": args or {}
+        }
+    return name, args
+
+
+def init_mcp_servers_from_config():
+    """
+    Called once at startup: auto-connects every server saved in
+    storage/mcp_servers.json. Failures are non-fatal and left visible in
+    list_mcp_servers() so Jarvis (or the user) can see what went wrong.
+    """
+    configs = _load_mcp_config()
+    if not configs:
+        return
+    if not _MCP_SDK_AVAILABLE:
+        print("⚠️ [MCP] mcp_servers.json has entries but the 'mcp' package "
+              "isn't installed — run: pip install mcp")
+        return
+    for cfg in configs:
+        name = cfg.get("name")
+        if not name:
+            continue
+        ok, msg = _mcp_manager.connect(name, cfg)
+        icon = "🔌" if ok else "⚠️"
+        print(f"{icon} [MCP] {msg}")
+
+
+def list_mcp_servers() -> str:
+    """
+    Lists connected MCP servers ONLY — not their tools — to keep this cheap
+    on context. Use show_server_tools(server) to see what a given server offers.
+    """
+    if not _MCP_SERVER_ORDER:
+        hint = "" if _MCP_SDK_AVAILABLE else " (install the 'mcp' package first: pip install mcp)"
+        return f"No MCP servers connected.{hint} Use connect_mcp_server(...) to add one."
+
+    lines = []
+    for i, name in enumerate(_MCP_SERVER_ORDER):
+        handle = _MCP_SERVERS[name]
+        if handle.connected:
+            transport = handle.config.get("transport", "stdio")
+            lines.append(f"[{i}] {name} — connected ({transport}) — {len(handle.tools)} tool(s)")
+        else:
+            lines.append(f"[{i}] {name} — connection failed: {handle.error}")
+    return "\n".join(lines)
+
+
+def show_server_tools(server) -> str:
+    """
+    Returns the tool names, descriptions, and JSON input schemas for ONE
+    server, identified by index (from list_mcp_servers) or name. This is
+    the only place full tool schemas are shown to Jarvis — deliberately
+    on-demand, per server, instead of always-loaded.
+    """
+    name = _mcp_resolve_name(server)
+    if name is None:
+        return (f"Unknown server '{server}'. Call list_mcp_servers() first "
+                f"to see valid indices/names.")
+    handle = _MCP_SERVERS[name]
+    if not handle.connected:
+        return f"Server '{name}' is not connected ({handle.error})."
+    if not handle.tools:
+        return f"Server '{name}' is connected but exposes no tools."
+    return json.dumps(
+        {"server": name, "tools": handle.tools},
+        indent=2
+    )
+
+
+def call_mcp_tool(server, tool_name: str, arguments) -> str:
+    """
+    Uniform invocation for ANY tool on ANY connected MCP server — this is
+    the ONLY tool actually needed to use MCP servers, once you've checked
+    show_server_tools() for the right tool_name/arguments shape.
+    """
+    name = _mcp_resolve_name(server)
+    if name is None:
+        return (f"Unknown server '{server}'. Call list_mcp_servers() first "
+                f"to see valid indices/names.")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments.strip() else {}
+        except Exception:
+            return f"Error: 'arguments' was not valid JSON: {arguments!r}"
+    return _mcp_manager.call_tool(name, tool_name, arguments or {})
+
+
+def connect_mcp_server(name: str, transport: str = "stdio", command: str = None,
+                        args: list = None, url: str = None, env: dict = None,
+                        headers: dict = None, persist: bool = True) -> str:
+    """
+    Connect to a new MCP server right now. If persist=True (default), it's
+    also saved to storage/mcp_servers.json so it auto-connects on every
+    future startup — this is the "easy to connect" path: one tool call and
+    it's remembered.
+
+    transport='stdio' needs command (+ optional args, env) — for local
+    servers launched as a subprocess, e.g. command='npx',
+    args=['-y', '@modelcontextprotocol/server-filesystem', '/home/user'].
+
+    transport='http' or 'sse' needs url (+ optional headers) — for remote
+    MCP servers reachable over the network.
+    """
+    if not name or not name.strip():
+        return "Error: a server 'name' is required."
+    name = name.strip()
+
+    config = {"name": name, "transport": transport}
+    if transport == "stdio":
+        if not command:
+            return "Error: transport='stdio' requires 'command'."
+        config["command"] = command
+        if args:
+            config["args"] = args
+        if env:
+            config["env"] = env
+    elif transport in ("http", "streamable_http", "sse"):
+        if not url:
+            return f"Error: transport='{transport}' requires 'url'."
+        config["url"] = url
+        if headers:
+            config["headers"] = headers
+    else:
+        return "Error: transport must be 'stdio', 'http', or 'sse'."
+
+    ok, msg = _mcp_manager.connect(name, config)
+    if ok and persist:
+        _mcp_upsert_config(config)
+        msg += " Saved — will auto-connect on future startups."
+    return msg
+
+
+def disconnect_mcp_server(server, forget: bool = False) -> str:
+    """
+    Disconnect a currently-connected MCP server. If forget=True, also
+    remove it from storage/mcp_servers.json so it stops auto-connecting.
+    """
+    name = _mcp_resolve_name(server)
+    if name is None:
+        return f"Unknown server '{server}'. Call list_mcp_servers() first."
+    msg = _mcp_manager.disconnect(name)
+    if forget:
+        _mcp_remove_config(name)
+        msg += " Removed from saved config."
+    return msg
 
 
 # =============================================================================
@@ -2486,8 +3128,9 @@ tools = [
         "function": {
             "name": "snapshot",
             "description": (
-                "Snapshot ALL visible, interactive elements in a desktop window OR a browser page "
-                "into a single numbered indexed table. ONE tool for both desktop and browser. "
+                "ONE tool that snapshots ALL visible, interactive elements into a numbered "
+                "indexed table — works IDENTICALLY on a desktop app window (Discord, VS Code, "
+                "Settings, any app) AND a browser tab. It is NOT browser-only. "
                 "Returns: IDX | TYPE | NAME/LABEL | STATUS. "
                 "Follow up with act(index, action) to interact by index — exact, never wrong. "
                 "\n\n"
@@ -2587,13 +3230,23 @@ tools = [
         "type": "function",
         "function": {
             "name": "query_gemini_app",
-            "description": "Opens the Gemini desktop application if it is closed, sends a complex natural language prompt, waits for the response generation to conclude, and extracts the full consolidated textual response back to Jarvis.",
+            "description": (
+                "Sends a prompt to Gemini via the actual WEB CHAT INTERFACE "
+                "(https://gemini.google.com/app) using the community `gemini_webapi` "
+                "library — NOT a browser automation, NOT a desktop application, and NOT "
+                "the metered developer API. It talks directly to Gemini's internal web "
+                "endpoints using session cookies, so there's no page to load or button "
+                "to click — just a plain request. Uses the free web app's own usage "
+                "limits. Returns ONLY the single newest reply, never the full "
+                "conversation history. Prefer consult_gemini for most cases — it already "
+                "routes through this same mechanism, with no fallback to the metered API."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "The complex query, data processing prompt, or reasoning task to pass down to the Gemini application window."
+                        "description": "The complex query, data processing prompt, or reasoning task to send to Gemini."
                     }
                 },
                 "required": ["prompt"]
@@ -3020,6 +3673,7 @@ tools = [
         "function": {
             "name": "consult_gemini",
             "description": (
+                "DEFAULT consult tool — try this FIRST for reasoning/analysis/research tasks. "
                 "Send a reasoning, analysis, or research task to a Gemini model via Google AI Studio. "
                 "Use this when: (1) the user explicitly says 'ask Gemini' or 'consult Gemini', "
                 "(2) the task requires deep reasoning, complex analysis, code review, architectural "
@@ -3050,6 +3704,142 @@ tools = [
                     }
                 },
                 "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "consult_openrouter",
+            "description": (
+                "Send a reasoning, analysis, or research task to a model on OpenRouter "
+                "(currently configured: see OPENROUTER_MODEL). "
+                "This is a FALLBACK/explicit-request tool, not a default choice — prefer "
+                "consult_gemini first. Only use consult_openrouter when: "
+                "(1) the user explicitly says 'ask OpenRouter' or names OpenRouter, or "
+                "(2) consult_gemini just failed/errored and you still need a second-brain "
+                "answer. Do not reach for this casually as an alternative to Gemini."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The full question or task for the model. Be specific and complete."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional: relevant context to include (file contents, memory, prior results)."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional: override the default OpenRouter model ID for this call."
+                    }
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_to_openrouter",
+            "description": (
+                "Hand off an entire task to OpenRouter as a real COWORKER, not just a "
+                "text consultant. Unlike consult_openrouter (which only returns text), "
+                "the OpenRouter model spun up here gets FULL access to every tool Jarvis "
+                "has — it can click UI elements, run terminal commands, read/write files, "
+                "browse the web, everything — and works through the task independently, "
+                "then reports back a final summary that you relay to the user. "
+                "\n\n"
+                "Use this when a sub-task is complex enough to benefit from a stronger "
+                "model actually DOING the work end-to-end (not just planning it), or "
+                "when the user explicitly asks to delegate/offload something. "
+                "\n\n"
+                "This runs in an ISOLATED conversation — the delegate does not see your "
+                "conversation history, only what you put in `task` and `context`. Be "
+                "complete and specific in both."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "The complete task to hand off, written as a self-contained "
+                            "instruction — the delegate has no other context except this "
+                            "and whatever you put in `context`."
+                        )
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional: relevant background the delegate needs (file contents, prior findings, constraints)."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional: override the default OpenRouter model ID for this delegated task."
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "description": "Optional: cap on tool-call steps the delegate can take before it must report back. Default 10."
+                    }
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_openrouter_models",
+            "description": (
+                "List models available on OpenRouter as a numbered indexed table "
+                "(IDX | context length | free? | model ID). Defaults to free-tier models only. "
+                "Follow up with set_openrouter_model_by_index(index) to switch the active model — "
+                "this is the CHOOSE-pattern way to pick a model instead of typing an exact ID."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "free_only": {
+                        "type": "boolean",
+                        "description": "If true (default), only show free-tier models. Set false to see all models including paid."
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_openrouter_model_by_index",
+            "description": "Switch the active OpenRouter model to the entry at `index` from list_openrouter_models.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "Index from list_openrouter_models output."}
+                },
+                "required": ["index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_openrouter_model",
+            "description": (
+                "Switch the active OpenRouter model directly by its exact model ID "
+                "(e.g. 'anthropic/claude-3.7-sonnet', 'meta-llama/llama-3.3-70b-instruct:free'). "
+                "Use list_openrouter_models + set_openrouter_model_by_index instead if you don't "
+                "know the exact ID. Takes effect immediately, no restart needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "model_id": {"type": "string", "description": "Exact OpenRouter model ID."}
+                },
+                "required": ["model_id"],
             },
         },
     },
@@ -3395,6 +4185,125 @@ tools = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_mcp_servers",
+            "description": (
+                "List connected MCP (Model Context Protocol) servers ONLY — names, "
+                "connection status, and tool COUNT, not the tools themselves. "
+                "Always call this first before using any MCP server. Follow up with "
+                "show_server_tools(server) to see what a specific server offers."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "show_server_tools",
+            "description": (
+                "Show the tool names, descriptions, and JSON input schemas for ONE "
+                "connected MCP server. Call list_mcp_servers() first to get the "
+                "server's index or name. Use this right before call_mcp_tool so you "
+                "know the exact tool_name and arguments shape to send."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "description": "Server index (e.g. '0') or name, from list_mcp_servers()."
+                    }
+                },
+                "required": ["server"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "call_mcp_tool",
+            "description": (
+                "Call ANY tool on ANY connected MCP server. This is the single, "
+                "uniform way to invoke MCP tools — check show_server_tools(server) "
+                "first for the exact tool_name and the arguments it expects."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "description": "Server index (e.g. '0') or name, from list_mcp_servers()."
+                    },
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Exact tool name, from show_server_tools()."
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": (
+                            "Arguments object matching that tool's input schema "
+                            "(from show_server_tools()). Use {} if it takes none."
+                        )
+                    }
+                },
+                "required": ["server", "tool_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "connect_mcp_server",
+            "description": (
+                "Connect a new MCP server and (by default) remember it for future "
+                "startups — the easy way to add a server. Use transport='stdio' for "
+                "a local server launched as a subprocess (command + args), or "
+                "transport='http'/'sse' for a remote server reachable by URL."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "A short unique name for this server, e.g. 'filesystem'."},
+                    "transport": {
+                        "type": "string",
+                        "enum": ["stdio", "http", "sse"],
+                        "description": "How to connect. 'stdio' for a local subprocess, 'http' or 'sse' for a remote URL."
+                    },
+                    "command": {"type": "string", "description": "Executable to launch (stdio only), e.g. 'npx' or 'python'."},
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Command-line arguments (stdio only), e.g. ['-y', '@modelcontextprotocol/server-filesystem', '/home/user']."
+                    },
+                    "url": {"type": "string", "description": "Server URL (http/sse only)."},
+                    "env": {"type": "object", "description": "Extra environment variables for the subprocess (stdio only)."},
+                    "headers": {"type": "object", "description": "Extra HTTP headers, e.g. an Authorization token (http/sse only)."},
+                    "persist": {
+                        "type": "boolean",
+                        "description": "Save to storage/mcp_servers.json so it auto-connects next startup. Default true."
+                    }
+                },
+                "required": ["name", "transport"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "disconnect_mcp_server",
+            "description": "Disconnect a connected MCP server. Optionally forget it so it stops auto-connecting on future startups.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "Server index (e.g. '0') or name, from list_mcp_servers()."},
+                    "forget": {"type": "boolean", "description": "Also remove it from storage/mcp_servers.json. Default false."}
+                },
+                "required": ["server"],
+            },
+        },
+    },
 ]
 
 def open_url(url: str, browser: str = "chrome") -> str:
@@ -3517,10 +4426,10 @@ CDP_BASE    = f"http://{CDP_HOST}:{CDP_PORT}"
 _cdp_ws_cache: dict[int, str] = {}   # tab_index → websocket URL
 
 try:
-    import requests as _requests
     import websocket as _websocket
     import json as _json_mod
-    _CDP_AVAILABLE = True
+    _requests = requests   # reuse the module-level import (already loaded above)
+    _CDP_AVAILABLE = requests is not None
 except ImportError:
     _CDP_AVAILABLE = False
 
@@ -3546,7 +4455,15 @@ def _cdp_call(ws_url: str, method: str, params: dict = None, _retries: int = 2) 
     for attempt in range(_retries + 1):
         ws = None
         try:
-            ws = _websocket.create_connection(ws_url, timeout=12)
+            # Chrome 111+ enforces an Origin allowlist on CDP WebSocket
+            # connections and rejects handshakes with no matching Origin
+            # header (this is the "origin policy" rejection). Sending an
+            # explicit localhost Origin header satisfies the default
+            # allowlist so --remote-allow-origins=* is not required.
+            ws = _websocket.create_connection(
+                ws_url, timeout=12,
+                origin=f"http://{CDP_HOST}:{CDP_PORT}"
+            )
             msg = _json_mod.dumps({"id": 1, "method": method, "params": params or {}})
             ws.send(msg)
             # Drain until we get our response (id==1); skip CDP events
@@ -3574,6 +4491,13 @@ def _cdp_call(ws_url: str, method: str, params: dict = None, _retries: int = 2) 
                     ws.close()
                 except Exception:
                     pass
+    final_err = str(last_err) if last_err else "unknown"
+    if "403" in final_err or "handshake" in final_err.lower() or "forbidden" in final_err.lower():
+        raise ConnectionError(
+            f"CDP WebSocket rejected (likely an origin policy issue): {final_err}\n"
+            f"Fix: relaunch Chrome/Brave with BOTH flags: "
+            f"--remote-debugging-port={CDP_PORT} --remote-allow-origins=*"
+        )
     raise ConnectionError(f"CDP call failed after {_retries + 1} attempts: {last_err}")
 
 def _cdp_ws_for_tab(tab_index: int = 0) -> str | None:
@@ -3596,9 +4520,140 @@ def _cdp_require() -> str | None:
             "Chrome is not running with remote debugging enabled.\n"
             "Launch Chrome with: --remote-debugging-port=9222\n"
             "  Windows: Create a shortcut with that flag appended to the Target.\n"
-            "  Linux:   google-chrome --remote-debugging-port=9222 &"
+            "  Linux:   google-chrome --remote-debugging-port=9222 &\n"
+            "If tabs ARE listed but WebSocket calls still fail with an origin/policy "
+            "error, add --remote-allow-origins=* as well (Jarvis already sends a "
+            "matching Origin header, so this should rarely be needed)."
         )
     return None
+
+
+# =============================================================================
+# GEMINI WEB APP CLIENT — via community `gemini_webapi` library
+# =============================================================================
+#
+# query_gemini_app() no longer drives a real Chrome tab over CDP. Instead it
+# uses the community-maintained `gemini_webapi` library
+# (https://github.com/HanaokaYuzu/Gemini-API), which talks directly to
+# gemini.google.com's internal endpoints using your browser's session
+# cookies. No page load, no clicking into a prompt box, no clipboard —
+# just a plain async HTTP call. It still uses the FREE web app's own
+# usage limits, not the metered developer API.
+#
+# INSTALLATION:
+#   pip install -U gemini_webapi
+#   pip install -U browser-cookie3      (optional, see below)
+#
+# AUTHENTICATION (one-time), whichever is easier:
+#   A) Automatic — install browser-cookie3 and be logged into
+#      https://gemini.google.com in a supported browser (Chrome, Firefox,
+#      Edge, Brave, etc — see the project README for the full list).
+#      gemini_webapi will pull the session cookies straight from your
+#      browser's cookie store; no further config needed.
+#   B) Manual — log into https://gemini.google.com, open DevTools (F12)
+#      -> Network tab -> refresh -> find the __Secure-1PSID and
+#      __Secure-1PSIDTS cookies (Application/Storage tab, or a request's
+#      Cookie header), then add them to the secrets file:
+#        { "GEMINI_SECURE_1PSID": "...", "GEMINI_SECURE_1PSIDTS": "..." }
+# =============================================================================
+
+_GEMINI_WEBAPI_AVAILABLE = False
+_gemini_webapi_load_msg  = ""
+try:
+    from gemini_webapi import GeminiClient as _GeminiWebClient
+    _GEMINI_WEBAPI_AVAILABLE = True
+except ImportError as _e:
+    _GeminiWebClient = None
+    _gemini_webapi_load_msg = f"gemini_webapi not installed: {_e}. Run: pip install -U gemini_webapi"
+
+_gemini_web_client      = None   # lazily-initialised GeminiClient (singleton)
+_gemini_web_client_lock = threading.Lock()
+
+_gemini_async_loop   = None       # persistent background asyncio loop
+_gemini_async_thread = None
+
+
+def _get_gemini_async_loop():
+    """
+    Start (once) a background thread running a persistent asyncio event
+    loop. gemini_webapi is async; this lets the rest of this otherwise-sync
+    script call into it and block for a result, while still letting the
+    library's background cookie-refresh task keep running between calls.
+    """
+    global _gemini_async_loop, _gemini_async_thread
+    if _gemini_async_loop is not None:
+        return _gemini_async_loop
+
+    _gemini_async_loop = asyncio.new_event_loop()
+
+    def _runner():
+        asyncio.set_event_loop(_gemini_async_loop)
+        _gemini_async_loop.run_forever()
+
+    _gemini_async_thread = threading.Thread(target=_runner, daemon=True, name="gemini-webapi-loop")
+    _gemini_async_thread.start()
+    return _gemini_async_loop
+
+
+def _run_gemini_coro(coro, timeout: float = 90.0):
+    """Run a gemini_webapi coroutine on the background loop and block for the result."""
+    loop = _get_gemini_async_loop()
+    fut  = asyncio.run_coroutine_threadsafe(coro, loop)
+    return fut.result(timeout=timeout)
+
+
+def _get_gemini_web_client():
+    """
+    Lazily create (and cache) the GeminiClient singleton.
+
+    Cookie resolution order:
+      1. GEMINI_SECURE_1PSID / GEMINI_SECURE_1PSIDTS from the secrets file,
+         if present.
+      2. Otherwise, pass no cookies and let gemini_webapi try to pull them
+         automatically via browser-cookie3 (if installed) from whatever
+         browser you're logged into gemini.google.com in.
+
+    Returns (client, None) on success, or (None, error_message) on failure.
+    """
+    global _gemini_web_client
+    if _gemini_web_client is not None:
+        return _gemini_web_client, None
+    if not _GEMINI_WEBAPI_AVAILABLE:
+        return None, _gemini_webapi_load_msg
+
+    with _gemini_web_client_lock:
+        if _gemini_web_client is not None:
+            return _gemini_web_client, None
+
+        secure_1psid, secure_1psidts = "", ""
+        secrets_path = os.path.abspath(SECRETS_FILE)
+        try:
+            if os.path.exists(secrets_path):
+                with open(secrets_path, "r", encoding="utf-8") as f:
+                    secrets = json.load(f)
+                secure_1psid   = secrets.get("GEMINI_SECURE_1PSID", "").strip()
+                secure_1psidts = secrets.get("GEMINI_SECURE_1PSIDTS", "").strip()
+        except Exception:
+            pass   # fall through to browser-cookie3 auto-detection
+
+        try:
+            client = _GeminiWebClient(secure_1psid or None, secure_1psidts or None)
+            _run_gemini_coro(
+                client.init(timeout=30, auto_close=False, auto_refresh=True),
+                timeout=35,
+            )
+            _gemini_web_client = client
+            return _gemini_web_client, None
+        except Exception as e:
+            return None, (
+                f"Failed to initialise Gemini web client: {e}. Either add "
+                f"GEMINI_SECURE_1PSID/GEMINI_SECURE_1PSIDTS to the secrets file "
+                f"({secrets_path}), or install browser-cookie3 (pip install -U "
+                f"browser-cookie3) and make sure you're logged into "
+                f"https://gemini.google.com in a supported browser."
+            )
+
+
 
 
 # JS helpers injected into pages
@@ -3716,6 +4771,25 @@ def read_browser_page(tab_index: int = 0) -> str:
 
 
 def snapshot_browser_elements(tab_index: int = 0, filter_type: str = "") -> str:
+    """
+    Snapshot every interactable element on the page — not just semantic
+    HTML controls. Catches:
+      - Standard interactive tags (a, button, input, select, textarea)
+      - ARIA roles (button, link, tab, menuitem, checkbox, radio, textbox, etc)
+      - contenteditable regions (Gmail compose, Google Docs, chat inputs,
+        rich-text editors — these have NO native tag/role but are typed into
+        constantly on modern sites)
+      - Elements with a raw onclick attribute (legacy/simple sites)
+      - label and summary elements (often the actual click target for a
+        checkbox/radio or a <details> disclosure)
+      - Anything with a non-negative tabindex (explicitly made focusable)
+    And traverses into OPEN SHADOW ROOTS recursively, since many modern
+    sites (YouTube, GitHub, most component-library-based apps) build their
+    real UI inside Web Components — a plain querySelectorAll from the light
+    DOM never sees those elements at all.
+    This is intended to make run_js_in_browser unnecessary for ordinary
+    "what can I click/type into on this page" questions.
+    """
     err = _cdp_require()
     if err:
         return err
@@ -3734,27 +4808,56 @@ def snapshot_browser_elements(tab_index: int = 0, filter_type: str = "") -> str:
         js = f"""
 (function(filterType) {{
     // Assign stable jarvis IDs to every element on this snapshot pass
-    if (!window.__jarvis_el_map) window.__jarvis_el_map = [];
     window.__jarvis_el_map = [];  // fresh snapshot, clear old refs
 
     var selectors = {{
-        'button':   'button, [role="button"], input[type="button"], input[type="submit"], input[type="reset"]',
+        'button':   'button, [role="button"], input[type="button"], input[type="submit"], input[type="reset"], [onclick]',
         'link':     'a[href]',
-        'input':    'input:not([type="hidden"]), textarea',
+        'input':    'input:not([type="hidden"]), textarea, [contenteditable]:not([contenteditable="false"])',
         'select':   'select',
         'textarea': 'textarea',
+        'editable': '[contenteditable]:not([contenteditable="false"]), textarea, input:not([type="hidden"])',
         '': 'a[href], button, input:not([type="hidden"]), select, textarea, ' +
             '[role="button"], [role="link"], [role="tab"], [role="menuitem"], ' +
             '[role="option"], [role="checkbox"], [role="radio"], [role="switch"], ' +
-            '[role="slider"], [role="spinbutton"], [role="combobox"], ' +
+            '[role="slider"], [role="spinbutton"], [role="combobox"], [role="textbox"], ' +
+            '[contenteditable]:not([contenteditable="false"]), [onclick], ' +
+            'label, summary, ' +
             '[tabindex]:not([tabindex="-1"])'
     }};
     var sel = selectors[filterType] || selectors[''];
-    var all = Array.from(document.querySelectorAll(sel));
+
+    // ── Recursive shadow-DOM-aware query ──────────────────────────────────
+    // Plain document.querySelectorAll cannot see into shadow roots at all,
+    // which means entire UIs built with Web Components (YouTube, GitHub,
+    // most modern component libraries) would otherwise be invisible.
+    function deepQuery(root, selector, out, depth) {{
+        if (depth > 6) return;   // safety cap on shadow-root nesting
+        try {{
+            var matches = root.querySelectorAll(selector);
+            for (var i = 0; i < matches.length; i++) out.push(matches[i]);
+        }} catch (e) {{ /* ignore malformed selector on this root */ }}
+        try {{
+            var everything = root.querySelectorAll('*');
+            for (var j = 0; j < everything.length; j++) {{
+                var node = everything[j];
+                if (node.shadowRoot) {{
+                    deepQuery(node.shadowRoot, selector, out, depth + 1);
+                }}
+            }}
+        }} catch (e) {{ /* ignore */ }}
+    }}
+
+    var all = [];
+    deepQuery(document, sel, all, 0);
 
     var results = [];
+    var seen = new Set();
     for (var i = 0; i < all.length; i++) {{
         var el = all[i];
+        if (seen.has(el)) continue;
+        seen.add(el);
+
         try {{
             var rect = el.getBoundingClientRect();
             if (rect.width <= 0 || rect.height <= 0) continue;
@@ -3766,13 +4869,21 @@ def snapshot_browser_elements(tab_index: int = 0, filter_type: str = "") -> str:
         var role = el.getAttribute('role') || el.tagName.toLowerCase();
         var inputType = el.getAttribute('type');
         if (role === 'input' && inputType) role = 'input[' + inputType + ']';
+        var isEditable = el.isContentEditable ||
+            (el.getAttribute('contenteditable') && el.getAttribute('contenteditable') !== 'false');
+        if (isEditable && role !== 'textarea') role = 'contenteditable';
 
-        // Best label
+        // Best label — for contenteditable, innerText is usually empty until
+        // focused/typed into, so fall back to common placeholder attributes
+        // used by rich-text editors (Gmail, Slack, Notion, etc).
         var label = (
             el.getAttribute('aria-label') ||
-            el.getAttribute('aria-labelledby') && document.getElementById(el.getAttribute('aria-labelledby')) && document.getElementById(el.getAttribute('aria-labelledby')).innerText ||
+            (el.getAttribute('aria-labelledby') && document.getElementById(el.getAttribute('aria-labelledby')) &&
+                document.getElementById(el.getAttribute('aria-labelledby')).innerText) ||
             el.getAttribute('title') ||
             el.getAttribute('placeholder') ||
+            el.getAttribute('aria-placeholder') ||
+            el.getAttribute('data-placeholder') ||
             el.innerText ||
             el.value ||
             el.getAttribute('name') ||
@@ -3894,7 +5005,30 @@ def act_on_browser_element(index: int, action: str = "click",
     var el = window.__jarvis_el_map && window.__jarvis_el_map[{jid}];
     if (!el) return 'stale';
     el.focus();
-    // Native input setter — works with React controlled inputs
+
+    var isEditable = el.isContentEditable ||
+        (el.getAttribute('contenteditable') && el.getAttribute('contenteditable') !== 'false');
+
+    if (isEditable) {{
+        // contenteditable regions (Gmail compose, Slack, Notion, chat inputs, etc)
+        // have no .value — set via execCommand/textContent and fire input events
+        // that frameworks listening for keystrokes will still pick up.
+        document.execCommand('selectAll', false, null);
+        document.execCommand('delete', false, null);
+        var inserted = false;
+        try {{
+            inserted = document.execCommand('insertText', false, {safe_text});
+        }} catch (e) {{ inserted = false; }}
+        if (!inserted) {{
+            el.textContent = {safe_text};
+        }}
+        el.dispatchEvent(new InputEvent('input', {{bubbles: true, data: {safe_text}, inputType: 'insertText'}}));
+        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+        return 'ok';
+    }}
+
+    // Native input/textarea — use the property setter so React-controlled
+    // inputs register the change (plain .value = x is invisible to React).
     var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
         window.HTMLInputElement.prototype, 'value') ||
         Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
@@ -4011,6 +5145,156 @@ def run_js_in_browser(script: str, tab_index: int = 0) -> str:
         return f"JS error: {e}"
     except Exception as e:
         return f"Error executing JS: {e}"
+
+
+def _cdp_press_enter(ws: str) -> None:
+    """Simulate a real Enter keypress via CDP Input events (not a JS-dispatched
+    synthetic event) — needed for sites like Gemini that listen for genuine
+    keydown/keyup on Enter to submit, rather than a form submit button."""
+    for evt_type, extra in [
+        ("keyDown", {"text": "\r", "unmodifiedText": "\r"}),
+        ("keyUp",   {}),
+    ]:
+        _cdp_call(ws, "Input.dispatchKeyEvent", {
+            "type": evt_type,
+            "key":  "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode":  13,
+            **extra,
+        })
+
+
+def _clipboard_read() -> str:
+    """
+    Read the OS clipboard — pyperclip on Windows, xclip/xsel on Linux.
+    Matches the same platform-aware pattern used elsewhere in this file
+    (type_text's clipboard paste, the legacy desktop Gemini bridge).
+    """
+    if _IS_LINUX:
+        out, _ = _run(["xclip", "-selection", "clipboard", "-o"])
+        if out:
+            return out
+        out2, _ = _run(["xsel", "--clipboard", "--output"])
+        return out2 or ""
+    else:
+        try:
+            import pyperclip
+            return pyperclip.paste() or ""
+        except Exception:
+            return ""
+
+
+def _clipboard_clear() -> None:
+    """
+    Clear the OS clipboard before triggering a copy, so a subsequent read
+    can distinguish "copy actually happened" from "copy button did nothing
+    and we're just reading whatever was already on the clipboard."
+    """
+    if _IS_LINUX:
+        try:
+            subprocess.run(["xclip", "-selection", "clipboard"], input="", text=True, timeout=3)
+        except Exception:
+            pass
+    else:
+        try:
+            import pyperclip
+            pyperclip.copy("")
+        except Exception:
+            pass
+
+
+def _cdp_verify_page_url(ws: str, expected_prefix: str) -> tuple[bool, str]:
+    """
+    Confirm the target behind `ws` is genuinely the expected page by asking
+    the page itself for `document.URL`, rather than trusting the `url` field
+    from Chrome's /json tab listing.
+
+    This matters because Chrome sometimes exposes internal WebUI surfaces
+    (tab hover-cards, tab-search previews, split-view prompts, etc) as their
+    own inspectable CDP targets, and their /json `url` field can still
+    contain the site's URL as embedded text/metadata — which causes a naive
+    substring match on the listing to connect to the wrong target entirely
+    and return the hover-card's own text ("Create split view", the page
+    title, etc) instead of the real page content.
+
+    Calls Runtime.enable first — a brand-new tab's target may not have
+    Runtime fully attached yet, and Runtime.evaluate can fail/throw on an
+    unattached target even though the tab is otherwise completely valid.
+    Retries once on a transient failure before giving up on this candidate.
+    """
+    for attempt in range(2):
+        try:
+            _cdp_call(ws, "Runtime.enable", {})
+            result = _cdp_call(ws, "Runtime.evaluate", {
+                "expression": "document.URL", "returnByValue": True
+            })
+            actual_url = (result.get("result", {}).get("result", {}).get("value") or "")
+            if actual_url:
+                return actual_url.startswith(expected_prefix), actual_url
+        except Exception:
+            pass
+        if attempt == 0:
+            time.sleep(0.4)
+    return False, ""
+
+
+def query_gemini_app(prompt: str, wait_for_response: int = 90) -> str:
+    """
+    Send a prompt to Gemini via the community `gemini_webapi` library
+    (https://github.com/HanaokaYuzu/Gemini-API), NOT Chrome/CDP DOM
+    automation and NOT UIA. This library talks directly to the Gemini web
+    app's internal endpoints using your browser's session cookies, so
+    there's no page to load, no prompt box to click into, and no "Copy"
+    button to find — it's a plain HTTP/async call, which is far more
+    reliable than driving a real browser tab.
+
+    Crucially, this still goes through the FREE WEB APP's own usage
+    limits (the same ones you'd get chatting manually at
+    gemini.google.com) — it is NOT the metered developer API, which has
+    much tighter free-tier limits.
+
+    Install:   pip install -U gemini_webapi
+    Optional:  pip install -U browser-cookie3   (lets gemini_webapi pull
+               cookies automatically from a browser you're already logged
+               into, instead of needing them in the secrets file)
+
+    Authentication (one-time), whichever is easier:
+      A) Automatic — install browser-cookie3 and be logged into
+         https://gemini.google.com in a supported browser. No extra config.
+      B) Manual — log into https://gemini.google.com, open DevTools (F12)
+         -> Network tab -> refresh -> find the __Secure-1PSID and
+         __Secure-1PSIDTS cookies, and add them to the secrets file:
+           { "GEMINI_SECURE_1PSID": "...", "GEMINI_SECURE_1PSIDTS": "..." }
+    """
+    client, err = _get_gemini_web_client()
+    if client is None:
+        return f"Error: {err}"
+
+    try:
+        response = _run_gemini_coro(client.generate_content(prompt), timeout=wait_for_response)
+    except Exception as e:
+        return f"Error: Gemini web request failed: {e}"
+
+    text = (getattr(response, "text", "") or "").strip()
+    if not text:
+        return "Gemini did not return any text in its response - try again."
+
+    # Run through the legacy tool-call JSON parser so any embedded
+    # tool-call JSON is flagged/stripped instead of being shown raw.
+    legacy_calls, cleaned_text = _extract_legacy_tool_calls(text)
+    if legacy_calls:
+        call_summary = ", ".join(
+            f"{c['function']['name']}({c['function']['arguments']})" for c in legacy_calls
+        )
+        return (
+            f"{cleaned_text}\n\n"
+            f"[NOTE: detected {len(legacy_calls)} embedded tool call(s) in Gemini's response: "
+            f"{call_summary}. query_gemini_app only returns text - dispatch these yourself if needed.]"
+        )
+
+    return cleaned_text or text
+
 
 
 
@@ -5848,13 +7132,27 @@ def _is_trivial_input(text: str) -> bool:
 
 def get_gemini_reasoning(user_input: str, conversation_history: list) -> str | None:
     """
-    Use Gemini to generate a concrete, tool-by-tool execution plan for the
-    local model to follow.
+    Generate a concrete, tool-by-tool execution plan for the primary model
+    to follow. Despite the name (kept for compatibility with existing call
+    sites), this now routes across THREE possible planning brains depending
+    on OPENROUTER_CONSULT_MODE:
 
-    Routes through the Gemini DESKTOP APP (zero API cost) via UIA clipboard
-    interaction. Falls back to the Gemini API only if the app is unavailable
-    or UIA is not installed.
+      "always"   — try OpenRouter FIRST (cheap/free API call, no desktop-app
+                   dependency, consulted on nearly every non-trivial turn),
+                   fall back to Gemini (app then API) if OpenRouter fails.
+      "fallback" — try Gemini (app then API) first as before, only fall
+                   back to OpenRouter if both Gemini routes fail.
+      "off"      — Gemini only, exactly the original behaviour.
+
+    When MODEL_PROVIDER == "openrouter" (OpenRouter is already the PRIMARY
+    execution brain), this consult step is skipped entirely — there's no
+    benefit to a strong model consulting a plan from itself.
     """
+    if MODEL_PROVIDER == "openrouter":
+        # Primary model IS OpenRouter already — skip the separate consult
+        # call, it would just be the same model reasoning about itself twice.
+        return None
+
     # Build the prompt (same regardless of routing)
     non_sys = [m for m in conversation_history if m.get("role") != "system"]
     recent  = non_sys[-6:] if len(non_sys) > 6 else non_sys
@@ -5871,25 +7169,25 @@ def get_gemini_reasoning(user_input: str, conversation_history: list) -> str | N
     tool_summary = ", ".join(tool_names)
 
     prompt = f"""You are the planning brain of Jarvis, a {os_name} desktop AI agent.
-A weak local model (qwen2.5-coder) will execute tool calls based on your plan.
+A weak local model ({MODEL_NAME}) will execute tool calls based on your plan.
 The local model follows instructions literally but cannot reason well — give it explicit steps.
 
 AVAILABLE TOOLS: {tool_summary}
 
 KEY RULES FOR YOUR PLAN:
 - To open an app: read_paths → execute_terminal_command("{launch}")
-- To read a web page: read_browser_page() — NOT read_aggregated_text (UIA can't read web content)
-- To interact with a web page: snapshot(target='browser') → act(target='browser', index=N)
+- To interact with a desktop app: list_active_windows() → snapshot(target='<window name>') → act(target='<window name>', index=N)
+- To read a web page: list_browser_tabs() → read_browser_page(tab_index=N) — NOT read_aggregated_text (UIA can't read web content)
+- To interact with a web page: list_browser_tabs() → snapshot(target='browser') → act(target='browser', index=N)
 - To open a URL in Chrome (PREFERRED): open_url(url="https://...") — one call, no clicking needed
 - To find an app path: list_paths_indexed() → get_path(index=N) then use path
 - To navigate the filesystem: list_directory(path) → open_path(path, index=N)
-- To interact with a UI (approach 1 — fast): click_ui_element(window_title="canonical app name e.g. Google Chrome", description="plain english element name")
-- To interact with a UI (approach 2 — exact, use when unsure): snapshot_ui(window_title="app") → act_on_element(window_title="app", index=N)
-- To type in a field: FIRST click_ui_element or snapshot+act to focus it, THEN type_text(text="...", expected_window="app name")
+- To type in a field: FIRST snapshot+act (or click_ui_element) to focus it, THEN type_text(text="...", expected_window="app name")
 - To navigate to a URL: ALWAYS use open_url(url="...") — never click the address bar manually
 - To wait for an app to open: wait(seconds=2)
 - Use canonical window names (e.g. "Google Chrome" not "New Tab - Google Chrome")
 - search_internet for quick lookups, then open_search_result(index) to open a result
+- Always discover first (list_active_windows / list_browser_tabs) before snapshot — never guess the target name
 
 RECENT CONVERSATION:
 {history_text}
@@ -5907,37 +7205,55 @@ If this is a simple question or single-tool task, write just 1 step.
 If uncertain about a path or app location, include read_paths as step 1.
 Maximum 8 steps. Be concise."""
 
-    # ── Route 1: Gemini desktop app (free, no API cost) ──────────────────────
-    if _UIA_AVAILABLE and ui_navigator is not None:
+    def _try_openrouter() -> str | None:
+        if not _OPENROUTER_AVAILABLE:
+            return None
         try:
-            print("🤖 [Gemini app] Sending plan request...")
-            result = ui_navigator.query_gemini_app(prompt)
-            if result and not result.startswith("Error"):
-                # Clean up any preamble Gemini might add
-                plan = result.strip()
-                print(f"🤖 [Gemini app plan ({len(plan)} chars)]:\n{plan}\n")
+            print(f"🤖 [OpenRouter consult] Model: {OPENROUTER_MODEL}")
+            resp = _openrouter_chat([{"role": "user", "content": prompt}], model=OPENROUTER_MODEL)
+            plan = (resp["message"]["content"] or "").strip()
+            if plan:
+                print(f"🤖 [OpenRouter plan ({len(plan)} chars)]:\n{plan}\n")
                 return plan
-            else:
-                print(f"⚠️  [Gemini app returned error: {result[:80]}] — falling back to API")
         except Exception as e:
-            print(f"⚠️  [Gemini app failed: {e}] — falling back to API")
+            print(f"⚠️  [OpenRouter consult failed: {e}]")
+        return None
 
-    # ── Route 2: Gemini API (fallback, costs tokens) ──────────────────────────
-    if _GEMINI_AVAILABLE and _gemini_client is not None:
-        try:
-            print("🤖 [Gemini API fallback] Sending plan request...")
-            model_id, _ = _pick_gemini_model(user_input)
-            response = _gemini_client.models.generate_content(
-                model=model_id,
-                contents=prompt,
-            )
-            plan = response.text.strip()
-            print(f"🤖 [Gemini API plan ({len(plan)} chars)]:\n{plan}\n")
+    def _try_gemini() -> str | None:
+        # Gemini web chat via the community gemini_webapi library — the
+        # only route. No fallback to the metered API: the free web chat
+        # UI's usage limits are far more generous than the API's free
+        # tier, so a silent API fallback would burn through API credits
+        # without anyone noticing.
+        if _GEMINI_WEBAPI_AVAILABLE:
+            try:
+                print("🤖 [Gemini web] Sending plan request...")
+                result = query_gemini_app(prompt)
+                if result and not result.startswith("Error"):
+                    plan = result.strip()
+                    print(f"🤖 [Gemini web plan ({len(plan)} chars)]:\n{plan}\n")
+                    return plan
+                else:
+                    print(f"⚠️  [Gemini web returned error: {result[:80]}]")
+            except Exception as e:
+                print(f"⚠️  [Gemini web failed: {e}]")
+        return None
+
+    # ── Route selection based on OPENROUTER_CONSULT_MODE ──────────────────────
+    if OPENROUTER_CONSULT_MODE == "always":
+        plan = _try_openrouter()
+        if plan:
             return plan
-        except Exception as e:
-            print(f"⚠️  [Gemini API failed: {e}]")
+        return _try_gemini()
 
-    return None
+    elif OPENROUTER_CONSULT_MODE == "fallback":
+        plan = _try_gemini()
+        if plan:
+            return plan
+        return _try_openrouter()
+
+    else:   # "off"
+        return _try_gemini()
 
 # Tools that count as "verification" — capped so Jarvis can't loop forever
 _VERIFY_TOOLS = {"fallback_view_screen", "fallback_find_text"}
@@ -6022,13 +7338,23 @@ def _try_parse_tool_json(blob: str):
         return None
     name = obj.get("name") or obj.get("function") or obj.get("tool")
     args = obj.get("arguments", obj.get("parameters", {}))
-    if not name or name not in _known_tool_names():
+    if not name:
         return None
     if isinstance(args, str):
         try:
             args = json.loads(args)
         except Exception:
             pass
+    if name not in _known_tool_names():
+        # Not a registered top-level tool. This is the exact case that used
+        # to be silently dropped (return None) before a name was ever
+        # checked against connected MCP servers — which is why a model
+        # calling an MCP tool directly (e.g. skipping call_mcp_tool, or
+        # mangling underscores: 'get_weather' -> 'getweather') never even
+        # reached dispatch. Try to autoroute it through call_mcp_tool first.
+        name, args = _mcp_autoroute_tool_call(name, args)
+        if name not in _known_tool_names():
+            return None
     return {"function": {"name": name, "arguments": args}}
 
 def _extract_legacy_tool_calls(content: str):
@@ -6125,10 +7451,74 @@ def _call_ollama(messages, result_q):
         result_q.put(("err", e))
 
 
+def _call_openrouter_primary(messages, result_q, model_override: str = None):
+    """
+    Run OpenRouter chat completion on a background thread — used when
+    MODEL_PROVIDER == "openrouter" (OpenRouter driving Jarvis directly,
+    not just consulted), OR when a caller forces OpenRouter for a single
+    sub-turn via _call_primary_model(provider_override="openrouter").
+
+    model_override lets delegate_to_openrouter() run the sub-agent on a
+    different model than OPENROUTER_MODEL for that one delegated task.
+
+    Many free-tier OpenRouter models have inconsistent native tool-calling
+    support (same failure mode as qwen2.5-coder locally) — they emit the
+    tool call as JSON inside `content` instead of the structured field.
+    We reuse the same legacy-parser fallback here for that reason, applied
+    unconditionally (not gated by _is_legacy_toolcall_model, since we can't
+    maintain a family list for every free OpenRouter model).
+    """
+    try:
+        use_model = model_override or OPENROUTER_MODEL
+        resp = _openrouter_chat(messages, model=use_model, tools_schema=tools)
+
+        if not resp["message"].get("tool_calls"):
+            raw_content = resp["message"].get("content") or ""
+            legacy_calls, cleaned_content = _extract_legacy_tool_calls(raw_content)
+            if legacy_calls:
+                legacy_calls = legacy_calls[:1]   # one tool at a time
+                resp["message"]["tool_calls"] = legacy_calls
+                resp["message"]["content"]    = cleaned_content
+
+        result_q.put(("ok", resp))
+    except Exception as e:
+        result_q.put(("err", e))
+
+
+def _call_primary_model(messages, result_q, provider_override: str = None, model_override: str = None):
+    """
+    Dispatches to the configured primary model provider (see MODEL_PROVIDER
+    at the top of this file). Both branches populate result_q with the same
+    ("ok", resp) / ("err", exc) contract, so process_chat_turn is completely
+    unaware of which backend actually ran.
+
+    provider_override lets a caller force a specific provider for THIS call
+    only, without touching the global MODEL_PROVIDER — used by
+    delegate_to_openrouter() to run a sub-agent turn on OpenRouter even when
+    Ollama is the configured primary.
+    """
+    provider = provider_override or MODEL_PROVIDER
+    if provider == "openrouter":
+        _call_openrouter_primary(messages, result_q, model_override=model_override)
+    else:
+        _call_ollama(messages, result_q)
+
+
 MAX_ACTION_TRIES = 3
 
-def get_system_prompt():
-    """Generates the master system prompt dynamically based on loaded modules."""
+def get_system_prompt(effective_provider: str = None, effective_model: str = None):
+    """
+    Generates the master system prompt dynamically based on loaded modules.
+
+    effective_provider / effective_model let a caller (e.g. a delegated
+    OpenRouter sub-agent) request the prompt as if that provider/model were
+    the one actually running, without touching the global MODEL_PROVIDER /
+    MODEL_NAME / OPENROUTER_MODEL — needed so the JSON-tool-call formatting
+    hint is correctly shown/hidden for whichever model is really executing
+    this turn.
+    """
+    provider = effective_provider or MODEL_PROVIDER
+    model_id = effective_model or (OPENROUTER_MODEL if provider == "openrouter" else MODEL_NAME)
     if _IS_LINUX:
         shell_rule = (
             "- SHELL: bash only. Never use PowerShell, cmd.exe, or Windows commands. "
@@ -6169,7 +7559,9 @@ def get_system_prompt():
         "\n- TOOL CALLS: output ONLY a single JSON object in this shape: "
         "{\"name\": \"<tool_name>\", \"arguments\": {<args>}}. "
         "No commentary before or after. <tool_call> tags also fine."
-        if _is_legacy_toolcall_model(MODEL_NAME) else ""
+        if (provider == "openrouter" and model_id.endswith(":free"))
+           or (provider == "ollama" and _is_legacy_toolcall_model(model_id))
+        else ""
     )
 
     return (
@@ -6188,6 +7580,8 @@ def get_system_prompt():
         "  Domain knowledge    → list_domain_knowledge_indexed() → read_domain_by_index(N)\n"
         "  Click UI element    → snapshot(target='AppName') → act(target='AppName', index=N)\n"
         "  Click browser elem  → snapshot(target='browser') → act(target='browser', index=N)\n"
+        "    (snapshot/act is ONE tool pair — 'AppName' targets a desktop window via UIA,\n"
+        "     'browser' targets the active tab via CDP. Same tool, different target.)\n"
         "  Click screen text   → ocr_snapshot() → click_ocr_index(N)\n"
         "  Open search result  → search_internet(q) → open_search_result(N)\n"
         "  Open a URL          → open_url(url='https://...')  [one call, always]\n"
@@ -6196,6 +7590,31 @@ def get_system_prompt():
         "FALLBACK SEARCH TOOLS (only when choose path unavailable or too slow):\n"
         "  click_ui_element(window, description) — only when certain of element name\n"
         "  read_paths / explore_path / list_skills — legacy, still work, no index\n"
+        "\n"
+        "━━━ UIA / BROWSER PIPELINE (always follow this exact sequence) ━━━\n"
+        "snapshot(target=...) and act(target=..., index=N) are ONE tool pair that works on\n"
+        "BOTH desktop apps (VS Code, Discord, Settings, any window) AND browser pages —\n"
+        "not browser-only. `target` decides which: a window name/canonical app name (e.g.\n"
+        "'Visual Studio Code', 'Discord', 'taskbar') routes through UIA for a desktop app;\n"
+        "'browser' or 'browser:N' routes through CDP for a browser tab. Same two-step\n"
+        "pattern either way — snapshot to see indexed elements, act to use one by index.\n"
+        "\n"
+        "DESKTOP APP:\n"
+        "  1. list_active_windows()              — discover the exact window/canonical name\n"
+        "  2. snapshot(target='<window name>')    — list every visible element with an index\n"
+        "  3. act(target='<window name>', index=N) — click/type/read that element by index\n"
+        "\n"
+        "BROWSER TAB:\n"
+        "  1. list_browser_tabs()                — discover which tab to work in (index/URL/title)\n"
+        "  2. read_browser_page(tab_index=N)      — read the tab's TEXT content (skip if you only need to click something)\n"
+        "  3. snapshot(target='browser')          — list every interactive element with an index\n"
+        "     (or snapshot(target='browser:N') for a specific non-active tab)\n"
+        "  4. act(target='browser', index=N)      — click/type/read that element by index\n"
+        "\n"
+        "Never skip the discovery step (list_active_windows / list_browser_tabs) — snapshot\n"
+        "needs the correct target name/tab, and guessing it wastes a turn on a failed call.\n"
+        "Never use run_js_in_browser or fallback_click_text as a first resort — only after\n"
+        "the pipeline above genuinely fails (canvas/WebGL page, no elements found, etc).\n"
         "\n"
         "━━━ CORE RULES ━━━\n"
         "- NEVER fabricate. Always use tools for real data.\n"
@@ -6206,11 +7625,10 @@ def get_system_prompt():
         f"- Retry cap: max {MAX_ACTION_TRIES} attempts per action.\n"
         "\n"
         "━━━ BROWSER ━━━\n"
+        "- Full discovery→act sequence: see UIA / BROWSER PIPELINE above.\n"
         "- open_url(url) opens any URL in Chrome — ALWAYS use this, never click address bar.\n"
         "- read_browser_page() reads web page text. UIA CANNOT read web content.\n"
-        "- snapshot(target='browser') → act(target='browser', index=N) for page interaction.\n"
-        "- run_js_in_browser(script) for JS execution on the page.\n"
-        "- list_browser_tabs() to see open tabs.\n"
+        "- run_js_in_browser(script) for JS execution on the page (last resort only).\n"
         "- Requires Chrome with --remote-debugging-port=9222.\n"
         "- Canonical window names: 'Google Chrome' not 'New Tab - Google Chrome'.\n"
         "  Shell surfaces: 'taskbar', 'start', 'tray', 'desktop', 'action center'.\n"
@@ -6220,9 +7638,38 @@ def get_system_prompt():
         "- set_current_goal on start; goal='none' on done.\n"
         "- write_response_memory only for 5+ step tasks.\n"
         "\n"
-        "━━━ GEMINI ━━━\n"
-        "- consult_gemini for complex reasoning, code review, architecture.\n"
-        "- Routes through Gemini desktop app (free) then API (fallback).\n"
+        "━━━ CONSULT BRAINS (GEMINI / OPENROUTER) ━━━\n"
+        "- DEFAULT to consult_gemini for complex reasoning, code review, architecture, "
+        "or any time you want a second opinion before acting. Try this FIRST.\n"
+        "  Routes through the Gemini desktop app (free) then API (fallback).\n"
+        "- Do NOT reach for consult_openrouter by default — only use it when:\n"
+        "    (a) the user explicitly says 'ask OpenRouter' / names OpenRouter, OR\n"
+        "    (b) consult_gemini has just failed/errored and you need a second-brain "
+        "answer anyway.\n"
+        "  Treat it strictly as a fallback, not an alternative to reach for casually.\n"
+        "- delegate_to_openrouter(task, context) — OFFLOAD an entire sub-task to a REAL\n"
+        "  COWORKER, not just a text answer. The delegate gets full tool access (UIA, CDP,\n"
+        "  terminal, files) and completes the task independently, then reports back a\n"
+        "  summary. Use this for substantial self-contained sub-tasks (e.g. 'research X\n"
+        "  and summarise', 'find and organize all PDFs in Downloads') — this is a\n"
+        "  legitimate, separate use case from consult_openrouter and isn't restricted\n"
+        "  by the fallback-only guidance above.\n"
+        "- If the user asks to change/switch the OpenRouter model: "
+        "list_openrouter_models() → set_openrouter_model_by_index(N). "
+        "Or set_openrouter_model(model_id) if they give an exact ID directly.\n"
+        "\n"
+        "━━━ MCP SERVERS (EXTERNAL TOOLS) ━━━\n"
+        "- Tool discovery is 3 steps — NEVER guess a tool_name or arguments shape:\n"
+        "  1. list_mcp_servers()            — which servers are connected (no tool detail)\n"
+        "  2. show_server_tools(server)     — that server's tools + JSON schemas\n"
+        "  3. call_mcp_tool(server, tool_name, arguments) — uniform call, ANY server/tool\n"
+        "- 'server' is the index (e.g. '0') or name shown by list_mcp_servers().\n"
+        "- Don't call show_server_tools repeatedly for the same server in one turn — "
+        "once you've seen its schema, just call_mcp_tool.\n"
+        "- connect_mcp_server(name, transport, ...) adds a new server and remembers it "
+        "for next startup. transport='stdio' needs command(+args); "
+        "transport='http'/'sse' needs url.\n"
+        "- disconnect_mcp_server(server, forget=True) removes a server for good.\n"
         "\n"
         "━━━ EXAMPLE FLOWS ━━━\n"
         f"{launch_example}"
@@ -6590,7 +8037,16 @@ def _decompose_task(user_request: str) -> str | None:
     return plan
 
 
-def process_chat_turn(conversation_history, user_request: str = "", gemini_plan: str = ""):
+def process_chat_turn(conversation_history, user_request: str = "", gemini_plan: str = "",
+                       force_provider: str = None, force_model: str = None,
+                       max_steps: int = 20):
+    """
+    force_provider / force_model let a caller run this ENTIRE step loop on a
+    specific model backend regardless of the global MODEL_PROVIDER — used by
+    delegate_to_openrouter() to spin up a self-contained OpenRouter "coworker"
+    sub-agent that has full tool access via the exact same engine as the
+    primary loop, without permanently switching Jarvis's primary provider.
+    """
     clear_response_memory()
     turn_tool_outputs     = []
     _said_parts           = []
@@ -6600,7 +8056,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
     action_attempt_counts: dict = {}
     _paths_consulted      = False
     _abort_event.clear()
-    MAX_STEPS  = 20
+    MAX_STEPS  = max_steps
     step_count = 0
     state      = TurnState(user_request, gemini_plan=gemini_plan)
 
@@ -6625,9 +8081,13 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
         non_sys  = [m for m in conversation_history if m.get("role") != "system"]
         trimmed  = sys_msgs + non_sys[-HISTORY_WINDOW:]
 
-        # ── Run ollama.chat on a thread so Ctrl+Q can interrupt the wait ──────
+        # ── Run the primary model on a thread so Ctrl+Q can interrupt the wait ─
         result_q = _queue.Queue()
-        t = threading.Thread(target=_call_ollama, args=(trimmed, result_q), daemon=True)
+        t = threading.Thread(
+            target=_call_primary_model,
+            args=(trimmed, result_q, force_provider, force_model),
+            daemon=True
+        )
         t.start()
         while t.is_alive():
             if _abort_event.is_set():
@@ -6637,7 +8097,9 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
 
         status, payload = result_q.get()
         if status == "err":
-            return f"[Ollama error: {payload}]", turn_tool_outputs
+            effective_provider = force_provider or MODEL_PROVIDER
+            provider_name = "OpenRouter" if effective_provider == "openrouter" else "Ollama"
+            return f"[{provider_name} error: {payload}]", turn_tool_outputs
         response   = payload
         tool_calls = response["message"].get("tool_calls")
         if tool_calls:
@@ -6693,6 +8155,15 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 except: arguments = {}
             else:
                 arguments = raw_args
+
+            # MCP autoroute: covers the structured/native tool_calls path
+            # (the legacy free-text JSON path is handled inside
+            # _try_parse_tool_json instead, before it ever gets here).
+            # If the model called an MCP server's tool directly by name —
+            # bypassing call_mcp_tool, with underscores/case/hyphens
+            # mangled or not — this rewrites it to the uniform
+            # call_mcp_tool(server, tool_name, arguments) call transparently.
+            func_name, arguments = _mcp_autoroute_tool_call(func_name, arguments)
 
             print(f" -> Executing: '{func_name}'")
             tool_images = None
@@ -7002,6 +8473,27 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     arguments.get("task_type", "auto"),
                     arguments.get("context", "")
                 )
+            elif func_name == "consult_openrouter":
+                tool_output = consult_openrouter(
+                    arguments.get("prompt", ""),
+                    arguments.get("context", ""),
+                    arguments.get("model") or None
+                )
+            elif func_name == "delegate_to_openrouter":
+                tool_output = delegate_to_openrouter(
+                    arguments.get("task", ""),
+                    arguments.get("context", ""),
+                    arguments.get("model") or None,
+                    int(arguments.get("max_steps", 10))
+                )
+            elif func_name == "list_openrouter_models":
+                tool_output = list_openrouter_models(
+                    bool(arguments.get("free_only", True))
+                )
+            elif func_name == "set_openrouter_model_by_index":
+                tool_output = set_openrouter_model_by_index(int(arguments.get("index", 0)))
+            elif func_name == "set_openrouter_model":
+                tool_output = set_openrouter_model(arguments.get("model_id", ""))
             elif func_name == "read_file_smart":
                 tool_output = read_file_smart(arguments.get("path", ""))
             elif func_name == "read_file_chunk":
@@ -7061,11 +8553,13 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             
             elif func_name == "query_gemini_app":
                 prompt_payload = arguments.get("prompt", "")
-                print(f"   [Bridge] Handing task execution off to Gemini Application...")
-                if _UIA_AVAILABLE:
-                    tool_output = ui_navigator.query_gemini_app(prompt=prompt_payload)
+                print(f"   [Bridge] Sending prompt to Gemini web app via gemini_webapi...")
+                if _GEMINI_WEBAPI_AVAILABLE:
+                    tool_output = query_gemini_app(prompt_payload)
                 else:
-                    tool_output = "Execution failed: UIA layer is unavailable."
+                    tool_output = (
+                        f"Execution failed: {_gemini_webapi_load_msg}"
+                    )
             
             elif func_name == "manage_gemini_chat":
                 tool_output = ui_navigator.manage_gemini_chat(
@@ -7084,6 +8578,37 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 _accumulated_reply.append(msg_text)
                 turn_tool_outputs.append(f"[say]: {msg_text}")
                 tool_output = "Message displayed to user."
+
+            elif func_name == "list_mcp_servers":
+                tool_output = list_mcp_servers()
+
+            elif func_name == "show_server_tools":
+                tool_output = show_server_tools(arguments.get("server"))
+
+            elif func_name == "call_mcp_tool":
+                tool_output = call_mcp_tool(
+                    arguments.get("server"),
+                    arguments.get("tool_name"),
+                    arguments.get("arguments", {})
+                )
+
+            elif func_name == "connect_mcp_server":
+                tool_output = connect_mcp_server(
+                    name=arguments.get("name", ""),
+                    transport=arguments.get("transport", "stdio"),
+                    command=arguments.get("command"),
+                    args=arguments.get("args"),
+                    url=arguments.get("url"),
+                    env=arguments.get("env"),
+                    headers=arguments.get("headers"),
+                    persist=arguments.get("persist", True)
+                )
+
+            elif func_name == "disconnect_mcp_server":
+                tool_output = disconnect_mcp_server(
+                    arguments.get("server"),
+                    forget=arguments.get("forget", False)
+                )
 
             else:
                 # ── Fuzzy tool name resolver ──────────────────────────────────
@@ -7129,6 +8654,22 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     # Gemini
                     "gemini":               "consult_gemini",
                     "ask_gemini":           "consult_gemini",
+                    # OpenRouter
+                    "openrouter":           "consult_openrouter",
+                    "ask_openrouter":       "consult_openrouter",
+                    "consult_or":           "consult_openrouter",
+                    "delegate":             "delegate_to_openrouter",
+                    "delegate_task":        "delegate_to_openrouter",
+                    "assign_task":          "delegate_to_openrouter",
+                    "offload_task":         "delegate_to_openrouter",
+                    "offload_to_openrouter": "delegate_to_openrouter",
+                    "delegate_or":          "delegate_to_openrouter",
+                    "list_models":          "list_openrouter_models",
+                    "list_or_models":       "list_openrouter_models",
+                    "switch_model":         "set_openrouter_model_by_index",
+                    "change_model":         "set_openrouter_model_by_index",
+                    "select_model":         "set_openrouter_model_by_index",
+                    "set_model":            "set_openrouter_model",
                     # UI snapshot/act — all old names → unified tools
                     "snapshot_ui":              "snapshot",
                     "snapshot_browser_elements": "snapshot",
@@ -7159,6 +8700,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     "open_result":          "open_search_result",
                     "read_page":            "read_browser_page",
                     "read_browser":         "read_browser_page",
+                    "read_browser_tab":     "read_browser_page",
                     "get_page_content":     "read_browser_page",
                     "browser_tabs":         "list_browser_tabs",
                     "list_tabs":            "list_browser_tabs",
@@ -7218,11 +8760,24 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                             f"Call '{resolved}' now with the same arguments."
                         )
                 else:
-                    known_list = ", ".join(sorted(_KNOWN_TOOLS))
-                    tool_output = (
-                        f"[UNKNOWN TOOL] '{func_name}' is not a valid tool. "
-                        f"Available tools: {known_list}"
-                    )
+                    mcp_matches = _mcp_find_tool_matches(func_name)
+                    if len(mcp_matches) > 1:
+                        options = "; ".join(
+                            f"server='{s}' tool_name='{t}'" for s, t in mcp_matches
+                        )
+                        tool_output = (
+                            f"[AMBIGUOUS MCP TOOL] '{func_name}' matches a tool on more than "
+                            f"one connected server: {options}. Call call_mcp_tool with the "
+                            f"specific server you meant."
+                        )
+                    else:
+                        known_list = ", ".join(sorted(_KNOWN_TOOLS))
+                        tool_output = (
+                            f"[UNKNOWN TOOL] '{func_name}' is not a valid tool. "
+                            f"Available tools: {known_list}. If this was meant to be an MCP "
+                            f"server tool, call list_mcp_servers() then show_server_tools(server) "
+                            f"to confirm the exact name, then call_mcp_tool(server, tool_name, arguments)."
+                        )
 
             # ── Record in TurnState ───────────────────────────────────────────
             state.record(func_name, arguments, tool_output)
@@ -7311,14 +8866,43 @@ if __name__ == "__main__":
             else:
                 print("    pip install uiautomation pywin32")
 
-    # ── Gemini status ──────────────────────────────────────────────────────────
-    if _GEMINI_AVAILABLE:
-        print("🤖 [Gemini: available — consult_gemini is active]")
+    # ── Gemini status (web chat only, via gemini_webapi — no API fallback) ─────
+    if _GEMINI_WEBAPI_AVAILABLE:
+        print("🤖 [Gemini: gemini_webapi installed — consult_gemini is active "
+              "(client/cookies initialise lazily on first use)]")
     else:
-        print(f"⚠️  [Gemini not available: {_gemini_load_msg}]")
+        print(f"⚠️  [Gemini web chat unavailable: {_gemini_webapi_load_msg}]")
+        print( "    Install: pip install -U gemini_webapi")
+        print( "    Optional (auto cookie import): pip install -U browser-cookie3")
+        print(f"    Or add cookies manually to the secrets file "
+              f"({os.path.abspath(SECRETS_FILE)}):")
+        print( "      { \"GEMINI_SECURE_1PSID\": \"...\", \"GEMINI_SECURE_1PSIDTS\": \"...\" }")
+    if _GEMINI_AVAILABLE:
+        print("    (Gemini API key is also configured, but is unused — consult_gemini "
+              "only uses the web chat interface now.)")
+
+    # ── OpenRouter status ──────────────────────────────────────────────────────
+    if _OPENROUTER_AVAILABLE:
+        print(f"🌍 [OpenRouter: available — model={OPENROUTER_MODEL}, "
+              f"consult_mode={OPENROUTER_CONSULT_MODE}]")
+    else:
+        print(f"⚠️  [OpenRouter not available: {_openrouter_load_msg}]")
         print(f"    Secrets file expected at: {os.path.abspath(SECRETS_FILE)}")
-        print( "    Format: { \"GEMINI_API_KEY\": \"your_key_here\" }")
-        print( "    Install: pip install google-genai")
+        print( "    Add key: { \"OPENROUTER_API_KEY\": \"sk-or-v1-...\" } (same file as Gemini)")
+        print( "    Get a key: https://openrouter.ai/keys")
+
+    # ── Primary model provider summary ────────────────────────────────────────
+    if MODEL_PROVIDER == "openrouter":
+        if not _OPENROUTER_AVAILABLE:
+            print("🛑 [MODEL_PROVIDER='openrouter' but OpenRouter is NOT configured — "
+                  "Jarvis cannot run until OPENROUTER_API_KEY is set!]")
+        else:
+            print(f"🧠 [PRIMARY MODEL: OpenRouter/{OPENROUTER_MODEL} — driving Jarvis directly]")
+    else:
+        print(f"🧠 [PRIMARY MODEL: Ollama/{MODEL_NAME} — local execution brain]")
+        if OPENROUTER_CONSULT_MODE != "off" and _OPENROUTER_AVAILABLE:
+            print(f"    Planning consult: OpenRouter/{OPENROUTER_MODEL} "
+                  f"({OPENROUTER_CONSULT_MODE}), Gemini as {'primary consult' if OPENROUTER_CONSULT_MODE=='fallback' else 'fallback'}")
 
     # ── CDP browser status ─────────────────────────────────────────────────────
     if _CDP_AVAILABLE:
@@ -7331,6 +8915,21 @@ if __name__ == "__main__":
     else:
         print("⚠️  [CDP not available — browser DOM tools disabled]")
         print("    Install: pip install websocket-client requests")
+
+    # ── MCP servers ─────────────────────────────────────────────────────────
+    if _MCP_SDK_AVAILABLE:
+        init_mcp_servers_from_config()
+        if _MCP_SERVER_ORDER:
+            connected_n = sum(1 for n in _MCP_SERVER_ORDER if _MCP_SERVERS[n].connected)
+            print(f"🧩 [MCP: {connected_n}/{len(_MCP_SERVER_ORDER)} server(s) connected — "
+                  f"list_mcp_servers() for details]")
+        else:
+            print(f"🧩 [MCP: SDK installed, no servers configured yet — "
+                  f"connect_mcp_server(...) to add one, or edit "
+                  f"{os.path.abspath(MCP_SERVERS_FILE)}]")
+    else:
+        print("⚠️  [MCP not available — 'mcp' package not installed]")
+        print("    Install: pip install mcp")
 
     print(f"🖥️  [Platform: {'Linux' if _IS_LINUX else 'Windows'} | "
           f"Screen: {SCREEN_W}x{SCREEN_H} | "
