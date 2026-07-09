@@ -115,9 +115,35 @@ MODEL_NAME     = "jarvishehe"
 #                of Ollama. Every tool-calling turn is a metered API call.
 #                Use this if you have an OpenRouter key and want a stronger
 #                model driving Jarvis directly instead of qwen2.5-coder.
+# "gemini_web" — use Gemini, accessed through the `gemini_webapi` library
+#                (account cookie sign-in, no API key, no per-token metering)
+#                as the PRIMARY execution brain. Reuses the same account
+#                session as consult_gemini/query_gemini_app (see the
+#                GEMINI WEB APP CLIENT section below). Every tool-calling
+#                step is a real web request to gemini.google.com's internal
+#                endpoints through a persistent ChatSession, so it is slower
+#                per-step than Ollama/OpenRouter — expect real latency on
+#                multi-hop tool loops. See GEMINI_WEB_MODEL below to pick
+#                the model tier.
+# "gemini_api" — use Gemini as the PRIMARY execution brain through the
+#                OFFICIAL Google Gemini API (an API key, not a browser/cookie
+#                hack), talking to Gemini's OpenAI-compatible /chat/completions
+#                endpoint with real structured function-calling. Same request
+#                shape as "openrouter", so it gets the exact same reliability
+#                (native tool_calls field, no scraping, no session juggling)
+#                and is fully wired into tool calling / MCP servers exactly
+#                like every other provider. See GEMINI_API_MODEL below.
 #
 # A future GUI will expose this as a dropdown — for now, edit directly.
-MODEL_PROVIDER = "ollama"   # "ollama" | "openrouter"
+# "groq"       — use GROQ_MODEL as the PRIMARY execution brain instead of
+#                Ollama. GroqCloud offers a genuinely free tier (no credit
+#                card) with fast inference and native structured tool
+#                calling on models like llama-3.3-70b-versatile and
+#                qwen/qwen3-32b. Same request shape as "openrouter" /
+#                "gemini_api" (OpenAI-compatible /chat/completions), so it
+#                is fully wired into tool calling / MCP servers exactly
+#                like every other provider. See GROQ_MODEL below.
+MODEL_PROVIDER = "gemini_web"   # "ollama" | "openrouter" | "gemini_web" | "gemini_api" | "groq"
 
 # ── OpenRouter model selection ────────────────────────────────────────────────
 # Used when MODEL_PROVIDER == "openrouter" (primary), and always used for
@@ -137,6 +163,23 @@ MODEL_PROVIDER = "ollama"   # "ollama" | "openrouter"
 OPENROUTER_MODEL          = "meta-llama/llama-3.3-70b-instruct:free"   # primary (if selected) AND consult model
 OPENROUTER_API_BASE       = "https://openrouter.ai/api/v1"
 
+# ── Fallback free models ──────────────────────────────────────────────────────
+# OpenRouter's ":free" models share a global rate-limit pool across ALL
+# OpenRouter users, not just you — so a single free model (like the
+# llama-3.3-70b:free default above) will very commonly return 429
+# ("Provider returned error") during busy periods, no matter how you
+# configure retries. When that happens, _openrouter_chat_with_fallback()
+# below automatically tries the next model in this list instead of just
+# failing the turn. Order = preference. Keep OPENROUTER_MODEL first (it's
+# tried first), the rest are only used if it 429s/502s/503s repeatedly.
+OPENROUTER_FALLBACK_MODELS = [
+    OPENROUTER_MODEL,
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "google/gemini-2.0-flash-exp:free",
+    "deepseek/deepseek-chat-v3.1:free",
+    "qwen/qwen3-235b-a22b:free",
+]
+
 # ── Secondary consultation mode ───────────────────────────────────────────────
 # Controls how often OpenRouter is consulted as a planning brain in addition
 # to (or instead of) Gemini. OpenRouter free models are consulted far more
@@ -147,6 +190,78 @@ OPENROUTER_API_BASE       = "https://openrouter.ai/api/v1"
 #   "fallback"  — only consult OpenRouter if Gemini (app + API) both fail
 #   "off"       — never consult OpenRouter as a secondary planner
 OPENROUTER_CONSULT_MODE   = "always"
+
+# ── Gemini API (official) model selection ─────────────────────────────────────
+# Used when MODEL_PROVIDER == "gemini_api". This is the REAL Google Gemini API
+# (an API key from https://aistudio.google.com/app/apikey), NOT the web-chat
+# scraping used by "gemini_web" — no cookies, no browser session, no auto
+# model detection. Structured function calling is native, so tool calling is
+# reliable step to step.
+GEMINI_API_MODEL = "gemini-3.1-flash-lite"   # exact model ID as listed at https://ai.google.dev/gemini-api/docs/models
+GEMINI_API_BASE  = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+# ── GroqCloud model selection ─────────────────────────────────────────────────
+# Used when MODEL_PROVIDER == "groq" (primary), and always available for
+# on-demand consultation/delegation regardless of MODEL_PROVIDER, exactly
+# like OpenRouter/Gemini API. GroqCloud's free tier needs only a key from
+# https://console.groq.com/keys — no credit card — and gives very fast
+# inference plus reliable native structured tool-calling.
+#
+# Model IDs: https://console.groq.com/docs/models (subject to change):
+#   "llama-3.3-70b-versatile"   — strong general-purpose, good tool calling
+#   "llama-3.1-8b-instant"      — fastest, smaller
+#   "qwen/qwen3-32b"            — strong reasoning/coding
+#   "deepseek-r1-distill-llama-70b" — reasoning-heavy
+#   "moonshotai/kimi-k2-instruct"   — large MoE, strong tool use
+GROQ_MODEL          = "llama-3.3-70b-versatile"   # primary (if selected) AND consult model
+GROQ_API_BASE        = "https://api.groq.com/openai/v1"
+
+# GroqCloud's free tier has generous per-minute/per-day request & token
+# limits that vary by model, and can occasionally 429 during bursts. When
+# that happens, _groq_chat_with_fallback() automatically tries the next
+# model in this list instead of just failing the turn. Order = preference.
+GROQ_FALLBACK_MODELS = [
+    GROQ_MODEL,
+    "llama-3.1-8b-instant",
+    "qwen/qwen3-32b",
+    "moonshotai/kimi-k2-instruct",
+]
+
+# ── Gemini-web (gemini_webapi) primary-execution settings ─────────────────────
+# Used only when MODEL_PROVIDER == "gemini_web". Separate from consult_gemini/
+# query_gemini_app's ad-hoc single-shot calls — this drives the ENTIRE
+# tool-calling loop through one persistent gemini_webapi ChatSession per
+# conversation (see "GEMINI WEB APP CLIENT" section for the underlying
+# client, and "GEMINI-WEB PRIMARY EXECUTION BACKEND" for the loop wiring).
+#
+# GEMINI_WEB_MODEL: "" (default) = auto-pick the fastest available model via
+# client.list_models() at runtime (never hardcode a model name — the web
+# app's exposed lineup changes over time and isn't guaranteed to match the
+# name you last saw). Set to an exact model_name/display_name string
+# (e.g. "gemini-3-flash") to pin one instead.
+GEMINI_WEB_MODEL              = "gemini-3-flash"   # exact model name as listed in gemini_webapi client.list_models()
+
+# NOTE: deliberately NOT using a Gem here. Gems proved problematic (flaky
+# create/update/fetch round trips, an extra persistent server-side object
+# that can drift out of sync, silent "no-gem mode" degradation). Instead
+# persona + tool JSON-output-format instructions are sent as a plain-text
+# priming message on the first turn of every fresh ChatSession (see
+# _gemini_web_persona_prompt()), and the native tool schema is discovered
+# on demand via list_native_tools()/show_native_tool_schema(tool_name)
+# instead of being inlined into anything persistent. Same capability, no
+# Gem dependency.
+
+# Per-hop and whole-task timeout budgets (seconds). Each tool-loop hop is a
+# real round trip through gemini.google.com, so these are generous compared
+# to the local-model/OpenRouter equivalents.
+GEMINI_WEB_HOP_TIMEOUT        = 120
+GEMINI_WEB_TOTAL_TASK_TIMEOUT = 1800
+
+# Marker prefixed to every tool-result message injected into the Gemini
+# ChatSession, so Gemini can reliably tell an injected tool result apart
+# from a genuine new user message. Keep this exact string in sync anywhere
+# else results are formatted for Gemini.
+GEMINI_WEB_TOOL_RESULT_MARKER = "[TOOL_RESULT]"
 
 # ── Legacy / weak native-tool-calling models ────────────────────────────────
 LEGACY_TOOLCALL_MODELS = (
@@ -2262,7 +2377,7 @@ _openrouter_load_ok, _openrouter_load_msg = _load_openrouter()
 
 
 def _openrouter_chat(messages: list, model: str = None, tools_schema: list = None,
-                      timeout: int = 60, _retries: int = 2) -> dict:
+                      timeout: int = 60, _retries: int = 4) -> dict:
     """
     Call OpenRouter's OpenAI-compatible /chat/completions endpoint.
     Returns a dict normalised to the SAME shape _call_ollama produces:
@@ -2321,9 +2436,13 @@ def _openrouter_chat(messages: list, model: str = None, tools_schema: list = Non
 
                 retryable = resp.status_code in (429, 502, 503, 504)
                 if retryable and attempt < _retries:
-                    wait_s = 1.5 * (attempt + 1)
+                    # Exponential backoff with a cap, plus small jitter, since
+                    # free-tier 429s are a SHARED rate-limit pool — a fixed
+                    # short wait often isn't enough for it to clear.
+                    import random as _random
+                    wait_s = min(2.0 * (2 ** attempt), 20.0) + _random.uniform(0, 0.75)
                     print(f"   [OpenRouter] {resp.status_code} ({err_msg[:80]}) — "
-                          f"retrying in {wait_s:.1f}s...")
+                          f"retrying in {wait_s:.1f}s... (attempt {attempt + 1}/{_retries + 1})")
                     time.sleep(wait_s)
                     last_err = err_msg
                     continue
@@ -2374,6 +2493,39 @@ def _openrouter_chat(messages: list, model: str = None, tools_schema: list = Non
     }
 
 
+def _openrouter_chat_with_fallback(messages: list, model: str = None, tools_schema: list = None,
+                                    timeout: int = 60) -> dict:
+    """
+    Wraps _openrouter_chat() with automatic fallback across
+    OPENROUTER_FALLBACK_MODELS. A single free-tier model can 429 for
+    minutes at a time because the rate limit is shared across ALL
+    OpenRouter users of that model, not just you — retrying the SAME
+    model harder doesn't help. This tries the requested model first
+    (with its own internal retries), and if it still fails with a
+    retryable error, moves on to the next model in the fallback list
+    before giving up.
+    """
+    requested = model or OPENROUTER_MODEL
+    chain = [requested] + [m for m in OPENROUTER_FALLBACK_MODELS if m != requested]
+
+    last_err = None
+    for i, m in enumerate(chain):
+        try:
+            resp = _openrouter_chat(messages, model=m, tools_schema=tools_schema, timeout=timeout)
+            if i > 0:
+                print(f"   [OpenRouter] Recovered using fallback model: {m}")
+            return resp
+        except RuntimeError as e:
+            last_err = e
+            msg = str(e)
+            retryable = any(code in msg for code in ("429", "502", "503", "504")) or "connection failed" in msg.lower()
+            if retryable and i < len(chain) - 1:
+                print(f"   [OpenRouter] {m} unavailable ({msg[:100]}) — trying next fallback model...")
+                continue
+            raise
+    raise last_err or RuntimeError("OpenRouter: all fallback models failed.")
+
+
 def consult_openrouter(prompt: str, context: str = "", model: str = None) -> str:
     """
     Send a plain reasoning/planning prompt to OpenRouter (no tool schema —
@@ -2393,7 +2545,7 @@ def consult_openrouter(prompt: str, context: str = "", model: str = None) -> str
     try:
         use_model = model or OPENROUTER_MODEL
         print(f"   [OpenRouter] Model: {use_model}")
-        resp   = _openrouter_chat(
+        resp   = _openrouter_chat_with_fallback(
             [{"role": "user", "content": full_prompt}],
             model=use_model
         )
@@ -2573,6 +2725,748 @@ def set_openrouter_model_by_index(index: int) -> str:
     if entry is None:
         return f"Index {index} not found. Call list_openrouter_models() first."
     return set_openrouter_model(entry["id"])
+
+
+# =============================================================================
+# GEMINI API (OFFICIAL) SETUP — real API key, no browser/cookie hacks
+# =============================================================================
+#
+# This is a SEPARATE code path from both consult_gemini (web-chat scraping)
+# and the unused google-genai SDK client (_gemini_client) loaded above. It
+# talks to Google's OFFICIAL OpenAI-compatible endpoint for the Gemini API:
+#     https://ai.google.dev/gemini-api/docs/openai
+# which means we can reuse the exact same plain-`requests` pipeline as
+# OpenRouter (_openrouter_chat) — same request shape, same normalised
+# response shape, same retry logic — instead of hand-rolling anything
+# genai-SDK-specific. Structured tool calling (the `tools` schema already
+# used everywhere else in this file) works natively here.
+#
+# API KEY SETUP (one-time):
+#   1. Get a free key at https://aistudio.google.com/app/apikey
+#   2. Add it to the SAME secrets file used everywhere else:
+#      { "GEMINI_API_KEY": "AIza...", "OPENROUTER_API_KEY": "sk-or-v1-..." }
+#
+_GEMINI_API_AVAILABLE = False
+_GEMINI_API_KEY        = None
+
+def _load_gemini_api():
+    """Load GEMINI_API_KEY from the shared secrets file (official API path)."""
+    global _GEMINI_API_AVAILABLE, _GEMINI_API_KEY
+    try:
+        secrets_path = os.path.abspath(SECRETS_FILE)
+        if not os.path.exists(secrets_path):
+            return False, f"Secrets file not found: {secrets_path}"
+        with open(secrets_path, "r", encoding="utf-8") as f:
+            secrets = json.load(f)
+        key = secrets.get("GEMINI_API_KEY", "").strip()
+        if not key:
+            return False, "GEMINI_API_KEY is empty in secrets file."
+        _GEMINI_API_KEY       = key
+        _GEMINI_API_AVAILABLE = True
+        return True, "OK"
+    except Exception as e:
+        return False, str(e)
+
+
+_gemini_api_load_ok, _gemini_api_load_msg = _load_gemini_api()
+
+
+def _sanitize_messages_for_gemini_api(messages: list) -> list:
+    """
+    Jarvis's internal conversation_history uses a loose, Ollama-shaped
+    message format that OpenRouter's backend tolerates/auto-repairs, but
+    Google's OFFICIAL OpenAI-compatible endpoint validates strictly and will
+    400 INVALID_ARGUMENT on it. Two specific things need fixing on the way
+    out, without touching the shared internal format used by every other
+    provider:
+
+    1. Assistant `tool_calls` entries here have no "id" / "type": "function"
+       — added by _openrouter_chat/_call_ollama's normaliser, but OpenAI's
+       schema requires both, and the FOLLOWING "tool" role message must
+       carry a matching "tool_call_id".
+    2. `function.arguments` is stored as a Python dict internally, but the
+       OpenAI/Gemini schema requires it to be a JSON-encoded STRING.
+
+    This walks the message list once, assigns synthetic ids to any
+    assistant tool_calls that are missing them, re-serialises arguments to
+    strings, and threads matching tool_call_id values onto the immediately
+    following "tool" messages (FIFO, since Jarvis only ever emits one tool
+    call per step — see "tool_calls[:1]" in process_chat_turn).
+    """
+    sanitized  = []
+    pending_ids = []
+    counter    = 0
+    for m in messages:
+        m = dict(m)
+        role = m.get("role")
+
+        if role == "assistant" and m.get("tool_calls"):
+            new_calls = []
+            for tc in m["tool_calls"]:
+                fn   = (tc or {}).get("function", {}) or {}
+                name = fn.get("name", "")
+                args = fn.get("arguments", {})
+                if not isinstance(args, str):
+                    try:
+                        args = json.dumps(args)
+                    except Exception:
+                        args = "{}"
+                call_id = tc.get("id") or f"call_{counter}"
+                counter += 1
+                pending_ids.append(call_id)
+                new_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                })
+            m["tool_calls"] = new_calls
+            if not m.get("content"):
+                m["content"] = None   # OpenAI schema allows null content alongside tool_calls
+            sanitized.append(m)
+
+        elif role == "tool":
+            if not m.get("tool_call_id"):
+                m["tool_call_id"] = pending_ids.pop(0) if pending_ids else f"call_{counter}"
+            sanitized.append(m)
+
+        else:
+            sanitized.append(m)
+
+    return sanitized
+
+
+def _gemini_api_chat(messages: list, model: str = None, tools_schema: list = None,
+                      timeout: int = 60, _retries: int = 2) -> dict:
+    """
+    Call Google's OFFICIAL Gemini API through its OpenAI-compatible
+    /chat/completions endpoint. Returns a dict normalised to the SAME shape
+    _call_ollama / _openrouter_chat produce:
+        {"message": {"role": "assistant", "content": str, "tool_calls": [...] }}
+    so process_chat_turn can treat every provider identically.
+
+    Retries on 429 (rate limit) and 502/503 (upstream overloaded), mirroring
+    _openrouter_chat exactly. Raises RuntimeError with the actual error
+    message from Gemini's response body on failure.
+    """
+    if not _GEMINI_API_AVAILABLE or not _GEMINI_API_KEY:
+        raise RuntimeError(
+            f"Gemini API not available: {_gemini_api_load_msg}. "
+            f"Add GEMINI_API_KEY to {SECRETS_FILE}"
+        )
+    if requests is None:
+        raise RuntimeError("requests library not installed: pip install requests")
+
+    model = model or GEMINI_API_MODEL
+
+    payload = {
+        "model": model,
+        "messages": _sanitize_messages_for_gemini_api(messages),
+    }
+    if tools_schema:
+        payload["tools"] = tools_schema
+
+    headers = {
+        "Authorization": f"Bearer {_GEMINI_API_KEY}",
+        "Content-Type":  "application/json",
+    }
+
+    last_err = None
+    for attempt in range(_retries + 1):
+        try:
+            resp = requests.post(
+                f"{GEMINI_API_BASE}/chat/completions",
+                headers=headers, json=payload, timeout=timeout
+            )
+
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+
+            if resp.status_code != 200:
+                # Google's error body is sometimes a dict ({"error": {...}}) and
+                # sometimes a single-element list ([{"error": {...}}]) — handle both.
+                err_container = data
+                if isinstance(err_container, list) and err_container:
+                    err_container = err_container[0]
+                err_obj = err_container.get("error", {}) if isinstance(err_container, dict) else {}
+                err_msg = err_obj.get("message") or resp.text[:300] or f"HTTP {resp.status_code}"
+
+                retryable = resp.status_code in (429, 502, 503, 504)
+                if retryable and attempt < _retries:
+                    wait_s = 1.5 * (attempt + 1)
+                    print(f"   [Gemini API] {resp.status_code} ({err_msg[:80]}) — "
+                          f"retrying in {wait_s:.1f}s...")
+                    time.sleep(wait_s)
+                    last_err = err_msg
+                    continue
+
+                raise RuntimeError(f"Gemini API error ({resp.status_code}): {err_msg}")
+
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(f"Gemini API error: {data['error'].get('message', data['error'])}")
+
+            break   # success
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_err = str(e)
+            if attempt < _retries:
+                wait_s = 1.5 * (attempt + 1)
+                print(f"   [Gemini API] Connection issue — retrying in {wait_s:.1f}s...")
+                time.sleep(wait_s)
+                continue
+            raise RuntimeError(f"Gemini API connection failed after {_retries + 1} attempts: {last_err}")
+    else:
+        raise RuntimeError(f"Gemini API failed after {_retries + 1} attempts: {last_err}")
+
+    choice  = (data.get("choices") or [{}])[0]
+    msg     = choice.get("message", {}) or {}
+    content = msg.get("content") or ""
+    raw_tool_calls = msg.get("tool_calls") or []
+
+    normalised_calls = []
+    for tc in raw_tool_calls:
+        fn = tc.get("function", {})
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                pass
+        normalised_calls.append({"function": {"name": fn.get("name", ""), "arguments": args}})
+
+    return {
+        "message": {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": normalised_calls,
+        }
+    }
+
+
+def consult_gemini_api(prompt: str, context: str = "", model: str = None) -> str:
+    """
+    Send a plain reasoning/planning prompt to the OFFICIAL Gemini API (API
+    key, not web chat) — no tool schema, text generation only. Same role as
+    consult_openrouter/consult_gemini, but using the metered official API.
+    """
+    if not _GEMINI_API_AVAILABLE:
+        return f"Gemini API is not available: {_gemini_api_load_msg}"
+
+    full_prompt = prompt.strip()
+    if context.strip():
+        if len(context) > 60000:
+            context = context[:30000] + "\n... [TRUNCATED] ...\n" + context[-30000:]
+        full_prompt = "[CONTEXT]\n" + context.strip() + "\n\n[TASK]\n" + full_prompt
+
+    try:
+        use_model = model or GEMINI_API_MODEL
+        print(f"   [Gemini API] Model: {use_model}")
+        resp   = _gemini_api_chat(
+            [{"role": "user", "content": full_prompt}],
+            model=use_model
+        )
+        result = (resp["message"]["content"] or "").strip()
+        print(f"   [Gemini API] Response received ({len(result)} chars)")
+        return f"[Gemini-API/{use_model}]\n" + result
+    except Exception as e:
+        return f"Gemini API error: {str(e)}"
+
+
+def delegate_to_gemini_api(task: str, context: str = "", model: str = None,
+                            max_steps: int = 10) -> str:
+    """
+    Mirror of delegate_to_openrouter(): hand `task` off to a fresh, FULLY
+    TOOL-CAPABLE agent loop running on the official Gemini API — it can call
+    UIA, CDP, filesystem, terminal, MCP tools, or any other tool Jarvis has,
+    exactly like the primary loop, then reports back a final summary.
+
+    Runs process_chat_turn on a brand-new isolated conversation seeded with
+    the task, with force_provider="gemini_api" so it runs on the Gemini API
+    regardless of the global MODEL_PROVIDER. Does NOT share conversation
+    history with the outer loop — only the final summary comes back.
+    """
+    if not _GEMINI_API_AVAILABLE:
+        return f"Gemini API is not available: {_gemini_api_load_msg}"
+
+    use_model = model or GEMINI_API_MODEL
+    print(f"   [Delegate → Gemini-API/{use_model}] Task: {task[:80]}")
+
+    _saved_scratchpad = None
+    try:
+        if os.path.exists(RESPONSE_MEMORY):
+            with open(RESPONSE_MEMORY, "r", encoding="utf-8") as f:
+                _saved_scratchpad = f.read()
+    except Exception:
+        pass
+
+    try:
+        sub_system_prompt = get_system_prompt(
+            effective_provider="gemini_api", effective_model=use_model
+        )
+        sub_system_prompt += (
+            "\n\n━━━ DELEGATED TASK MODE ━━━\n"
+            "You have been handed a specific task by Jarvis (the primary agent) to "
+            "complete independently. You have FULL access to every tool listed above — "
+            "act autonomously to complete it, calling tools directly rather than asking "
+            "anyone for permission. When finished, reply with a clear plain-text summary "
+            "of what you did and the result — this summary is relayed directly to the "
+            "user, so make it complete and readable on its own."
+        )
+
+        task_message = task.strip()
+        if context.strip():
+            task_message = f"[CONTEXT FROM JARVIS]\n{context.strip()}\n\n[TASK]\n{task_message}"
+
+        sub_history = [
+            {"role": "system", "content": sub_system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"{task_message}\n\n"
+                    "[SYSTEM]: Act immediately. Execute the first tool call now. "
+                    "Do not explain — just act. Give a final plain-text summary when done."
+                ),
+            },
+        ]
+
+        summary, sub_tool_outputs = process_chat_turn(
+            sub_history,
+            user_request=task,
+            force_provider="gemini_api",
+            force_model=use_model,
+            max_steps=max_steps,
+        )
+
+        step_note = f" ({len(sub_tool_outputs)} tool call(s) executed)" if sub_tool_outputs else ""
+        return f"[Gemini-API coworker/{use_model} — task complete{step_note}]\n{summary}"
+
+    except Exception as e:
+        return f"Delegation to Gemini API failed: {e}"
+
+    finally:
+        try:
+            if _saved_scratchpad is not None:
+                with open(RESPONSE_MEMORY, "w", encoding="utf-8") as f:
+                    f.write(_saved_scratchpad)
+        except Exception:
+            pass
+
+
+def set_gemini_api_model(model_id: str) -> str:
+    """
+    Switch GEMINI_API_MODEL at runtime — no restart needed. Applies
+    immediately to consult_gemini_api, delegate_to_gemini_api, and (if
+    MODEL_PROVIDER == "gemini_api") the primary execution loop.
+    """
+    global GEMINI_API_MODEL
+    old = GEMINI_API_MODEL
+    new = model_id.strip()
+    if not new:
+        return "Error: empty model ID."
+    GEMINI_API_MODEL = new
+    print(f"🔀 [Gemini API model switched: '{old}' → '{new}']")
+    return (
+        f"Gemini API model switched: '{old}' → '{new}'. "
+        f"This is in-memory only for the current session — edit GEMINI_API_MODEL "
+        f"in main.py to make it the default on next launch."
+    )
+
+
+# =============================================================================
+# GROQCLOUD SETUP
+# =============================================================================
+# GroqCloud (https://console.groq.com) runs open models (Llama, Qwen,
+# DeepSeek, Kimi, ...) on custom LPU hardware, and exposes a genuinely free
+# tier — no credit card required — through the SAME OpenAI-compatible
+# /chat/completions endpoint shape as OpenRouter and the official Gemini
+# API. That means we can reuse the exact same plain-`requests` pipeline
+# (same request shape, same normalised response shape, same retry/fallback
+# logic) instead of hand-rolling anything Groq-specific. Structured tool
+# calling works natively and is reliable on Groq's supported models.
+#
+# API KEY SETUP (one-time):
+#   1. Get a free key at https://console.groq.com/keys
+#   2. Add it to the SAME secrets file used everywhere else:
+#      { "GEMINI_API_KEY": "...", "OPENROUTER_API_KEY": "...", "GROQ_API_KEY": "gsk_..." }
+#
+_GROQ_AVAILABLE = False
+_GROQ_API_KEY    = None
+
+def _load_groq():
+    """Load GROQ_API_KEY from the shared secrets file."""
+    global _GROQ_AVAILABLE, _GROQ_API_KEY
+    try:
+        secrets_path = os.path.abspath(SECRETS_FILE)
+        if not os.path.exists(secrets_path):
+            return False, f"Secrets file not found: {secrets_path}"
+        with open(secrets_path, "r", encoding="utf-8") as f:
+            secrets = json.load(f)
+        key = secrets.get("GROQ_API_KEY", "").strip()
+        if not key:
+            return False, "GROQ_API_KEY is empty in secrets file."
+        _GROQ_API_KEY   = key
+        _GROQ_AVAILABLE = True
+        return True, "OK"
+    except Exception as e:
+        return False, str(e)
+
+
+_groq_load_ok, _groq_load_msg = _load_groq()
+
+
+def _sanitize_messages_for_groq(messages: list) -> list:
+    """
+    Same fixup as _sanitize_messages_for_gemini_api(): Jarvis's internal
+    conversation_history uses a loose, Ollama-shaped message format.
+    GroqCloud's OpenAI-compatible endpoint validates strictly and will 400
+    on missing tool_call ids / non-string function.arguments, so we repair
+    those on the way out without touching the shared internal format used
+    by every other provider.
+    """
+    sanitized   = []
+    pending_ids = []
+    counter     = 0
+    for m in messages:
+        m = dict(m)
+        role = m.get("role")
+
+        if role == "assistant" and m.get("tool_calls"):
+            new_calls = []
+            for tc in m["tool_calls"]:
+                fn   = (tc or {}).get("function", {}) or {}
+                name = fn.get("name", "")
+                args = fn.get("arguments", {})
+                if not isinstance(args, str):
+                    try:
+                        args = json.dumps(args)
+                    except Exception:
+                        args = "{}"
+                call_id = tc.get("id") or f"call_{counter}"
+                counter += 1
+                pending_ids.append(call_id)
+                new_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                })
+            m["tool_calls"] = new_calls
+            if not m.get("content"):
+                m["content"] = None
+            sanitized.append(m)
+
+        elif role == "tool":
+            if not m.get("tool_call_id"):
+                m["tool_call_id"] = pending_ids.pop(0) if pending_ids else f"call_{counter}"
+            sanitized.append(m)
+
+        else:
+            sanitized.append(m)
+
+    return sanitized
+
+
+def _groq_chat(messages: list, model: str = None, tools_schema: list = None,
+               timeout: int = 60, _retries: int = 2) -> dict:
+    """
+    Call GroqCloud's OpenAI-compatible /chat/completions endpoint. Returns a
+    dict normalised to the SAME shape _call_ollama / _openrouter_chat /
+    _gemini_api_chat produce:
+        {"message": {"role": "assistant", "content": str, "tool_calls": [...] }}
+    so process_chat_turn can treat every provider identically.
+
+    Retries on 429 (rate limit) and 502/503 (upstream overloaded), mirroring
+    _openrouter_chat / _gemini_api_chat exactly. Raises RuntimeError with the
+    actual error message from Groq's response body on failure.
+    """
+    if not _GROQ_AVAILABLE or not _GROQ_API_KEY:
+        raise RuntimeError(
+            f"GroqCloud not available: {_groq_load_msg}. "
+            f"Add GROQ_API_KEY to {SECRETS_FILE}"
+        )
+    if requests is None:
+        raise RuntimeError("requests library not installed: pip install requests")
+
+    model = model or GROQ_MODEL
+
+    payload = {
+        "model": model,
+        "messages": _sanitize_messages_for_groq(messages),
+    }
+    if tools_schema:
+        payload["tools"] = tools_schema
+
+    headers = {
+        "Authorization": f"Bearer {_GROQ_API_KEY}",
+        "Content-Type":  "application/json",
+    }
+
+    last_err = None
+    for attempt in range(_retries + 1):
+        try:
+            resp = requests.post(
+                f"{GROQ_API_BASE}/chat/completions",
+                headers=headers, json=payload, timeout=timeout
+            )
+
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+
+            if resp.status_code != 200:
+                err_obj = data.get("error", {}) if isinstance(data, dict) else {}
+                err_msg = err_obj.get("message") or resp.text[:300] or f"HTTP {resp.status_code}"
+
+                retryable = resp.status_code in (429, 502, 503, 504)
+                if retryable and attempt < _retries:
+                    wait_s = 1.5 * (attempt + 1)
+                    print(f"   [Groq] {resp.status_code} ({err_msg[:80]}) — "
+                          f"retrying in {wait_s:.1f}s...")
+                    time.sleep(wait_s)
+                    last_err = err_msg
+                    continue
+
+                raise RuntimeError(f"Groq error ({resp.status_code}): {err_msg}")
+
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(f"Groq error: {data['error'].get('message', data['error'])}")
+
+            break   # success
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_err = str(e)
+            if attempt < _retries:
+                wait_s = 1.5 * (attempt + 1)
+                print(f"   [Groq] Connection issue — retrying in {wait_s:.1f}s...")
+                time.sleep(wait_s)
+                continue
+            raise RuntimeError(f"Groq connection failed after {_retries + 1} attempts: {last_err}")
+    else:
+        raise RuntimeError(f"Groq failed after {_retries + 1} attempts: {last_err}")
+
+    choice  = (data.get("choices") or [{}])[0]
+    msg     = choice.get("message", {}) or {}
+    content = msg.get("content") or ""
+    raw_tool_calls = msg.get("tool_calls") or []
+
+    normalised_calls = []
+    for tc in raw_tool_calls:
+        fn = tc.get("function", {})
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                pass
+        normalised_calls.append({"function": {"name": fn.get("name", ""), "arguments": args}})
+
+    return {
+        "message": {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": normalised_calls,
+        }
+    }
+
+
+def _groq_chat_with_fallback(messages: list, model: str = None, tools_schema: list = None,
+                              timeout: int = 60) -> dict:
+    """
+    Wraps _groq_chat() with automatic fallback across GROQ_FALLBACK_MODELS,
+    mirroring _openrouter_chat_with_fallback(). If the requested (or
+    default) model repeatedly fails with a retryable error, try the next
+    model in the fallback chain instead of failing the whole turn.
+    """
+    requested = model or GROQ_MODEL
+    chain = [requested] + [m for m in GROQ_FALLBACK_MODELS if m != requested]
+
+    last_exc = None
+    for m in chain:
+        try:
+            resp = _groq_chat(messages, model=m, tools_schema=tools_schema, timeout=timeout)
+            if m != requested:
+                print(f"   [Groq] Fell back to model: {m}")
+            return resp
+        except Exception as e:
+            last_exc = e
+            print(f"   [Groq] Model '{m}' failed ({e}) — trying next fallback...")
+            continue
+    raise RuntimeError(f"All Groq models failed. Last error: {last_exc}")
+
+
+def consult_groq(prompt: str, context: str = "", model: str = None) -> str:
+    """
+    Send a plain reasoning/planning prompt to GroqCloud — no tool schema,
+    text generation only. Same role as consult_openrouter/consult_gemini_api,
+    but using GroqCloud's free-tier fast inference.
+    """
+    if not _GROQ_AVAILABLE:
+        return f"GroqCloud is not available: {_groq_load_msg}"
+
+    full_prompt = prompt.strip()
+    if context.strip():
+        if len(context) > 60000:
+            context = context[:30000] + "\n... [TRUNCATED] ...\n" + context[-30000:]
+        full_prompt = "[CONTEXT]\n" + context.strip() + "\n\n[TASK]\n" + full_prompt
+
+    try:
+        use_model = model or GROQ_MODEL
+        print(f"   [Groq] Model: {use_model}")
+        resp   = _groq_chat_with_fallback(
+            [{"role": "user", "content": full_prompt}],
+            model=use_model
+        )
+        result = (resp["message"]["content"] or "").strip()
+        print(f"   [Groq] Response received ({len(result)} chars)")
+        return f"[Groq/{use_model}]\n" + result
+    except Exception as e:
+        return f"GroqCloud error: {str(e)}"
+
+
+def delegate_to_groq(task: str, context: str = "", model: str = None,
+                      max_steps: int = 10) -> str:
+    """
+    Mirror of delegate_to_openrouter()/delegate_to_gemini_api(): hand `task`
+    off to a fresh, FULLY TOOL-CAPABLE agent loop running on GroqCloud — it
+    can call UIA, CDP, filesystem, terminal, MCP tools, or any other tool
+    Jarvis has, exactly like the primary loop, then reports back a final
+    summary.
+
+    Runs process_chat_turn on a brand-new isolated conversation seeded with
+    the task, with force_provider="groq" so it runs on GroqCloud regardless
+    of the global MODEL_PROVIDER. Does NOT share conversation history with
+    the outer loop — only the final summary comes back.
+    """
+    if not _GROQ_AVAILABLE:
+        return f"GroqCloud is not available: {_groq_load_msg}"
+
+    use_model = model or GROQ_MODEL
+    print(f"   [Delegate → Groq/{use_model}] Task: {task[:80]}")
+
+    _saved_scratchpad = None
+    try:
+        if os.path.exists(RESPONSE_MEMORY):
+            with open(RESPONSE_MEMORY, "r", encoding="utf-8") as f:
+                _saved_scratchpad = f.read()
+    except Exception:
+        pass
+
+    try:
+        sub_system_prompt = get_system_prompt(
+            effective_provider="groq", effective_model=use_model
+        )
+        sub_system_prompt += (
+            "\n\n━━━ DELEGATED TASK MODE ━━━\n"
+            "You have been handed a specific task by Jarvis (the primary agent) to "
+            "complete independently. You have FULL access to every tool listed above — "
+            "act autonomously to complete it, calling tools directly rather than asking "
+            "anyone for permission. When finished, reply with a clear plain-text summary "
+            "of what you did and the result — this summary is relayed directly to the "
+            "user, so make it complete and readable on its own."
+        )
+
+        task_message = task.strip()
+        if context.strip():
+            task_message = f"[CONTEXT FROM JARVIS]\n{context.strip()}\n\n[TASK]\n{task_message}"
+
+        sub_history = [
+            {"role": "system", "content": sub_system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"{task_message}\n\n"
+                    "[SYSTEM]: Act immediately. Execute the first tool call now. "
+                    "Do not explain — just act. Give a final plain-text summary when done."
+                ),
+            },
+        ]
+
+        summary, sub_tool_outputs = process_chat_turn(
+            sub_history,
+            user_request=task,
+            force_provider="groq",
+            force_model=use_model,
+            max_steps=max_steps,
+        )
+
+        step_note = f" ({len(sub_tool_outputs)} tool call(s) executed)" if sub_tool_outputs else ""
+        return f"[Groq coworker/{use_model} — task complete{step_note}]\n{summary}"
+
+    except Exception as e:
+        return f"Delegation to GroqCloud failed: {e}"
+
+    finally:
+        try:
+            if _saved_scratchpad is not None:
+                with open(RESPONSE_MEMORY, "w", encoding="utf-8") as f:
+                    f.write(_saved_scratchpad)
+        except Exception:
+            pass
+
+
+def set_groq_model(model_id: str) -> str:
+    """
+    Switch GROQ_MODEL at runtime — no restart needed. Applies immediately to
+    consult_groq, delegate_to_groq, and (if MODEL_PROVIDER == "groq") the
+    primary execution loop, since all three read the module-level global.
+    """
+    global GROQ_MODEL
+    old = GROQ_MODEL
+    new = model_id.strip()
+    if not new:
+        return "Error: empty model ID."
+    GROQ_MODEL = new
+    print(f"🔀 [Groq model switched: '{old}' → '{new}']")
+    return (
+        f"Groq model switched: '{old}' → '{new}'. "
+        f"This is in-memory only for the current session — edit GROQ_MODEL "
+        f"in main.py to make it the default on next launch."
+    )
+
+
+def list_groq_models() -> str:
+    """
+    Fetch the live list of models currently available on GroqCloud from
+    /models, format it as a numbered indexed table. Follow up with
+    set_groq_model_by_index(N) or set_groq_model(model_id) to switch.
+    """
+    if not _GROQ_AVAILABLE:
+        return f"GroqCloud is not available: {_groq_load_msg}"
+    if requests is None:
+        return "requests library not installed: pip install requests"
+
+    try:
+        headers = {"Authorization": f"Bearer {_GROQ_API_KEY}"}
+        resp = requests.get(f"{GROQ_API_BASE}/models", headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("data", [])
+    except Exception as e:
+        return f"Failed to fetch Groq model list: {e}"
+
+    if not items:
+        return "No models returned by GroqCloud."
+
+    items.sort(key=lambda m: m.get("id", ""))
+    _store_index("groq_models", items)
+
+    lines = [
+        f"currently active: {GROQ_MODEL}",
+        "Use set_groq_model_by_index(index) to switch.",
+        ""
+    ]
+    for i, m in enumerate(items):
+        lines.append(f"[{i}] {m.get('id', '?')} (owner: {m.get('owned_by', '?')})")
+    return "\n".join(lines)
+
+
+def set_groq_model_by_index(index: int) -> str:
+    """Switch GROQ_MODEL to the entry at `index` from list_groq_models."""
+    entry = _get_indexed("groq_models", index)
+    if not entry:
+        return f"Index {index} not found. Call list_groq_models() first."
+    return set_groq_model(entry["id"])
 
 
 # =============================================================================
@@ -2979,6 +3873,61 @@ def call_mcp_tool(server, tool_name: str, arguments) -> str:
     return _mcp_manager.call_tool(name, tool_name, arguments or {})
 
 
+def list_native_tools() -> str:
+    """
+    Lists every built-in Jarvis tool by name + one-line description ONLY —
+    no parameter schemas — to keep this cheap on context. Use
+    show_native_tool_schema(tool_name) to get the full JSON parameter
+    schema for a specific tool before calling it.
+
+    This exists so the full native tool catalogue never has to be inlined
+    into a persistent system prompt/Gem: providers that support real native
+    function-calling (Ollama/OpenRouter/Gemini-API/Groq) already get the
+    full `tools` schema for free via the API's tools= parameter, so this
+    on-demand pair (list_native_tools / show_native_tool_schema) is mainly
+    for Gemini-web, which has no native tool-calling protocol and would
+    otherwise need everything inlined into one big Gem prompt.
+    """
+    lines = []
+    for i, t in enumerate(tools):
+        fn = t.get("function", {})
+        name = fn.get("name", "?")
+        desc = (fn.get("description") or "").strip().splitlines()[0] if fn.get("description") else ""
+        lines.append(f"[{i}] {name} — {desc}")
+    return "\n".join(lines)
+
+
+def show_native_tool_schema(tool_name: str) -> str:
+    """
+    Returns the full {name, description, parameters} JSON schema for ONE
+    native Jarvis tool, identified by index (from list_native_tools) or
+    exact name. Call this right before using a tool you haven't already
+    seen the schema for this session.
+    """
+    match = None
+    if isinstance(tool_name, str) and tool_name.strip().isdigit():
+        idx = int(tool_name.strip())
+        if 0 <= idx < len(tools):
+            match = tools[idx]
+    if match is None:
+        for t in tools:
+            if t.get("function", {}).get("name") == tool_name:
+                match = t
+                break
+    if match is None:
+        return (f"Unknown native tool '{tool_name}'. Call list_native_tools() first "
+                f"to see valid indices/names.")
+    fn = match.get("function", {})
+    return json.dumps(
+        {
+            "name": fn.get("name"),
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters", {}),
+        },
+        indent=2,
+    )
+
+
 def connect_mcp_server(name: str, transport: str = "stdio", command: str = None,
                         args: list = None, url: str = None, env: dict = None,
                         headers: dict = None, persist: bool = True) -> str:
@@ -3037,6 +3986,220 @@ def disconnect_mcp_server(server, forget: bool = False) -> str:
         _mcp_remove_config(name)
         msg += " Removed from saved config."
     return msg
+
+
+# =============================================================================
+# 0b. GUI USER-PROMPT TOOLS
+# =============================================================================
+# Lets Jarvis pop up a small native GUI dialog to get something from the user
+# without guessing — a missing file path, an approval, a disambiguating
+# choice, or arbitrary free text. Every call BLOCKS until the user responds
+# (or dismisses the window), then the answer is fed back as a normal tool
+# result so Jarvis can continue the same turn. The model can request several
+# of these in a single turn (e.g. ask a question AND request a file path);
+# by default it requests none — these are opt-in, situational tools, not a
+# forced step at the end of every turn.
+try:
+    import tkinter as _tk
+    from tkinter import filedialog as _tk_filedialog
+    _TKINTER_AVAILABLE = True
+except ImportError:
+    _tk = None
+    _tk_filedialog = None
+    _TKINTER_AVAILABLE = False
+
+# When Jarvis is running inside the CustomTkinter desktop GUI (gui.pyw), the
+# GUI installs a callable here at startup. If present, every ask_user_*
+# tool below routes through it instead of popping up a separate native
+# tkinter window — the request/response instead renders as an inline card
+# in the main chat, styled to match the rest of the app. The hook's
+# signature is: hook(kind: str, payload: dict) -> str, and it BLOCKS the
+# calling thread (the engine worker thread) until the user responds, so
+# every ask_user_* call below still behaves exactly as documented from the
+# model's point of view. When running main.py standalone (no GUI attached),
+# this stays None and the original native tkinter dialogs are used as-is.
+_gui_ask_hook = None
+
+
+def _gui_root():
+    """Create a hidden, always-on-top root window to anchor a dialog to."""
+    root = _tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    return root
+
+
+def ask_user_text(prompt: str, title: str = "Jarvis needs input") -> str:
+    """
+    Pop up a GUI textbox asking the user to type a free-form answer — e.g. a
+    missing file path, a name, a value, or anything else with no fixed set
+    of options. Returns the typed text, '[USER SUBMITTED EMPTY TEXT]' if
+    they submitted blank, or '[USER CANCELLED]' if they closed the dialog.
+    """
+    if _gui_ask_hook is not None:
+        return _gui_ask_hook("text", {"prompt": prompt, "title": title})
+    if not _TKINTER_AVAILABLE:
+        return "[GUI ERROR] tkinter not available on this system — ask the user in plain text instead."
+    result = {"value": None}
+    root = _gui_root()
+    win = _tk.Toplevel(root)
+    win.title(title)
+    try: win.attributes("-topmost", True)
+    except Exception: pass
+
+    _tk.Label(win, text=prompt, wraplength=420, justify="left", padx=16, pady=12).pack()
+    entry = _tk.Entry(win, width=52)
+    entry.pack(padx=16, pady=(0, 8))
+    entry.focus_set()
+
+    def submit(event=None):
+        result["value"] = entry.get()
+        win.destroy()
+
+    def cancel():
+        result["value"] = None
+        win.destroy()
+
+    entry.bind("<Return>", submit)
+    btn_frame = _tk.Frame(win)
+    btn_frame.pack(pady=(0, 12))
+    _tk.Button(btn_frame, text="Submit", command=submit, width=10).pack(side="left", padx=6)
+    _tk.Button(btn_frame, text="Cancel", command=cancel, width=10).pack(side="left", padx=6)
+
+    win.protocol("WM_DELETE_WINDOW", cancel)
+    win.grab_set()
+    root.wait_window(win)
+    root.destroy()
+
+    if result["value"] is None:
+        return "[USER CANCELLED]"
+    return result["value"] if result["value"] else "[USER SUBMITTED EMPTY TEXT]"
+
+
+def ask_user_file_path(prompt: str = "Select a file", must_exist: bool = True) -> str:
+    """
+    Pop up a native file-picker dialog. Use this whenever the user tells you
+    to open/read/edit/save something involving a file but does not give you
+    a path — instead of guessing, ask. Returns the absolute path chosen, or
+    '[USER CANCELLED]' if they closed the dialog without picking anything.
+    """
+    if _gui_ask_hook is not None:
+        return _gui_ask_hook("file", {"prompt": prompt, "must_exist": must_exist})
+    if not _TKINTER_AVAILABLE:
+        return "[GUI ERROR] tkinter not available on this system — ask the user for the path in plain text instead."
+    root = _gui_root()
+    try:
+        if must_exist:
+            path = _tk_filedialog.askopenfilename(title=prompt, parent=root)
+        else:
+            path = _tk_filedialog.asksaveasfilename(title=prompt, parent=root)
+    finally:
+        root.destroy()
+    return path if path else "[USER CANCELLED]"
+
+
+def ask_user_approval(message: str, details: str = "") -> str:
+    """
+    Pop up an Approve / Decline GUI dialog with two buttons. Use this before
+    doing something the user should explicitly sign off on — deleting or
+    overwriting files, sending a message, spending money, running a risky
+    or irreversible command, etc. Returns 'APPROVED' or 'DECLINED'.
+    """
+    if _gui_ask_hook is not None:
+        return _gui_ask_hook("approval", {"message": message, "details": details})
+    if not _TKINTER_AVAILABLE:
+        return "[GUI ERROR] tkinter not available on this system — ask the user to approve in plain text instead."
+    result = {"value": "DECLINED"}
+    root = _gui_root()
+    win = _tk.Toplevel(root)
+    win.title("Jarvis requests approval")
+    try: win.attributes("-topmost", True)
+    except Exception: pass
+
+    _tk.Label(win, text=message, wraplength=420, justify="left",
+              padx=16, pady=(16, 4), font=("Segoe UI", 10, "bold")).pack()
+    if details:
+        _tk.Label(win, text=details, wraplength=420, justify="left", padx=16, pady=(0, 8)).pack()
+
+    def approve():
+        result["value"] = "APPROVED"
+        win.destroy()
+
+    def decline():
+        result["value"] = "DECLINED"
+        win.destroy()
+
+    btn_frame = _tk.Frame(win)
+    btn_frame.pack(pady=12)
+    _tk.Button(btn_frame, text="\u2705 Approve", command=approve, width=12, bg="#d7f5d7").pack(side="left", padx=8)
+    _tk.Button(btn_frame, text="\u274c Decline", command=decline, width=12, bg="#f5d7d7").pack(side="left", padx=8)
+
+    win.protocol("WM_DELETE_WINDOW", decline)
+    win.grab_set()
+    root.wait_window(win)
+    root.destroy()
+    return result["value"]
+
+
+def ask_user_choice(question: str, choice_1: str = "", choice_2: str = "",
+                     choice_3: str = "", choice_4: str = "", allow_custom: bool = True) -> str:
+    """
+    Pop up a multiple-choice GUI dialog: your question plus up to 4 options
+    you define, and (unless allow_custom=False) a 5th free-text box so the
+    user can type something else entirely. Use this to disambiguate what the
+    user wants with a couple of taps instead of a back-and-forth in text.
+    Returns the exact text of the option the user picked, their custom text,
+    or '[USER CANCELLED]' if they closed the dialog.
+    """
+    if _gui_ask_hook is not None:
+        return _gui_ask_hook("choice", {
+            "question": question,
+            "options": [c for c in (choice_1, choice_2, choice_3, choice_4) if c],
+            "allow_custom": allow_custom,
+        })
+    if not _TKINTER_AVAILABLE:
+        return "[GUI ERROR] tkinter not available on this system — ask the user in plain text instead."
+    options = [c for c in (choice_1, choice_2, choice_3, choice_4) if c]
+    result = {"value": None}
+    root = _gui_root()
+    win = _tk.Toplevel(root)
+    win.title("Jarvis has a question")
+    try: win.attributes("-topmost", True)
+    except Exception: pass
+
+    _tk.Label(win, text=question, wraplength=420, justify="left",
+              padx=16, pady=(16, 8), font=("Segoe UI", 10, "bold")).pack()
+
+    def choose(opt):
+        result["value"] = opt
+        win.destroy()
+
+    for opt in options:
+        _tk.Button(win, text=opt, width=48, anchor="w",
+                   command=lambda o=opt: choose(o)).pack(padx=16, pady=3, fill="x")
+
+    if allow_custom:
+        row = _tk.Frame(win)
+        row.pack(padx=16, pady=(10, 4), fill="x")
+        custom_entry = _tk.Entry(row, width=36)
+        custom_entry.pack(side="left", fill="x", expand=True)
+
+        def submit_custom(event=None):
+            txt = custom_entry.get().strip()
+            if txt:
+                choose(txt)
+
+        custom_entry.bind("<Return>", submit_custom)
+        _tk.Button(row, text="Other...", command=submit_custom).pack(side="left", padx=(6, 0))
+
+    win.protocol("WM_DELETE_WINDOW", lambda: choose("[USER CANCELLED]"))
+    win.grab_set()
+    root.wait_window(win)
+    root.destroy()
+    return result["value"] if result["value"] is not None else "[USER CANCELLED]"
 
 
 # =============================================================================
@@ -3846,6 +5009,277 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "consult_gemini_api",
+            "description": (
+                "Send a plain reasoning/planning prompt to Gemini via the OFFICIAL "
+                "Google Gemini API (real API key, structured request — not the web-chat "
+                "scraping used by consult_gemini). Returns text only, no tool access — "
+                "use delegate_to_gemini_api instead if the task needs real actions taken."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The question or planning prompt."},
+                    "context": {"type": "string", "description": "Optional background context."},
+                    "model": {
+                        "type": "string",
+                        "description": "Optional: override the default Gemini API model ID for this call."
+                    }
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_to_gemini_api",
+            "description": (
+                "Hand off an entire task to the OFFICIAL Gemini API as a real COWORKER, "
+                "not just a text consultant — same idea as delegate_to_openrouter but "
+                "running on Gemini through a real API key with native structured tool "
+                "calling (not the web-chat session used by delegate_to_gemini_web). The "
+                "Gemini sub-agent gets FULL access to every tool Jarvis has — UI "
+                "automation, terminal, files, browser, MCP servers, everything — and "
+                "works through the task independently in an ISOLATED conversation, then "
+                "reports back a final summary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "The complete task to hand off, written as a self-contained "
+                            "instruction — the delegate has no other context except this "
+                            "and whatever you put in `context`."
+                        )
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional: relevant background the delegate needs (file contents, prior findings, constraints)."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional: override the default Gemini API model ID for this delegated task."
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "description": "Optional: cap on tool-call steps the delegate can take before it must report back. Default 10."
+                    }
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_gemini_api_model",
+            "description": (
+                "Switch the active Gemini API model directly by its exact model ID "
+                "(e.g. 'gemini-3.1-flash-lite'). Takes effect immediately, no restart needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "model_id": {"type": "string", "description": "Exact Gemini API model ID."}
+                },
+                "required": ["model_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "consult_groq",
+            "description": (
+                "Send a reasoning, analysis, or research task to a model on GroqCloud "
+                "(currently configured: see GROQ_MODEL) — GroqCloud's free tier gives "
+                "fast inference with no credit card required. "
+                "This is a FALLBACK/explicit-request tool, not a default choice — prefer "
+                "consult_gemini first. Only use consult_groq when: "
+                "(1) the user explicitly says 'ask Groq' or names GroqCloud, or "
+                "(2) consult_gemini just failed/errored and you still need a second-brain "
+                "answer. Do not reach for this casually as an alternative to Gemini."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The full question or task for the model. Be specific and complete."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional: relevant context to include (file contents, memory, prior results)."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional: override the default Groq model ID for this call."
+                    }
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_to_groq",
+            "description": (
+                "Hand off an entire task to GroqCloud as a real COWORKER, not just a "
+                "text consultant. Unlike consult_groq (which only returns text), "
+                "the Groq model spun up here gets FULL access to every tool Jarvis "
+                "has — it can click UI elements, run terminal commands, read/write files, "
+                "browse the web, everything — and works through the task independently, "
+                "then reports back a final summary that you relay to the user. GroqCloud "
+                "runs on fast LPU hardware, so this is a good pick when the user wants "
+                "quick free-tier turnaround on a delegated sub-task. "
+                "\n\n"
+                "This runs in an ISOLATED conversation — the delegate does not see your "
+                "conversation history, only what you put in `task` and `context`. Be "
+                "complete and specific in both."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "The complete task to hand off, written as a self-contained "
+                            "instruction — the delegate has no other context except this "
+                            "and whatever you put in `context`."
+                        )
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional: relevant background the delegate needs (file contents, prior findings, constraints)."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional: override the default Groq model ID for this delegated task."
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "description": "Optional: cap on tool-call steps the delegate can take before it must report back. Default 10."
+                    }
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_groq_models",
+            "description": (
+                "List models currently available on GroqCloud as a numbered indexed "
+                "table (IDX | model ID | owner). Follow up with "
+                "set_groq_model_by_index(index) to switch the active model — this is "
+                "the CHOOSE-pattern way to pick a model instead of typing an exact ID."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_groq_model_by_index",
+            "description": "Switch the active Groq model to the entry at `index` from list_groq_models.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "Index from list_groq_models output."}
+                },
+                "required": ["index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_groq_model",
+            "description": (
+                "Switch the active Groq model directly by its exact model ID "
+                "(e.g. 'llama-3.3-70b-versatile', 'qwen/qwen3-32b'). "
+                "Use list_groq_models + set_groq_model_by_index instead if you don't "
+                "know the exact ID. Takes effect immediately, no restart needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "model_id": {"type": "string", "description": "Exact Groq model ID."}
+                },
+                "required": ["model_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_to_gemini_web",
+            "description": (
+                "Hand off an entire task to Gemini (via the web-app account session, "
+                "gemini_webapi) as a real COWORKER, not just a text consultant — "
+                "same idea as delegate_to_openrouter but running on Gemini's own "
+                "account session instead. The Gemini sub-agent gets FULL access to "
+                "every tool Jarvis has and works through the task independently in "
+                "an ISOLATED conversation (its own ChatSession), then reports back a "
+                "final summary. Slower per-step than delegate_to_openrouter (each "
+                "step is a real gemini.google.com round trip) — prefer "
+                "delegate_to_openrouter unless the user specifically asks for Gemini."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "The complete task to hand off, written as a self-contained "
+                            "instruction — the delegate has no other context except this "
+                            "and whatever you put in `context`."
+                        )
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional: relevant background the delegate needs (file contents, prior findings, constraints)."
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "description": "Optional: cap on tool-call steps the delegate can take before it must report back. Default 10."
+                    }
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_gemini_web_model",
+            "description": (
+                "Pin the model Gemini-web uses (when MODEL_PROVIDER=='gemini_web', or "
+                "for delegate_to_gemini_web) to an exact model_name/display_name string "
+                "(e.g. 'gemini-3-flash'). Pass an empty string to go back to "
+                "auto-selecting the fastest available model at runtime."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "model_name": {"type": "string", "description": "Exact Gemini model name/display name, or '' for auto."}
+                },
+                "required": ["model_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "wait",
             "description": "Pause execution for a specific number of seconds. Use this when waiting for an application to launch, a web page to load, or a background process to complete.",
             "parameters": {
@@ -4304,7 +5738,252 @@ tools = [
             },
         },
     },
+    # ── GUI user-interaction tools ─────────────────────────────────────────────
+    # Optional, situational. Default is to call NONE of these. Use one only
+    # when you actually need something specific from the user that you can't
+    # reasonably infer or find yourself. Several can be called in the same turn.
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user_text",
+            "description": (
+                "Pop up a GUI textbox and ask the user to type a free-form answer. "
+                "Use for anything with no fixed set of options — a name, a value, "
+                "clarifying detail, etc. Blocks until the user submits or cancels."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The question/instruction shown above the textbox."},
+                    "title": {"type": "string", "description": "Dialog window title. Optional."}
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user_file_path",
+            "description": (
+                "Pop up a native file-picker dialog. Use this whenever the user tells "
+                "you to open/read/edit/save a file but does not give you a path — ask "
+                "instead of guessing. Blocks until the user picks a file or cancels."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Dialog title, e.g. 'Select the file to open'. Optional."},
+                    "must_exist": {
+                        "type": "boolean",
+                        "description": "True (default) for picking an existing file to open. False for a save/new-file dialog."
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user_approval",
+            "description": (
+                "Pop up an Approve / Decline GUI dialog with two buttons. Use before "
+                "anything the user should explicitly sign off on — deleting or "
+                "overwriting files, sending a message on their behalf, spending money, "
+                "running a risky or irreversible command. Blocks until the user clicks "
+                "a button. Returns 'APPROVED' or 'DECLINED'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Short, bold headline of what's being approved, e.g. 'Delete 12 files in Downloads?'"},
+                    "details": {"type": "string", "description": "Optional extra context/detail shown below the headline."}
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user_choice",
+            "description": (
+                "Pop up a multiple-choice GUI dialog: your question plus up to 4 "
+                "options you define as buttons, and (by default) a 5th free-text box "
+                "so the user can type something else. Use this to disambiguate what "
+                "the user wants with a tap instead of back-and-forth text. Blocks "
+                "until the user picks a button or submits custom text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question shown at the top of the dialog."},
+                    "choice_1": {"type": "string", "description": "First option button label."},
+                    "choice_2": {"type": "string", "description": "Second option button label. Optional."},
+                    "choice_3": {"type": "string", "description": "Third option button label. Optional."},
+                    "choice_4": {"type": "string", "description": "Fourth option button label. Optional."},
+                    "allow_custom": {
+                        "type": "boolean",
+                        "description": "Whether to show a free-text 'Other...' box in addition to the buttons. Default true."
+                    }
+                },
+                "required": ["question", "choice_1"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_native_tools",
+            "description": (
+                "List every built-in Jarvis tool by name + one-line description "
+                "ONLY — not full parameter schemas. Follow up with "
+                "show_native_tool_schema(tool_name) to get the exact arguments a "
+                "tool expects before calling it. Mainly useful when you were not "
+                "given the full native tool catalogue up front."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "show_native_tool_schema",
+            "description": (
+                "Show the full JSON parameter schema for ONE native Jarvis tool. "
+                "Call list_native_tools() first to get the tool's index or exact "
+                "name, then call this right before using it so you know the exact "
+                "arguments shape to send."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Tool index (e.g. '0') or exact name, from list_native_tools()."
+                    }
+                },
+                "required": ["tool_name"],
+            },
+        },
+    },
 ]
+
+# =============================================================================
+# GROQ LAZY TOOL LOADING (Option A)
+# =============================================================================
+# Groq's free tier is TPM-capped (as low as 6000 tokens/minute on some
+# models). The full `tools` schema above is ~73KB / ~18k tokens on its own —
+# more than the entire budget before a single message is sent. Instead of
+# sending all ~88 tool schemas on every Groq call, we send a small CORE set
+# covering the actions Jarvis needs most often, plus two meta-tools
+# (list_more_tools / load_tool_by_index) that let Jarvis pull in any other
+# tool's full schema on demand, mirroring the existing
+# "list indexed, then load by index" pattern used for skills/paths/MCP.
+#
+# Loaded extra tools persist for the rest of the session (reset on
+# "new session") so Jarvis doesn't have to reload the same tool repeatedly.
+
+_TOOLS_BY_NAME = {t["function"]["name"]: t for t in tools}
+
+GROQ_CORE_TOOL_NAMES = [
+    "execute_terminal_command",
+    "list_paths_indexed", "get_path",
+    "list_directory", "open_path", "find_file", "open_path_by_index",
+    "read_local_file", "write_local_file", "append_local_file",
+    "search_internet", "open_url",
+    "type_text", "wait", "say",
+    "ask_user_text", "ask_user_approval", "ask_user_choice", "ask_user_file_path",
+]
+GROQ_CORE_TOOL_NAMES = [n for n in GROQ_CORE_TOOL_NAMES if n in _TOOLS_BY_NAME]
+
+_GROQ_META_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_more_tools",
+            "description": (
+                "List ALL tools NOT currently loaded, as a numbered index with a "
+                "one-line description each (e.g. GUI automation, browser DOM/CDP, "
+                "MCP servers, domain knowledge, model delegation/consulting, memory "
+                "and goal tools). The core tools already cover terminal, files, "
+                "paths, search, URLs, and user prompts — only call this when none of "
+                "those fit. Follow up with load_tool_by_index to actually load one."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_tool_by_index",
+            "description": (
+                "Load a tool from the most recent list_more_tools() index so it "
+                "becomes callable on your NEXT turn. Loaded tools persist for the "
+                "rest of the session and stack — previously loaded tools stay "
+                "available."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "Index number from list_more_tools()."}
+                },
+                "required": ["index"],
+            },
+        },
+    },
+]
+
+# Tools loaded on-demand for the Groq provider this session.
+_groq_extra_tools: list = []
+# Numbered index cache backing the last list_more_tools() call, so
+# load_tool_by_index(N) knows what N refers to.
+_groq_more_tools_index: list = []
+
+
+def list_more_tools() -> str:
+    """Return a numbered index of every tool not already loaded for Groq."""
+    global _groq_more_tools_index
+    loaded_names = set(GROQ_CORE_TOOL_NAMES) | {t["function"]["name"] for t in _groq_extra_tools}
+    remaining = [n for n in _TOOLS_BY_NAME if n not in loaded_names]
+    _groq_more_tools_index = remaining
+    if not remaining:
+        return "All tools are already loaded."
+    lines = []
+    for i, name in enumerate(remaining):
+        desc = _TOOLS_BY_NAME[name]["function"].get("description", "") or ""
+        short = desc.split(". ")[0].split("\n")[0][:110]
+        lines.append(f"{i}  {name}  — {short}")
+    return "\n".join(lines)
+
+
+def load_tool_by_index(index: int) -> str:
+    """Load a tool by index from the last list_more_tools() call."""
+    if not _groq_more_tools_index:
+        return "Call list_more_tools() first to see what's available."
+    if not (0 <= index < len(_groq_more_tools_index)):
+        return f"Invalid index. Valid range: 0-{len(_groq_more_tools_index) - 1}."
+    name = _groq_more_tools_index[index]
+    if any(t["function"]["name"] == name for t in _groq_extra_tools):
+        return f"'{name}' is already loaded."
+    _groq_extra_tools.append(_TOOLS_BY_NAME[name])
+    return f"Loaded '{name}'. It's now available for your next tool call."
+
+
+def reset_groq_loaded_tools():
+    """Clear session-loaded extra tools — called on 'new session'."""
+    global _groq_extra_tools, _groq_more_tools_index
+    _groq_extra_tools = []
+    _groq_more_tools_index = []
+
+
+def _get_groq_tools_schema() -> list:
+    """Core tool subset + anything loaded on-demand + the meta-tools, kept
+    small deliberately to fit Groq's tight TPM budget."""
+    core = [_TOOLS_BY_NAME[n] for n in GROQ_CORE_TOOL_NAMES]
+    return core + _groq_extra_tools + _GROQ_META_TOOLS
+
 
 def open_url(url: str, browser: str = "chrome") -> str:
     """
@@ -4561,9 +6240,25 @@ _GEMINI_WEBAPI_AVAILABLE = False
 _gemini_webapi_load_msg  = ""
 try:
     from gemini_webapi import GeminiClient as _GeminiWebClient
+    from gemini_webapi.constants import Model as _GeminiModelEnum
     _GEMINI_WEBAPI_AVAILABLE = True
+
+    # gemini_webapi logs internally via loguru at DEBUG/WARNING level,
+    # which by default dumps raw HTTP response bodies (the ")]}'" /
+    # array-of-arrays payloads you saw printed) straight to stderr on
+    # every request — none of that is an actual Jarvis error, it's just
+    # unfiltered library-internal logging. Cap it to ERROR so only real
+    # failures surface; auth/session recovery is handled by our own
+    # retry logic below, not by reading these log lines.
+    try:
+        from loguru import logger as _gemini_loguru_logger
+        _gemini_loguru_logger.remove()
+        _gemini_loguru_logger.add(lambda msg: None, level="ERROR")
+    except Exception:
+        pass
 except ImportError as _e:
     _GeminiWebClient = None
+    _GeminiModelEnum = None
     _gemini_webapi_load_msg = f"gemini_webapi not installed: {_e}. Run: pip install -U gemini_webapi"
 
 _gemini_web_client      = None   # lazily-initialised GeminiClient (singleton)
@@ -4652,6 +6347,441 @@ def _get_gemini_web_client():
                 f"browser-cookie3) and make sure you're logged into "
                 f"https://gemini.google.com in a supported browser."
             )
+
+
+
+
+# =============================================================================
+# GEMINI-WEB PRIMARY EXECUTION BACKEND
+# =============================================================================
+# Implements MODEL_PROVIDER == "gemini_web": Gemini, driven through the same
+# gemini_webapi client/session plumbing set up above, as a full tool-calling
+# execution brain sitting alongside Ollama and OpenRouter. See the module
+# docstring / implementation brief for the full architecture. Summary:
+#
+#   - NO GEM. Gems proved problematic (flaky create/update/fetch round trips,
+#     an extra persistent server-side object to get out of sync, silent
+#     "no-gem mode" degradation) for what they bought us. Instead the same
+#     persona + JSON tool-call-format instructions are sent as a single
+#     plain-text priming message — the FIRST message of a fresh ChatSession
+#     — exactly once per conversation, no create_gem/update_gem/fetch_gems
+#     calls anywhere in this backend anymore.
+#   - The native tool schema is NOT inlined into that priming message either.
+#     Instead Gemini gets two native tools of its own — list_native_tools()
+#     and show_native_tool_schema(tool_name) — and discovers native tools on
+#     demand in-turn, the exact same pattern already used for MCP tools via
+#     list_mcp_servers()/show_server_tools(). This keeps every hop's prompt
+#     small and means the tool catalogue can never drift out of sync with a
+#     stale cached Gem prompt, since there's nothing cached server-side to
+#     go stale.
+#   - One persistent gemini_webapi ChatSession per conversation_history
+#     object carries multi-hop tool-loop context across round trips; new
+#     tool results are injected into that SAME session as new messages
+#     (prefixed with GEMINI_WEB_TOOL_RESULT_MARKER), never as independent
+#     generate_content() calls (which would lose the session).
+#   - Output is parsed with the exact same legacy JSON tool-call parser used
+#     for Ollama/OpenRouter free-text tool calls (_extract_legacy_tool_calls),
+#     scanning ONLY output.text — never output.thoughts.
+#   - A `source`/`server` field on the emitted JSON (see _try_parse_tool_json)
+#     disambiguates native vs. MCP dispatch; this is threaded through the
+#     shared parser so it benefits every provider, not just Gemini.
+# =============================================================================
+
+# Concurrency guard: the scraped-cookie session backing _gemini_web_client is
+# a SINGLE account session. Multiple simultaneous tool-loop tasks hammering
+# it concurrently would interleave ChatSession state unpredictably. Rather
+# than silently allowing that, every Gemini-web primary call is serialized
+# through this lock — a second concurrent task simply waits its turn instead
+# of corrupting the first task's in-progress tool loop.
+_gemini_primary_call_lock = threading.Lock()
+
+# One gemini_webapi ChatSession per conversation_history object, keyed by
+# id() (conversation_history is a plain list owned/mutated by the caller,
+# never replaced mid-conversation in this codebase, so id() is stable for
+# the conversation's lifetime). Also tracks how much of that list has
+# already been delivered to Gemini, so each hop only sends the NEW
+# messages (the session already has everything sent previously) rather
+# than re-sending the whole transcript as text every step.
+#   id(conversation_history) -> {
+#       "chat": ChatSession,
+#       "sent": list[dict]   # exact message objects already delivered
+#   }
+_gemini_web_sessions: dict = {}
+
+# Cached "fastest available model" resolution, refreshed once per process
+# (or whenever GEMINI_WEB_MODEL changes) rather than on every hop.
+_gemini_web_model_cache = None
+
+
+def _gemini_web_persona_prompt() -> str:
+    """
+    Builds the plain-text persona + JSON tool-call output convention that
+    used to live in a Gem. Sent as the FIRST message of every fresh
+    ChatSession (see _gemini_web_get_session/_call_gemini_web_primary) —
+    no create_gem/update_gem/fetch_gems round trip, nothing pinned
+    server-side, nothing that can go stale or silently fall back to
+    "no-gem mode".
+
+    Deliberately does NOT inline the native tool schema. Instead Gemini
+    gets list_native_tools()/show_native_tool_schema(tool_name) — the same
+    on-demand discovery pattern already used for MCP tools via
+    list_mcp_servers()/show_server_tools() — so this priming message stays
+    small and the tool catalogue can never drift out of sync.
+    """
+    return (
+        "You are Jarvis, a desktop AI agent. You act by emitting tool calls "
+        "as JSON — you have no native function-calling protocol here, so "
+        "this JSON convention IS your only way to act.\n"
+        "\n"
+        "\u2501\u2501\u2501 TOOL-CALL OUTPUT FORMAT \u2501\u2501\u2501\n"
+        "When you want to call a tool, your ENTIRE reply must be ONE JSON "
+        "object and nothing else \u2014 no commentary before or after, no markdown "
+        "fences required (but tolerated if you include them):\n"
+        '  {"name": "<tool_name>", "arguments": {<args>}, "source": "<source>"}\n'
+        "\n"
+        "`source` tells the harness which catalogue the tool comes from:\n"
+        '  - "native"   \u2014 a built-in Jarvis tool. This is almost every call.\n'
+        '  - "mcp:<server>" \u2014 the tool came from show_server_tools(<server>) for\n'
+        "                 a connected MCP server (e.g. \"mcp:jira\"). Only use this\n"
+        "                 after you've actually called show_server_tools for that\n"
+        "                 server this session \u2014 don't guess an MCP tool exists.\n"
+        "If you omit `source`, the harness assumes \"native\".\n"
+        "\n"
+        "Call exactly ONE tool per reply. Never batch multiple tool calls into one "
+        "JSON object or array \u2014 one at a time, wait for the [TOOL_RESULT], then "
+        "decide the next step.\n"
+        "\n"
+        "When you are done and have a final answer for the user (no more tools "
+        "needed), reply with PLAIN TEXT \u2014 no JSON, no `name`/`arguments` keys.\n"
+        "\n"
+        "\u2501\u2501\u2501 WHERE TOOLS COME FROM (nothing is pre-loaded \u2014 discover, don't guess) \u2501\u2501\u2501\n"
+        "- NATIVE tools: every tool Jarvis has built in. You are NOT given their "
+        "full schemas up front. Call list_native_tools() (a native tool) to see "
+        "names + one-line descriptions, then show_native_tool_schema(tool_name) "
+        "for the exact arguments a specific tool expects, before calling it for "
+        "the first time this session.\n"
+        "- MCP tools: external servers connected to Jarvis, which can change "
+        "independently of this prompt. Call list_mcp_servers() to see what's "
+        "connected, then show_server_tools(server) to get that ONE server's tool "
+        "schemas before calling any of its tools. Never assume an MCP tool's "
+        "name or arguments without having called show_server_tools for it first "
+        "this session.\n"
+        "- call_mcp_tool(server, tool_name, arguments) is the uniform way to "
+        "invoke any MCP tool once you know its schema, if you'd rather route "
+        "through it explicitly than emit source=\"mcp:<server>\" directly \u2014 both "
+        "work identically, the harness normalizes to the same dispatch.\n"
+        "- Once you've discovered a tool's schema this session, you don't need "
+        "to look it up again \u2014 just call it.\n"
+        "\n"
+        "\u2501\u2501\u2501 ACT, DON'T NARRATE \u2501\u2501\u2501\n"
+        "If you have a next step to take, emit the tool-call JSON for it. Never "
+        "write out what you're 'about to do' as plain text instead of doing it. "
+        "Plain-text replies with no tool call are ONLY for a genuine final "
+        "answer, or a question you need the user to answer before continuing.\n"
+    )
+
+
+def _gemini_web_pick_model(client):
+    """
+    Resolve the model to drive the primary execution loop with.
+
+      - If GEMINI_WEB_MODEL is set, use it verbatim (matched against
+        client.list_models() by model_name/display_name).
+      - Otherwise auto-pick the fastest suitable model from whatever the
+        account currently has available (never hardcode a specific fast/
+        lite model name — the web app's lineup isn't stable over time).
+        Heuristic: prefer a "flash"-tier model over "pro"/"advanced"/
+        "thinking" variants, since latency is a real cost here (§2.4/§3.5).
+
+    Returns a Model/AvailableModel/str suitable for the `model=` kwarg on
+    ChatSession/generate_content, or Model.UNSPECIFIED (let Gemini pick)
+    if nothing usable was found.
+    """
+    global _gemini_web_model_cache
+    if _gemini_web_model_cache is not None:
+        return _gemini_web_model_cache
+
+    if GEMINI_WEB_MODEL:
+        _gemini_web_model_cache = GEMINI_WEB_MODEL
+        return _gemini_web_model_cache
+
+    try:
+        available = client.list_models() or []
+    except Exception:
+        available = []
+
+    if not available:
+        _gemini_web_model_cache = _GeminiModelEnum.UNSPECIFIED if _GeminiModelEnum else None
+        return _gemini_web_model_cache
+
+    def _rank(m):
+        name = (m.model_name or "").lower() + " " + (m.display_name or "").lower()
+        if "flash" in name and "thinking" not in name and "advanced" not in name and "plus" not in name:
+            return 0
+        if "flash" in name:
+            return 1
+        return 2
+
+    available.sort(key=_rank)
+    chosen = available[0]
+    print(f"🧠 [Gemini-web] Auto-selected model: {chosen.model_name} ({chosen.display_name})")
+    _gemini_web_model_cache = chosen
+    return _gemini_web_model_cache
+
+
+def _gemini_web_render_message(msg: dict) -> str | None:
+    """
+    Render one OpenAI-style conversation_history message into Gemini-web
+    prompt text. Returns None for messages that shouldn't be sent at all
+    (Gemini's own prior assistant turns are already in the ChatSession
+    server-side — re-sending them would duplicate context).
+    """
+    role    = msg.get("role", "")
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        # Some call sites build OpenAI-style multi-part content; flatten to text.
+        content = "\n".join(
+            part.get("text", "") for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    content = (content or "").strip()
+
+    if role == "system":
+        # The persona/system prompt is primed once as the first turn of a
+        # fresh ChatSession (see _gemini_web_persona_prompt /
+        # _call_gemini_web_primary) — resending conversation_history's own
+        # system entries on every hop would just bloat each round trip for
+        # no benefit. Skip entirely.
+        return None
+    if role == "assistant":
+        # Gemini's own prior turns already live server-side in the
+        # ChatSession; nothing to inject back.
+        return None
+    if role == "tool":
+        if not content:
+            return None
+        return f"{GEMINI_WEB_TOOL_RESULT_MARKER} {content}"
+    # role == "user" (or unknown, treated as a plain user turn)
+    return content if content else None
+
+
+def _gemini_web_get_session(conversation_history: list, client, model):
+    """
+    Get-or-create the persistent ChatSession for this conversation, and
+    return (chat_session, delta_messages, is_new) where delta_messages is
+    the list of conversation_history entries not yet delivered to Gemini,
+    and is_new is True the very first time this session is created (so the
+    caller knows to prime it with the persona prompt as the first turn —
+    no Gem, so nothing is pinned server-side automatically).
+
+    If conversation_history has been rewritten out from under us in a way
+    that isn't a clean append (e.g. the sliding HISTORY_WINDOW in
+    process_chat_turn dropped older entries, or this is a genuinely new
+    task reusing the same list object), the safe move is to start a FRESH
+    ChatSession and resend the full current window as one prompt — silent
+    corruption of an old session's dangling state is worse than one extra
+    full-context turn.
+    """
+    key   = id(conversation_history)
+    state = _gemini_web_sessions.get(key)
+
+    if state is not None:
+        sent = state["sent"]
+        if len(conversation_history) >= len(sent) and conversation_history[:len(sent)] == sent:
+            delta = conversation_history[len(sent):]
+            state["sent"] = list(conversation_history)
+            return state["chat"], delta, False
+        # History diverged from what we last sent (window slid, or history
+        # was mutated) — treat as a fresh task on a fresh session.
+        print("   [Gemini-web] Conversation history diverged from session state — "
+              "starting a fresh ChatSession for this task.")
+
+    chat = client.start_chat(model=model)
+    _gemini_web_sessions[key] = {"chat": chat, "sent": list(conversation_history)}
+    return chat, list(conversation_history), True
+
+
+def _gemini_web_reset_session(conversation_history: list):
+    """Drop the cached session for this conversation (used on unrecoverable
+    session/auth failures, so the next call starts clean instead of
+    repeatedly hammering a dead session)."""
+    _gemini_web_sessions.pop(id(conversation_history), None)
+
+
+def _call_gemini_web_primary(messages, result_q, model_override: str = None):
+    """
+    Drives ONE step of the primary tool-calling loop via Gemini through
+    gemini_webapi, on a persistent ChatSession. Populates result_q with the
+    exact same ("ok", resp) / ("err", exc) contract as
+    _call_ollama/_call_openrouter_primary, so process_chat_turn is
+    completely unaware Gemini is driving instead of a local/OpenRouter
+    model — this is the entire point of matching the existing dispatch
+    pattern instead of a parallel one.
+
+    `messages` here is the SAME trimmed conversation_history list
+    process_chat_turn already threads through the other two backends
+    (system messages + a sliding window of the rest) — used both to derive
+    the ChatSession delta (§2.4) and, on a fresh/diverged session, as the
+    full resend content.
+
+    Session-recovery (§3.5): on an auth/session failure mid-loop, one
+    reinit + one retry is attempted before surfacing a clear recoverable
+    error — never silently corrupting the loop by pretending the call
+    succeeded.
+    """
+    try:
+        from gemini_webapi.exceptions import AuthError, GeminiError, TimeoutError as _GeminiTimeoutError
+    except ImportError:
+        AuthError = GeminiError = _GeminiTimeoutError = Exception  # pragma: no cover
+
+    def _attempt():
+        client, err = _get_gemini_web_client()
+        if err:
+            raise RuntimeError(f"Gemini web client unavailable: {err}")
+
+        model = model_override or _gemini_web_pick_model(client)
+
+        chat, delta, is_new = _gemini_web_get_session(messages, client, model)
+
+        rendered = [r for r in (_gemini_web_render_message(m) for m in delta) if r]
+        if is_new:
+            # No Gem here — prime the fresh ChatSession with the persona +
+            # tool-call-format instructions as the very first turn, exactly
+            # once per conversation, instead of a pinned server-side object.
+            rendered = [_gemini_web_persona_prompt()] + rendered
+        if not rendered:
+            # Nothing new to say (can happen right after a fresh-session
+            # full resend where everything was system/assistant messages).
+            # Fall back to a neutral nudge so we never send an empty prompt.
+            prompt = "[SYSTEM]: Continue with the task."
+        else:
+            prompt = "\n\n".join(rendered)
+
+        with _gemini_primary_call_lock:
+            output = _run_gemini_coro(
+                chat.send_message(prompt),
+                timeout=GEMINI_WEB_HOP_TIMEOUT,
+            )
+        return output
+
+    try:
+        try:
+            output = _attempt()
+        except (AuthError, _GeminiTimeoutError, GeminiError) as e:
+            # Session fragility is a first-class risk (§ context) — one
+            # recovery attempt: drop the dead client/session and retry
+            # exactly once before giving up.
+            print(f"⚠️  [Gemini-web] Session/auth error mid-loop ({e}) — "
+                  f"reinitializing and retrying once...")
+            global _gemini_web_client
+            _gemini_web_client = None
+            _gemini_web_reset_session(messages)
+            output = _attempt()
+
+        raw_text = output.text or ""   # NEVER read output.thoughts here (§3.3)
+
+        legacy_calls, cleaned_content = _extract_legacy_tool_calls(raw_text)
+        if legacy_calls:
+            legacy_calls = legacy_calls[:1]   # one tool at a time (§ non-goals)
+
+        resp = {
+            "message": {
+                "role": "assistant",
+                "content": cleaned_content,
+                "tool_calls": legacy_calls,
+            }
+        }
+        result_q.put(("ok", resp))
+
+    except Exception as e:
+        _gemini_web_reset_session(messages)
+        result_q.put(("err", (
+            f"Gemini-web session/request failed: {e}. If this persists, the "
+            f"scraped cookie session likely expired — refresh "
+            f"GEMINI_SECURE_1PSID/GEMINI_SECURE_1PSIDTS in the secrets file, "
+            f"or re-login in the browser gemini_webapi pulls cookies from."
+        )))
+
+
+def set_gemini_web_model(model_name: str) -> str:
+    """
+    Pin GEMINI_WEB_MODEL to an exact model name/display name, or pass ""
+    to go back to auto-selecting the fastest available model. Takes effect
+    on the next primary-loop call — no restart needed.
+    """
+    global GEMINI_WEB_MODEL, _gemini_web_model_cache
+    old = GEMINI_WEB_MODEL
+    GEMINI_WEB_MODEL = (model_name or "").strip()
+    _gemini_web_model_cache = None
+    return (f"Gemini-web model changed: '{old or '(auto)'}' → "
+            f"'{GEMINI_WEB_MODEL or '(auto)'}'. Takes effect on the next call.")
+
+
+def delegate_to_gemini_web(task: str, context: str = "", max_steps: int = 10) -> str:
+    """
+    Mirror of delegate_to_openrouter(): hand `task` off to a fresh,
+    FULLY TOOL-CAPABLE agent loop running on Gemini-web — full access to
+    every tool Jarvis has, in an ISOLATED conversation (its own
+    ChatSession, not shared with the caller's), reporting back a final
+    summary.
+    """
+    if not _GEMINI_WEBAPI_AVAILABLE:
+        return f"Gemini web client is not available: {_gemini_webapi_load_msg}"
+
+    print(f"   [Delegate → Gemini-web] Task: {task[:80]}")
+
+    _saved_scratchpad = None
+    try:
+        if os.path.exists(RESPONSE_MEMORY):
+            with open(RESPONSE_MEMORY, "r", encoding="utf-8") as f:
+                _saved_scratchpad = f.read()
+    except Exception:
+        pass
+
+    try:
+        sub_system_prompt = get_system_prompt(effective_provider="gemini_web")
+        sub_system_prompt += (
+            "\n\n━━━ DELEGATED TASK MODE ━━━\n"
+            "You have been handed a specific task by Jarvis (the primary agent) to "
+            "complete independently. Act autonomously to complete it. When finished, "
+            "reply with a clear plain-text summary of what you did and the result — "
+            "this summary is relayed directly to the user."
+        )
+        task_message = task.strip()
+        if context.strip():
+            task_message = f"[CONTEXT FROM JARVIS]\n{context.strip()}\n\n[TASK]\n{task_message}"
+
+        sub_history = [
+            {"role": "system", "content": sub_system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"{task_message}\n\n"
+                    "[SYSTEM]: Act immediately. Emit the first tool-call JSON now. "
+                    "Do not explain — just act. Give a final plain-text summary when done."
+                ),
+            },
+        ]
+
+        summary, sub_tool_outputs = process_chat_turn(
+            sub_history,
+            user_request=task,
+            force_provider="gemini_web",
+            max_steps=max_steps,
+        )
+        step_note = f" ({len(sub_tool_outputs)} tool call(s) executed)" if sub_tool_outputs else ""
+        return f"[Gemini-web coworker — task complete{step_note}]\n{summary}"
+
+    except Exception as e:
+        return f"Delegation to Gemini-web failed: {e}"
+
+    finally:
+        try:
+            if _saved_scratchpad is not None:
+                with open(RESPONSE_MEMORY, "w", encoding="utf-8") as f:
+                    f.write(_saved_scratchpad)
+        except Exception:
+            pass
 
 
 
@@ -7148,9 +9278,10 @@ def get_gemini_reasoning(user_input: str, conversation_history: list) -> str | N
     execution brain), this consult step is skipped entirely — there's no
     benefit to a strong model consulting a plan from itself.
     """
-    if MODEL_PROVIDER == "openrouter":
-        # Primary model IS OpenRouter already — skip the separate consult
-        # call, it would just be the same model reasoning about itself twice.
+    if MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq"):
+        # Primary model IS OpenRouter or Gemini-web already — skip the
+        # separate consult call, it would just be the same model (or the
+        # same account's Gemini session) reasoning about itself twice.
         return None
 
     # Build the prompt (same regardless of routing)
@@ -7210,7 +9341,7 @@ Maximum 8 steps. Be concise."""
             return None
         try:
             print(f"🤖 [OpenRouter consult] Model: {OPENROUTER_MODEL}")
-            resp = _openrouter_chat([{"role": "user", "content": prompt}], model=OPENROUTER_MODEL)
+            resp = _openrouter_chat_with_fallback([{"role": "user", "content": prompt}], model=OPENROUTER_MODEL)
             plan = (resp["message"]["content"] or "").strip()
             if plan:
                 print(f"🤖 [OpenRouter plan ({len(plan)} chars)]:\n{plan}\n")
@@ -7338,6 +9469,7 @@ def _try_parse_tool_json(blob: str):
         return None
     name = obj.get("name") or obj.get("function") or obj.get("tool")
     args = obj.get("arguments", obj.get("parameters", {}))
+    source = obj.get("source") or obj.get("server")
     if not name:
         return None
     if isinstance(args, str):
@@ -7345,6 +9477,26 @@ def _try_parse_tool_json(blob: str):
             args = json.loads(args)
         except Exception:
             pass
+
+    # Explicit source/server field (currently emitted by the Gemini-web
+    # backend, see §2.3 of the Gemini implementation brief — routes
+    # unambiguously instead of relying on name-collision autodetection).
+    # "native" / missing / unrecognized -> fall through to normal handling.
+    # "mcp:<server>" or a bare server name/index -> route straight to
+    # call_mcp_tool, skipping the fuzzy name-matching autoroute entirely.
+    if source and source != "native":
+        server = source.split(":", 1)[1] if ":" in source else source
+        resolved = _mcp_resolve_name(server)
+        if resolved is not None:
+            return {"function": {"name": "call_mcp_tool", "arguments": {
+                "server": resolved, "tool_name": name, "arguments": args or {}
+            }}}
+        # Unknown server named explicitly — don't silently fall back to
+        # native dispatch (that could hit an unrelated native tool that
+        # happens to share this name); surface nothing so the caller's
+        # normal "no valid tool call" repair path kicks in.
+        return None
+
     if name not in _known_tool_names():
         # Not a registered top-level tool. This is the exact case that used
         # to be silently dropped (return None) before a name was ever
@@ -7470,7 +9622,71 @@ def _call_openrouter_primary(messages, result_q, model_override: str = None):
     """
     try:
         use_model = model_override or OPENROUTER_MODEL
-        resp = _openrouter_chat(messages, model=use_model, tools_schema=tools)
+        resp = _openrouter_chat_with_fallback(messages, model=use_model, tools_schema=tools)
+
+        if not resp["message"].get("tool_calls"):
+            raw_content = resp["message"].get("content") or ""
+            legacy_calls, cleaned_content = _extract_legacy_tool_calls(raw_content)
+            if legacy_calls:
+                legacy_calls = legacy_calls[:1]   # one tool at a time
+                resp["message"]["tool_calls"] = legacy_calls
+                resp["message"]["content"]    = cleaned_content
+
+        result_q.put(("ok", resp))
+    except Exception as e:
+        result_q.put(("err", e))
+
+
+def _call_gemini_api_primary(messages, result_q, model_override: str = None):
+    """
+    Run a Gemini API (official) chat completion on a background thread —
+    used when MODEL_PROVIDER == "gemini_api" (Gemini API driving Jarvis
+    directly), OR when a caller forces it for a single sub-turn via
+    _call_primary_model(provider_override="gemini_api").
+
+    model_override lets delegate_to_gemini_api() run the sub-agent on a
+    different model than GEMINI_API_MODEL for that one delegated task.
+
+    Gemini's structured function-calling is reliable, but we still run the
+    same legacy free-text <tool_call> fallback used for OpenRouter/Ollama
+    as a safety net in case a given model ever emits the call as text
+    instead of the structured field.
+    """
+    try:
+        use_model = model_override or GEMINI_API_MODEL
+        resp = _gemini_api_chat(messages, model=use_model, tools_schema=tools)
+
+        if not resp["message"].get("tool_calls"):
+            raw_content = resp["message"].get("content") or ""
+            legacy_calls, cleaned_content = _extract_legacy_tool_calls(raw_content)
+            if legacy_calls:
+                legacy_calls = legacy_calls[:1]   # one tool at a time
+                resp["message"]["tool_calls"] = legacy_calls
+                resp["message"]["content"]    = cleaned_content
+
+        result_q.put(("ok", resp))
+    except Exception as e:
+        result_q.put(("err", e))
+
+
+def _call_groq_primary(messages, result_q, model_override: str = None):
+    """
+    Run a GroqCloud chat completion on a background thread — used when
+    MODEL_PROVIDER == "groq" (GroqCloud driving Jarvis directly), OR when a
+    caller forces it for a single sub-turn via
+    _call_primary_model(provider_override="groq").
+
+    model_override lets delegate_to_groq() run the sub-agent on a different
+    model than GROQ_MODEL for that one delegated task.
+
+    GroqCloud's structured function-calling is reliable on supported
+    models, but we still run the same legacy free-text <tool_call> fallback
+    used for OpenRouter/Gemini API/Ollama as a safety net in case a given
+    model ever emits the call as text instead of the structured field.
+    """
+    try:
+        use_model = model_override or GROQ_MODEL
+        resp = _groq_chat_with_fallback(messages, model=use_model, tools_schema=_get_groq_tools_schema())
 
         if not resp["message"].get("tool_calls"):
             raw_content = resp["message"].get("content") or ""
@@ -7488,18 +9704,25 @@ def _call_openrouter_primary(messages, result_q, model_override: str = None):
 def _call_primary_model(messages, result_q, provider_override: str = None, model_override: str = None):
     """
     Dispatches to the configured primary model provider (see MODEL_PROVIDER
-    at the top of this file). Both branches populate result_q with the same
+    at the top of this file). Every branch populates result_q with the same
     ("ok", resp) / ("err", exc) contract, so process_chat_turn is completely
     unaware of which backend actually ran.
 
     provider_override lets a caller force a specific provider for THIS call
     only, without touching the global MODEL_PROVIDER — used by
-    delegate_to_openrouter() to run a sub-agent turn on OpenRouter even when
-    Ollama is the configured primary.
+    delegate_to_openrouter() / delegate_to_gemini_api() / delegate_to_groq()
+    to run a sub-agent turn on a specific provider even when something else
+    is the configured primary.
     """
     provider = provider_override or MODEL_PROVIDER
     if provider == "openrouter":
         _call_openrouter_primary(messages, result_q, model_override=model_override)
+    elif provider == "gemini_web":
+        _call_gemini_web_primary(messages, result_q, model_override=model_override)
+    elif provider == "gemini_api":
+        _call_gemini_api_primary(messages, result_q, model_override=model_override)
+    elif provider == "groq":
+        _call_groq_primary(messages, result_q, model_override=model_override)
     else:
         _call_ollama(messages, result_q)
 
@@ -7518,7 +9741,18 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
     this turn.
     """
     provider = effective_provider or MODEL_PROVIDER
-    model_id = effective_model or (OPENROUTER_MODEL if provider == "openrouter" else MODEL_NAME)
+    if effective_model:
+        model_id = effective_model
+    elif provider == "openrouter":
+        model_id = OPENROUTER_MODEL
+    elif provider == "gemini_web":
+        model_id = GEMINI_WEB_MODEL or "gemini-web/auto"
+    elif provider == "gemini_api":
+        model_id = GEMINI_API_MODEL
+    elif provider == "groq":
+        model_id = GROQ_MODEL
+    else:
+        model_id = MODEL_NAME
     if _IS_LINUX:
         shell_rule = (
             "- SHELL: bash only. Never use PowerShell, cmd.exe, or Windows commands. "
@@ -7555,17 +9789,55 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
             "  ASSISTANT: Chrome is open.\n"
         )
 
+    groq_tools_hint = (
+        "\n\n━━━ LIMITED TOOL SET (GroqCloud TPM budget) ━━━\n"
+        "To stay under Groq's per-minute token limit, you only have a CORE set of "
+        "tools loaded right now (terminal, files, paths, search, URL, user-prompt "
+        "tools). If you need something else — GUI automation, browser DOM/CDP, MCP, "
+        "domain knowledge, model delegation, memory/goal tools — call "
+        "list_more_tools() to see everything else available, then "
+        "load_tool_by_index(N) to load the one you need. It becomes callable on "
+        "your NEXT turn and stays loaded for the rest of the session.\n"
+        if provider == "groq" else ""
+    )
+
     legacy_toolcall_hint = (
         "\n- TOOL CALLS: output ONLY a single JSON object in this shape: "
         "{\"name\": \"<tool_name>\", \"arguments\": {<args>}}. "
         "No commentary before or after. <tool_call> tags also fine."
         if (provider == "openrouter" and model_id.endswith(":free"))
            or (provider == "ollama" and _is_legacy_toolcall_model(model_id))
+           or provider == "gemini_web"
         else ""
     )
 
     return (
         f"You are Jarvis, a {'Linux' if _IS_LINUX else 'Windows'} desktop AI agent.\n"
+        "\n"
+        "\n"
+        "━━━ ACT, DON'T NARRATE ━━━\n"
+        "If you have a next step to take, CALL THE TOOL for it. Never write out what\n"
+        "you're 'about to do', 'going to do', or a numbered plan as your response text\n"
+        "instead of doing it. Plain-text replies with no tool call are ONLY for: a\n"
+        "genuine final answer/result to the user, or a question you need the user to\n"
+        "answer before continuing. If you catch yourself typing 'I will...' or 'Let\n"
+        "me...', stop — issue the tool call instead of describing it.\n"
+        "\n"
+        "━━━ GUI USER-PROMPT TOOLS (optional, use when genuinely needed) ━━━\n"
+        "You have 4 tools that pop up a small GUI dialog and BLOCK until the user\n"
+        "responds, then feed the answer back to you so you can keep working the\n"
+        "same turn. Default is to call NONE of them — only reach for one when you\n"
+        "actually lack something you can't infer or find yourself:\n"
+        "  - ask_user_text(prompt, title?)            → free-form textbox\n"
+        "  - ask_user_file_path(prompt?, must_exist?)  → native file picker\n"
+        "  - ask_user_approval(message, details?)      → Approve/Decline buttons\n"
+        "  - ask_user_choice(question, choice_1..4, allow_custom?) → up to 4 buttons\n"
+        "                                                 + optional free-text option\n"
+        "Examples: user says 'open that file' with no path → ask_user_file_path.\n"
+        "You're about to delete/overwrite something or run something risky →\n"
+        "ask_user_approval. Multiple interpretations of a request →\n"
+        "ask_user_choice with your best 2-4 guesses. You can call more than one\n"
+        "of these in the same turn if you genuinely need more than one answer.\n"
         "\n"
         "━━━ PRIME DIRECTIVE: CHOOSE, DON'T SEARCH ━━━\n"
         "Every action has a CHOOSE version (numbered list + act by index = exact)\n"
@@ -7674,6 +9946,12 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
         "- If the user asks to change/switch the OpenRouter model: "
         "list_openrouter_models() → set_openrouter_model_by_index(N). "
         "Or set_openrouter_model(model_id) if they give an exact ID directly.\n"
+        "- consult_gemini_api(prompt, context) / delegate_to_gemini_api(task, context) — "
+        "same idea as the OpenRouter pair above, but via the OFFICIAL Gemini API key "
+        "(not the free desktop-app route consult_gemini uses). Reach for these when the "
+        "user explicitly asks for the Gemini API specifically, or when MODEL_PROVIDER "
+        "is already 'gemini_api' and you want a nested sub-agent instead of the primary "
+        "loop doing everything serially. set_gemini_api_model(model_id) switches the model.\n"
         "\n"
         "━━━ MCP SERVERS (EXTERNAL TOOLS) ━━━\n"
         "- Tool discovery is 3 steps — NEVER guess a tool_name or arguments shape:\n"
@@ -7705,6 +9983,7 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
         "\n"
         "- Replies: Markdown.\n"
         f"{legacy_toolcall_hint}"
+        f"{groq_tools_hint}"
     )
 
 
@@ -8054,6 +10333,42 @@ def _decompose_task(user_request: str) -> str | None:
     return plan
 
 
+_STALL_PATTERNS = re.compile(
+    r'^\s*(i will|i\'ll|i am going to|i\'m going to|let me|now i will|next i will|'
+    r'next,? i will|first,? i will|i need to|i am about to|i\'m about to|'
+    r'to do this,? i will|here\'s what i\'ll do|here is what i\'ll do|'
+    r'i plan to|my plan is|the plan is|steps? to (do|complete) this)\b',
+    re.IGNORECASE
+)
+
+_STALL_COMPLETION_HINTS = re.compile(
+    r'\b(done|completed|finished|successfully|here is the result|here\'s the result|'
+    r'here is your|here\'s your|i have (opened|created|written|deleted|found|sent|updated))\b',
+    re.IGNORECASE
+)
+
+def _looks_like_stalled_plan(text: str) -> bool:
+    """
+    True if the model's plain-text reply reads like it's ANNOUNCING an
+    intended action ("I'll open the file and...") rather than reporting a
+    completed result or asking the user something. Used to catch the model
+    narrating steps instead of actually calling the tools that do them.
+    """
+    if not text:
+        return False
+    t = text.strip()
+    if t.endswith("?"):
+        return False   # legitimately waiting on the user
+    if _STALL_COMPLETION_HINTS.search(t):
+        return False   # reads like a completed result
+    if _STALL_PATTERNS.match(t):
+        return True
+    # Numbered step list ("1. ...\n2. ...") with no completion language
+    if re.search(r'(?:^|\n)\s*[1-9]\.\s', t) and len(t) < 800:
+        return True
+    return False
+
+
 def process_chat_turn(conversation_history, user_request: str = "", gemini_plan: str = "",
                        force_provider: str = None, force_model: str = None,
                        max_steps: int = 20):
@@ -8076,6 +10391,8 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
     MAX_STEPS  = max_steps
     step_count = 0
     state      = TurnState(user_request, gemini_plan=gemini_plan)
+    stall_nudge_count  = 0
+    MAX_STALL_NUDGES   = 3
 
     # Keep system messages always; slide a window over the rest
     HISTORY_WINDOW = 20
@@ -8115,7 +10432,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
         status, payload = result_q.get()
         if status == "err":
             effective_provider = force_provider or MODEL_PROVIDER
-            provider_name = "OpenRouter" if effective_provider == "openrouter" else "Ollama"
+            provider_name = {
+                "openrouter": "OpenRouter",
+                "gemini_web": "Gemini-web",
+                "gemini_api": "Gemini-API",
+                "groq": "Groq",
+            }.get(effective_provider, "Ollama")
             return f"[{provider_name} error: {payload}]", turn_tool_outputs
         response   = payload
         tool_calls = response["message"].get("tool_calls")
@@ -8133,6 +10455,20 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
 
         if not tool_calls:
             conversation_history.append(response["message"])
+
+            if _looks_like_stalled_plan(msg_content) and stall_nudge_count < MAX_STALL_NUDGES:
+                stall_nudge_count += 1
+                print(f"\n⚠️  [Jarvis announced an action instead of doing it — nudging ({stall_nudge_count}/{MAX_STALL_NUDGES})]")
+                conversation_history.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM]: You just described what you're about to do instead of "
+                        "doing it. Do not narrate steps in plain text — call the actual "
+                        "tool for the next step RIGHT NOW. No commentary, just the tool call."
+                    )
+                })
+                continue
+
             # Combine all text accumulated across the whole turn
             full_reply = "\n\n".join(p for p in _accumulated_reply if p.strip())
             return full_reply, turn_tool_outputs
@@ -8144,8 +10480,21 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
         if all_verify:
             verify_call_count += 1
             if verify_call_count > MAX_VERIFY_CALLS:
-                # Force the model to stop verifying and give a final reply
+                # Force the model to stop verifying and give a final reply.
+                # IMPORTANT: response["message"] still carries tool_calls, and every
+                # provider (Gemini API strictly, others loosely) expects a function-call
+                # turn to be immediately followed by a matching function-response turn —
+                # so we must close it out with a synthetic tool response BEFORE the
+                # plain user nudge, instead of leaving the tool call dangling.
                 conversation_history.append(response["message"])
+                for tc in tool_calls:
+                    conversation_history.append({
+                        "role": "tool",
+                        "content": (
+                            "[SKIPPED] Verification call limit reached — this call was "
+                            "not executed. Stop verifying and give your final reply."
+                        ),
+                    })
                 conversation_history.append({
                     "role": "user",
                     "content": (
@@ -8208,7 +10557,13 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                         # one more model call to produce the failure reply
 
             # ── Tool dispatch ──────────────────────────────────────────────────
-            if func_name == "read_local_file":
+            if func_name == "list_more_tools":
+                tool_output = list_more_tools()
+
+            elif func_name == "load_tool_by_index":
+                tool_output = load_tool_by_index(int(arguments.get("index", 0)))
+
+            elif func_name == "read_local_file":
                 raw_path           = arguments.get("path", "")
                 resolved, res_msg  = resolve_file_path(raw_path)
                 file_result        = read_local_file(resolved)
@@ -8511,6 +10866,48 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 tool_output = set_openrouter_model_by_index(int(arguments.get("index", 0)))
             elif func_name == "set_openrouter_model":
                 tool_output = set_openrouter_model(arguments.get("model_id", ""))
+            elif func_name == "consult_gemini_api":
+                tool_output = consult_gemini_api(
+                    arguments.get("prompt", ""),
+                    arguments.get("context", ""),
+                    arguments.get("model") or None
+                )
+            elif func_name == "delegate_to_gemini_api":
+                tool_output = delegate_to_gemini_api(
+                    arguments.get("task", ""),
+                    arguments.get("context", ""),
+                    arguments.get("model") or None,
+                    int(arguments.get("max_steps", 10))
+                )
+            elif func_name == "set_gemini_api_model":
+                tool_output = set_gemini_api_model(arguments.get("model_id", ""))
+            elif func_name == "consult_groq":
+                tool_output = consult_groq(
+                    arguments.get("prompt", ""),
+                    arguments.get("context", ""),
+                    arguments.get("model") or None
+                )
+            elif func_name == "delegate_to_groq":
+                tool_output = delegate_to_groq(
+                    arguments.get("task", ""),
+                    arguments.get("context", ""),
+                    arguments.get("model") or None,
+                    int(arguments.get("max_steps", 10))
+                )
+            elif func_name == "list_groq_models":
+                tool_output = list_groq_models()
+            elif func_name == "set_groq_model_by_index":
+                tool_output = set_groq_model_by_index(int(arguments.get("index", 0)))
+            elif func_name == "set_groq_model":
+                tool_output = set_groq_model(arguments.get("model_id", ""))
+            elif func_name == "delegate_to_gemini_web":
+                tool_output = delegate_to_gemini_web(
+                    arguments.get("task", ""),
+                    arguments.get("context", ""),
+                    int(arguments.get("max_steps", 10))
+                )
+            elif func_name == "set_gemini_web_model":
+                tool_output = set_gemini_web_model(arguments.get("model_name", ""))
             elif func_name == "read_file_smart":
                 tool_output = read_file_smart(arguments.get("path", ""))
             elif func_name == "read_file_chunk":
@@ -8596,6 +10993,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 turn_tool_outputs.append(f"[say]: {msg_text}")
                 tool_output = "Message displayed to user."
 
+            elif func_name == "list_native_tools":
+                tool_output = list_native_tools()
+
+            elif func_name == "show_native_tool_schema":
+                tool_output = show_native_tool_schema(arguments.get("tool_name"))
+
             elif func_name == "list_mcp_servers":
                 tool_output = list_mcp_servers()
 
@@ -8625,6 +11028,38 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 tool_output = disconnect_mcp_server(
                     arguments.get("server"),
                     forget=arguments.get("forget", False)
+                )
+
+            elif func_name == "ask_user_text":
+                print(f"   [GUI] Asking user for text input...")
+                tool_output = ask_user_text(
+                    arguments.get("prompt", ""),
+                    arguments.get("title", "Jarvis needs input")
+                )
+
+            elif func_name == "ask_user_file_path":
+                print(f"   [GUI] Asking user to pick a file path...")
+                tool_output = ask_user_file_path(
+                    arguments.get("prompt", "Select a file"),
+                    must_exist=arguments.get("must_exist", True)
+                )
+
+            elif func_name == "ask_user_approval":
+                print(f"   [GUI] Asking user for approval...")
+                tool_output = ask_user_approval(
+                    arguments.get("message", ""),
+                    arguments.get("details", "")
+                )
+
+            elif func_name == "ask_user_choice":
+                print(f"   [GUI] Asking user to choose...")
+                tool_output = ask_user_choice(
+                    arguments.get("question", ""),
+                    arguments.get("choice_1", ""),
+                    arguments.get("choice_2", ""),
+                    arguments.get("choice_3", ""),
+                    arguments.get("choice_4", ""),
+                    allow_custom=arguments.get("allow_custom", True)
                 )
 
             else:
@@ -8687,6 +11122,21 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     "change_model":         "set_openrouter_model_by_index",
                     "select_model":         "set_openrouter_model_by_index",
                     "set_model":            "set_openrouter_model",
+                    # GroqCloud
+                    "groq":                 "consult_groq",
+                    "ask_groq":             "consult_groq",
+                    "consult_gq":           "consult_groq",
+                    "delegate_groq":        "delegate_to_groq",
+                    "offload_to_groq":      "delegate_to_groq",
+                    "list_groq_models":     "list_groq_models",
+                    "switch_groq_model":    "set_groq_model_by_index",
+                    "set_groq_model":       "set_groq_model",
+                    # Gemini-web (primary-execution delegate, distinct from consult_gemini)
+                    "delegate_gemini":      "delegate_to_gemini_web",
+                    "delegate_to_gemini":   "delegate_to_gemini_web",
+                    "offload_to_gemini":    "delegate_to_gemini_web",
+                    "delegate_gw":          "delegate_to_gemini_web",
+                    "set_gemini_model":     "set_gemini_web_model",
                     # UI snapshot/act — all old names → unified tools
                     "snapshot_ui":              "snapshot",
                     "snapshot_browser_elements": "snapshot",
@@ -8898,6 +11348,15 @@ if __name__ == "__main__":
         print("    (Gemini API key is also configured, but is unused — consult_gemini "
               "only uses the web chat interface now.)")
 
+    # ── Gemini API (official) status ────────────────────────────────────────────
+    if _GEMINI_API_AVAILABLE:
+        print(f"🔑 [Gemini API (official): available — model={GEMINI_API_MODEL}]")
+    else:
+        print(f"⚠️  [Gemini API (official) not available: {_gemini_api_load_msg}]")
+        print(f"    Secrets file expected at: {os.path.abspath(SECRETS_FILE)}")
+        print( "    Add key: { \"GEMINI_API_KEY\": \"AIza...\" } (same file as everything else)")
+        print( "    Get a key: https://aistudio.google.com/app/apikey")
+
     # ── OpenRouter status ──────────────────────────────────────────────────────
     if _OPENROUTER_AVAILABLE:
         print(f"🌍 [OpenRouter: available — model={OPENROUTER_MODEL}, "
@@ -8908,6 +11367,15 @@ if __name__ == "__main__":
         print( "    Add key: { \"OPENROUTER_API_KEY\": \"sk-or-v1-...\" } (same file as Gemini)")
         print( "    Get a key: https://openrouter.ai/keys")
 
+    # ── GroqCloud status ────────────────────────────────────────────────────────
+    if _GROQ_AVAILABLE:
+        print(f"⚡ [GroqCloud: available — model={GROQ_MODEL}]")
+    else:
+        print(f"⚠️  [GroqCloud not available: {_groq_load_msg}]")
+        print(f"    Secrets file expected at: {os.path.abspath(SECRETS_FILE)}")
+        print( "    Add key: { \"GROQ_API_KEY\": \"gsk_...\" } (same file as everything else)")
+        print( "    Get a free key: https://console.groq.com/keys")
+
     # ── Primary model provider summary ────────────────────────────────────────
     if MODEL_PROVIDER == "openrouter":
         if not _OPENROUTER_AVAILABLE:
@@ -8915,6 +11383,31 @@ if __name__ == "__main__":
                   "Jarvis cannot run until OPENROUTER_API_KEY is set!]")
         else:
             print(f"🧠 [PRIMARY MODEL: OpenRouter/{OPENROUTER_MODEL} — driving Jarvis directly]")
+    elif MODEL_PROVIDER == "gemini_web":
+        if not _GEMINI_WEBAPI_AVAILABLE:
+            print(f"🛑 [MODEL_PROVIDER='gemini_web' but gemini_webapi is NOT installed — "
+                  f"{_gemini_webapi_load_msg}]")
+        else:
+            _gw_client, _gw_err = _get_gemini_web_client()
+            if _gw_err:
+                print(f"🛑 [MODEL_PROVIDER='gemini_web' but the client failed to initialize: {_gw_err}]")
+            else:
+                print(f"🧠 [PRIMARY MODEL: Gemini-web/{GEMINI_WEB_MODEL or 'auto'} — "
+                      f"driving Jarvis directly via gemini_webapi ChatSession]")
+    elif MODEL_PROVIDER == "gemini_api":
+        if not _GEMINI_API_AVAILABLE:
+            print("🛑 [MODEL_PROVIDER='gemini_api' but the Gemini API is NOT configured — "
+                  "Jarvis cannot run until GEMINI_API_KEY is set!]")
+        else:
+            print(f"🧠 [PRIMARY MODEL: Gemini-API/{GEMINI_API_MODEL} — driving Jarvis directly "
+                  f"via the official API]")
+    elif MODEL_PROVIDER == "groq":
+        if not _GROQ_AVAILABLE:
+            print("🛑 [MODEL_PROVIDER='groq' but GroqCloud is NOT configured — "
+                  "Jarvis cannot run until GROQ_API_KEY is set!]")
+        else:
+            print(f"🧠 [PRIMARY MODEL: Groq/{GROQ_MODEL} — driving Jarvis directly "
+                  f"via GroqCloud's free-tier API]")
     else:
         print(f"🧠 [PRIMARY MODEL: Ollama/{MODEL_NAME} — local execution brain]")
         if OPENROUTER_CONSULT_MODE != "off" and _OPENROUTER_AVAILABLE:
@@ -8993,6 +11486,7 @@ if __name__ == "__main__":
                     os.remove(SESSION_MEMORY)
                     print("🗑️ Session memory cleared.")
                 _current_goal = None
+                reset_groq_loaded_tools()
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
                 write_local_file(
                     SESSION_MEMORY,
