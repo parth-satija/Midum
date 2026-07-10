@@ -3,6 +3,7 @@ import os
 import re
 import json
 import base64
+import tempfile
 import datetime
 import subprocess
 import threading
@@ -68,7 +69,7 @@ except ImportError:
     _docx = None
     _DOCX_AVAILABLE = False
 
-# MCP (Model Context Protocol) client SDK — lets Jarvis connect to external
+# MCP (Model Context Protocol) client SDK — lets Midum connect to external
 # MCP servers (stdio subprocesses, or remote HTTP/SSE endpoints) and call
 # their tools. Install with:  pip install mcp
 try:
@@ -91,7 +92,7 @@ except ImportError:
     _RICH_AVAILABLE   = False
 
 def _print_reply(label: str, text: str):
-    """Print Jarvis's reply, rendering Markdown if rich is available."""
+    """Print Midum's reply, rendering Markdown if rich is available."""
     # Suppress replies that are pure JSON/punctuation leftovers from legacy parsing
     if not text or re.match(r'^[{}\[\]",:\s]*$', text.strip()):
         return
@@ -114,7 +115,7 @@ MODEL_NAME     = "jarvishehe"
 # "openrouter" — use OPENROUTER_MODEL as the PRIMARY execution brain instead
 #                of Ollama. Every tool-calling turn is a metered API call.
 #                Use this if you have an OpenRouter key and want a stronger
-#                model driving Jarvis directly instead of qwen2.5-coder.
+#                model driving Midum directly instead of qwen2.5-coder.
 # "gemini_web" — use Gemini, accessed through the `gemini_webapi` library
 #                (account cookie sign-in, no API key, no per-token metering)
 #                as the PRIMARY execution brain. Reuses the same account
@@ -471,7 +472,7 @@ if _UIA_AVAILABLE:
             a chosen subtree root, collecting all actionable controls regardless
             of how deep they sit.
           - If a subtree yields nothing, automatically retry one level shallower
-            in the tree (parent) so Jarvis doesn't have to manually backtrack.
+            in the tree (parent) so Midum doesn't have to manually backtrack.
         """
 
         MAX_DISCOVER_DEPTH = 12
@@ -663,7 +664,7 @@ if _UIA_AVAILABLE:
             names), return the canonical app name for blueprint keying.
 
             "Python vs C++ - Google Search - Google Chrome" → "Google Chrome"
-            "main.py - Jarvis - Visual Studio Code"         → "Visual Studio Code"
+            "main.py - Midum - Visual Studio Code"         → "Visual Studio Code"
             "New tab - Google Chrome"                       → "Google Chrome"
             "Discord"                                       → "Discord"
             """
@@ -1727,7 +1728,7 @@ class AppMapNavigatorLinux:
 
     Uses AT-SPI2 for accessibility tree inspection and xdotool for all
     mouse/keyboard simulation. The public API is identical to AppMapNavigator
-    so the rest of Jarvis (tool dispatch, tool schemas) requires no changes —
+    so the rest of Midum (tool dispatch, tool schemas) requires no changes —
     just swap which navigator is assigned to ui_navigator at startup.
 
     Window identification uses xdotool search --name (substring, case-insensitive)
@@ -2412,7 +2413,7 @@ def _openrouter_chat(messages: list, model: str = None, tools_schema: list = Non
         "Authorization": f"Bearer {_OPENROUTER_API_KEY}",
         "Content-Type":  "application/json",
         "HTTP-Referer":  "https://github.com/jarvis-local-agent",
-        "X-Title":       "Jarvis Desktop Agent",
+        "X-Title":       "Midum Desktop Agent",
     }
 
     last_err = None
@@ -2562,13 +2563,13 @@ def delegate_to_openrouter(task: str, context: str = "", model: str = None,
     Turn OpenRouter into an actual coworker instead of just a text consultant.
     Hands `task` off to a fresh, FULLY TOOL-CAPABLE agent loop running on
     OpenRouter — it can call UIA, CDP, filesystem, terminal, or any other
-    tool Jarvis has, exactly like the primary loop, then reports back a
+    tool Midum has, exactly like the primary loop, then reports back a
     final summary that gets relayed to the user.
 
     Architecturally this spins up process_chat_turn on a brand-new isolated
     conversation seeded with the task, with force_provider="openrouter" so
     it runs on OpenRouter regardless of the global MODEL_PROVIDER. The outer
-    Jarvis loop and this delegated sub-loop do NOT share conversation
+    Midum loop and this delegated sub-loop do NOT share conversation
     history — only the final summary comes back to the caller.
 
     The shared response-memory scratchpad file is saved and restored around
@@ -2596,7 +2597,7 @@ def delegate_to_openrouter(task: str, context: str = "", model: str = None,
         )
         sub_system_prompt += (
             "\n\n━━━ DELEGATED TASK MODE ━━━\n"
-            "You have been handed a specific task by Jarvis (the primary agent) to "
+            "You have been handed a specific task by Midum (the primary agent) to "
             "complete independently. You have FULL access to every tool listed above — "
             "act autonomously to complete it, calling tools directly rather than asking "
             "anyone for permission. When finished, reply with a clear plain-text summary "
@@ -2606,7 +2607,7 @@ def delegate_to_openrouter(task: str, context: str = "", model: str = None,
 
         task_message = task.strip()
         if context.strip():
-            task_message = f"[CONTEXT FROM JARVIS]\n{context.strip()}\n\n[TASK]\n{task_message}"
+            task_message = f"[CONTEXT FROM MIDUM]\n{context.strip()}\n\n[TASK]\n{task_message}"
 
         sub_history = [
             {"role": "system", "content": sub_system_prompt},
@@ -2773,7 +2774,7 @@ _gemini_api_load_ok, _gemini_api_load_msg = _load_gemini_api()
 
 def _sanitize_messages_for_gemini_api(messages: list) -> list:
     """
-    Jarvis's internal conversation_history uses a loose, Ollama-shaped
+    Midum's internal conversation_history uses a loose, Ollama-shaped
     message format that OpenRouter's backend tolerates/auto-repairs, but
     Google's OFFICIAL OpenAI-compatible endpoint validates strictly and will
     400 INVALID_ARGUMENT on it. Two specific things need fixing on the way
@@ -2790,7 +2791,7 @@ def _sanitize_messages_for_gemini_api(messages: list) -> list:
     This walks the message list once, assigns synthetic ids to any
     assistant tool_calls that are missing them, re-serialises arguments to
     strings, and threads matching tool_call_id values onto the immediately
-    following "tool" messages (FIFO, since Jarvis only ever emits one tool
+    following "tool" messages (FIFO, since Midum only ever emits one tool
     call per step — see "tool_calls[:1]" in process_chat_turn).
     """
     sanitized  = []
@@ -2978,7 +2979,7 @@ def delegate_to_gemini_api(task: str, context: str = "", model: str = None,
     """
     Mirror of delegate_to_openrouter(): hand `task` off to a fresh, FULLY
     TOOL-CAPABLE agent loop running on the official Gemini API — it can call
-    UIA, CDP, filesystem, terminal, MCP tools, or any other tool Jarvis has,
+    UIA, CDP, filesystem, terminal, MCP tools, or any other tool Midum has,
     exactly like the primary loop, then reports back a final summary.
 
     Runs process_chat_turn on a brand-new isolated conversation seeded with
@@ -3006,7 +3007,7 @@ def delegate_to_gemini_api(task: str, context: str = "", model: str = None,
         )
         sub_system_prompt += (
             "\n\n━━━ DELEGATED TASK MODE ━━━\n"
-            "You have been handed a specific task by Jarvis (the primary agent) to "
+            "You have been handed a specific task by Midum (the primary agent) to "
             "complete independently. You have FULL access to every tool listed above — "
             "act autonomously to complete it, calling tools directly rather than asking "
             "anyone for permission. When finished, reply with a clear plain-text summary "
@@ -3016,7 +3017,7 @@ def delegate_to_gemini_api(task: str, context: str = "", model: str = None,
 
         task_message = task.strip()
         if context.strip():
-            task_message = f"[CONTEXT FROM JARVIS]\n{context.strip()}\n\n[TASK]\n{task_message}"
+            task_message = f"[CONTEXT FROM MIDUM]\n{context.strip()}\n\n[TASK]\n{task_message}"
 
         sub_history = [
             {"role": "system", "content": sub_system_prompt},
@@ -3117,7 +3118,7 @@ _groq_load_ok, _groq_load_msg = _load_groq()
 
 def _sanitize_messages_for_groq(messages: list) -> list:
     """
-    Same fixup as _sanitize_messages_for_gemini_api(): Jarvis's internal
+    Same fixup as _sanitize_messages_for_gemini_api(): Midum's internal
     conversation_history uses a loose, Ollama-shaped message format.
     GroqCloud's OpenAI-compatible endpoint validates strictly and will 400
     on missing tool_call ids / non-string function.arguments, so we repair
@@ -3330,7 +3331,7 @@ def delegate_to_groq(task: str, context: str = "", model: str = None,
     Mirror of delegate_to_openrouter()/delegate_to_gemini_api(): hand `task`
     off to a fresh, FULLY TOOL-CAPABLE agent loop running on GroqCloud — it
     can call UIA, CDP, filesystem, terminal, MCP tools, or any other tool
-    Jarvis has, exactly like the primary loop, then reports back a final
+    Midum has, exactly like the primary loop, then reports back a final
     summary.
 
     Runs process_chat_turn on a brand-new isolated conversation seeded with
@@ -3358,7 +3359,7 @@ def delegate_to_groq(task: str, context: str = "", model: str = None,
         )
         sub_system_prompt += (
             "\n\n━━━ DELEGATED TASK MODE ━━━\n"
-            "You have been handed a specific task by Jarvis (the primary agent) to "
+            "You have been handed a specific task by Midum (the primary agent) to "
             "complete independently. You have FULL access to every tool listed above — "
             "act autonomously to complete it, calling tools directly rather than asking "
             "anyone for permission. When finished, reply with a clear plain-text summary "
@@ -3368,7 +3369,7 @@ def delegate_to_groq(task: str, context: str = "", model: str = None,
 
         task_message = task.strip()
         if context.strip():
-            task_message = f"[CONTEXT FROM JARVIS]\n{context.strip()}\n\n[TASK]\n{task_message}"
+            task_message = f"[CONTEXT FROM MIDUM]\n{context.strip()}\n\n[TASK]\n{task_message}"
 
         sub_history = [
             {"role": "system", "content": sub_system_prompt},
@@ -3473,11 +3474,11 @@ def set_groq_model_by_index(index: int) -> str:
 # MCP (MODEL CONTEXT PROTOCOL) SERVER SUPPORT
 # =============================================================================
 #
-# Lets Jarvis connect to external MCP servers and use their tools WITHOUT
-# dumping every registered tool's JSON schema into Jarvis's context window
+# Lets Midum connect to external MCP servers and use their tools WITHOUT
+# dumping every registered tool's JSON schema into Midum's context window
 # (which is exactly what would happen if each MCP tool were added directly
 # to the `tools` list below — with several servers connected that can blow
-# past the context budget fast). Instead, Jarvis gets three uniform tools:
+# past the context budget fast). Instead, Midum gets three uniform tools:
 #
 #   list_mcp_servers()                       — which servers are connected (no tool detail)
 #   show_server_tools(server)                — on demand: tools + schemas for ONE server
@@ -3505,7 +3506,7 @@ _MCP_SERVERS: dict      = {}     # name -> _MCPServerHandle
 
 
 class _MCPServerHandle:
-    """Everything Jarvis knows about one connected (or attempted) MCP server."""
+    """Everything Midum knows about one connected (or attempted) MCP server."""
     def __init__(self, name: str, config: dict):
         self.name        = name
         self.config      = config
@@ -3557,7 +3558,7 @@ class _MCPManager:
     Owns a single background asyncio event loop that MCP client sessions run
     on for their whole lifetime (they're async context managers that need to
     stay entered between calls), and exposes plain synchronous methods so
-    the rest of Jarvis — which is entirely sync/threaded — never has to
+    the rest of Midum — which is entirely sync/threaded — never has to
     touch asyncio directly.
     """
     def __init__(self):
@@ -3795,7 +3796,7 @@ def init_mcp_servers_from_config():
     """
     Called once at startup: auto-connects every server saved in
     storage/mcp_servers.json. Failures are non-fatal and left visible in
-    list_mcp_servers() so Jarvis (or the user) can see what went wrong.
+    list_mcp_servers() so Midum (or the user) can see what went wrong.
     """
     configs = _load_mcp_config()
     if not configs:
@@ -3837,7 +3838,7 @@ def show_server_tools(server) -> str:
     """
     Returns the tool names, descriptions, and JSON input schemas for ONE
     server, identified by index (from list_mcp_servers) or name. This is
-    the only place full tool schemas are shown to Jarvis — deliberately
+    the only place full tool schemas are shown to Midum — deliberately
     on-demand, per server, instead of always-loaded.
     """
     name = _mcp_resolve_name(server)
@@ -3875,7 +3876,7 @@ def call_mcp_tool(server, tool_name: str, arguments) -> str:
 
 def list_native_tools() -> str:
     """
-    Lists every built-in Jarvis tool by name + one-line description ONLY —
+    Lists every built-in Midum tool by name + one-line description ONLY —
     no parameter schemas — to keep this cheap on context. Use
     show_native_tool_schema(tool_name) to get the full JSON parameter
     schema for a specific tool before calling it.
@@ -3900,7 +3901,7 @@ def list_native_tools() -> str:
 def show_native_tool_schema(tool_name: str) -> str:
     """
     Returns the full {name, description, parameters} JSON schema for ONE
-    native Jarvis tool, identified by index (from list_native_tools) or
+    native Midum tool, identified by index (from list_native_tools) or
     exact name. Call this right before using a tool you haven't already
     seen the schema for this session.
     """
@@ -3991,11 +3992,11 @@ def disconnect_mcp_server(server, forget: bool = False) -> str:
 # =============================================================================
 # 0b. GUI USER-PROMPT TOOLS
 # =============================================================================
-# Lets Jarvis pop up a small native GUI dialog to get something from the user
+# Lets Midum pop up a small native GUI dialog to get something from the user
 # without guessing — a missing file path, an approval, a disambiguating
 # choice, or arbitrary free text. Every call BLOCKS until the user responds
 # (or dismisses the window), then the answer is fed back as a normal tool
-# result so Jarvis can continue the same turn. The model can request several
+# result so Midum can continue the same turn. The model can request several
 # of these in a single turn (e.g. ask a question AND request a file path);
 # by default it requests none — these are opt-in, situational tools, not a
 # forced step at the end of every turn.
@@ -4008,7 +4009,7 @@ except ImportError:
     _tk_filedialog = None
     _TKINTER_AVAILABLE = False
 
-# When Jarvis is running inside the CustomTkinter desktop GUI (gui.pyw), the
+# When Midum is running inside the CustomTkinter desktop GUI (gui.pyw), the
 # GUI installs a callable here at startup. If present, every ask_user_*
 # tool below routes through it instead of popping up a separate native
 # tkinter window — the request/response instead renders as an inline card
@@ -4032,7 +4033,7 @@ def _gui_root():
     return root
 
 
-def ask_user_text(prompt: str, title: str = "Jarvis needs input") -> str:
+def ask_user_text(prompt: str, title: str = "Midum needs input") -> str:
     """
     Pop up a GUI textbox asking the user to type a free-form answer — e.g. a
     missing file path, a name, a value, or anything else with no fixed set
@@ -4115,7 +4116,7 @@ def ask_user_approval(message: str, details: str = "") -> str:
     result = {"value": "DECLINED"}
     root = _gui_root()
     win = _tk.Toplevel(root)
-    win.title("Jarvis requests approval")
+    win.title("Midum requests approval")
     try: win.attributes("-topmost", True)
     except Exception: pass
 
@@ -4166,7 +4167,7 @@ def ask_user_choice(question: str, choice_1: str = "", choice_2: str = "",
     result = {"value": None}
     root = _gui_root()
     win = _tk.Toplevel(root)
-    win.title("Jarvis has a question")
+    win.title("Midum has a question")
     try: win.attributes("-topmost", True)
     except Exception: pass
 
@@ -4640,7 +4641,7 @@ tools = [
             "description": (
                 "Type text at the current cursor position using keyboard simulation. "
                 "Always set expected_window to the title of the window you just clicked — "
-                "this prevents accidentally typing into the wrong app (e.g. Jarvis's own terminal). "
+                "this prevents accidentally typing into the wrong app (e.g. Midum's own terminal). "
                 "Use special_key for Enter, Tab, Escape, F-keys etc."
             ),
             "parameters": {
@@ -4842,7 +4843,7 @@ tools = [
                 "(2) the task requires deep reasoning, complex analysis, code review, architectural "
                 "decisions, or multi-step planning that exceeds your own confident ability, "
                 "(3) you need a second opinion or want to cross-check your own reasoning. "
-                "Jarvis selects the most appropriate model automatically based on task complexity "
+                "Midum selects the most appropriate model automatically based on task complexity "
                 "unless you specify task_type. "
                 "Models available (free tier): "
                 "quick=gemini-2.0-flash-lite (fast, simple tasks), "
@@ -4910,7 +4911,7 @@ tools = [
             "description": (
                 "Hand off an entire task to OpenRouter as a real COWORKER, not just a "
                 "text consultant. Unlike consult_openrouter (which only returns text), "
-                "the OpenRouter model spun up here gets FULL access to every tool Jarvis "
+                "the OpenRouter model spun up here gets FULL access to every tool Midum "
                 "has — it can click UI elements, run terminal commands, read/write files, "
                 "browse the web, everything — and works through the task independently, "
                 "then reports back a final summary that you relay to the user. "
@@ -5039,7 +5040,7 @@ tools = [
                 "not just a text consultant — same idea as delegate_to_openrouter but "
                 "running on Gemini through a real API key with native structured tool "
                 "calling (not the web-chat session used by delegate_to_gemini_web). The "
-                "Gemini sub-agent gets FULL access to every tool Jarvis has — UI "
+                "Gemini sub-agent gets FULL access to every tool Midum has — UI "
                 "automation, terminal, files, browser, MCP servers, everything — and "
                 "works through the task independently in an ISOLATED conversation, then "
                 "reports back a final summary."
@@ -5130,7 +5131,7 @@ tools = [
             "description": (
                 "Hand off an entire task to GroqCloud as a real COWORKER, not just a "
                 "text consultant. Unlike consult_groq (which only returns text), "
-                "the Groq model spun up here gets FULL access to every tool Jarvis "
+                "the Groq model spun up here gets FULL access to every tool Midum "
                 "has — it can click UI elements, run terminal commands, read/write files, "
                 "browse the web, everything — and works through the task independently, "
                 "then reports back a final summary that you relay to the user. GroqCloud "
@@ -5228,7 +5229,7 @@ tools = [
                 "gemini_webapi) as a real COWORKER, not just a text consultant — "
                 "same idea as delegate_to_openrouter but running on Gemini's own "
                 "account session instead. The Gemini sub-agent gets FULL access to "
-                "every tool Jarvis has and works through the task independently in "
+                "every tool Midum has and works through the task independently in "
                 "an ISOLATED conversation (its own ChatSession), then reports back a "
                 "final summary. Slower per-step than delegate_to_openrouter (each "
                 "step is a real gemini.google.com round trip) — prefer "
@@ -5297,6 +5298,95 @@ tools = [
     {"type":"function","function":{"name":"read_file_smart","description":"Read any file: txt/md/py/json/csv/html/.pdf(requires pymupdf)/.docx(requires mammoth). Returns chunk 1 for large files with chunk count — call read_file_chunk for rest.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the file."}},"required":["path"]}}},
     {"type":"function","function":{"name":"read_file_chunk","description":"Read chunk N (1-based) of a large file after read_file_smart reports multiple chunks.","parameters":{"type":"object","properties":{"path":{"type":"string"},"chunk_index":{"type":"integer","description":"1-based chunk number."}},"required":["path","chunk_index"]}}},
     {"type":"function","function":{"name":"write_docx_file","description":"Write a .docx Word document from Markdown-style text (# headings, **bold**). Requires python-docx: pip install python-docx.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path ending in .docx."},"content":{"type":"string","description":"Markdown-style text content."}},"required":["path","content"]}}},
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": (
+                "Generate one or more images from a text prompt using Gemini's web app "
+                "(gemini.google.com) via the free gemini_webapi session — the same session "
+                "used by query_gemini_app/delegate_to_gemini_web. No image API key, no "
+                "per-image metering, and the image is NOT saved to disk automatically — it's "
+                "kept in memory and shown inline in the GUI chat with Download/Copy buttons "
+                "the user can click if they want to keep it. Use this whenever the user asks "
+                "you to create/generate/draw/make a picture or image."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Detailed description of the image to generate, e.g. 'A watercolor painting of a lighthouse at sunset'."
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "How many image variations to request (default 1)."
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_flowchart",
+            "description": (
+                "Build and render a full explanatory flowchart in the chat (a real box-and-arrow "
+                "diagram in the GUI, plus ASCII and Mermaid fallbacks in plain terminal mode). "
+                "Use this any time you need to explain a process, decision tree, algorithm, or "
+                "step-by-step system visually instead of (or in addition to) prose. "
+                "Give every node a short unique 'id', a human-readable 'label', a 'type' "
+                "(start | process | decision | io | end), and a 'next' list of the ids it flows "
+                "into — optionally with an edge 'label' (e.g. 'yes'/'no' out of a decision node)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short title for the flowchart."
+                    },
+                    "steps": {
+                        "type": "array",
+                        "description": "The nodes of the flowchart, in any order (at least one should be type='start').",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "Short unique identifier for this node, e.g. 'check_login'."
+                                },
+                                "label": {
+                                    "type": "string",
+                                    "description": "The text shown inside the node's box."
+                                },
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["start", "process", "decision", "io", "end"],
+                                    "description": "Node shape/role. 'start' = entry point, 'decision' = branching question, 'io' = input/output, 'end' = terminal node."
+                                },
+                                "next": {
+                                    "type": "array",
+                                    "description": "IDs (or {to, label} objects) this node flows into. Use edge labels like 'yes'/'no' on decision branches.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "to": {"type": "string", "description": "id of the next node."},
+                                            "label": {"type": "string", "description": "Optional label for this edge, e.g. 'yes', 'no', 'on error'."}
+                                        },
+                                        "required": ["to"]
+                                    }
+                                }
+                            },
+                            "required": ["id", "label", "type"]
+                        }
+                    }
+                },
+                "required": ["title", "steps"]
+            }
+        }
+    },
     {"type":"function","function":{"name":"write_response_memory","description":"Overwrite the response scratchpad (response_memory.md). Call FIRST for any multi-step task with a numbered plan. Wiped automatically when set_current_goal(none) fires.","parameters":{"type":"object","properties":{"content":{"type":"string","description":"Plan, checklist, or notes."}},"required":["content"]}}},
     {"type":"function","function":{"name":"append_response_memory","description":"Append a note or partial result to the response scratchpad. Use to log progress and accumulate partial outputs during a task.","parameters":{"type":"object","properties":{"content":{"type":"string","description":"Note or partial result."}},"required":["content"]}}},
     {"type":"function","function":{"name":"read_response_memory","description":"Read the current response scratchpad to check your plan or assemble a final answer from accumulated notes.","parameters":{"type":"object","properties":{}}}},
@@ -5837,7 +5927,7 @@ tools = [
         "function": {
             "name": "list_native_tools",
             "description": (
-                "List every built-in Jarvis tool by name + one-line description "
+                "List every built-in Midum tool by name + one-line description "
                 "ONLY — not full parameter schemas. Follow up with "
                 "show_native_tool_schema(tool_name) to get the exact arguments a "
                 "tool expects before calling it. Mainly useful when you were not "
@@ -5851,7 +5941,7 @@ tools = [
         "function": {
             "name": "show_native_tool_schema",
             "description": (
-                "Show the full JSON parameter schema for ONE native Jarvis tool. "
+                "Show the full JSON parameter schema for ONE native Midum tool. "
                 "Call list_native_tools() first to get the tool's index or exact "
                 "name, then call this right before using it so you know the exact "
                 "arguments shape to send."
@@ -5877,13 +5967,13 @@ tools = [
 # models). The full `tools` schema above is ~73KB / ~18k tokens on its own —
 # more than the entire budget before a single message is sent. Instead of
 # sending all ~88 tool schemas on every Groq call, we send a small CORE set
-# covering the actions Jarvis needs most often, plus two meta-tools
-# (list_more_tools / load_tool_by_index) that let Jarvis pull in any other
+# covering the actions Midum needs most often, plus two meta-tools
+# (list_more_tools / load_tool_by_index) that let Midum pull in any other
 # tool's full schema on demand, mirroring the existing
 # "list indexed, then load by index" pattern used for skills/paths/MCP.
 #
 # Loaded extra tools persist for the rest of the session (reset on
-# "new session") so Jarvis doesn't have to reload the same tool repeatedly.
+# "new session") so Midum doesn't have to reload the same tool repeatedly.
 
 _TOOLS_BY_NAME = {t["function"]["name"]: t for t in tools}
 
@@ -6201,7 +6291,7 @@ def _cdp_require() -> str | None:
             "  Windows: Create a shortcut with that flag appended to the Target.\n"
             "  Linux:   google-chrome --remote-debugging-port=9222 &\n"
             "If tabs ARE listed but WebSocket calls still fail with an origin/policy "
-            "error, add --remote-allow-origins=* as well (Jarvis already sends a "
+            "error, add --remote-allow-origins=* as well (Midum already sends a "
             "matching Origin header, so this should rarely be needed)."
         )
     return None
@@ -6246,7 +6336,7 @@ try:
     # gemini_webapi logs internally via loguru at DEBUG/WARNING level,
     # which by default dumps raw HTTP response bodies (the ")]}'" /
     # array-of-arrays payloads you saw printed) straight to stderr on
-    # every request — none of that is an actual Jarvis error, it's just
+    # every request — none of that is an actual Midum error, it's just
     # unfiltered library-internal logging. Cap it to ERROR so only real
     # failures surface; auth/session recovery is handled by our own
     # retry logic below, not by reading these log lines.
@@ -6429,7 +6519,7 @@ def _gemini_web_persona_prompt() -> str:
     small and the tool catalogue can never drift out of sync.
     """
     return (
-        "You are Jarvis, a desktop AI agent. You act by emitting tool calls "
+        "You are Midum, a desktop AI agent. You act by emitting tool calls "
         "as JSON — you have no native function-calling protocol here, so "
         "this JSON convention IS your only way to act.\n"
         "\n"
@@ -6440,7 +6530,7 @@ def _gemini_web_persona_prompt() -> str:
         '  {"name": "<tool_name>", "arguments": {<args>}, "source": "<source>"}\n'
         "\n"
         "`source` tells the harness which catalogue the tool comes from:\n"
-        '  - "native"   \u2014 a built-in Jarvis tool. This is almost every call.\n'
+        '  - "native"   \u2014 a built-in Midum tool. This is almost every call.\n'
         '  - "mcp:<server>" \u2014 the tool came from show_server_tools(<server>) for\n'
         "                 a connected MCP server (e.g. \"mcp:jira\"). Only use this\n"
         "                 after you've actually called show_server_tools for that\n"
@@ -6455,12 +6545,12 @@ def _gemini_web_persona_prompt() -> str:
         "needed), reply with PLAIN TEXT \u2014 no JSON, no `name`/`arguments` keys.\n"
         "\n"
         "\u2501\u2501\u2501 WHERE TOOLS COME FROM (nothing is pre-loaded \u2014 discover, don't guess) \u2501\u2501\u2501\n"
-        "- NATIVE tools: every tool Jarvis has built in. You are NOT given their "
+        "- NATIVE tools: every tool Midum has built in. You are NOT given their "
         "full schemas up front. Call list_native_tools() (a native tool) to see "
         "names + one-line descriptions, then show_native_tool_schema(tool_name) "
         "for the exact arguments a specific tool expects, before calling it for "
         "the first time this session.\n"
-        "- MCP tools: external servers connected to Jarvis, which can change "
+        "- MCP tools: external servers connected to Midum, which can change "
         "independently of this prompt. Call list_mcp_servers() to see what's "
         "connected, then show_server_tools(server) to get that ONE server's tool "
         "schemas before calling any of its tools. Never assume an MCP tool's "
@@ -6721,7 +6811,7 @@ def delegate_to_gemini_web(task: str, context: str = "", max_steps: int = 10) ->
     """
     Mirror of delegate_to_openrouter(): hand `task` off to a fresh,
     FULLY TOOL-CAPABLE agent loop running on Gemini-web — full access to
-    every tool Jarvis has, in an ISOLATED conversation (its own
+    every tool Midum has, in an ISOLATED conversation (its own
     ChatSession, not shared with the caller's), reporting back a final
     summary.
     """
@@ -6742,14 +6832,14 @@ def delegate_to_gemini_web(task: str, context: str = "", max_steps: int = 10) ->
         sub_system_prompt = get_system_prompt(effective_provider="gemini_web")
         sub_system_prompt += (
             "\n\n━━━ DELEGATED TASK MODE ━━━\n"
-            "You have been handed a specific task by Jarvis (the primary agent) to "
+            "You have been handed a specific task by Midum (the primary agent) to "
             "complete independently. Act autonomously to complete it. When finished, "
             "reply with a clear plain-text summary of what you did and the result — "
             "this summary is relayed directly to the user."
         )
         task_message = task.strip()
         if context.strip():
-            task_message = f"[CONTEXT FROM JARVIS]\n{context.strip()}\n\n[TASK]\n{task_message}"
+            task_message = f"[CONTEXT FROM MIDUM]\n{context.strip()}\n\n[TASK]\n{task_message}"
 
         sub_history = [
             {"role": "system", "content": sub_system_prompt},
@@ -6937,7 +7027,7 @@ def snapshot_browser_elements(tab_index: int = 0, filter_type: str = "") -> str:
         filter_arg = _json_mod.dumps(filter_type.lower())
         js = f"""
 (function(filterType) {{
-    // Assign stable jarvis IDs to every element on this snapshot pass
+    // Assign stable midum IDs to every element on this snapshot pass
     window.__jarvis_el_map = [];  // fresh snapshot, clear old refs
 
     var selectors = {{
@@ -7557,6 +7647,268 @@ def write_docx_file(path, content):
         return f"Success: wrote DOCX to {path}"
     except Exception as e:
         return f"Error writing DOCX: {str(e)}"
+
+def generate_image(prompt: str, count: int = 1) -> str:
+    """
+    Generate one or more images from a text prompt using Gemini's own web
+    app (https://gemini.google.com) via the community `gemini_webapi`
+    library — the SAME free, cookie-based session used by query_gemini_app /
+    delegate_to_gemini_web. No separate image API key, no per-image
+    metering; it goes through the same usage limits as chatting at
+    gemini.google.com manually.
+
+    Image generation on Gemini's backend is NOT synchronous with the text
+    response — the chat reply can come back before the image has actually
+    finished rendering/uploading to Google's CDN, which makes a single
+    generate_content() call unreliable (empty `images`, or a download that
+    404s because the file isn't there yet). This retries the generation
+    request itself if no images come back, and retries each individual
+    image download with backoff if it 404s/errors, before giving up.
+
+    The image(s) are NOT written anywhere persistent — gemini_webapi only
+    exposes an async file-download call, so each image is downloaded to a
+    throwaway temp file just long enough to read its bytes into memory,
+    then the temp file is deleted immediately. The bytes are shipped to the
+    GUI as base64 inside an ```image_data_json``` block, which renders them
+    as inline thumbnails (kept in RAM only) with Download/Copy buttons —
+    nothing touches disk unless the user explicitly clicks Download.
+    """
+    if not _GEMINI_WEBAPI_AVAILABLE:
+        return f"Error: Gemini web chat is unavailable — {_gemini_webapi_load_msg}"
+
+    client, err = _get_gemini_web_client()
+    if client is None:
+        return f"Error: {err}"
+
+    full_prompt = (prompt or "").strip()
+    if not full_prompt:
+        return "Error: 'prompt' must describe the image you want generated."
+    try:
+        n = max(1, int(count or 1))
+    except (TypeError, ValueError):
+        n = 1
+    if n > 1:
+        full_prompt += f"\n\n(Generate {n} distinct variations of this image.)"
+
+    # ── Request generation, retrying if Gemini answers with text but no
+    #    images yet — this happens when the image render hasn't landed by
+    #    the time the chat turn "finishes". ──────────────────────────────────
+    GEN_ATTEMPTS   = 3
+    GEN_RETRY_WAIT = 6   # seconds between generation retries
+
+    response, images, last_text = None, [], ""
+    for attempt in range(1, GEN_ATTEMPTS + 1):
+        print(f"   [Gemini web] Requesting image generation "
+              f"(attempt {attempt}/{GEN_ATTEMPTS}): {full_prompt[:80]!r}...")
+        try:
+            response = _run_gemini_coro(client.generate_content(full_prompt), timeout=180)
+        except Exception as e:
+            if attempt == GEN_ATTEMPTS:
+                return f"Error: Gemini web image request failed: {e}"
+            time.sleep(GEN_RETRY_WAIT)
+            continue
+
+        images = list(getattr(response, "images", None) or [])
+        last_text = (getattr(response, "text", "") or "").strip()
+        if images:
+            break
+        if attempt < GEN_ATTEMPTS:
+            print(f"   [Gemini web] No image in response yet — "
+                  f"waiting {GEN_RETRY_WAIT}s and retrying...")
+            time.sleep(GEN_RETRY_WAIT)
+
+    if not images:
+        return (
+            "Gemini did not return any images for this prompt after "
+            f"{GEN_ATTEMPTS} attempts. Try being more explicit, e.g. "
+            "\"Generate an image of a red fox in a snowy forest, digital art\"."
+            + (f"\n\nGemini replied with text instead:\n{last_text}" if last_text else "")
+        )
+
+    # ── Download each image, retrying with backoff since the CDN copy can
+    #    briefly 404 right after generation completes. ─────────────────────
+    SAVE_ATTEMPTS = 3
+    SAVE_RETRY_WAIT = 4   # seconds, doubles each retry
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    encoded_images, errors = [], []
+
+    with tempfile.TemporaryDirectory(prefix="gemini_img_") as tmp_dir:
+        for idx, img in enumerate(images, start=1):
+            filename = f"gemini_{ts}_{idx}.png"
+            tmp_path = os.path.join(tmp_dir, filename)
+            last_err = None
+            for save_attempt in range(1, SAVE_ATTEMPTS + 1):
+                try:
+                    # gemini_webapi only exposes an async DOWNLOAD-TO-FILE
+                    # call — there's no "give me raw bytes" method — so we
+                    # save to the temp dir, read the bytes back, then let
+                    # TemporaryDirectory clean the file up when this block
+                    # exits. Net effect: no persistent disk usage, only a
+                    # few ms of scratch space.
+                    _run_gemini_coro(
+                        img.save(path=tmp_dir, filename=filename, verbose=False),
+                        timeout=90,
+                    )
+                    with open(tmp_path, "rb") as f:
+                        raw_bytes = f.read()
+                    if not raw_bytes:
+                        raise ValueError("downloaded file was empty")
+                    encoded_images.append({
+                        "filename": filename,
+                        "data_b64": base64.b64encode(raw_bytes).decode("ascii"),
+                    })
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    if save_attempt < SAVE_ATTEMPTS:
+                        wait = SAVE_RETRY_WAIT * save_attempt
+                        print(f"   [Gemini web] Image {idx} not ready yet "
+                              f"({e}) — waiting {wait}s and retrying "
+                              f"({save_attempt}/{SAVE_ATTEMPTS})...")
+                        time.sleep(wait)
+            if last_err is not None:
+                errors.append(f"image {idx}: {last_err}")
+
+    if not encoded_images:
+        return (
+            f"Error: Gemini returned {len(images)} image(s) but none could be retrieved "
+            f"after {SAVE_ATTEMPTS} attempts each: {'; '.join(errors)}"
+        )
+
+    payload = json.dumps({"prompt": full_prompt, "images": encoded_images})
+    warn = f"\n\n({len(errors)} image(s) failed: {'; '.join(errors)})" if errors else ""
+
+    return (
+        f"Generated {len(encoded_images)} image(s) for: \"{prompt}\"\n\n"
+        f"```image_data_json\n{payload}\n```\n\n"
+        f"(Kept in memory only — use the Download button under an image to save it.)"
+        f"{warn}"
+    )
+
+
+def create_flowchart(title, steps):
+    """
+    Build an explanatory flowchart from a list of node objects.
+
+    steps: list of dicts, each:
+        {
+          "id": "unique_id",
+          "label": "human-readable text",
+          "type": "start" | "process" | "decision" | "io" | "end",
+          "next": [ {"to": "other_id", "label": "optional edge label"}, ... ]
+        }
+
+    Returns:
+      - a ```flowchart_json``` fenced block: consumed by the GUI to draw a
+        real box-and-arrow diagram inline in the chat.
+      - a plain-text ASCII rendering, readable in a terminal.
+      - a portable Mermaid ("```mermaid```") version that can be pasted into
+        any Mermaid-compatible viewer (e.g. GitHub, Notion, mermaid.live).
+    """
+    try:
+        if not steps:
+            return "Error: 'steps' must be a non-empty list of node objects."
+
+        nodes = {}
+        for s in steps:
+            sid = str(s.get("id", "")).strip()
+            if not sid:
+                return "Error: every step needs a non-empty 'id'."
+            nodes[sid] = {
+                "id": sid,
+                "label": str(s.get("label", sid)),
+                "type": (s.get("type") or "process").strip().lower(),
+                "next": s.get("next") or [],
+            }
+
+        start_ids = [nid for nid, n in nodes.items() if n["type"] == "start"]
+        if not start_ids:
+            start_ids = [next(iter(nodes))]
+
+        # ── Mermaid source (portable fallback) ─────────────────────────────
+        shape = {
+            "start":    ("([", "])"),
+            "end":      ("([", "])"),
+            "decision": ("{", "}"),
+            "io":       ("[/", "/]"),
+            "process":  ("[", "]"),
+        }
+        mermaid_lines = ["flowchart TD"]
+        for n in nodes.values():
+            op, cl = shape.get(n["type"], ("[", "]"))
+            safe_label = n["label"].replace('"', "'")
+            mermaid_lines.append(f'    {n["id"]}{op}"{safe_label}"{cl}')
+        for n in nodes.values():
+            for edge in n["next"]:
+                to  = edge.get("to")    if isinstance(edge, dict) else edge
+                lbl = edge.get("label") if isinstance(edge, dict) else ""
+                if to not in nodes:
+                    continue
+                if lbl:
+                    mermaid_lines.append(f'    {n["id"]} -- "{lbl}" --> {to}')
+                else:
+                    mermaid_lines.append(f'    {n["id"]} --> {to}')
+        mermaid_src = "\n".join(mermaid_lines)
+
+        # ── ASCII rendering (terminal-friendly) ─────────────────────────────
+        visited = set()
+        ascii_lines = [f"FLOWCHART: {title}", "=" * max(12, len(title) + 11), ""]
+        glyph = {"start": "▶", "end": "■", "decision": "◆", "io": "▤"}
+
+        def render_node(nid, indent=0, branch_label=None):
+            pad = "  " * indent
+            node = nodes.get(nid)
+            if node is None:
+                ascii_lines.append(f"{pad}[missing node: {nid}]")
+                return
+            if nid in visited:
+                ascii_lines.append(f"{pad}↩ (back to '{node['label']}')")
+                return
+            visited.add(nid)
+
+            prefix = f"[{branch_label}] " if branch_label else ""
+            label_line = f"{pad}{prefix}{glyph.get(node['type'], '▢')} {node['label']}  ({node['type']})"
+            border = "─" * max(4, len(label_line) - len(pad))
+            ascii_lines.append(f"{pad}┌{border}┐")
+            ascii_lines.append(label_line)
+            ascii_lines.append(f"{pad}└{border}┘")
+
+            nexts = node["next"]
+            multi = len(nexts) > 1
+            for edge in nexts:
+                to  = edge.get("to")    if isinstance(edge, dict) else edge
+                lbl = edge.get("label") if isinstance(edge, dict) else None
+                ascii_lines.append(f"{pad}   │")
+                arrow = f"{pad}   ▼" + (f"  [{lbl}]" if lbl and not multi else "")
+                ascii_lines.append(arrow)
+                render_node(to, indent + (1 if multi else 0), lbl if multi else None)
+
+        for sid in start_ids:
+            render_node(sid)
+            ascii_lines.append("")
+
+        unreached = [nid for nid in nodes if nid not in visited]
+        if unreached:
+            ascii_lines.append("(Unreached nodes — not connected from a start node:)")
+            for nid in unreached:
+                render_node(nid)
+
+        ascii_block = "\n".join(ascii_lines)
+
+        payload = json.dumps({"title": title, "nodes": list(nodes.values()), "starts": start_ids})
+
+        return (
+            f"Flowchart '{title}' created with {len(nodes)} node(s).\n\n"
+            f"```flowchart_json\n{payload}\n```\n\n"
+            f"```text\n{ascii_block}\n```\n\n"
+            f"Portable Mermaid version (paste into any Mermaid-compatible viewer):\n"
+            f"```mermaid\n{mermaid_src}\n```"
+        )
+    except Exception as e:
+        return f"Error building flowchart: {str(e)}"
+
 
 def write_response_memory(content):
     """Overwrite the response scratchpad."""
@@ -8618,24 +8970,24 @@ def _ensure_kb_files():
     os.makedirs(STORAGE_DIR, exist_ok=True)
     if not os.path.exists(INSTRUCTIONS_FILE):
         write_local_file(INSTRUCTIONS_FILE,
-            "# Jarvis Instructions & Preferences\n"
+            "# Midum Instructions & Preferences\n"
             "User preferences and behavioural rules.\n"
             "Format: one rule per line, starting with '- '.\n\n"
             "## Preferences\n")
     if not os.path.exists(PATHS_FILE):
         write_local_file(PATHS_FILE,
-            "# Jarvis Paths\n"
+            "# Midum Paths\n"
             "Absolute paths to applications, folders and files.\n\n"
             "## Paths\n")
     if not os.path.exists(DOMAIN_INDEX):
         write_local_file(DOMAIN_INDEX,
-            "# Jarvis Domain Knowledge Index\n"
+            "# Midum Domain Knowledge Index\n"
             "Registered domain-specific knowledge files.\n"
             "Format: `filename_without_ext` - description\n\n"
             "## Files\n")
     if not os.path.exists(DOMAIN_SKILLS_INDEX):
         write_local_file(DOMAIN_SKILLS_INDEX,
-            "# Jarvis Domain Skills Index\n"
+            "# Midum Domain Skills Index\n"
             "Registered domain-specific skill files.\n"
             "Format: [domain] `filename_without_ext` - description\n\n"
             "## Skills\n")
@@ -8733,7 +9085,7 @@ def list_skills():
     if not os.path.exists(SKILLS_INDEX):
         write_local_file(
             SKILLS_INDEX,
-            "# Jarvis Skills Index\n\nSkill files live in: "
+            "# Midum Skills Index\n\nSkill files live in: "
             + SKILLS_DIR + "\n\n## Skills\n_No skills registered yet._\n"
         )
         return "Skills index created. No skills registered yet."
@@ -8813,7 +9165,7 @@ def set_current_goal(goal, reason=""):
     raw = (
         open(SESSION_MEMORY, "r", encoding="utf-8").read()
         if os.path.exists(SESSION_MEMORY)
-        else f"# Jarvis Session Memory\nSession started: {ts}\n"
+        else f"# Midum Session Memory\nSession started: {ts}\n"
     )
     lines      = raw.splitlines(keepends=True)
     header_end = 0
@@ -8875,7 +9227,7 @@ def load_memory_into_context(path, label):
         return None
     try:
         content = open(path, "r", encoding="utf-8").read().strip()
-        return f"[JARVIS {label.upper()} MEMORY]\n{content}" if content else None
+        return f"[MIDUM {label.upper()} MEMORY]\n{content}" if content else None
     except Exception:
         return None
 
@@ -8910,7 +9262,7 @@ def python_trigger_memory_update(turn_tool_outputs, assistant_reply):
 
 def _bootstrap_all_files():
     """
-    Create every folder and file Jarvis needs on first run.
+    Create every folder and file Midum needs on first run.
     All calls are no-ops if the file already exists.
     Ship only main.py + gui.py — everything else is generated here.
     """
@@ -8938,7 +9290,7 @@ def _bootstrap_all_files():
     # ── Core knowledge files ──────────────────────────────────────────────────
     if _IS_LINUX:
         seed(COMMANDS_FILE,
-            "# Jarvis Commands\n"
+            "# Midum Commands\n"
             "# Add preferred bash commands below.\n"
             "# Format: `CommandName` — description\n\n"
             "## Commands\n"
@@ -8950,7 +9302,7 @@ def _bootstrap_all_files():
             "- `nohup` — run a command that persists after terminal closes\n"
         )
         seed(INSTRUCTIONS_FILE,
-            "# Jarvis Instructions & Preferences\n"
+            "# Midum Instructions & Preferences\n"
             "# Add user preferences and behavioural rules below.\n"
             "# Format: one rule per line, starting with '- '\n\n"
             "## Preferences\n"
@@ -8960,7 +9312,7 @@ def _bootstrap_all_files():
         )
     else:
         seed(COMMANDS_FILE,
-            "# Jarvis Commands\n"
+            "# Midum Commands\n"
             "# Add preferred PowerShell commands below.\n"
             "# Format: `CommandName` — description\n\n"
             "## Commands\n"
@@ -8970,7 +9322,7 @@ def _bootstrap_all_files():
             "- `start` — shorthand to open files/apps\n"
         )
         seed(INSTRUCTIONS_FILE,
-            "# Jarvis Instructions & Preferences\n"
+            "# Midum Instructions & Preferences\n"
             "# Add user preferences and behavioural rules below.\n"
             "# Format: one rule per line, starting with '- '\n\n"
             "## Preferences\n"
@@ -8979,27 +9331,27 @@ def _bootstrap_all_files():
         )
 
     seed(PATHS_FILE,
-        "# Jarvis Paths\n"
+        "# Midum Paths\n"
         "# Absolute paths to applications, folders and files on this machine.\n\n"
         "## Paths\n"
     )
 
     seed(DOMAIN_INDEX,
-        "# Jarvis Domain Knowledge Index\n"
+        "# Midum Domain Knowledge Index\n"
         "# Registered domain-specific knowledge files.\n"
         "# Format: `filename_without_ext` - description\n\n"
         "## Files\n"
     )
 
     seed(DOMAIN_SKILLS_INDEX,
-        "# Jarvis Domain Skills Index\n"
+        "# Midum Domain Skills Index\n"
         "# Registered domain-specific skill files.\n"
         "# Format: [domain] `filename_without_ext` - description\n\n"
         "## Skills\n"
     )
 
     seed(SKILLS_INDEX,
-        "# Jarvis Skills Index\n\n"
+        "# Midum Skills Index\n\n"
         "Each entry lists a skill filename and its description.\n"
         f"Skill files live in: {SKILLS_DIR}\n\n"
         "## Skills\n"
@@ -9008,12 +9360,12 @@ def _bootstrap_all_files():
 
     # ── Memory files ──────────────────────────────────────────────────────────
     seed(MASTER_MEMORY,
-        "# Jarvis Master Memory\n"
+        "# Midum Master Memory\n"
         f"Initialised: {ts}\n"
     )
 
     seed(SESSION_MEMORY,
-        "# Jarvis Session Memory\n"
+        "# Midum Session Memory\n"
         f"Session started: {ts}\n\n"
         "## Current Goal\n"
         "_No active goal._\n\n"
@@ -9022,7 +9374,7 @@ def _bootstrap_all_files():
 
     seed(RESPONSE_MEMORY, "")   # starts empty every run; cleared by set_current_goal(none)
 
-    print("✅ [All Jarvis files and folders verified/created.]")
+    print("✅ [All Midum files and folders verified/created.]")
 
 
 def init_memory_at_startup():
@@ -9040,7 +9392,7 @@ def init_memory_at_startup():
     else:
         print("🧠 [No master memory — starting fresh.]")
         if not os.path.exists(MASTER_MEMORY):
-            write_local_file(MASTER_MEMORY, "# Jarvis Master Memory\n")
+            write_local_file(MASTER_MEMORY, "# Midum Master Memory\n")
 
     if os.path.exists(SESSION_MEMORY):
         session_ctx = load_memory_into_context(SESSION_MEMORY, "session (continued)")
@@ -9055,7 +9407,7 @@ def init_memory_at_startup():
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         write_local_file(
             SESSION_MEMORY,
-            f"# Jarvis Session Memory\nSession started: {ts}\n\n"
+            f"# Midum Session Memory\nSession started: {ts}\n\n"
             f"{GOAL_SECTION_HEADER}\n_No active goal._\n\n{GOAL_SECTION_END}\n"
         )
         print("🧠 [New session memory created.]")
@@ -9065,7 +9417,7 @@ def init_memory_at_startup():
             with open(INSTRUCTIONS_FILE, "r", encoding="utf-8") as _f:
                 _instr = _f.read().strip()
             if _instr:
-                injections.append("[JARVIS INSTRUCTIONS — always active]\n" + _instr)
+                injections.append("[MIDUM INSTRUCTIONS — always active]\n" + _instr)
                 print("📌 [Instructions loaded.]")
         except Exception:
             pass
@@ -9299,7 +9651,7 @@ def get_gemini_reasoning(user_input: str, conversation_history: list) -> str | N
     tool_names   = [t["function"]["name"] for t in tools]
     tool_summary = ", ".join(tool_names)
 
-    prompt = f"""You are the planning brain of Jarvis, a {os_name} desktop AI agent.
+    prompt = f"""You are the planning brain of Midum, a {os_name} desktop AI agent.
 A weak local model ({MODEL_NAME}) will execute tool calls based on your plan.
 The local model follows instructions literally but cannot reason well — give it explicit steps.
 
@@ -9386,7 +9738,7 @@ Maximum 8 steps. Be concise."""
     else:   # "off"
         return _try_gemini()
 
-# Tools that count as "verification" — capped so Jarvis can't loop forever
+# Tools that count as "verification" — capped so Midum can't loop forever
 _VERIFY_TOOLS = {"fallback_view_screen", "fallback_find_text"}
 # Maximum consecutive verification tool calls allowed before we force a reply
 MAX_VERIFY_CALLS = 2
@@ -9606,7 +9958,7 @@ def _call_ollama(messages, result_q):
 def _call_openrouter_primary(messages, result_q, model_override: str = None):
     """
     Run OpenRouter chat completion on a background thread — used when
-    MODEL_PROVIDER == "openrouter" (OpenRouter driving Jarvis directly,
+    MODEL_PROVIDER == "openrouter" (OpenRouter driving Midum directly,
     not just consulted), OR when a caller forces OpenRouter for a single
     sub-turn via _call_primary_model(provider_override="openrouter").
 
@@ -9640,7 +9992,7 @@ def _call_openrouter_primary(messages, result_q, model_override: str = None):
 def _call_gemini_api_primary(messages, result_q, model_override: str = None):
     """
     Run a Gemini API (official) chat completion on a background thread —
-    used when MODEL_PROVIDER == "gemini_api" (Gemini API driving Jarvis
+    used when MODEL_PROVIDER == "gemini_api" (Gemini API driving Midum
     directly), OR when a caller forces it for a single sub-turn via
     _call_primary_model(provider_override="gemini_api").
 
@@ -9672,7 +10024,7 @@ def _call_gemini_api_primary(messages, result_q, model_override: str = None):
 def _call_groq_primary(messages, result_q, model_override: str = None):
     """
     Run a GroqCloud chat completion on a background thread — used when
-    MODEL_PROVIDER == "groq" (GroqCloud driving Jarvis directly), OR when a
+    MODEL_PROVIDER == "groq" (GroqCloud driving Midum directly), OR when a
     caller forces it for a single sub-turn via
     _call_primary_model(provider_override="groq").
 
@@ -9812,7 +10164,7 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
     )
 
     return (
-        f"You are Jarvis, a {'Linux' if _IS_LINUX else 'Windows'} desktop AI agent.\n"
+        f"You are Midum, a {'Linux' if _IS_LINUX else 'Windows'} desktop AI agent.\n"
         "\n"
         "\n"
         "━━━ ACT, DON'T NARRATE ━━━\n"
@@ -9904,6 +10256,36 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
         "needs the correct target name/tab, and guessing it wastes a turn on a failed call.\n"
         "Never use run_js_in_browser or fallback_click_text as a first resort — only after\n"
         "the pipeline above genuinely fails (canvas/WebGL page, no elements found, etc).\n"
+        "\n"
+        "━━━ FLOWCHARTS ━━━\n"
+        "Use create_flowchart whenever explaining a process, algorithm, decision tree,\n"
+        "system architecture, or any multi-step 'if this then that' logic would be clearer\n"
+        "as a diagram than as prose — not just when the user says the word 'flowchart'.\n"
+        "Triggers include: 'explain how X works', 'walk me through the steps', 'what happens\n"
+        "if...', 'show me the logic/architecture/pipeline for...', debugging a multi-branch\n"
+        "process, or onboarding/how-to content with more than ~4 sequential steps.\n"
+        "\n"
+        "Call it as: {\"name\": \"create_flowchart\", \"arguments\": {\"title\": \"...\", \"steps\": "
+        "[{\"id\": \"...\", \"label\": \"...\", \"type\": \"start|process|decision|io|end\", \"next\": "
+        "[{\"to\": \"...\", \"label\": \"optional, e.g. yes/no\"}]}, ...]}}\n"
+        "Give every node a short unique id, exactly one 'start' node, label decision-branch\n"
+        "edges (e.g. 'yes'/'no'/'on error') so the branches are self-explanatory, and mark\n"
+        "terminal nodes as 'end'.\n"
+        "\n"
+        "CRITICAL — DO NOT RETYPE THE RESULT: the tool's return value already contains a\n"
+        "```flowchart_json``` fenced block. This is NOT generic JSON for you to read,\n"
+        "summarize, reformat, or reproduce under a different label — it is consumed\n"
+        "directly by the GUI, which renders it as an actual box-and-arrow diagram ONLY if\n"
+        "the fence language is exactly `flowchart_json`. Copy that entire fenced block\n"
+        "(fence markers, the exact language tag, and the JSON body) VERBATIM, character for\n"
+        "character, into your reply. Never relabel it as ```json```, ```mermaid```, or plain\n"
+        "text, never re-indent/pretty-print it, and never describe its contents instead of\n"
+        "including it — any of those will silently break the rendering and dump raw JSON in\n"
+        "the user's face instead of a diagram. You may add a short sentence of framing text\n"
+        "before or after the block, but the block itself must pass through untouched.\n"
+        "\n"
+        "The same rule applies to generate_image's ```image_data_json``` block — copy it\n"
+        "verbatim too, never relabel or paraphrase it.\n"
         "\n"
         "━━━ CORE RULES ━━━\n"
         "- NEVER fabricate. Always use tools for real data.\n"
@@ -10377,7 +10759,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
     specific model backend regardless of the global MODEL_PROVIDER — used by
     delegate_to_openrouter() to spin up a self-contained OpenRouter "coworker"
     sub-agent that has full tool access via the exact same engine as the
-    primary loop, without permanently switching Jarvis's primary provider.
+    primary loop, without permanently switching Midum's primary provider.
     """
     clear_response_memory()
     turn_tool_outputs     = []
@@ -10406,7 +10788,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
         # ── Step ceiling ──────────────────────────────────────────────────────
         step_count += 1
         if step_count > MAX_STEPS:
-            msg = "[MAX STEPS REACHED] Jarvis exceeded the step limit for this turn."
+            msg = "[MAX STEPS REACHED] Midum exceeded the step limit for this turn."
             print(f"\n🚫 {msg}")
             _accumulated_reply.append(msg)
             break
@@ -10451,14 +10833,14 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
         if msg_content and not re.match(r'^[{}\[\]",:\s]*$', msg_content):
             _accumulated_reply.append(msg_content)
             if msg_content and tool_calls:
-                print(f"\n💬 Jarvis: {msg_content}")
+                print(f"\n💬 Midum: {msg_content}")
 
         if not tool_calls:
             conversation_history.append(response["message"])
 
             if _looks_like_stalled_plan(msg_content) and stall_nudge_count < MAX_STALL_NUDGES:
                 stall_nudge_count += 1
-                print(f"\n⚠️  [Jarvis announced an action instead of doing it — nudging ({stall_nudge_count}/{MAX_STALL_NUDGES})]")
+                print(f"\n⚠️  [Midum announced an action instead of doing it — nudging ({stall_nudge_count}/{MAX_STALL_NUDGES})]")
                 conversation_history.append({
                     "role": "user",
                     "content": (
@@ -10508,7 +10890,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             verify_call_count = 0   # reset counter when a real action runs
 
         conversation_history.append(response["message"])
-        print(f"\n⚡ Jarvis requested {len(tool_calls)} action(s)...")
+        print(f"\n⚡ Midum requested {len(tool_calls)} action(s)...")
 
         needs_lookup = False
         unknown_cmd  = ""
@@ -10914,6 +11296,13 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 tool_output = read_file_chunk(arguments.get("path",""), int(arguments.get("chunk_index",1)))
             elif func_name == "write_docx_file":
                 tool_output = write_docx_file(arguments.get("path",""), arguments.get("content",""))
+            elif func_name == "create_flowchart":
+                tool_output = create_flowchart(arguments.get("title", "Flowchart"), arguments.get("steps", []))
+            elif func_name == "generate_image":
+                tool_output = generate_image(
+                    arguments.get("prompt", ""),
+                    int(arguments.get("count", 1) or 1)
+                )
             elif func_name == "write_response_memory":
                 tool_output = write_response_memory(arguments.get("content",""))
             elif func_name == "append_response_memory":
@@ -10987,7 +11376,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
 
             elif func_name == "say":
                 msg_text = arguments.get("message", "")
-                _print_reply("Jarvis:", msg_text)
+                _print_reply("Midum:", msg_text)
                 _said_parts.append(msg_text)
                 _accumulated_reply.append(msg_text)
                 turn_tool_outputs.append(f"[say]: {msg_text}")
@@ -11034,7 +11423,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 print(f"   [GUI] Asking user for text input...")
                 tool_output = ask_user_text(
                     arguments.get("prompt", ""),
-                    arguments.get("title", "Jarvis needs input")
+                    arguments.get("title", "Midum needs input")
                 )
 
             elif func_name == "ask_user_file_path":
@@ -11217,7 +11606,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                         # Resolved to itself — tool exists but has no dispatch case
                         tool_output = (
                             f"[INTERNAL ERROR] Tool '{func_name}' is registered but has no "
-                            f"dispatch handler. This is a Jarvis bug — report it."
+                            f"dispatch handler. This is a Midum bug — report it."
                         )
                     else:
                         print(f"   [Tool resolver] '{func_name}' → '{resolved}'")
@@ -11380,9 +11769,9 @@ if __name__ == "__main__":
     if MODEL_PROVIDER == "openrouter":
         if not _OPENROUTER_AVAILABLE:
             print("🛑 [MODEL_PROVIDER='openrouter' but OpenRouter is NOT configured — "
-                  "Jarvis cannot run until OPENROUTER_API_KEY is set!]")
+                  "Midum cannot run until OPENROUTER_API_KEY is set!]")
         else:
-            print(f"🧠 [PRIMARY MODEL: OpenRouter/{OPENROUTER_MODEL} — driving Jarvis directly]")
+            print(f"🧠 [PRIMARY MODEL: OpenRouter/{OPENROUTER_MODEL} — driving Midum directly]")
     elif MODEL_PROVIDER == "gemini_web":
         if not _GEMINI_WEBAPI_AVAILABLE:
             print(f"🛑 [MODEL_PROVIDER='gemini_web' but gemini_webapi is NOT installed — "
@@ -11393,20 +11782,20 @@ if __name__ == "__main__":
                 print(f"🛑 [MODEL_PROVIDER='gemini_web' but the client failed to initialize: {_gw_err}]")
             else:
                 print(f"🧠 [PRIMARY MODEL: Gemini-web/{GEMINI_WEB_MODEL or 'auto'} — "
-                      f"driving Jarvis directly via gemini_webapi ChatSession]")
+                      f"driving Midum directly via gemini_webapi ChatSession]")
     elif MODEL_PROVIDER == "gemini_api":
         if not _GEMINI_API_AVAILABLE:
             print("🛑 [MODEL_PROVIDER='gemini_api' but the Gemini API is NOT configured — "
-                  "Jarvis cannot run until GEMINI_API_KEY is set!]")
+                  "Midum cannot run until GEMINI_API_KEY is set!]")
         else:
-            print(f"🧠 [PRIMARY MODEL: Gemini-API/{GEMINI_API_MODEL} — driving Jarvis directly "
+            print(f"🧠 [PRIMARY MODEL: Gemini-API/{GEMINI_API_MODEL} — driving Midum directly "
                   f"via the official API]")
     elif MODEL_PROVIDER == "groq":
         if not _GROQ_AVAILABLE:
             print("🛑 [MODEL_PROVIDER='groq' but GroqCloud is NOT configured — "
-                  "Jarvis cannot run until GROQ_API_KEY is set!]")
+                  "Midum cannot run until GROQ_API_KEY is set!]")
         else:
-            print(f"🧠 [PRIMARY MODEL: Groq/{GROQ_MODEL} — driving Jarvis directly "
+            print(f"🧠 [PRIMARY MODEL: Groq/{GROQ_MODEL} — driving Midum directly "
                   f"via GroqCloud's free-tier API]")
     else:
         print(f"🧠 [PRIMARY MODEL: Ollama/{MODEL_NAME} — local execution brain]")
@@ -11449,14 +11838,14 @@ if __name__ == "__main__":
 
     try:
         with open(LOG_FILE, "w", encoding="utf-8") as f:
-            f.write("# Jarvis Master Interaction Log\n")
+            f.write("# Midum Master Interaction Log\n")
             f.write(f"Session started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
             f.write("=========================================\n\n")
     except Exception as e:
         print(f"⚠️ Warning: Could not initialise log file: {e}")
 
     print("\n====================================================")
-    print("Jarvis local agent started. Persistent Chat Ready.")
+    print("Midum local agent started. Persistent Chat Ready.")
     print(f"Tracking live session in: {LOG_FILE}")
     print("Type 'new session' to wipe session memory.")
     print("Type 'exit' or 'quit' to close.")
@@ -11490,7 +11879,7 @@ if __name__ == "__main__":
                 ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
                 write_local_file(
                     SESSION_MEMORY,
-                    f"# Jarvis Session Memory\nSession started: {ts}\n\n"
+                    f"# Midum Session Memory\nSession started: {ts}\n\n"
                     f"{GOAL_SECTION_HEADER}\n_No active goal._\n\n{GOAL_SECTION_END}\n"
                 )
                 print("🧠 New session started.\n")
@@ -11549,7 +11938,7 @@ if __name__ == "__main__":
                 user_request=user_input,
                 gemini_plan=gemini_plan
             )
-            _print_reply("Jarvis:", assistant_reply)
+            _print_reply("Midum:", assistant_reply)
 
             python_trigger_memory_update(turn_tool_outputs, assistant_reply)
 
@@ -11558,7 +11947,7 @@ if __name__ == "__main__":
                     f.write(f"# Response {turn_counter}\n\n")
                     f.write(f"### **User Prompt:**\n> {user_input}\n\n")
                     f.write(f"_Goal: {_current_goal or 'none'}_\n\n")
-                    f.write(f"### **Jarvis Reply:**\n{assistant_reply}\n\n---\n\n")
+                    f.write(f"### **Midum Reply:**\n{assistant_reply}\n\n---\n\n")
                 print(f"💾 [Logged response {turn_counter}]")
                 turn_counter += 1
             except Exception as e:

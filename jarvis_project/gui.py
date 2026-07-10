@@ -1,5 +1,5 @@
 """
-gui.py — Jarvis Desktop GUI
+gui.py — Midum Desktop GUI
 Entry point: python gui.py
 
 Requires:
@@ -19,17 +19,33 @@ import json
 import traceback
 import subprocess
 import re
+import io
+import base64
+import uuid
 
 import customtkinter as ctk
 from tkinter import messagebox, filedialog
 import tkinter as tk
 
-# ── Import core Jarvis engine ─────────────────────────────────────────────────
+# Pillow is used only for inline image thumbnails (generate_image tool
+# output). The GUI works fine without it — thumbnails just fall back to a
+# clickable file-path line.
+try:
+    from PIL import Image as _PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PILImage = None
+    _PIL_AVAILABLE = False
+
+# ── Import core Midum engine ─────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import main as jarvis
+import main as midum
+
+# Where persisted chat sessions live on disk (one JSON file per chat).
+CHATS_DIR = os.path.join(midum.STORAGE_DIR, "chats")
 
 # =============================================================================
 # THEME & PALETTE (Refined Dark — Slate Carbon)
@@ -64,7 +80,7 @@ C = {
 
     # Chat bubbles
     "user_msg":   "#1a2744",   # User message bubble
-    "jarvis_msg": "#0f1623",   # Jarvis response bubble
+    "midum_msg": "#0f1623",   # Midum response bubble
 
     # Console
     "tool_bg":    "#050810",   # Terminal / mono background
@@ -86,7 +102,7 @@ FONT_HEAD   = ("Segoe UI",      15, "bold")
 # Sentinel prefix used to tag say()-tool output pushed through the stdout
 # queue so _poll() can route it to a live chat bubble instead of only the
 # sidebar log. Unlikely to collide with real engine output.
-_SAY_TAG = "\x02JARVIS_SAY\x02"
+_SAY_TAG = "\x02MIDUM_SAY\x02"
 
 # Any line whose stripped text starts with one of these emoji is treated as
 # a "major system event" (memory writes, goal changes, skill/instruction/path
@@ -124,31 +140,31 @@ def _is_tool_line(raw_line: str) -> bool:
 # MANUAL TOOL SANDBOX DISPATCHER
 # =============================================================================
 # Mirrors process_chat_turn's real dispatch table in main.py exactly, so every
-# tool in jarvis.tools behaves identically here as it would during a live
+# tool in midum.tools behaves identically here as it would during a live
 # agent turn — including the tools that have no 1:1 module-level function
 # (snapshot/act route to CDP or UIA depending on target; several tools are
-# methods on jarvis.ui_navigator, not the jarvis module itself).
+# methods on midum.ui_navigator, not the midum module itself).
 # The generic fallback at the bottom means any NEW tool later added to
 # main.py that doesn't need special routing works automatically with zero
-# GUI changes — the tool list itself is already pulled live from jarvis.tools.
-def _dispatch_jarvis_tool(tool_name: str, args: dict):
+# GUI changes — the tool list itself is already pulled live from midum.tools.
+def _dispatch_midum_tool(tool_name: str, args: dict):
     # ── say() — sandbox-safe stand-in; doesn't touch real turn-scoped state ──
     if tool_name == "say":
         return f"[say] {args.get('message', '')}"
 
     # ── File I/O requiring relative-path resolution first ────────────────────
     if tool_name == "read_local_file":
-        resolved, _ = jarvis.resolve_file_path(args.get("path", ""))
-        return jarvis.read_local_file(resolved)
+        resolved, _ = midum.resolve_file_path(args.get("path", ""))
+        return midum.read_local_file(resolved)
     if tool_name == "write_local_file":
-        resolved, _ = jarvis.resolve_file_path(args.get("path", ""))
-        return jarvis.write_local_file(resolved, args.get("content", ""))
+        resolved, _ = midum.resolve_file_path(args.get("path", ""))
+        return midum.write_local_file(resolved, args.get("content", ""))
     if tool_name == "append_local_file":
-        resolved, _ = jarvis.resolve_file_path(args.get("path", ""))
-        return jarvis.append_local_file(resolved, args.get("content", ""))
+        resolved, _ = midum.resolve_file_path(args.get("path", ""))
+        return midum.append_local_file(resolved, args.get("content", ""))
 
     # ── Unified snapshot/act — route to CDP (browser) or UIA (desktop) ───────
-    # These have NO module-level jarvis.snapshot / jarvis.act function at all;
+    # These have NO module-level midum.snapshot / midum.act function at all;
     # they only exist as inline routing inside process_chat_turn, which is
     # exactly why they silently failed before. Replicated here in full.
     if tool_name in ("snapshot", "snapshot_ui", "snapshot_browser_elements"):
@@ -161,10 +177,10 @@ def _dispatch_jarvis_tool(tool_name: str, args: dict):
                     tab_index = int(target.split(":", 1)[1])
                 except ValueError:
                     pass
-            return jarvis.snapshot_browser_elements(tab_index, filter_type)
-        if jarvis.ui_navigator is None:
-            return jarvis._uia_unavailable_message()
-        return jarvis.ui_navigator.snapshot_ui(target, filter_type)
+            return midum.snapshot_browser_elements(tab_index, filter_type)
+        if midum.ui_navigator is None:
+            return midum._uia_unavailable_message()
+        return midum.ui_navigator.snapshot_ui(target, filter_type)
 
     if tool_name in ("act", "act_on_element", "act_on_browser_element"):
         target       = args.get("target") or args.get("window_title", "")
@@ -178,35 +194,35 @@ def _dispatch_jarvis_tool(tool_name: str, args: dict):
                     tab_index = int(target.split(":", 1)[1])
                 except ValueError:
                     pass
-            return jarvis.act_on_browser_element(index, action, text_to_type, tab_index)
-        if jarvis.ui_navigator is None:
-            return jarvis._uia_unavailable_message()
-        return jarvis.ui_navigator.act_on_element_by_index(target, index, action, text_to_type)
+            return midum.act_on_browser_element(index, action, text_to_type, tab_index)
+        if midum.ui_navigator is None:
+            return midum._uia_unavailable_message()
+        return midum.ui_navigator.act_on_element_by_index(target, index, action, text_to_type)
 
-    # ── Methods that live on ui_navigator, not the jarvis module itself ──────
+    # ── Methods that live on ui_navigator, not the midum module itself ──────
     if tool_name in ("read_aggregated_text", "query_gemini_app", "manage_gemini_chat"):
-        if jarvis.ui_navigator is None:
+        if midum.ui_navigator is None:
             return "UI automation is currently unavailable."
-        return getattr(jarvis.ui_navigator, tool_name)(**args)
+        return getattr(midum.ui_navigator, tool_name)(**args)
 
     # ── Screenshot — truncate the base64 payload so the textbox doesn't choke ─
     if tool_name == "fallback_view_screen":
-        out = jarvis.capture_screen_to_ram()
+        out = midum.capture_screen_to_ram()
         if isinstance(out, str) and len(out) > 1000 and not out.startswith("Error"):
             return (f"Screenshot captured to RAM ({len(out)} bytes of base64 data — "
                      f"hidden here to avoid GUI lag, but the tool itself is functional).")
         return out
 
     # ── Generic fallback — every remaining tool maps straight onto the
-    # jarvis module or jarvis.ui_navigator by name. This is what makes new
+    # midum module or midum.ui_navigator by name. This is what makes new
     # tools "just work" automatically without touching the GUI again. ───────
-    if hasattr(jarvis, tool_name):
-        return getattr(jarvis, tool_name)(**args)
-    if jarvis.ui_navigator is not None and hasattr(jarvis.ui_navigator, tool_name):
-        return getattr(jarvis.ui_navigator, tool_name)(**args)
+    if hasattr(midum, tool_name):
+        return getattr(midum, tool_name)(**args)
+    if midum.ui_navigator is not None and hasattr(midum.ui_navigator, tool_name):
+        return getattr(midum.ui_navigator, tool_name)(**args)
 
-    return (f"Error: '{tool_name}' is registered in jarvis.tools but has no matching "
-            f"function on the jarvis module or ui_navigator. This is a main.py gap, "
+    return (f"Error: '{tool_name}' is registered in midum.tools but has no matching "
+            f"function on the midum module or ui_navigator. This is a main.py gap, "
             f"not a GUI issue — add a module-level function or ui_navigator method "
             f"named '{tool_name}'.")
 
@@ -231,9 +247,9 @@ class _StdoutRedirector:
         sys.stdout = self._old
 
 # =============================================================================
-# JARVIS SESSION STATE (shared between GUI and engine thread)
+# MIDUM SESSION STATE (shared between GUI and engine thread)
 # =============================================================================
-class JarvisSession:
+class MidumSession:
     def __init__(self):
         self.history          = []
         self.turn_counter     = 1
@@ -263,6 +279,232 @@ class JarvisSession:
     def snapshot(self) -> list:
         with self._lock:
             return list(self.history)
+
+
+# =============================================================================
+# PERSISTENT CHAT STORAGE — one JSON file per chat under storage/chats/
+# =============================================================================
+class ChatStore:
+    """
+    Persists chat sessions to disk so they survive app restarts and can be
+    reopened later. Each chat is a single JSON file named "<id>.json"
+    containing:
+        id            — uuid4 hex
+        title         — derived from the first user message (editable later)
+        created_at    — ISO timestamp, set once
+        updated_at    — ISO timestamp, refreshed on every save
+        history       — full LLM message history (role/content dicts) so the
+                         chat can be resumed with complete context
+        display       — list of (tag, text) tuples used to replay the chat
+                         bubbles in the GUI without re-running anything
+    """
+
+    def __init__(self, directory: str):
+        self.dir = directory
+        os.makedirs(self.dir, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def _path(self, chat_id: str) -> str:
+        return os.path.join(self.dir, f"{chat_id}.json")
+
+    def list_chats(self) -> list:
+        """Returns [{id, title, created_at, updated_at}, ...] newest first."""
+        items = []
+        with self._lock:
+            try:
+                fnames = os.listdir(self.dir)
+            except Exception:
+                fnames = []
+            for fname in fnames:
+                if not fname.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(self.dir, fname), "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    items.append({
+                        "id":         data.get("id", fname[:-5]),
+                        "title":      data.get("title") or "Untitled chat",
+                        "created_at": data.get("created_at", ""),
+                        "updated_at": data.get("updated_at", ""),
+                    })
+                except Exception:
+                    continue
+        items.sort(key=lambda x: x["updated_at"], reverse=True)
+        return items
+
+    def load(self, chat_id: str) -> dict:
+        with self._lock:
+            with open(self._path(chat_id), "r", encoding="utf-8") as f:
+                return json.load(f)
+
+    def save(self, chat_id: str, title: str, history: list, display_log: list) -> None:
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        created_at = now
+        path = self._path(chat_id)
+        with self._lock:
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        created_at = json.load(f).get("created_at", now)
+                except Exception:
+                    pass
+            data = {
+                "id": chat_id,
+                "title": title or "Untitled chat",
+                "created_at": created_at,
+                "updated_at": now,
+                "history": history,
+                "display": display_log,
+            }
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+
+    def delete(self, chat_id: str) -> None:
+        with self._lock:
+            path = self._path(chat_id)
+            if os.path.exists(path):
+                os.remove(path)
+
+    def rename(self, chat_id: str, new_title: str) -> None:
+        with self._lock:
+            path = self._path(chat_id)
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            data["title"] = new_title or "Untitled chat"
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+
+
+# =============================================================================
+# CHAT HISTORY BROWSER — lists persisted chats, not a sidebar tab
+# =============================================================================
+class ChatHistoryDialog(ctk.CTkToplevel):
+    """
+    Standalone window (opened via the sidebar's 🕘 History button) that lists
+    every persisted chat, newest first, and lets the user reopen, rename, or
+    delete one. Kept out of the CTkTabview on purpose — chat history isn't a
+    "system tab", it's a modal browsing action.
+    """
+
+    def __init__(self, parent, chat_store: "ChatStore", current_chat_id, on_open, on_deleted_current):
+        super().__init__(parent)
+        self.title("🕘 Chat History")
+        self.geometry("460x560")
+        self.minsize(360, 320)
+        self.configure(fg_color=C["bg"])
+
+        self._store = chat_store
+        self._current_chat_id = current_chat_id
+        self._on_open = on_open
+        self._on_deleted_current = on_deleted_current
+
+        shell = ctk.CTkFrame(self, fg_color=C["panel"], corner_radius=20, border_width=1, border_color=C["border"])
+        shell.pack(fill="both", expand=True, padx=8, pady=8)
+        shell.grid_rowconfigure(1, weight=1)
+        shell.grid_columnconfigure(0, weight=1)
+
+        hdr = ctk.CTkFrame(shell, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(hdr, text="Chat History", font=FONT_TITLE, text_color=C["text"]).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            hdr, text="✕", width=28, height=28, fg_color="transparent",
+            hover_color=C["surface2"], text_color=C["subtext"], corner_radius=14,
+            command=self.destroy
+        ).grid(row=0, column=1, sticky="e")
+
+        self._list_frame = ctk.CTkScrollableFrame(
+            shell, fg_color=C["surface"], corner_radius=16,
+            border_width=1, border_color=C["border"]
+        )
+        self._list_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        self._list_frame.grid_columnconfigure(0, weight=1)
+
+        self._populate()
+
+        self.lift()
+        self.focus_force()
+        self.grab_set()
+
+    def _populate(self):
+        for w in self._list_frame.winfo_children():
+            w.destroy()
+
+        chats = self._store.list_chats()
+
+        if not chats:
+            ctk.CTkLabel(
+                self._list_frame, text="No saved chats yet.",
+                font=FONT_SMALL, text_color=C["subtext"]
+            ).grid(row=0, column=0, sticky="w", padx=8, pady=12)
+            return
+
+        for i, chat in enumerate(chats):
+            self._build_row(i, chat)
+
+    def _build_row(self, row: int, chat: dict):
+        is_current = chat["id"] == self._current_chat_id
+
+        card = ctk.CTkFrame(
+            self._list_frame, corner_radius=14,
+            fg_color=C["accent_faint"] if is_current else C["panel"],
+            border_width=1, border_color=C["accent"] if is_current else C["border2"],
+        )
+        card.grid(row=row, column=0, sticky="ew", padx=6, pady=5)
+        card.grid_columnconfigure(0, weight=1)
+
+        info = ctk.CTkFrame(card, fg_color="transparent")
+        info.grid(row=0, column=0, sticky="ew", padx=(14, 6), pady=10)
+        info.grid_columnconfigure(0, weight=1)
+
+        title = chat["title"] or "Untitled chat"
+        if len(title) > 46:
+            title = title[:45] + "…"
+        ctk.CTkLabel(
+            info, text=title, font=FONT_BOLD, text_color=C["text"],
+            anchor="w", justify="left"
+        ).grid(row=0, column=0, sticky="ew")
+
+        ts = chat.get("updated_at", "")
+        ts_display = ts.replace("T", "  ") if ts else ""
+        ctk.CTkLabel(
+            info, text=ts_display, font=FONT_TINY, text_color=C["subtext"], anchor="w"
+        ).grid(row=1, column=0, sticky="ew", pady=(2, 0))
+
+        btns = ctk.CTkFrame(card, fg_color="transparent")
+        btns.grid(row=0, column=1, sticky="e", padx=(0, 10), pady=10)
+
+        ctk.CTkButton(
+            btns, text="Open", width=56, height=26, font=FONT_LABEL,
+            fg_color=C["accent"], hover_color=C["accent_dim"], corner_radius=13,
+            command=lambda cid=chat["id"]: self._open(cid)
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            btns, text="🗑", width=30, height=26, font=FONT_LABEL,
+            fg_color="transparent", hover_color="#2d1010",
+            text_color=C["red"], border_width=1, border_color="#3f0f0f", corner_radius=13,
+            command=lambda cid=chat["id"], t=title: self._delete(cid, t)
+        ).pack(side="left")
+
+    def _open(self, chat_id: str):
+        self._on_open(chat_id)
+        self.destroy()
+
+    def _delete(self, chat_id: str, title: str):
+        if not messagebox.askyesno("Delete Chat", f'Permanently delete "{title}"?'):
+            return
+        self._store.delete(chat_id)
+        if chat_id == self._current_chat_id:
+            self._on_deleted_current()
+        self._populate()
+
 
 # =============================================================================
 # SLEEK MODAL DIALOGUES FOR FILE CREATION
@@ -567,31 +809,31 @@ DEFAULT_PROVIDER_KEY = "ollama"
 def _default_model_for_provider(provider_key: str) -> str:
     """Returns the model id currently configured in main.py for a provider."""
     return {
-        "ollama":     jarvis.MODEL_NAME,
-        "openrouter": jarvis.OPENROUTER_MODEL,
-        "gemini_web": jarvis.GEMINI_WEB_MODEL or "(auto)",
-        "gemini_api": jarvis.GEMINI_API_MODEL,
-        "groq":       jarvis.GROQ_MODEL,
+        "ollama":     midum.MODEL_NAME,
+        "openrouter": midum.OPENROUTER_MODEL,
+        "gemini_web": midum.GEMINI_WEB_MODEL or "(auto)",
+        "gemini_api": midum.GEMINI_API_MODEL,
+        "groq":       midum.GROQ_MODEL,
     }.get(provider_key, "")
 
 
 def _known_models_for_provider(provider_key: str) -> list:
     """Best-effort list of model choices to seed the dropdown with."""
     if provider_key == "openrouter":
-        return list(dict.fromkeys(jarvis.OPENROUTER_FALLBACK_MODELS))
+        return list(dict.fromkeys(midum.OPENROUTER_FALLBACK_MODELS))
     if provider_key == "groq":
-        return list(dict.fromkeys(jarvis.GROQ_FALLBACK_MODELS))
+        return list(dict.fromkeys(midum.GROQ_FALLBACK_MODELS))
     if provider_key == "gemini_api":
-        return list(dict.fromkeys([jarvis.GEMINI_API_MODEL, "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"]))
+        return list(dict.fromkeys([midum.GEMINI_API_MODEL, "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"]))
     if provider_key == "gemini_web":
-        return list(dict.fromkeys([jarvis.GEMINI_WEB_MODEL or "(auto)", "(auto)", "gemini-3-flash"]))
-    return [jarvis.MODEL_NAME]
+        return list(dict.fromkeys([midum.GEMINI_WEB_MODEL or "(auto)", "(auto)", "gemini-3-flash"]))
+    return [midum.MODEL_NAME]
 
 
 def _list_ollama_models() -> list:
     """Queries the local Ollama daemon for installed model names. Never raises."""
     try:
-        resp = jarvis.ollama.list()
+        resp = midum.ollama.list()
         models = resp.get("models", []) if isinstance(resp, dict) else getattr(resp, "models", [])
         names = []
         for m in models:
@@ -603,19 +845,26 @@ def _list_ollama_models() -> list:
         return []
 
 
-class JarvisGUI(ctk.CTk):
+class MidumGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Jarvis Control Center")
+        self.title("Midum Control Center")
         self.geometry("1600x950")
         self.minsize(1200, 750)
         self.configure(fg_color=C["bg"])
 
-        self._session      = JarvisSession()
+        self._session      = MidumSession()
         self._thinking     = False
         self._log_queue    = queue.Queue()   # stdout lines from engine
         self._reply_queue  = queue.Queue()   # (reply, tool_outputs) from engine
+
+        # ── Persistent chat history ─────────────────────────────────────────
+        self._chat_store      = ChatStore(CHATS_DIR)
+        self._current_chat_id = uuid.uuid4().hex
+        self._chat_title      = None      # derived from first user message
+        self._display_log     = []        # [(tag, text), ...] replay log
+        self._replaying_chat  = False     # True while re-rendering a loaded chat
 
         # Provider / model selection — defaults to Local (Ollama) on every
         # launch, regardless of MODEL_PROVIDER hardcoded in main.py.
@@ -632,7 +881,7 @@ class JarvisGUI(ctk.CTk):
         sys.stdout = self._stdout_redir
 
         # ── say() tool compatibility ────────────────────────────────────────
-        # jarvis._print_reply binds a rich Console to sys.stdout at MODULE
+        # midum._print_reply binds a rich Console to sys.stdout at MODULE
         # IMPORT time (before our redirection above ever runs), so its rich
         # markdown branch would silently bypass the GUI entirely. We intercept
         # the function directly instead of relying on stdout capture, and tag
@@ -642,13 +891,13 @@ class JarvisGUI(ctk.CTk):
             if not text or re.match(r'^[{}\[\]",:\s]*$', text.strip()):
                 return
             self._log_queue.put(_SAY_TAG + text)
-        jarvis._print_reply = _gui_say_intercept
+        midum._print_reply = _gui_say_intercept
 
         # ── ask_user_* inline chat interaction hook ─────────────────────────
         # Wires main.py's ask_user_text / ask_user_file_path / ask_user_approval
         # / ask_user_choice tools to render as inline cards in the main chat
         # instead of separate native tkinter popups. See _handle_gui_ask below.
-        jarvis._gui_ask_hook = self._handle_gui_ask
+        midum._gui_ask_hook = self._handle_gui_ask
 
         # Setup base directory trackers
         self._base_work_dir = r"D:\\"
@@ -677,44 +926,44 @@ class JarvisGUI(ctk.CTk):
         Runs off the main thread since each connection can block on a
         subprocess spawn / network handshake.
         """
-        configs = jarvis._load_mcp_config()
+        configs = midum._load_mcp_config()
         if not configs:
             return
 
         self._activity_append(f"🔌 Reconnecting {len(configs)} saved MCP server(s)...\n")
 
         def worker():
-            jarvis.init_mcp_servers_from_config()
+            midum.init_mcp_servers_from_config()
             self.after(0, self._refresh_mcp_list)
             self.after(0, lambda: self._activity_append("🔌 MCP auto-connect pass complete.\n"))
 
         threading.Thread(target=worker, daemon=True).start()
 
         # 1. Ensure core directories and files exist
-        jarvis._bootstrap_all_files()
+        midum._bootstrap_all_files()
         
         # 2. Fetch master system prompt from the engine
         try:
-            sys_prompt = jarvis.get_system_prompt()
+            sys_prompt = midum.get_system_prompt()
         except AttributeError:
             # Fallback if get_system_prompt hasn't been merged into main.py yet
-            sys_prompt = "You are Jarvis. Rules:\n- Proceed safely."
+            sys_prompt = "You are Midum. Rules:\n- Proceed safely."
 
         # 3. Load general core memories safely (bypass CLI input loops)
         memories = []
-        master_ctx = jarvis.load_memory_into_context(jarvis.MASTER_MEMORY, "master")
+        master_ctx = midum.load_memory_into_context(midum.MASTER_MEMORY, "master")
         if master_ctx: 
             memories.append(master_ctx)
         
-        session_ctx = jarvis.load_memory_into_context(jarvis.SESSION_MEMORY, "session (continued)")
+        session_ctx = midum.load_memory_into_context(midum.SESSION_MEMORY, "session (continued)")
         if session_ctx: 
             memories.append(session_ctx)
             
         try:
-            with open(jarvis.INSTRUCTIONS_FILE, "r", encoding="utf-8") as f:
+            with open(midum.INSTRUCTIONS_FILE, "r", encoding="utf-8") as f:
                 _instr = f.read().strip()
             if _instr: 
-                memories.append("[JARVIS INSTRUCTIONS — always active]\n" + _instr)
+                memories.append("[MIDUM INSTRUCTIONS — always active]\n" + _instr)
         except Exception:
             pass
 
@@ -759,7 +1008,7 @@ class JarvisGUI(ctk.CTk):
         brand = ctk.CTkFrame(bar, fg_color="transparent")
         brand.grid(row=0, column=0, sticky="w", padx=(12, 0))
         ctk.CTkLabel(brand, text="⚡", font=("Segoe UI", 13), text_color=C["accent"]).pack(side="left")
-        ctk.CTkLabel(brand, text="Jarvis", font=("Segoe UI", 12, "bold"), text_color=C["text"]).pack(side="left", padx=(5, 0))
+        ctk.CTkLabel(brand, text="Midum", font=("Segoe UI", 12, "bold"), text_color=C["text"]).pack(side="left", padx=(5, 0))
 
         # Status (center-left)
         status_row = ctk.CTkFrame(bar, fg_color="transparent")
@@ -795,13 +1044,25 @@ class JarvisGUI(ctk.CTk):
         # Add to paned window — sets initial width and enforces minimum
         self._paned.add(self._sidebar, minsize=200, width=420)
 
-        # ── New Session ───────────────────────────────────────────────────────
+        # ── New Session · Chat History ──────────────────────────────────────
+        session_row = ctk.CTkFrame(self._sidebar, fg_color="transparent")
+        session_row.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+        session_row.grid_columnconfigure(0, weight=1)
+        session_row.grid_columnconfigure(1, weight=0)
+
         ctk.CTkButton(
-            self._sidebar, text="+ New Session", height=30,
+            session_row, text="+ New Session", height=30,
             fg_color=C["surface2"], hover_color=C["border2"],
             text_color=C["text"], font=FONT_SMALL,
             corner_radius=20, command=self._new_session
-        ).grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        ctk.CTkButton(
+            session_row, text="🕘", width=36, height=30,
+            fg_color=C["surface2"], hover_color=C["border2"],
+            text_color=C["text"], font=FONT_SMALL,
+            corner_radius=20, command=self._open_history_dialog
+        ).grid(row=0, column=1, sticky="e")
 
         # ── Workspace label ───────────────────────────────────────────────────
         ctk.CTkLabel(
@@ -854,19 +1115,45 @@ class JarvisGUI(ctk.CTk):
         ).grid(row=4, column=0, sticky="ew", padx=10, pady=(4, 0))
 
         # ── System tabs (expands) ─────────────────────────────────────────────
+        # Rounded card look: the whole tabview sits on a raised, bordered
+        # surface, and the segmented-button strip (the row of tab labels)
+        # gets its own pill-shaped buttons with generous spacing instead of
+        # the flat, square default look.
+        tabs_outer = ctk.CTkFrame(
+            self._sidebar, fg_color=C["surface"], corner_radius=16,
+            border_width=1, border_color=C["border2"]
+        )
+        tabs_outer.grid(row=5, column=0, sticky="nsew", padx=8, pady=(8, 0))
+        tabs_outer.grid_rowconfigure(0, weight=1)
+        tabs_outer.grid_columnconfigure(0, weight=1)
+
         self._tabs = ctk.CTkTabview(
-            self._sidebar,
-            fg_color=C["surface"],
-            segmented_button_fg_color=C["surface"],
+            tabs_outer,
+            fg_color="transparent",
+            segmented_button_fg_color=C["panel"],
             segmented_button_selected_color=C["accent"],
             segmented_button_selected_hover_color=C["accent_dim"],
             segmented_button_unselected_hover_color=C["surface2"],
-            corner_radius=0
+            segmented_button_unselected_color=C["panel"],
+            text_color=C["text"],
+            text_color_disabled=C["subtext"],
+            corner_radius=14,
         )
-        self._tabs.grid(row=5, column=0, sticky="nsew", padx=0, pady=0)
+        self._tabs.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 
         for tab in ("Log", "Model", "Parameters", "System Core", "Knowledge", "Skills", "Tools", "MCP"):
             self._tabs.add(tab)
+
+        # The segmented button is the actual row of tab labels — style it
+        # directly for rounded pills, tighter/cleaner font, and breathing
+        # room between each label instead of the cramped default strip.
+        try:
+            seg = self._tabs._segmented_button
+            seg.configure(font=FONT_LABEL, corner_radius=12, height=30)
+            for child in seg._buttons_dict.values():
+                child.configure(corner_radius=12, font=FONT_LABEL)
+        except Exception:
+            pass
 
         self._build_activity_panel()
         self._build_model_tab()
@@ -953,7 +1240,7 @@ class JarvisGUI(ctk.CTk):
         input_box.grid_columnconfigure(0, weight=1)
 
         self._input = ctk.CTkEntry(
-            input_box, placeholder_text="Message Jarvis...",
+            input_box, placeholder_text="Message Midum...",
             font=FONT_BODY, fg_color="transparent",
             text_color=C["text"], border_width=0,
             height=46, corner_radius=26
@@ -1095,7 +1382,7 @@ class JarvisGUI(ctk.CTk):
             self._model_combobox.set(default_model)
 
     def _apply_model_selection(self, startup: bool = False):
-        """Commits the chosen provider/model. Mutates the matching jarvis.py
+        """Commits the chosen provider/model. Mutates the matching midum.py
         global(s) so every part of the engine (system prompt, status labels,
         consult/delegate helpers) sees the new selection consistently, and
         stores it locally so _run_turn can pass it as force_provider/force_model."""
@@ -1109,17 +1396,17 @@ class JarvisGUI(ctk.CTk):
         self._selected_provider = provider_key
         self._selected_model    = model_id
 
-        jarvis.MODEL_PROVIDER = provider_key
+        midum.MODEL_PROVIDER = provider_key
         if provider_key == "ollama":
-            jarvis.MODEL_NAME = model_id
+            midum.MODEL_NAME = model_id
         elif provider_key == "openrouter":
-            jarvis.OPENROUTER_MODEL = model_id
+            midum.OPENROUTER_MODEL = model_id
         elif provider_key == "gemini_web":
-            jarvis.GEMINI_WEB_MODEL = model_id
+            midum.GEMINI_WEB_MODEL = model_id
         elif provider_key == "gemini_api":
-            jarvis.GEMINI_API_MODEL = model_id
+            midum.GEMINI_API_MODEL = model_id
         elif provider_key == "groq":
-            jarvis.GROQ_MODEL = model_id
+            midum.GROQ_MODEL = model_id
 
         label = _PROVIDER_KEY_TO_LABEL[provider_key]
         shown = model_id or "(auto)"
@@ -1199,12 +1486,12 @@ class JarvisGUI(ctk.CTk):
 
     def _get_sys_core_path(self, selection: str) -> str:
         mapping = {
-            "Master Memory": jarvis.MASTER_MEMORY,
-            "Session Memory": jarvis.SESSION_MEMORY,
-            "Instructions": jarvis.INSTRUCTIONS_FILE,
-            "Paths": jarvis.PATHS_FILE,
-            "Active Project": jarvis._active_project_memory_path,
-            "Scratchpad": jarvis.RESPONSE_MEMORY
+            "Master Memory": midum.MASTER_MEMORY,
+            "Session Memory": midum.SESSION_MEMORY,
+            "Instructions": midum.INSTRUCTIONS_FILE,
+            "Paths": midum.PATHS_FILE,
+            "Active Project": midum._active_project_memory_path,
+            "Scratchpad": midum.RESPONSE_MEMORY
         }
         return mapping.get(selection)
 
@@ -1270,9 +1557,9 @@ class JarvisGUI(ctk.CTk):
     def _refresh_knowledge_dropdown(self, select_name=None):
         try:
             files = []
-            if os.path.exists(jarvis.STORAGE_DIR):
-                for f in os.listdir(jarvis.STORAGE_DIR):
-                    if f.endswith(".md") and os.path.isfile(os.path.join(jarvis.STORAGE_DIR, f)):
+            if os.path.exists(midum.STORAGE_DIR):
+                for f in os.listdir(midum.STORAGE_DIR):
+                    if f.endswith(".md") and os.path.isfile(os.path.join(midum.STORAGE_DIR, f)):
                         # Exclude system files from custom list
                         if f.lower() not in ("master_memory.md", "session_memory.md", "instructions.md", "paths.md", "response_memory.md"):
                             files.append(f)
@@ -1298,7 +1585,7 @@ class JarvisGUI(ctk.CTk):
     def _on_knowledge_selected(self, filename: str):
         if filename == "No custom bases found":
             return
-        path = os.path.join(jarvis.STORAGE_DIR, filename)
+        path = os.path.join(midum.STORAGE_DIR, filename)
         self._knowledge_active_file = path
         self._load_file_into_box(self._knowledge_box, path)
 
@@ -1313,7 +1600,7 @@ class JarvisGUI(ctk.CTk):
 
     def _execute_create_knowledge(self, name, description):
         try:
-            result = jarvis.create_domain_knowledge(name, description)
+            result = midum.create_domain_knowledge(name, description)
             self._activity_append(f"⚙️ {result}\n")
             
             safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', name.strip().lower())
@@ -1371,9 +1658,9 @@ class JarvisGUI(ctk.CTk):
     def _refresh_skills_dropdown(self, select_name=None):
         try:
             files = []
-            if os.path.exists(jarvis.SKILLS_DIR):
-                for f in os.listdir(jarvis.SKILLS_DIR):
-                    if f.endswith(".md") and os.path.isfile(os.path.join(jarvis.SKILLS_DIR, f)):
+            if os.path.exists(midum.SKILLS_DIR):
+                for f in os.listdir(midum.SKILLS_DIR):
+                    if f.endswith(".md") and os.path.isfile(os.path.join(midum.SKILLS_DIR, f)):
                         files.append(f)
             files.sort()
 
@@ -1397,7 +1684,7 @@ class JarvisGUI(ctk.CTk):
     def _on_skill_selected(self, filename: str):
         if filename == "No custom skills found":
             return
-        path = os.path.join(jarvis.SKILLS_DIR, filename)
+        path = os.path.join(midum.SKILLS_DIR, filename)
         self._skills_active_file = path
         self._load_file_into_box(self._skills_box, path)
 
@@ -1419,7 +1706,7 @@ class JarvisGUI(ctk.CTk):
                 f"1. [ ] State objective details.\n"
                 f"2. [ ] Invoke terminal execution calls.\n"
             )
-            result = jarvis.create_domain_skill(name, domain, description, initial_content)
+            result = midum.create_domain_skill(name, domain, description, initial_content)
             self._activity_append(f"⚙️ {result}\n")
 
             safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', name.strip().lower())
@@ -1441,7 +1728,7 @@ class JarvisGUI(ctk.CTk):
         control_frame.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 4))
         control_frame.grid_columnconfigure(0, weight=1)
 
-        tool_names = [t["function"]["name"] for t in jarvis.tools]
+        tool_names = [t["function"]["name"] for t in midum.tools]
         tool_names.sort()
 
         self._manual_tool_dropdown = ctk.CTkOptionMenu(
@@ -1489,7 +1776,7 @@ class JarvisGUI(ctk.CTk):
         self._manual_arg_entries.clear()
 
         # Locate tool schema to build arguments dynamically
-        schema = next((t["function"] for t in jarvis.tools if t["function"]["name"] == tool_name), None)
+        schema = next((t["function"] for t in midum.tools if t["function"]["name"] == tool_name), None)
         if not schema:
             return
 
@@ -1534,9 +1821,9 @@ class JarvisGUI(ctk.CTk):
 
     def _execute_manual_tool(self):
         tool_name = self._manual_tool_dropdown.get()
-        schema = next((t["function"] for t in jarvis.tools if t["function"]["name"] == tool_name), None)
+        schema = next((t["function"] for t in midum.tools if t["function"]["name"] == tool_name), None)
         if not schema:
-            self._update_manual_output(f"Error: '{tool_name}' has no registered schema in jarvis.tools.")
+            self._update_manual_output(f"Error: '{tool_name}' has no registered schema in midum.tools.")
             return
 
         props    = schema.get("parameters", {}).get("properties", {})
@@ -1583,7 +1870,7 @@ class JarvisGUI(ctk.CTk):
 
         def run_tool_background():
             try:
-                out = _dispatch_jarvis_tool(tool_name, args)
+                out = _dispatch_midum_tool(tool_name, args)
                 self.after(0, self._update_manual_output, str(out))
             except TypeError as e:
                 expected = ", ".join(props.keys()) or "(none)"
@@ -1650,8 +1937,8 @@ class JarvisGUI(ctk.CTk):
         self._refresh_mcp_list()
 
     def _refresh_mcp_list(self):
-        """Rebuilds the server list from jarvis's live MCP state."""
-        if not jarvis._MCP_SDK_AVAILABLE:
+        """Rebuilds the server list from midum's live MCP state."""
+        if not midum._MCP_SDK_AVAILABLE:
             self._mcp_sdk_banner.configure(
                 text="⚠️ 'mcp' package not installed — run: pip install mcp"
             )
@@ -1661,7 +1948,7 @@ class JarvisGUI(ctk.CTk):
         for widget in self._mcp_list_frame.winfo_children():
             widget.destroy()
 
-        names = list(jarvis._MCP_SERVER_ORDER)
+        names = list(midum._MCP_SERVER_ORDER)
         if not names:
             ctk.CTkLabel(
                 self._mcp_list_frame,
@@ -1674,7 +1961,7 @@ class JarvisGUI(ctk.CTk):
             self._build_mcp_row(i, name)
 
     def _build_mcp_row(self, row: int, name: str):
-        handle = jarvis._MCP_SERVERS.get(name)
+        handle = midum._MCP_SERVERS.get(name)
         if handle is None:
             return
 
@@ -1744,7 +2031,7 @@ class JarvisGUI(ctk.CTk):
 
         def worker():
             try:
-                result = jarvis.connect_mcp_server(
+                result = midum.connect_mcp_server(
                     name=payload["name"],
                     transport=payload.get("transport", "stdio"),
                     command=payload.get("command"),
@@ -1762,13 +2049,13 @@ class JarvisGUI(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _retry_mcp_server(self, name: str):
-        handle = jarvis._MCP_SERVERS.get(name)
+        handle = midum._MCP_SERVERS.get(name)
         if not handle:
             return
         self._activity_append(f"🔌 Retrying MCP server '{name}'...\n")
 
         def worker():
-            ok, msg = jarvis._mcp_manager.connect(name, handle.config)
+            ok, msg = midum._mcp_manager.connect(name, handle.config)
             self.after(0, lambda: self._activity_append(f"⚙️ {msg}\n"))
             self.after(0, self._refresh_mcp_list)
 
@@ -1787,14 +2074,14 @@ class JarvisGUI(ctk.CTk):
             return
 
         def worker():
-            result = jarvis.disconnect_mcp_server(name, forget=forget)
+            result = midum.disconnect_mcp_server(name, forget=forget)
             self.after(0, lambda: self._activity_append(f"⚙️ {result}\n"))
             self.after(0, self._refresh_mcp_list)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _view_mcp_tools(self, name: str):
-        content = jarvis.show_server_tools(name)
+        content = midum.show_server_tools(name)
         ViewMCPToolsDialog(self, name, content)
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -1843,13 +2130,13 @@ class JarvisGUI(ctk.CTk):
 
         project_dir = os.path.join(self._base_work_dir, selected_project)
         project_file = os.path.join(project_dir, "project_memory.md")
-        jarvis._active_project_memory_path = project_file
+        midum._active_project_memory_path = project_file
 
         # Auto-create active memory if it is missing
         if not os.path.exists(project_file):
             try:
                 os.makedirs(project_dir, exist_ok=True)
-                jarvis.write_local_file(
+                midum.write_local_file(
                     project_file,
                     f"# Project Memory: {selected_project}\n"
                     f"Created: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
@@ -1864,26 +2151,26 @@ class JarvisGUI(ctk.CTk):
                 # Flush old project memory and append newly updated profile
                 self._session.memory_injections = [
                     inj for inj in self._session.memory_injections 
-                    if not inj.startswith("[JARVIS PROJECT MEMORY")
+                    if not inj.startswith("[MIDUM PROJECT MEMORY")
                 ]
                 self._session.memory_injections.append(
-                    f"[JARVIS PROJECT MEMORY — {selected_project}]\n{content}"
+                    f"[MIDUM PROJECT MEMORY — {selected_project}]\n{content}"
                 )
                 
                 # Rebuild current live session context
                 self._session.history = [
                     msg for msg in self._session.history 
-                    if not (msg.get("role") == "system" and msg.get("content", "").startswith("[JARVIS PROJECT MEMORY"))
+                    if not (msg.get("role") == "system" and msg.get("content", "").startswith("[MIDUM PROJECT MEMORY"))
                 ]
                 self._session.history.append({
                     "role": "system",
-                    "content": f"[JARVIS PROJECT MEMORY — {selected_project}]\n{content}"
+                    "content": f"[MIDUM PROJECT MEMORY — {selected_project}]\n{content}"
                 })
         except Exception as e:
             self._activity_append(f"⚠️ Context injection failure: {e}\n")
 
         # Log updates
-        jarvis.update_memory("master", f"Active project context switched to: {selected_project} ({project_dir})")
+        midum.update_memory("master", f"Active project context switched to: {selected_project} ({project_dir})")
         self._chat_append("system", f"[Workspace context switched to: {selected_project}]\n")
         
         self._set_status("Ready", C["green"])
@@ -1891,7 +2178,7 @@ class JarvisGUI(ctk.CTk):
         self._refresh_file_list(project_dir)
 
         # Force active load if dropdown is currently viewing "Active Project"
-        if self._sys_core_active_file == jarvis._active_project_memory_path or self._sys_core_dropdown.get() == "Active Project":
+        if self._sys_core_active_file == midum._active_project_memory_path or self._sys_core_dropdown.get() == "Active Project":
             self._on_sys_core_selected("Active Project")
 
     def _refresh_file_list(self, directory: str):
@@ -1930,7 +2217,7 @@ class JarvisGUI(ctk.CTk):
                 
             os.makedirs(project_dir, exist_ok=True)
             project_file = os.path.join(project_dir, "project_memory.md")
-            jarvis.write_local_file(
+            midum.write_local_file(
                 project_file,
                 f"# Project Memory: {clean_name}\n"
                 f"Created: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
@@ -1952,7 +2239,7 @@ class JarvisGUI(ctk.CTk):
 
     def _open_project_in_vscode(self):
         """Shortcut action that directly deploys the active workspace inside Visual Studio Code."""
-        proj = jarvis._active_project_memory_path
+        proj = midum._active_project_memory_path
         if proj:
             dir_path = os.path.dirname(proj)
             try:
@@ -1965,7 +2252,7 @@ class JarvisGUI(ctk.CTk):
 
     def _open_project_terminal(self):
         """Shortcut command launching a detached PowerShell window directly focused on the active workspace."""
-        proj = jarvis._active_project_memory_path
+        proj = midum._active_project_memory_path
         if proj:
             dir_path = os.path.dirname(proj)
             try:
@@ -2021,8 +2308,8 @@ class JarvisGUI(ctk.CTk):
 
     def _run_turn(self, history_snapshot: list):
         try:
-            jarvis._abort_event.clear()
-            reply, tool_outputs = jarvis.process_chat_turn(
+            midum._abort_event.clear()
+            reply, tool_outputs = midum.process_chat_turn(
                 history_snapshot,
                 force_provider=self._selected_provider,
                 force_model=self._selected_model or None,
@@ -2067,12 +2354,16 @@ class JarvisGUI(ctk.CTk):
                 status = None
 
             if status == "ok":
-                self._chat_append("jarvis", reply)
+                cleaned_reply, visuals = self._extract_and_strip_visuals(reply, tool_outputs)
+                if cleaned_reply:
+                    self._chat_append("midum", cleaned_reply)
+                for lang, body in visuals:
+                    self._chat_append("midum", f"```{lang}\n{body}\n```")
                 self._set_status("Ready", C["green"])
                 
                 # Dynamic memory updates
                 threading.Thread(
-                    target=jarvis.python_trigger_memory_update,
+                    target=midum.python_trigger_memory_update,
                     args=(tool_outputs, reply),
                     daemon=True
                 ).start()
@@ -2085,7 +2376,7 @@ class JarvisGUI(ctk.CTk):
                 if hasattr(self, "_skills_active_file") and self._skills_active_file:
                     self._load_file_into_box(self._skills_box, self._skills_active_file)
                 
-                proj = jarvis._active_project_memory_path
+                proj = midum._active_project_memory_path
                 if proj:
                     self._refresh_file_list(os.path.dirname(proj))
                 
@@ -2105,7 +2396,7 @@ class JarvisGUI(ctk.CTk):
     # CORE CONTROLLER ACTIONS
     # ──────────────────────────────────────────────────────────────────────────
     def _abort(self):
-        jarvis._abort_event.set()
+        midum._abort_event.set()
         self._set_status("Aborted", C["red"])
         self._activity_append("🛑 Execution pipeline aborted by user (Ctrl+Q)\n")
 
@@ -2117,18 +2408,19 @@ class JarvisGUI(ctk.CTk):
             return
 
         try:
-            if os.path.exists(jarvis.SESSION_MEMORY):
-                os.remove(jarvis.SESSION_MEMORY)
-            jarvis._current_goal = None
+            if os.path.exists(midum.SESSION_MEMORY):
+                os.remove(midum.SESSION_MEMORY)
+            midum._current_goal = None
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            jarvis.write_local_file(
-                jarvis.SESSION_MEMORY,
-                f"# Jarvis Session Memory\nSession started: {ts}\n\n"
-                f"{jarvis.GOAL_SECTION_HEADER}\n_No active goal._\n\n"
-                f"{jarvis.GOAL_SECTION_END}\n"
+            midum.write_local_file(
+                midum.SESSION_MEMORY,
+                f"# Midum Session Memory\nSession started: {ts}\n\n"
+                f"{midum.GOAL_SECTION_HEADER}\n_No active goal._\n\n"
+                f"{midum.GOAL_SECTION_END}\n"
             )
             self._session.reset()
             self._clear_chat()
+            self._start_new_chat_record()
             self._chat_append("system", "[Session wiped, starting fresh context]\n")
             self._refresh_status()
             self._set_status("Ready", C["green"])
@@ -2140,9 +2432,9 @@ class JarvisGUI(ctk.CTk):
         if self._thinking:
             if not messagebox.askyesno("Engine Busy", "A processing cycle is currently executing. Force shut down?"):
                 return
-            jarvis._abort_event.set()
+            midum._abort_event.set()
         
-        self._activity_append("🔌 Shutting down Jarvis Engine Core...\n")
+        self._activity_append("🔌 Shutting down Midum Engine Core...\n")
         self._set_status("Shutting Down", C["red"])
         self.after(500, self._complete_shutdown)
 
@@ -2158,25 +2450,25 @@ class JarvisGUI(ctk.CTk):
         _prov_label = _PROVIDER_KEY_TO_LABEL.get(self._selected_provider, self._selected_provider)
         self._lbl_model.configure(text=f"{_prov_label} — {self._selected_model or '(auto)'}")
         self._lbl_goal.configure(
-            text=jarvis._current_goal or "None active",
-            text_color=C["accent"] if jarvis._current_goal else C["subtext"]
+            text=midum._current_goal or "None active",
+            text_color=C["accent"] if midum._current_goal else C["subtext"]
         )
-        proj = jarvis._active_project_memory_path
+        proj = midum._active_project_memory_path
         self._lbl_project.configure(
             text=os.path.dirname(proj) if proj else "No project selected",
             text_color=C["green"] if proj else C["subtext"]
         )
         self._lbl_gemini.configure(
-            text="✅ System Connected" if jarvis._GEMINI_AVAILABLE else "⚠️  Unconnected",
-            text_color=C["green"] if jarvis._GEMINI_AVAILABLE else C["yellow"]
+            text="✅ System Connected" if midum._GEMINI_AVAILABLE else "⚠️  Unconnected",
+            text_color=C["green"] if midum._GEMINI_AVAILABLE else C["yellow"]
         )
         self._lbl_ocr.configure(
-            text="✅ System Connected" if jarvis._TESSERACT_AVAILABLE else "⚠️  Unconnected",
-            text_color=C["green"] if jarvis._TESSERACT_AVAILABLE else C["yellow"]
+            text="✅ System Connected" if midum._TESSERACT_AVAILABLE else "⚠️  Unconnected",
+            text_color=C["green"] if midum._TESSERACT_AVAILABLE else C["yellow"]
         )
         self._lbl_uia.configure(
-            text="✅ System Connected" if jarvis._UIA_AVAILABLE else "⚠️  Unconnected",
-            text_color=C["green"] if jarvis._UIA_AVAILABLE else C["yellow"]
+            text="✅ System Connected" if midum._UIA_AVAILABLE else "⚠️  Unconnected",
+            text_color=C["green"] if midum._UIA_AVAILABLE else C["yellow"]
         )
         self._lbl_turns.configure(
             text=str(self._session.turn_counter)
@@ -2260,6 +2552,19 @@ class JarvisGUI(ctk.CTk):
                       underline=True)
         tb.tag_config("normal",      font=FONT_BODY,                   foreground=C["text"])
 
+        # ── Flowchart diagram tags ──────────────────────────────────────────
+        tb.tag_config("fc_title",    font=("Segoe UI", 13, "bold"),   foreground=C["text"])
+        tb.tag_config("fc_rule",     font=FONT_MONO,                  foreground=C["border2"])
+        tb.tag_config("fc_arrow",    font=FONT_MONO,                  foreground=C["subtext"])
+        tb.tag_config("fc_edge_lbl", font=("Segoe UI", 10, "italic"), foreground=C["subtext"])
+        tb.tag_config("fc_node_start", font=FONT_MONO, foreground=C["green"],   background=C["surface"])
+        tb.tag_config("fc_node_end",   font=FONT_MONO, foreground=C["red"],     background=C["surface"])
+        tb.tag_config("fc_node_decision", font=FONT_MONO, foreground=C["yellow"], background=C["surface"])
+        tb.tag_config("fc_node_io",    font=FONT_MONO, foreground=C["accent2"], background=C["surface"])
+        tb.tag_config("fc_node_process", font=FONT_MONO, foreground=C["accent"], background=C["surface"])
+        tb.tag_config("fc_node_type",  font=("Segoe UI", 9, "italic"), foreground=C["subtext"],
+                      background=C["surface"])
+
     def _md_inline(self, tb: tk.Text, text: str, base_tag: str = "normal") -> None:
         """
         Insert inline-formatted text into tb, handling:
@@ -2312,6 +2617,218 @@ class JarvisGUI(ctk.CTk):
         if pos < len(text):
             tb.insert("end", text[pos:], base_tag)
 
+    def _copy_image_bytes_to_clipboard(self, png_bytes: bytes) -> tuple[bool, str]:
+        """
+        Copy raw image bytes to the SYSTEM clipboard (so it can be pasted
+        into other apps as an actual image, not just a file path).
+        Tries the platform-appropriate mechanism; returns (ok, message).
+        """
+        try:
+            if sys.platform.startswith("win"):
+                import win32clipboard  # pywin32
+                from PIL import Image as _Img
+                bmp = io.BytesIO()
+                _Img.open(io.BytesIO(png_bytes)).convert("RGB").save(bmp, "BMP")
+                data = bmp.getvalue()[14:]  # strip BMP file header -> DIB
+                win32clipboard.OpenClipboard()
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
+                win32clipboard.CloseClipboard()
+                return True, "Image copied to clipboard."
+            else:
+                # Linux (X11): requires xclip. Wayland users: wl-copy.
+                for cmd in (["xclip", "-selection", "clipboard", "-t", "image/png"],
+                            ["wl-copy", "--type", "image/png"]):
+                    try:
+                        subprocess.run(cmd, input=png_bytes, check=True,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        return True, "Image copied to clipboard."
+                    except (FileNotFoundError, subprocess.CalledProcessError):
+                        continue
+                return False, "Clipboard copy needs 'xclip' (X11) or 'wl-copy' (Wayland) installed."
+        except ImportError:
+            return False, "Clipboard copy on Windows needs pywin32: pip install pywin32"
+        except Exception as e:
+            return False, f"Clipboard copy failed: {e}"
+
+    def _render_image_gallery(self, tb: tk.Text, payload: dict) -> None:
+        """
+        Render the images produced by main.py's generate_image tool inline
+        in the chat, entirely from base64 bytes kept in memory — nothing is
+        read from or written to disk unless the user clicks Download.
+        payload = {"prompt": str, "images": [{"filename": str, "data_b64": str}, ...]}
+        """
+        prompt = payload.get("prompt", "")
+        images = payload.get("images", []) or []
+
+        tb.insert("end", f"\n🖼️  Generated image(s)", "fc_title")
+        if prompt:
+            tb.insert("end", f"  —  \"{prompt}\"\n", "fc_edge_lbl")
+        else:
+            tb.insert("end", "\n")
+
+        if not _PIL_AVAILABLE:
+            tb.insert("end", "(Install Pillow — pip install pillow — to preview images inline.)\n",
+                      "fc_edge_lbl")
+
+        # Keep CTkImage/PhotoImage references alive for the widget's lifetime.
+        if not hasattr(self, "_image_refs"):
+            self._image_refs = []
+
+        for img_entry in images:
+            filename = img_entry.get("filename") or "image.png"
+            b64      = img_entry.get("data_b64", "")
+            try:
+                raw_bytes = base64.b64decode(b64)
+            except Exception:
+                tb.insert("end", f"⚠ could not decode image data for {filename}\n", "fc_edge_lbl")
+                continue
+
+            if _PIL_AVAILABLE:
+                try:
+                    pil_img = _PILImage.open(io.BytesIO(raw_bytes))
+                    pil_img.load()
+                    thumb = pil_img.copy()
+                    thumb.thumbnail((320, 320))
+                    ctk_img = ctk.CTkImage(light_image=thumb, dark_image=thumb, size=thumb.size)
+                    self._image_refs.append(ctk_img)
+
+                    frame = ctk.CTkFrame(tb, fg_color=C["surface"], border_width=1,
+                                          border_color=C["border2"])
+                    img_lbl = ctk.CTkLabel(frame, image=ctk_img, text="")
+                    img_lbl.pack(padx=6, pady=(6, 4))
+
+                    btn_row = ctk.CTkFrame(frame, fg_color="transparent")
+                    btn_row.pack(padx=6, pady=(0, 6), fill="x")
+
+                    dl_btn = ctk.CTkButton(
+                        btn_row, text="⬇ Download", width=100, height=26,
+                        fg_color=C["accent"], hover_color=C["accent_dim"],
+                        font=FONT_SMALL,
+                        command=lambda b=raw_bytes, fn=filename: self._download_image_bytes(b, fn),
+                    )
+                    dl_btn.pack(side="left", padx=(0, 6))
+
+                    cp_btn = ctk.CTkButton(
+                        btn_row, text="⧉ Copy", width=90, height=26,
+                        fg_color=C["surface2"], hover_color=C["border2"],
+                        font=FONT_SMALL,
+                        command=lambda b=raw_bytes: self._copy_image_button_clicked(b),
+                    )
+                    cp_btn.pack(side="left")
+
+                    tb.insert("end", "\n")
+                    tb.window_create("end", window=frame, padx=4, pady=4)
+                    tb.insert("end", "\n")
+                    tb.insert("end", f"{filename}  ({len(raw_bytes)/1024:.0f} KB, in-memory only)\n",
+                              "fc_node_type")
+                    continue
+                except Exception:
+                    pass  # fall through to the no-preview branch below
+
+            # No Pillow, or thumbnailing failed — still offer Download/Copy as text-row actions.
+            row = ctk.CTkFrame(tb, fg_color=C["surface"], border_width=1, border_color=C["border2"])
+            ctk.CTkLabel(row, text=f"📄 {filename} ({len(raw_bytes)/1024:.0f} KB)",
+                         font=FONT_SMALL, text_color=C["text"]).pack(side="left", padx=8, pady=6)
+            ctk.CTkButton(row, text="⬇ Download", width=100, height=26,
+                          command=lambda b=raw_bytes, fn=filename: self._download_image_bytes(b, fn)
+                          ).pack(side="left", padx=(4, 4), pady=6)
+            ctk.CTkButton(row, text="⧉ Copy", width=90, height=26,
+                          command=lambda b=raw_bytes: self._copy_image_button_clicked(b)
+                          ).pack(side="left", padx=(0, 8), pady=6)
+            tb.insert("end", "\n")
+            tb.window_create("end", window=row, padx=4, pady=4)
+            tb.insert("end", "\n")
+
+        tb.insert("end", "─" * 46 + "\n", "fc_rule")
+
+    def _download_image_bytes(self, raw_bytes: bytes, suggested_name: str) -> None:
+        """Save in-memory image bytes to disk only when the user explicitly asks."""
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            initialfile=suggested_name,
+            filetypes=[("PNG image", "*.png"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(raw_bytes)
+            messagebox.showinfo("Saved", f"Image saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def _copy_image_button_clicked(self, raw_bytes: bytes) -> None:
+        ok, msg = self._copy_image_bytes_to_clipboard(raw_bytes)
+        if ok:
+            messagebox.showinfo("Copied", msg)
+        else:
+            messagebox.showwarning("Copy unavailable", msg)
+
+    def _render_flowchart_diagram(self, tb: tk.Text, payload: dict) -> None:
+        """
+        Render a structured flowchart (produced by main.py's create_flowchart tool)
+        as an indented box-and-arrow diagram directly inside the chat Text widget.
+        payload = {"title": str, "starts": [id,...], "nodes": [{id,label,type,next:[{to,label}]}]}
+        """
+        node_tag = {
+            "start":    "fc_node_start",
+            "end":      "fc_node_end",
+            "decision": "fc_node_decision",
+            "io":       "fc_node_io",
+        }
+        nodes = {n["id"]: n for n in payload.get("nodes", [])}
+        starts = payload.get("starts") or (list(nodes.keys())[:1])
+        title = payload.get("title", "Flowchart")
+
+        tb.insert("end", f"\n📊  {title}\n", "fc_title")
+        tb.insert("end", "─" * 46 + "\n", "fc_rule")
+
+        visited = set()
+
+        def draw_node(nid, indent):
+            pad = "   " * indent
+            node = nodes.get(nid)
+            if node is None:
+                tb.insert("end", f"{pad}⚠ missing node '{nid}'\n", "fc_edge_lbl")
+                return
+            if nid in visited:
+                tb.insert("end", f"{pad}↩ back to: ", "fc_arrow")
+                tb.insert("end", f" {node['label']} \n", node_tag.get(node.get("type"), "fc_node_process"))
+                return
+            visited.add(nid)
+
+            tag = node_tag.get(node.get("type"), "fc_node_process")
+            label = node.get("label", nid)
+            tb.insert("end", pad)
+            tb.insert("end", f" {label} ", tag)
+            tb.insert("end", f"  [{node.get('type','process')}]\n", "fc_node_type")
+
+            nexts = node.get("next") or []
+            multi = len(nexts) > 1
+            for edge in nexts:
+                to = edge.get("to") if isinstance(edge, dict) else edge
+                lbl = edge.get("label") if isinstance(edge, dict) else None
+                tb.insert("end", pad + "   │\n", "fc_arrow")
+                arrow_line = pad + "   ▼"
+                tb.insert("end", arrow_line, "fc_arrow")
+                if lbl:
+                    tb.insert("end", f"  ({lbl})", "fc_edge_lbl")
+                tb.insert("end", "\n")
+                draw_node(to, indent + (1 if multi else 0))
+
+        for sid in starts:
+            draw_node(sid, 0)
+            tb.insert("end", "\n")
+
+        unreached = [nid for nid in nodes if nid not in visited]
+        if unreached:
+            tb.insert("end", "Not reachable from a start node:\n", "fc_edge_lbl")
+            for nid in unreached:
+                draw_node(nid, 0)
+
+        tb.insert("end", "─" * 46 + "\n", "fc_rule")
+
     def _render_markdown(self, tb: tk.Text, raw: str) -> None:
         """
         Full block-level markdown parser → renders into tb.
@@ -2342,6 +2859,37 @@ class JarvisGUI(ctk.CTk):
             if fence:
                 fence_char, lang = fence.group(1), fence.group(2).strip()
                 i += 1
+                if lang == "flowchart_json":
+                    body_lines = []
+                    while i < n and not lines[i].startswith(fence_char):
+                        body_lines.append(lines[i])
+                        i += 1
+                    i += 1  # closing fence
+                    try:
+                        payload = json.loads("\n".join(body_lines))
+                        self._render_flowchart_diagram(tb, payload)
+                    except Exception:
+                        # Malformed payload — fall back to plain code display
+                        tb.insert("end", "─" * 62 + "\n", "code_rule")
+                        for bl in body_lines:
+                            tb.insert("end", bl + "\n", "code_body")
+                        tb.insert("end", "─" * 62 + "\n", "code_rule")
+                    continue
+                if lang == "image_data_json":
+                    body_lines = []
+                    while i < n and not lines[i].startswith(fence_char):
+                        body_lines.append(lines[i])
+                        i += 1
+                    i += 1  # closing fence
+                    try:
+                        payload = json.loads("\n".join(body_lines))
+                        self._render_image_gallery(tb, payload)
+                    except Exception:
+                        tb.insert("end", "─" * 62 + "\n", "code_rule")
+                        for bl in body_lines:
+                            tb.insert("end", bl + "\n", "code_body")
+                        tb.insert("end", "─" * 62 + "\n", "code_rule")
+                    continue
                 if lang:
                     tb.insert("end", f" {lang} \n", "code_lang")
                 tb.insert("end", "─" * 62 + "\n", "code_rule")
@@ -2462,6 +3010,8 @@ class JarvisGUI(ctk.CTk):
         """
         if not text:
             return
+        if not self._replaying_chat:
+            self._display_log.append(("tool", text))
         self._chat_scroll.update_idletasks()
 
         row = ctk.CTkFrame(self._chat_scroll, fg_color="transparent")
@@ -2485,7 +3035,7 @@ class JarvisGUI(ctk.CTk):
     def _chat_append_say(self, text: str):
         """
         Render a live say()-tool narration from the model as an interim
-        Jarvis message in the main chat, styled like a normal reply but
+        Midum message in the main chat, styled like a normal reply but
         marked with a 💬 icon so it reads as "thinking out loud" rather
         than the final answer.
         """
@@ -2504,7 +3054,7 @@ class JarvisGUI(ctk.CTk):
             header, text="💬", font=("Segoe UI", 12), text_color=C["accent"]
         ).pack(side="left", padx=(2, 5))
         ctk.CTkLabel(
-            header, text="Jarvis", font=FONT_BOLD, text_color=C["accent"]
+            header, text="Midum", font=FONT_BOLD, text_color=C["accent"]
         ).pack(side="left")
 
         tb = tk.Text(
@@ -2532,8 +3082,63 @@ class JarvisGUI(ctk.CTk):
 
         self.after(30, self._scroll_to_bottom)
 
+    # Tool outputs that carry a rendered visual (image thumbnails, flowchart
+    # diagrams, ...) get pulled straight from the raw tool_output text and
+    # rendered directly — we do NOT trust the model's own reply to carry the
+    # payload correctly. In practice models often echo the JSON body back
+    # but "normalize" our custom fence tag (```flowchart_json```) to a
+    # generic one like ```json```, which would otherwise dump raw JSON into
+    # the chat with no diagram ever rendering. So: always render visuals
+    # from tool_outputs directly, and strip any fenced block from the
+    # model's reply whose body matches one of those payloads (regardless of
+    # what language tag the model gave it) so it isn't shown twice as ugly
+    # raw text next to the real render.
+    _VISUAL_FENCE_LANGS = ("image_data_json", "flowchart_json")
+    _TOOL_VISUAL_FENCE_RE = re.compile(
+        r"```(" + "|".join(_VISUAL_FENCE_LANGS) + r")\n(.*?)```", re.DOTALL
+    )
+    _ANY_FENCE_RE = re.compile(r"```([\w_]*)\n(.*?)```", re.DOTALL)
+
+    def _extract_and_strip_visuals(self, reply: str, tool_outputs: list) -> tuple[str, list]:
+        visuals = []
+        seen_bodies = set()
+        for tool_output in tool_outputs or []:
+            if not isinstance(tool_output, str) or "```" not in tool_output:
+                continue
+            for lang, body in self._TOOL_VISUAL_FENCE_RE.findall(tool_output):
+                body = body.strip()
+                if body and body not in seen_bodies:
+                    seen_bodies.add(body)
+                    visuals.append((lang, body))
+
+        if not visuals:
+            return reply, []
+
+        def _strip_if_echoed(m: re.Match) -> str:
+            block_body = m.group(2).strip()
+            for _, vbody in visuals:
+                # Substring match (not exact-equal) so it still catches the
+                # payload even if the model trimmed whitespace or added a
+                # trailing comment when it re-typed the block.
+                if block_body and (block_body in vbody or vbody in block_body):
+                    return ""  # drop — the real render replaces it below
+            return m.group(0)
+
+        cleaned_reply = self._ANY_FENCE_RE.sub(_strip_if_echoed, reply).strip()
+        return cleaned_reply, visuals
+
+    def _render_missed_tool_visuals(self, reply: str, tool_outputs: list) -> None:
+        # Kept for compatibility; superseded by _extract_and_strip_visuals,
+        # which is now called from _poll() before the reply is even shown.
+        pass
+
     def _chat_append(self, tag: str, text: str):
         """Append a message into the fixed-width center column of the chat scroll."""
+        if not self._replaying_chat:
+            self._display_log.append((tag, text))
+            if tag == "user" and not self._chat_title:
+                self._chat_title = text.strip()[:60] or None
+            self._persist_current_chat()
         self._chat_scroll.update_idletasks()
 
         # ── System / error notices ────────────────────────────────────────────
@@ -2569,14 +3174,14 @@ class JarvisGUI(ctk.CTk):
             self.after(50, self._scroll_to_bottom)
             return
 
-        # ── JARVIS response — full markdown, no bubble ────────────────────────
+        # ── MIDUM response — full markdown, no bubble ────────────────────────
         row_frame = ctk.CTkFrame(self._chat_scroll, fg_color="transparent")
         row_frame.grid(row=self._chat_row, column=1, sticky="ew", pady=(10, 4))
         self._chat_row += 1
         row_frame.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
-            row_frame, text="Jarvis", font=FONT_BOLD, text_color=C["accent"]
+            row_frame, text="Midum", font=FONT_BOLD, text_color=C["accent"]
         ).grid(row=0, column=0, sticky="w", padx=(2, 0), pady=(0, 4))
 
         tb = tk.Text(
@@ -2609,7 +3214,7 @@ class JarvisGUI(ctk.CTk):
     # ─────────────────────────────────────────────────────────────────────────
     # INLINE GUI-INTERACTION CARDS — ask_user_text / _file_path / _approval /
     # _choice, rendered mid-turn directly inside the main chat instead of a
-    # separate native popup. jarvis._gui_ask_hook (installed in __init__)
+    # separate native popup. midum._gui_ask_hook (installed in __init__)
     # calls _handle_gui_ask() from the ENGINE WORKER THREAD; it hands widget
     # construction off to the main thread via self.after() and blocks on a
     # threading.Event until the person responds, then returns the answer
@@ -2669,7 +3274,7 @@ class JarvisGUI(ctk.CTk):
 
         # ── Free-text prompt ────────────────────────────────────────────────
         if kind == "text":
-            title  = payload.get("title") or "Jarvis needs input"
+            title  = payload.get("title") or "Midum needs input"
             prompt = payload.get("prompt", "")
             _, card = self._inline_ask_card("❓", title)
 
@@ -2713,7 +3318,7 @@ class JarvisGUI(ctk.CTk):
         if kind == "approval":
             message = payload.get("message", "")
             details = payload.get("details", "")
-            _, card = self._inline_ask_card("⚠", "Jarvis requests approval")
+            _, card = self._inline_ask_card("⚠", "Midum requests approval")
 
             ctk.CTkLabel(
                 card, text=message, font=FONT_BOLD, text_color=C["text"],
@@ -2752,7 +3357,7 @@ class JarvisGUI(ctk.CTk):
             question     = payload.get("question", "")
             options      = payload.get("options") or []
             allow_custom = payload.get("allow_custom", True)
-            _, card = self._inline_ask_card("❓", "Jarvis has a question")
+            _, card = self._inline_ask_card("❓", "Midum has a question")
 
             ctk.CTkLabel(
                 card, text=question, font=FONT_BOLD, text_color=C["text"],
@@ -2799,7 +3404,7 @@ class JarvisGUI(ctk.CTk):
         if kind == "file":
             prompt     = payload.get("prompt", "Select a file")
             must_exist = payload.get("must_exist", True)
-            _, card = self._inline_ask_card("📁", "Jarvis needs a file")
+            _, card = self._inline_ask_card("📁", "Midum needs a file")
 
             ctk.CTkLabel(
                 card, text=prompt, font=FONT_BODY, text_color=C["text"],
@@ -2861,6 +3466,73 @@ class JarvisGUI(ctk.CTk):
         self._chat_col_anchor.grid_propagate(False)
         self._chat_row = 1
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # PERSISTENT CHAT HISTORY — save/load/switch, browsed via the History dialog
+    # ──────────────────────────────────────────────────────────────────────────
+    def _persist_current_chat(self):
+        """Writes the current chat (LLM history + display log) to disk. Cheap
+        enough to call after every message since it's a single small JSON
+        file write, and keeps history durable even if the app is killed."""
+        if self._replaying_chat:
+            return
+        if not self._display_log:
+            return  # nothing said yet — don't litter disk with empty chats
+        try:
+            title = self._chat_title or "Untitled chat"
+            self._chat_store.save(
+                self._current_chat_id, title,
+                self._session.snapshot(), list(self._display_log)
+            )
+        except Exception as e:
+            self._activity_append(f"⚠ Failed to save chat history: {e}\n")
+
+    def _start_new_chat_record(self):
+        """Begins a brand-new chat id/title/display-log without touching the
+        engine session — used on startup and after _new_session()."""
+        self._current_chat_id = uuid.uuid4().hex
+        self._chat_title = None
+        self._display_log = []
+
+    def _open_history_dialog(self):
+        ChatHistoryDialog(
+            self, self._chat_store, self._current_chat_id,
+            on_open=self._load_chat_by_id,
+            on_deleted_current=self._start_new_chat_record,
+        )
+
+    def _load_chat_by_id(self, chat_id: str):
+        if self._thinking:
+            messagebox.showwarning("Active Session Execution", "Please wait for current run to finish or click Abort first.")
+            return
+        try:
+            data = self._chat_store.load(chat_id)
+        except Exception as e:
+            messagebox.showerror("Error loading chat", str(e))
+            return
+
+        self._current_chat_id = data.get("id", chat_id)
+        self._chat_title = data.get("title")
+
+        history = data.get("history") or []
+        with self._session._lock:
+            self._session.history = history
+            self._session.turn_counter = max(1, sum(1 for m in history if m.get("role") == "user"))
+
+        self._clear_chat()
+        self._replaying_chat = True
+        try:
+            for tag, text in data.get("display", []):
+                if tag == "tool":
+                    self._chat_append_tool(text)
+                else:
+                    self._chat_append(tag, text)
+        finally:
+            self._replaying_chat = False
+        self._display_log = list(data.get("display", []))
+
+        self._set_status("Ready", C["green"])
+        self._refresh_status()
+
     def _activity_append(self, text: str):
         self._activity_box.configure(state="normal")
         self._activity_box.insert("end", text)
@@ -2893,7 +3565,7 @@ class JarvisGUI(ctk.CTk):
 # ENTRYPOINT DETECTORS
 # =============================================================================
 if __name__ == "__main__":
-    app = JarvisGUI()
+    app = MidumGUI()
     app.protocol("WM_DELETE_WINDOW", app.on_close)
     app._bind_keys()
     app.mainloop()
