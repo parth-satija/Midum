@@ -141,7 +141,7 @@ Without Remote Debugging, Midum falls back to UI Automation (UIA), which works f
 ### Example (Chrome/Brave/Edge)
 On Windows, use this command (replace the path with your actual browser executable path):
 ```PowerShell
-& "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe" --remote-debugging-port=9222
+& "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe" --remote-debugging-port=9222 --remote-allow-origins=*
 ```
 Midum will automatically use the debugging interface when available and fall back to UIA otherwise.
 
