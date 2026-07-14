@@ -57,7 +57,16 @@ MODEL_NAME     = "jarvishehe"
 #                "gemini_api" (OpenAI-compatible /chat/completions), so it
 #                is fully wired into tool calling / MCP servers exactly
 #                like every other provider. See GROQ_MODEL below.
-MODEL_PROVIDER = "gemini_web"   # "ollama" | "openrouter" | "gemini_web" | "gemini_api" | "groq"
+# "ollama_cloud" — use OLLAMA_CLOUD_MODEL as the PRIMARY execution brain,
+#                running on Ollama's own hosted GPUs (https://ollama.com)
+#                instead of the local Ollama daemon. Uses the SAME `ollama`
+#                Python client as the local "ollama" provider — just pointed
+#                at OLLAMA_CLOUD_HOST with a bearer token — so tool_calls
+#                come back in the exact native shape already handled by
+#                _call_ollama, no JSON-translation layer needed. Requires an
+#                API key from https://ollama.com/settings/keys. See
+#                OLLAMA_CLOUD_MODEL below.
+MODEL_PROVIDER = "gemini_web"   # "ollama" | "openrouter" | "gemini_web" | "gemini_api" | "groq" | "ollama_cloud"
 
 # ── OpenRouter model selection ────────────────────────────────────────────────
 # Used when MODEL_PROVIDER == "openrouter" (primary), and always used for
@@ -139,6 +148,30 @@ GROQ_FALLBACK_MODELS = [
     "llama-3.1-8b-instant",
     "qwen/qwen3-32b",
     "moonshotai/kimi-k2-instruct",
+]
+
+# ── Ollama Cloud model selection ──────────────────────────────────────────────
+# Used when MODEL_PROVIDER == "ollama_cloud" (primary), and always available
+# for on-demand consultation/delegation regardless of MODEL_PROVIDER, exactly
+# like OpenRouter/Gemini API/Groq. Needs only an API key from
+# https://ollama.com/settings/keys — no local GPU or model download required.
+#
+# Model IDs: https://ollama.com/search?c=cloud (subject to change):
+#   "gpt-oss:120b-cloud"        — strong general-purpose, good tool calling
+#   "gpt-oss:20b-cloud"         — smaller/faster
+#   "qwen3-coder:480b-cloud"    — large coding-focused MoE
+#   "deepseek-v3.1:671b-cloud"  — very large, strong reasoning
+#   "kimi-k2:1t-cloud"          — largest MoE, strong tool use
+OLLAMA_CLOUD_MODEL = "gpt-oss:120b-cloud"   # primary (if selected) AND consult model
+OLLAMA_CLOUD_HOST  = "https://ollama.com"
+
+# Ollama Cloud can occasionally queue/rate-limit during bursts. When that
+# happens, _ollama_cloud_chat_with_fallback() automatically tries the next
+# model in this list instead of just failing the turn. Order = preference.
+OLLAMA_CLOUD_FALLBACK_MODELS = [
+    OLLAMA_CLOUD_MODEL,
+    "gpt-oss:20b-cloud",
+    "qwen3-coder:480b-cloud",
 ]
 
 # ── Gemini-web (gemini_webapi) primary-execution settings ─────────────────────

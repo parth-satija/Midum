@@ -1131,9 +1131,18 @@ tools = [
                 "diagram in the GUI, plus ASCII and Mermaid fallbacks in plain terminal mode). "
                 "Use this any time you need to explain a process, decision tree, algorithm, or "
                 "step-by-step system visually instead of (or in addition to) prose. "
-                "Give every node a short unique 'id', a human-readable 'label', a 'type' "
-                "(start | process | decision | io | end), and a 'next' list of the ids it flows "
-                "into — optionally with an edge 'label' (e.g. 'yes'/'no' out of a decision node)."
+                "\n\n"
+                "SIMPLEST CASE — for a straight-line process, just pass 'steps' as a list of plain "
+                "strings, one per box, in order: create_flowchart(title='Login flow', steps="
+                "['User enters credentials', 'Validate password', 'Show dashboard']). Ids are "
+                "auto-generated, steps are auto-connected in the order given, and the first/last "
+                "are auto-marked start/end — no 'id', 'type', or 'next' fields needed at all. "
+                "\n\n"
+                "BRANCHING — only when you need a decision tree: give a step an explicit 'id' "
+                "(or rely on the auto id shown in the description) and pass a top-level 'edges' "
+                "list of {from, to, label} to wire up custom connections, e.g. a decision node "
+                "with 'yes'/'no' branches to two different next steps. 'edges' overrides the "
+                "automatic sequential chaining."
             ),
             "parameters": {
                 "type": "object",
@@ -1144,37 +1153,40 @@ tools = [
                     },
                     "steps": {
                         "type": "array",
-                        "description": "The nodes of the flowchart, in any order (at least one should be type='start').",
+                        "description": (
+                            "The steps/nodes of the flowchart, in order. Each item is EITHER a "
+                            "plain string (just the label — id/type/connections are all inferred "
+                            "automatically), OR an object {id?, label, type?, next?} for cases "
+                            "needing more control. Mixing strings and objects in the same list is fine."
+                        ),
+                        "items": {
+                            "description": (
+                                "A plain string label, or an object with: 'label' (required text "
+                                "shown in the box), 'id' (optional short identifier, auto-generated "
+                                "from the label if omitted), 'type' (optional: start|process|"
+                                "decision|io|end, inferred from connectivity if omitted), 'next' "
+                                "(optional list of ids or {to, label} objects this step flows into — "
+                                "only needed if not using the top-level 'edges' list instead)."
+                            )
+                        }
+                    },
+                    "edges": {
+                        "type": "array",
+                        "description": (
+                            "OPTIONAL — only needed for branching/decision trees. A list of "
+                            "connections between step ids, e.g. {\"from\": \"check_login\", \"to\": "
+                            "\"show_dashboard\", \"label\": \"yes\"}. If omitted, steps are "
+                            "auto-connected in the order given (a simple straight-line flow) — "
+                            "leave this out entirely for linear processes."
+                        ),
                         "items": {
                             "type": "object",
                             "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "description": "Short unique identifier for this node, e.g. 'check_login'."
-                                },
-                                "label": {
-                                    "type": "string",
-                                    "description": "The text shown inside the node's box."
-                                },
-                                "type": {
-                                    "type": "string",
-                                    "enum": ["start", "process", "decision", "io", "end"],
-                                    "description": "Node shape/role. 'start' = entry point, 'decision' = branching question, 'io' = input/output, 'end' = terminal node."
-                                },
-                                "next": {
-                                    "type": "array",
-                                    "description": "IDs (or {to, label} objects) this node flows into. Use edge labels like 'yes'/'no' on decision branches.",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "to": {"type": "string", "description": "id of the next node."},
-                                            "label": {"type": "string", "description": "Optional label for this edge, e.g. 'yes', 'no', 'on error'."}
-                                        },
-                                        "required": ["to"]
-                                    }
-                                }
+                                "from": {"type": "string", "description": "id of the source step."},
+                                "to": {"type": "string", "description": "id of the destination step."},
+                                "label": {"type": "string", "description": "Optional edge label, e.g. 'yes', 'no', 'on error'."}
                             },
-                            "required": ["id", "label", "type"]
+                            "required": ["from", "to"]
                         }
                     }
                 },

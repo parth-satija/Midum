@@ -11,6 +11,7 @@ from providers.gemini_api_backend import _gemini_api_chat, consult_gemini_api, d
 from providers.gemini_reasoning import consult_gemini
 from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _call_gemini_web_primary, _gemini_webapi_load_msg, delegate_to_gemini_web, set_gemini_web_model
 from providers.groq_backend import _groq_chat_with_fallback, consult_groq, delegate_to_groq, list_groq_models, set_groq_model, set_groq_model_by_index
+from providers.ollama_cloud_backend import _ollama_cloud_chat_with_fallback, consult_ollama_cloud, delegate_to_ollama_cloud, list_ollama_cloud_models, set_ollama_cloud_model
 from screen_capture import capture_screen_to_ram, fallback_click_grid, fallback_click_text, fallback_find_text, type_text
 from skills import list_skills, load_skill
 from state import _abort_event
@@ -80,7 +81,7 @@ def get_gemini_reasoning(user_input: str, conversation_history: list) -> str | N
     execution brain), this consult step is skipped entirely — there's no
     benefit to a strong model consulting a plan from itself.
     """
-    if config.MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq"):
+    if config.MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq", "ollama_cloud"):
         # Primary model IS OpenRouter or Gemini-web already — skip the
         # separate consult call, it would just be the same model (or the
         # same account's Gemini session) reasoning about itself twice.
@@ -508,6 +509,38 @@ def _call_groq_primary(messages, result_q, model_override: str = None):
         result_q.put(("err", e))
 
 
+def _call_ollama_cloud_primary(messages, result_q, model_override: str = None):
+    """
+    Run an Ollama Cloud chat completion on a background thread — used when
+    MODEL_PROVIDER == "ollama_cloud" (Ollama Cloud driving Midum directly),
+    OR when a caller forces it for a single sub-turn via
+    _call_primary_model(provider_override="ollama_cloud").
+
+    model_override lets delegate_to_ollama_cloud() run the sub-agent on a
+    different model than config.OLLAMA_CLOUD_MODEL for that one delegated task.
+
+    Ollama Cloud uses the same native `ollama` client as the local provider,
+    so tool_calls already come back in the structured field — the legacy
+    free-text fallback is still run as a safety net, same as every other
+    provider.
+    """
+    try:
+        use_model = model_override or config.OLLAMA_CLOUD_MODEL
+        resp = _ollama_cloud_chat_with_fallback(messages, model=use_model, tools_schema=tools)
+
+        if not resp["message"].get("tool_calls"):
+            raw_content = resp["message"].get("content") or ""
+            legacy_calls, cleaned_content = _extract_legacy_tool_calls(raw_content)
+            if legacy_calls:
+                legacy_calls = legacy_calls[:1]   # one tool at a time
+                resp["message"]["tool_calls"] = legacy_calls
+                resp["message"]["content"]    = cleaned_content
+
+        result_q.put(("ok", resp))
+    except Exception as e:
+        result_q.put(("err", e))
+
+
 def _call_primary_model(messages, result_q, provider_override: str = None, model_override: str = None):
     """
     Dispatches to the configured primary model provider (see MODEL_PROVIDER
@@ -530,6 +563,8 @@ def _call_primary_model(messages, result_q, provider_override: str = None, model
         _call_gemini_api_primary(messages, result_q, model_override=model_override)
     elif provider == "groq":
         _call_groq_primary(messages, result_q, model_override=model_override)
+    elif provider == "ollama_cloud":
+        _call_ollama_cloud_primary(messages, result_q, model_override=model_override)
     else:
         _call_ollama(messages, result_q)
 
@@ -991,6 +1026,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 "gemini_web": "Gemini-web",
                 "gemini_api": "Gemini-API",
                 "groq": "Groq",
+                "ollama_cloud": "Ollama Cloud",
             }.get(effective_provider, "Ollama")
             return f"[{provider_name} error: {payload}]", turn_tool_outputs
         response   = payload
@@ -1454,6 +1490,23 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 tool_output = set_groq_model_by_index(int(arguments.get("index", 0)))
             elif func_name == "set_groq_model":
                 tool_output = set_groq_model(arguments.get("model_id", ""))
+            elif func_name == "consult_ollama_cloud":
+                tool_output = consult_ollama_cloud(
+                    arguments.get("prompt", ""),
+                    arguments.get("context", ""),
+                    arguments.get("model") or None
+                )
+            elif func_name == "delegate_to_ollama_cloud":
+                tool_output = delegate_to_ollama_cloud(
+                    arguments.get("task", ""),
+                    arguments.get("context", ""),
+                    arguments.get("model") or None,
+                    int(arguments.get("max_steps", 10))
+                )
+            elif func_name == "list_ollama_cloud_models":
+                tool_output = list_ollama_cloud_models()
+            elif func_name == "set_ollama_cloud_model":
+                tool_output = set_ollama_cloud_model(arguments.get("model_id", ""))
             elif func_name == "delegate_to_gemini_web":
                 tool_output = delegate_to_gemini_web(
                     arguments.get("task", ""),
@@ -1469,7 +1522,11 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             elif func_name == "write_docx_file":
                 tool_output = write_docx_file(arguments.get("path",""), arguments.get("content",""))
             elif func_name == "create_flowchart":
-                tool_output = create_flowchart(arguments.get("title", "Flowchart"), arguments.get("steps", []))
+                tool_output = create_flowchart(
+                    arguments.get("title", "Flowchart"),
+                    arguments.get("steps", []),
+                    arguments.get("edges")
+                )
             elif func_name == "generate_image":
                 tool_output = generate_image(
                     arguments.get("prompt", ""),
@@ -1547,10 +1604,17 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 tool_output = wait(seconds)
 
             elif func_name == "say":
+                # NOTE: msg_text is intentionally NOT appended to
+                # _accumulated_reply. _print_reply() already streams it to
+                # the user immediately (as a live GUI bubble via the
+                # _gui_say_intercept hook, or as a console line in CLI
+                # mode). Adding it to _accumulated_reply as well caused it
+                # to be shown a SECOND time at the end of the turn, each
+                # copy carrying its own 'Midum:' label/header — i.e. every
+                # say() call rendered twice.
                 msg_text = arguments.get("message", "")
                 _print_reply("Midum:", msg_text)
                 _said_parts.append(msg_text)
-                _accumulated_reply.append(msg_text)
                 turn_tool_outputs.append(f"[say]: {msg_text}")
                 tool_output = "Message displayed to user."
 

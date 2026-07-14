@@ -501,17 +501,35 @@ def generate_image(prompt: str, count: int = 1) -> str:
     )
 
 
-def create_flowchart(title, steps):
-    """
-    Build an explanatory flowchart from a list of node objects.
+def _flowchart_slugify(text: str, idx: int) -> str:
+    """Turn a label into a short, readable node id, e.g. 'Check login' -> 'check_login'."""
+    s = re.sub(r"[^a-z0-9]+", "_", str(text).strip().lower()).strip("_")
+    return (s or f"step_{idx}")[:30]
 
-    steps: list of dicts, each:
-        {
-          "id": "unique_id",
-          "label": "human-readable text",
-          "type": "start" | "process" | "decision" | "io" | "end",
-          "next": [ {"to": "other_id", "label": "optional edge label"}, ... ]
-        }
+
+def create_flowchart(title, steps, edges=None):
+    """
+    Build an explanatory flowchart — deliberately easy to call for the common
+    case, while still supporting full branching control when needed.
+
+    SIMPLEST FORM — a straight-line process, no ids/types/edges needed:
+        create_flowchart(title="Login flow", steps=[
+            "User enters credentials",
+            "Validate password",
+            "Show dashboard",
+        ])
+      Steps are auto-assigned ids, auto-connected in the order given, and the
+      first/last are automatically marked 'start'/'end'.
+
+    STEPS as objects (optional fields — only 'label' is required):
+        {"id": "...", "label": "...", "type": "start|process|decision|io|end",
+         "next": [{"to": "other_id", "label": "optional edge label"}, ...]}
+      Plain strings and objects can be mixed freely in the same list.
+
+    BRANCHING — for decision trees, pass top-level `edges` instead of `next`
+    on each step (whichever is easier to write); this OVERRIDES auto-chaining:
+        edges=[{"from": "check_login", "to": "show_dashboard", "label": "yes"},
+               {"from": "check_login", "to": "retry", "label": "no"}]
 
     Returns:
       - a ```flowchart_json``` fenced block: consumed by the GUI to draw a
@@ -522,13 +540,92 @@ def create_flowchart(title, steps):
     """
     try:
         if not steps:
-            return "Error: 'steps' must be a non-empty list of node objects."
+            return "Error: 'steps' must be a non-empty list (plain strings are fine)."
+
+        # ── Normalise steps: plain strings become {"label": "..."} ───────────
+        raw_nodes = []
+        for i, s in enumerate(steps):
+            if isinstance(s, str):
+                raw_nodes.append({"label": s})
+            elif isinstance(s, dict):
+                raw_nodes.append(dict(s))
+            else:
+                return f"Error: step {i} must be a string or an object, got {type(s).__name__}."
+
+        # ── Assign ids: keep any given id, auto-slug the rest, dedupe ─────
+        used_ids = set()
+        for i, n in enumerate(raw_nodes):
+            nid = str(n.get("id") or "").strip()
+            if not nid:
+                base = _flowchart_slugify(n.get("label", f"step {i}"), i)
+                nid, suffix = base, 1
+                while nid in used_ids:
+                    suffix += 1
+                    nid = f"{base}_{suffix}"
+            n["id"] = nid
+            used_ids.add(nid)
+        id_list = [n["id"] for n in raw_nodes]
+
+        # ── Resolve connections: top-level `edges` > per-step `next` >
+        #    auto-chain steps sequentially in the order given. ────────────
+        edge_list = []   # (from_id, to_id, label)
+        if edges:
+            for e in edges:
+                if isinstance(e, (list, tuple)):
+                    frm = e[0] if len(e) > 0 else None
+                    to  = e[1] if len(e) > 1 else None
+                    lbl = e[2] if len(e) > 2 else ""
+                elif isinstance(e, dict):
+                    frm, to, lbl = e.get("from"), e.get("to"), e.get("label", "")
+                else:
+                    continue
+                if frm and to:
+                    edge_list.append((str(frm), str(to), lbl or ""))
+        elif any(n.get("next") for n in raw_nodes):
+            for n in raw_nodes:
+                for e in (n.get("next") or []):
+                    if isinstance(e, dict):
+                        to, lbl = e.get("to"), e.get("label", "")
+                    else:
+                        to, lbl = e, ""
+                    if to:
+                        edge_list.append((n["id"], str(to), lbl or ""))
+        else:
+            for a, b in zip(id_list, id_list[1:]):
+                edge_list.append((a, b, ""))
+
+        # ── Infer node types from connectivity when not given explicitly ───
+        outgoing, incoming = {}, {}
+        for frm, to, _ in edge_list:
+            outgoing.setdefault(frm, []).append(to)
+            incoming.setdefault(to, []).append(frm)
+
+        for n in raw_nodes:
+            if n.get("type"):
+                n["type"] = str(n["type"]).strip().lower()
+                continue
+            nid = n["id"]
+            if nid in outgoing and nid not in incoming:
+                n["type"] = "start"
+            elif nid in incoming and nid not in outgoing:
+                n["type"] = "end"
+            else:
+                n["type"] = "process"
+        if not any(n["type"] == "start" for n in raw_nodes):
+            raw_nodes[0]["type"] = "start"
+
+        # ── Rebuild canonical `next` per node from the resolved edge list ──
+        next_by_id = {}
+        for frm, to, lbl in edge_list:
+            next_by_id.setdefault(frm, []).append({"to": to, "label": lbl})
+        for n in raw_nodes:
+            n["next"] = next_by_id.get(n["id"], [])
+
+        steps = raw_nodes   # feed the (unchanged) render pipeline below
 
         nodes = {}
         for s in steps:
-            sid = str(s.get("id", "")).strip()
-            if not sid:
-                return "Error: every step needs a non-empty 'id'."
+            sid = s["id"]
             nodes[sid] = {
                 "id": sid,
                 "label": str(s.get("label", sid)),

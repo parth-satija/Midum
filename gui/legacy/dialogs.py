@@ -12,7 +12,7 @@ class ChatHistoryDialog(ctk.CTkToplevel):
     """
 
     def __init__(self, parent, chat_store: "ChatStore", current_chat_id, on_open, on_deleted_current):
-        from gui.app import C, FONT_TITLE
+        from gui.legacy.app import C, FONT_TITLE
         super().__init__(parent)
         self.title("🕘 Chat History")
         self.geometry("460x560")
@@ -53,7 +53,7 @@ class ChatHistoryDialog(ctk.CTkToplevel):
         self.grab_set()
 
     def _populate(self):
-        from gui.app import C, FONT_SMALL
+        from gui.legacy.app import C, FONT_SMALL
         for w in self._list_frame.winfo_children():
             w.destroy()
 
@@ -70,7 +70,7 @@ class ChatHistoryDialog(ctk.CTkToplevel):
             self._build_row(i, chat)
 
     def _build_row(self, row: int, chat: dict):
-        from gui.app import C, FONT_BOLD, FONT_LABEL, FONT_TINY
+        from gui.legacy.app import C, FONT_BOLD, FONT_LABEL, FONT_TINY
         is_current = chat["id"] == self._current_chat_id
 
         card = ctk.CTkFrame(
@@ -135,7 +135,7 @@ class ChatHistoryDialog(ctk.CTkToplevel):
 # --- from gui.py, section 2 ---
 class CreateKnowledgeDialog(ctk.CTkToplevel):
     def __init__(self, parent, on_success_callback):
-        from gui.app import C, FONT_BODY, FONT_LABEL, FONT_TITLE
+        from gui.legacy.app import C, FONT_BODY, FONT_LABEL, FONT_TITLE
         super().__init__(parent)
         self.title("✚ Create Domain Knowledge Base")
         self.geometry("450x250")
@@ -185,7 +185,7 @@ class CreateKnowledgeDialog(ctk.CTkToplevel):
 # --- from gui.py, section 3 ---
 class CreateSkillDialog(ctk.CTkToplevel):
     def __init__(self, parent, on_success_callback):
-        from gui.app import C, FONT_BODY, FONT_LABEL, FONT_TITLE
+        from gui.legacy.app import C, FONT_BODY, FONT_LABEL, FONT_TITLE
         super().__init__(parent)
         self.title("✚ Create Custom Skill")
         self.geometry("450x300")
@@ -244,7 +244,7 @@ class CreateSkillDialog(ctk.CTkToplevel):
 class AddMCPServerDialog(ctk.CTkToplevel):
     """Connect a new MCP server — stdio (local subprocess) or http/sse (remote)."""
     def __init__(self, parent, on_success_callback):
-        from gui.app import C, FONT_BODY, FONT_LABEL, FONT_SMALL, FONT_TITLE
+        from gui.legacy.app import C, FONT_BODY, FONT_LABEL, FONT_SMALL, FONT_TITLE
         super().__init__(parent)
         self.title("✚ Connect MCP Server")
         self.geometry("460x560")
@@ -310,7 +310,7 @@ class AddMCPServerDialog(ctk.CTkToplevel):
         self.grab_set()
 
     def _field_in(self, parent, label_text, placeholder="", multiline=False):
-        from gui.app import C, FONT_BODY, FONT_LABEL, FONT_MONO
+        from gui.legacy.app import C, FONT_BODY, FONT_LABEL, FONT_MONO
         ctk.CTkLabel(parent, text=label_text, font=FONT_LABEL, text_color=C["subtext"]).pack(anchor="w", pady=(10, 0))
         if multiline:
             widget = ctk.CTkTextbox(
@@ -389,7 +389,7 @@ class AddMCPServerDialog(ctk.CTkToplevel):
 class ViewMCPToolsDialog(ctk.CTkToplevel):
     """Read-only view of a connected server's tools + JSON schemas."""
     def __init__(self, parent, server_name: str, content: str):
-        from gui.app import C, FONT_MONO, FONT_TITLE
+        from gui.legacy.app import C, FONT_MONO, FONT_TITLE
         super().__init__(parent)
         self.title(f"🧩 {server_name} — Tools")
         self.geometry("560x480")
