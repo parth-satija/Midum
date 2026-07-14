@@ -341,6 +341,7 @@ class Api:
             "model": _default_model_for_provider(DEFAULT_PROVIDER_KEY),
             "theme": self._DEFAULT_THEME,
             "colors": dict(self._DEFAULT_COLORS),
+            "blobs": True,
         }
         path = self._settings_path()
         try:
@@ -355,6 +356,8 @@ class Api:
                     defaults["theme"] = saved["theme"]
                 if isinstance(saved.get("colors"), dict):
                     defaults["colors"].update(saved["colors"])
+                if "blobs" in saved:
+                    defaults["blobs"] = bool(saved["blobs"])
         except Exception as e:
             self._push_event("log", {"text": f"⚠️ Failed to read saved settings: {e}\n"})
         return defaults
@@ -370,6 +373,8 @@ class Api:
                 current["theme"] = settings["theme"]
             if isinstance(settings.get("colors"), dict):
                 current["colors"].update({k: v for k, v in settings["colors"].items() if v})
+            if "blobs" in settings:
+                current["blobs"] = bool(settings["blobs"])
 
             path = self._settings_path()
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1057,6 +1062,7 @@ input,textarea{font-family:inherit;}
 @media (prefers-reduced-motion: reduce){
   .pane::before, .pane::after{ display:none; }
 }
+html.no-blobs .pane::before, html.no-blobs .pane::after{ display:none; }
 
 /* Tool pane */
 #tool-pane-wrap{left:0;width:0;}
@@ -1162,6 +1168,18 @@ code.inline-code{background:var(--surface2);color:var(--tool-text);border-radius
 .flowchart-wrap{background:var(--surface);border:1px solid var(--border2);border-radius:16px;
   padding:14px;overflow:auto;margin:8px 0;max-width:100%;}
 .flowchart-wrap svg{display:block;margin:0 auto;}
+
+/* Generated-image gallery + save button */
+.img-frame{position:relative;display:inline-block;margin-top:8px;max-width:100%;}
+.img-frame img{max-width:100%;border-radius:8px;display:block;}
+.img-save-btn{
+  position:absolute;top:8px;right:8px;width:32px;height:32px;border-radius:50%;
+  background:rgba(10,9,22,.72);border:1px solid var(--border2);backdrop-filter:blur(4px);
+  color:var(--text);display:flex;align-items:center;justify-content:center;font-size:15px;
+  text-decoration:none;opacity:0;transition:opacity .15s var(--ease),background .15s var(--ease);
+}
+.img-frame:hover .img-save-btn{opacity:1;}
+.img-save-btn:hover{background:var(--accent);}
 .fc-node-process{fill:var(--surface2);stroke:var(--border2);}
 .fc-node-start{fill:var(--accent-faint);stroke:var(--accent);}
 .fc-node-end{fill:var(--accent-faint);stroke:var(--accent);}
@@ -1515,15 +1533,22 @@ function renderMidumContent(text){
       if (lang === 'flowchart_json') {
         renderedBlock = renderFlowchartSVG(payload);
       } else if (lang === 'image_data_json') {
-        // This part was missing. We need to render the image gallery.
-        // For now, let's just show the prompt and a placeholder.
-        // A full implementation would create image elements.
-        const prompt = payload.prompt || "Generated Image(s)";
-        let imagesHtml = (payload.images || []).map(img => {
-          return `<div><img src="data:image/png;base64,${img.data_b64}" style="max-width:100%; border-radius: 8px; margin-top: 8px;" alt="${escapeHtml(prompt)}"/></div>`;
+        // Image gallery: each image gets a hover-revealed save button so it
+        // can be downloaded straight from the chat bubble. `title` mirrors
+        // the flowchart block's own title field (falls back to `prompt`,
+        // then a generic label) instead of only ever reading `prompt`.
+        const title = payload.title || payload.prompt || "Generated Image(s)";
+        const images = payload.images || [];
+        let imagesHtml = images.map((img, i) => {
+          const base = (img.filename || `midum_image_${i + 1}`).replace(/\.[^.\/]+$/, '');
+          const fname = `${base}.png`;
+          return `<div class="img-frame">
+            <img src="data:image/png;base64,${img.data_b64}" alt="${escapeHtml(title)}"/>
+            <a class="img-save-btn" href="data:image/png;base64,${img.data_b64}" download="${escapeHtml(fname)}" title="Save image">💾</a>
+          </div>`;
         }).join('');
         renderedBlock = `<div class="flowchart-wrap">
-                           <div style="font-size:11px;color:var(--subtext);margin-bottom:6px;">🖼️ ${escapeHtml(prompt)}</div>
+                           <div style="font-size:11px;color:var(--subtext);margin-bottom:6px;">🖼️ ${escapeHtml(title)}</div>
                            ${imagesHtml}
                          </div>`;
       }
@@ -1764,6 +1789,12 @@ function buildSidebar(){
         <button class="ghost-btn" data-theme="dark" style="flex:1;">🌙 Dark</button>
         <button class="ghost-btn" data-theme="light" style="flex:1;">☀️ Light</button>
       </div>
+      <div class="hdr-row" style="margin-top:4px;">
+        <div class="field-label" style="margin:0;">AMBIENT BLOBS</div>
+        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);">
+          <input type="checkbox" id="settings-blobs" checked style="width:14px;height:14px;"/> Enabled
+        </label>
+      </div>
       <div class="field-label">DEFAULT PROVIDER</div>
       <select id="settings-provider"></select>
       <div class="field-label">DEFAULT MODEL</div>
@@ -1832,6 +1863,9 @@ function buildSidebar(){
   document.querySelectorAll('#settings-theme-toggle [data-theme]').forEach(btn=>{
     btn.onclick = ()=>applyTheme(btn.dataset.theme);
   });
+  document.getElementById("settings-blobs").onchange = (e)=>{
+    document.documentElement.classList.toggle("no-blobs", !e.target.checked);
+  };
 }
 
 const DEFAULT_COLORS = {accent:"#f97316", accent2:"#7c3aed", bg:"#02010a", panel:"#0a0916", text:"#e2e8f0"};
@@ -1883,6 +1917,12 @@ function applyColors(colors){
   if (colors.text) root.setProperty("--text", colors.text);
 }
 
+function applyBlobs(enabled){
+  document.documentElement.classList.toggle("no-blobs", !enabled);
+  const cb = document.getElementById("settings-blobs");
+  if (cb) cb.checked = !!enabled;
+}
+
 function fillDatalist(id, values){
   const dl = document.getElementById(id);
   if (!dl) return;
@@ -1893,6 +1933,7 @@ function fillDatalist(id, values){
 async function loadSettingsPanel(){
   const s = await api("get_settings");
   applyTheme(s.theme || "dark");
+  applyBlobs(s.blobs !== false);
   const provSel = document.getElementById("settings-provider");
   if (provSel && !provSel.options.length){
     const info = await api("get_providers");
@@ -1913,16 +1954,18 @@ async function loadSettingsPanel(){
 async function saveSettingsPanel(){
   const provider = document.getElementById("settings-provider").value;
   const model = document.getElementById("settings-model").value;
+  const blobs = document.getElementById("settings-blobs").checked;
   const colors = {};
   ["accent","accent2","bg","panel","text"].forEach(k=>{
     const el = document.getElementById(`settings-color-${k}`);
     if (el) colors[k] = el.value;
   });
-  const r = await api("save_settings", {provider, model, theme: _activeTheme, colors});
+  const r = await api("save_settings", {provider, model, theme: _activeTheme, colors, blobs});
   const status = document.getElementById("settings-status");
   if (r.ok){
     applyTheme(r.settings.theme || "dark");
     applyColors(r.settings.colors);
+    applyBlobs(r.settings.blobs !== false);
     if (status) status.textContent = "Saved — will be remembered next launch.";
   } else if (status) {
     status.textContent = `Error: ${r.error}`;
@@ -2287,6 +2330,7 @@ window.addEventListener("pywebviewready", async ()=>{
     const s = await api("get_settings");
     applyTheme(s.theme || "dark");
     applyColors(s.colors);
+    applyBlobs(s.blobs !== false);
   } catch (e) { /* pywebview bridge not ready yet on some platforms — fine */ }
 
   await api("startup");
