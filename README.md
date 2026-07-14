@@ -88,11 +88,18 @@ This is the **recommended way to run Midum**, since it exposes everything the CL
 ## Setup Instructions
 
 ### Step 1
-Download the ZIP file from the releases and extract it into an empty folder, or clone the repo into an empty folder.
+Download the ZIP file from the releases and extract it into an empty folder, or clone the repo into an empty folder. Once extracted, `cd` into the project folder — this is a proper Python package, so all commands below should be run **from inside it**, not from a parent directory:
+```PowerShell
+cd midum_pkg
+```
 
 ### Step 2
-Install the Python libraries required for the scripts to run:
-```Powershell
+Install the required Python libraries. The easiest way is via the included `requirements.txt`:
+```PowerShell
+pip install -r requirements.txt
+```
+If you'd rather install everything explicitly (or `requirements.txt` is ever out of date), this is the full list:
+```PowerShell
 pip install ollama pillow ddgs keyboard pymupdf mammoth python-docx rich pytesseract pywin32 uiautomation customtkinter google-genai requests mcp
 pip install -U gemini_webapi
 pip install -U browser-cookie3   # optional but recommended
@@ -102,16 +109,16 @@ pip install -U browser-cookie3   # optional but recommended
 Ollama is now **optional**. Midum can run its primary reasoning loop directly on **Gemini** (via the official Gemini API or via `gemini_webapi` cookie sign-in) instead of a local model, so you can skip straight to Step 6 if you'd rather not run anything locally.
 
 If you *do* want a fully local, offline-capable setup, download Ollama and pull a tool-calling-capable model of your choice (older models like `qwen2.5-coder` are also supported):
-```Powershell
+```PowerShell
 ollama pull qwen2.5-coder:7b
 ```
 Then change the first line of the `Modelfile` to configure it for the model of your choice (it currently defaults to **qwen2.5-coder:7b**), and apply it by running the following **in the folder the Modelfile is located**:
-```Powershell
+```PowerShell
 ollama create midum -f ./Modelfile
 ```
 
 ### Step 4
-Open `main.py` and set `MODEL_PROVIDER` to your provider of choice:
+Open `config.py` and set `MODEL_PROVIDER` to your provider of choice:
 ```python
 MODEL_PROVIDER = "ollama"       # local Ollama model
 MODEL_PROVIDER = "gemini_api"   # official Gemini API (API key from aistudio.google.com)
@@ -122,7 +129,10 @@ MODEL_PROVIDER = "groq"         # GroqCloud (free tier, fast inference)
 Fill in the matching model/key settings just below `MODEL_PROVIDER` for whichever provider you chose (e.g. `GEMINI_API_MODEL`, `OPENROUTER_MODEL`, `GROQ_MODEL`).
 
 ### Step 5
-Run `main.py` once. This creates all the necessary files.
+Run `main.py` once, from inside the project folder. This creates all the necessary files:
+```PowerShell
+python main.py
+```
 
 ### Optional Step — OCR
 Download and install Tesseract, as it enables OCR-based screen reading and clicking. Midum is completely functional without OCR — it's only used as a fallback for UI interaction.
@@ -130,6 +140,13 @@ Download and install Tesseract, as it enables OCR-based screen reading and click
 ### Step 6 — Launch Midum
 - Run the **`gui.py`** script if you want to run the **Midum Control Centre**, which gives you the full functionality of Midum plus the ability to modify any underlying file (skill files, knowledge bases, memory files, etc.) directly in the app. This is the **recommended** approach.
 - Run the **`main.py`** script if you prefer the CLI tool instead. This requires an IDE if you want to modify any files yourself (or you can just tell Midum to do it).
+
+Both are run the same way, from inside the project folder:
+```PowerShell
+python gui.py
+# or
+python main.py
+```
 
 ---
 
