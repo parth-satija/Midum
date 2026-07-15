@@ -14,6 +14,7 @@ import threading
 import datetime
 import queue
 import json
+import base64
 import traceback
 import subprocess
 import re
@@ -32,17 +33,14 @@ CHATS_DIR = os.path.join(midum.STORAGE_DIR, "chats")
 
 _SAY_TAG = "\x02MIDUM_SAY\x02"
 
-_TOOL_LINE_EMOJI = (
-    "🧠", "🎯", "📋", "📌", "📍", "📚", "🗑", "💾", "🔌", "🛑", "🚫", "✅",
-    "⚠️", "🤖", "👁️", "🖥️", "🌐", "⌨️", "🐧", "📁", "🔍", "⚡",
-)
+# Only lines that represent an actual tool invocation should light up the
+# pulsing dot. "-> Executing: '<tool_name>'" is printed exactly once per
+# real tool call (see orchestration.py's process_chat_turn); the various
+# emoji-prefixed status/log lines used throughout startup and elsewhere
+# are NOT tool calls and must not trigger the dot, even though several of
+# them happen to share emoji with tool-related output.
 _TOOL_LINE_KEYWORDS = (
-    "-> executing:", "requested", "[uia]", "[cdp]", "[terminal]", "[type]",
-    "[click]", "[wait]", "[blueprint]", "[snapshot", "[gemini", "[resolver]",
-    "[legacy parser]", "[ocr", "[grid click]", "[open_url]",
-    "[rule violation]", "[retry cap]", "[tool name error]",
-    "[unknown tool]", "[internal error]", "[tool resolver]",
-    "[max steps reached]", "[response aborted", "[path resolved",
+    "-> executing:",
 )
 
 
@@ -50,10 +48,8 @@ def _is_tool_line(raw_line: str) -> bool:
     line = raw_line.strip()
     if not line:
         return False
-    if line[0] in _TOOL_LINE_EMOJI:
-        return True
     low = line.lower()
-    return any(k in low for k in _TOOL_LINE_KEYWORDS)
+    return any(low.startswith(k) for k in _TOOL_LINE_KEYWORDS)
 
 
 class _StdoutRedirector:
@@ -331,6 +327,14 @@ class Api:
         "bg": "#02010a", "panel": "#0a0916", "text": "#e2e8f0",
     }
     _DEFAULT_THEME = "dark"
+    _DEFAULT_BG_IMAGE = {
+        "enabled": False, "path": "",
+        "brightness": 100, "blur": 0, "opacity": 100,
+    }
+    _IMAGE_MIME_TYPES = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    }
 
     def _settings_path(self):
         return os.path.join(midum.STORAGE_DIR, self._SETTINGS_FILENAME)
@@ -341,7 +345,7 @@ class Api:
             "model": _default_model_for_provider(DEFAULT_PROVIDER_KEY),
             "theme": self._DEFAULT_THEME,
             "colors": dict(self._DEFAULT_COLORS),
-            "blobs": True,
+            "bg_image": dict(self._DEFAULT_BG_IMAGE),
         }
         path = self._settings_path()
         try:
@@ -356,8 +360,8 @@ class Api:
                     defaults["theme"] = saved["theme"]
                 if isinstance(saved.get("colors"), dict):
                     defaults["colors"].update(saved["colors"])
-                if "blobs" in saved:
-                    defaults["blobs"] = bool(saved["blobs"])
+                if isinstance(saved.get("bg_image"), dict):
+                    defaults["bg_image"].update(saved["bg_image"])
         except Exception as e:
             self._push_event("log", {"text": f"⚠️ Failed to read saved settings: {e}\n"})
         return defaults
@@ -373,8 +377,14 @@ class Api:
                 current["theme"] = settings["theme"]
             if isinstance(settings.get("colors"), dict):
                 current["colors"].update({k: v for k, v in settings["colors"].items() if v})
-            if "blobs" in settings:
-                current["blobs"] = bool(settings["blobs"])
+            if isinstance(settings.get("bg_image"), dict):
+                # Path changes only ever come through pick_background_image /
+                # clear_background_image (which persist immediately), so
+                # this call only touches the display knobs.
+                incoming = settings["bg_image"]
+                for key in ("enabled", "brightness", "blur", "opacity"):
+                    if key in incoming:
+                        current["bg_image"][key] = incoming[key]
 
             path = self._settings_path()
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -389,6 +399,108 @@ class Api:
             return {"ok": True, "settings": current}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    def _persist_bg_image(self, updates: dict):
+        current = self.get_settings()
+        current["bg_image"].update(updates)
+        path = self._settings_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(current, f, indent=2)
+        return current
+
+    def _image_to_data_url(self, path: str):
+        """Bake brightness/blur/opacity into the pixels themselves (via
+        Pillow) and return a plain PNG data URL with no CSS filter needed
+        on the frontend. This is what makes the effect truly static: once
+        baked, the browser just paints flat pixels -- there is nothing for
+        it to recompute on repaint, which is what caused the continuous
+        flashing and the opacity intermittently snapping back to full when
+        a live CSS `filter`/`opacity` was being recomputed instead.
+        """
+        settings = self.get_settings()
+        cfg = settings.get("bg_image") or {}
+        return self._bake_image(path, cfg.get("brightness", 100), cfg.get("blur", 0), cfg.get("opacity", 100))
+
+    def _bake_image(self, path: str, brightness: int, blur: int, opacity: int):
+        try:
+            from PIL import Image, ImageEnhance, ImageFilter
+            import io
+            img = Image.open(path).convert("RGBA")
+            # Downscale first -- keeps the Gaussian blur (which is O(radius)
+            # per pixel) and the final base64 payload cheap regardless of
+            # how large the source photo is. 1920px is plenty for a
+            # full-viewport background.
+            max_dim = 1920
+            if max(img.size) > max_dim:
+                scale = max_dim / max(img.size)
+                img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.LANCZOS)
+            if brightness and brightness != 100:
+                img = ImageEnhance.Brightness(img).enhance(brightness / 100.0)
+            if blur and blur > 0:
+                img = img.filter(ImageFilter.GaussianBlur(radius=blur))
+            if opacity is not None and opacity < 100:
+                r, g, b, a = img.split()
+                a = a.point(lambda v: int(v * (opacity / 100.0)))
+                img.putalpha(a)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            return f"data:image/png;base64,{b64}"
+        except ImportError:
+            # Pillow isn't installed -- fall back to the raw file with no
+            # baking (brightness/blur/opacity controls just won't do
+            # anything visually until `pip install pillow` is run).
+            ext = os.path.splitext(path)[1].lower()
+            mime = self._IMAGE_MIME_TYPES.get(ext, "image/png")
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("ascii")
+            return f"data:{mime};base64,{b64}"
+
+    def pick_background_image(self):
+        try:
+            result = self.window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                file_types=("Image files (*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp)", "All files (*.*)"),
+            )
+        except Exception:
+            result = None
+        if not result:
+            return {"ok": False, "error": "No file selected."}
+        path = result[0] if isinstance(result, (list, tuple)) else result
+        current = self._persist_bg_image({"path": path, "enabled": True})
+        try:
+            data_url = self._image_to_data_url(path)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "path": path, "data_url": data_url, "settings": current}
+
+    def get_background_image_data(self):
+        settings = self.get_settings()
+        path = (settings.get("bg_image") or {}).get("path") or ""
+        if not path or not os.path.exists(path):
+            return {"ok": False}
+        try:
+            return {"ok": True, "data_url": self._image_to_data_url(path)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def preview_background_image(self, brightness: int, blur: int, opacity: int):
+        """Re-bake using the currently-stored image path but not-yet-saved
+        slider values, for live preview. Called debounced from the
+        frontend (not on every slider tick) so this stays cheap."""
+        settings = self.get_settings()
+        path = (settings.get("bg_image") or {}).get("path") or ""
+        if not path or not os.path.exists(path):
+            return {"ok": False}
+        try:
+            return {"ok": True, "data_url": self._bake_image(path, brightness, blur, opacity)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def clear_background_image(self):
+        current = self._persist_bg_image({"path": "", "enabled": False})
+        return {"ok": True, "settings": current}
 
     # ── Workspace / projects ─────────────────────────────────────────────
     def _scan_workspace_directory(self):
@@ -1003,66 +1115,46 @@ input,textarea{font-family:inherit;}
   position:absolute;top:0;height:100%;
   transition:left .28s var(--ease), width .28s var(--ease), opacity .2s var(--ease);
 }
+/* -- Background image layer: a single static, full-viewport image behind
+   the panes. Brightness/blur/opacity are baked into the image's pixels
+   server-side (Pillow) before it ever reaches the DOM -- this element
+   just paints a flat PNG via background-image, with NO CSS filter or
+   opacity property on it. That's deliberate: a live filter/opacity here
+   forced the browser to recompute it on every repaint (which happens
+   continuously thanks to the tool-dot pulse and row/word entrance
+   animations elsewhere on the page), which is what caused the constant
+   flashing and the opacity intermittently snapping back to full. */
+#bg-image-layer{
+  position:fixed;inset:0;z-index:0;pointer-events:none;
+  background-size:cover;background-position:center;background-repeat:no-repeat;
+  display:none;
+}
+html.has-bg-image #bg-image-layer{ display:block; }
+
 .pane{
   position:absolute;inset:calc(var(--gap)/2);border-radius:var(--radius);
   background:var(--panel);border:1px solid var(--border2);
   display:flex;flex-direction:column;overflow:hidden;
+  z-index:1;
+}
+/* "Liquid glass" look, only when a background image is active. This is a
+   flat translucent tint (color-mix, resolved once at paint time like any
+   normal background-color) with NO backdrop-filter: backdrop-filter has
+   to continuously re-blur whatever's behind it, and this UI has several
+   always-running animations behind the panes, so it was never actually
+   static in practice -- that mismatch between the comment's intent and
+   the compositor's real behavior was the root cause of the flashing. */
+html.has-bg-image .pane{
+  background:color-mix(in srgb, var(--panel) 62%, transparent);
+  border:1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  box-shadow:inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent), 0 8px 30px rgba(0,0,0,.35);
+}
+html.has-bg-image #topbar{
+  background:color-mix(in srgb, var(--panel) 62%, transparent);
+  border:1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  box-shadow:inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent), 0 8px 30px rgba(0,0,0,.35);
 }
 .pane-hidden{opacity:0;pointer-events:none;}
-
-/* -- Ambient blobs: two continuous light sources drifting under every pane,
-   plus a third that trails the mouse -- all driven by a single JS rAF loop
-   (see the IIFE near the bottom of the script) that writes plain CSS custom
-   properties every frame. That's what makes the motion perfectly smooth
-   instead of hopping between a handful of keyframe stops: the position is
-   recomputed continuously from sine waves / a lerp, never "jumps" from A to
-   B, and never repeats on a fixed loop period.
-   Trick: background-attachment:fixed anchors each gradient to the
-   *viewport*, not to this element. Every .pane gets the identical fixed
-   background, so visually each blob reads as one continuous shape gliding
-   beneath the whole UI. Each pane's own overflow:hidden + border-radius
-   clips it to that pane's shape, so it's simply absent over the gaps
-   between panels -- no separate blobs, no visible seams. Still just a
-   couple of composited layers with a blur filter -- no canvas, no per-
-   element JS work, no particles. */
-.pane::before, .pane::after{
-  content:"";
-  position:absolute;inset:-2px;
-  background-repeat:no-repeat;
-  background-attachment:fixed;
-  filter:blur(64px) saturate(1.35) hue-rotate(var(--blob-hue,0deg));
-  mix-blend-mode:screen;
-  pointer-events:none;
-  z-index:0;
-}
-.pane::before{
-  background-image:
-    radial-gradient(closest-side, var(--accent) 0%, transparent 68%),
-    radial-gradient(closest-side, var(--accent2) 0%, transparent 68%);
-  background-size:62vmax 62vmax, 52vmax 52vmax;
-  background-position:
-    var(--blob1-x,10%) var(--blob1-y,20%),
-    var(--blob2-x,80%) var(--blob2-y,70%);
-  opacity:.26;
-}
-/* Mouse-follow blob -- a different, fixed hue so it reads as a distinct
-   light source from the ambient pair. Position is set in px (not %) so it
-   can track the cursor precisely; --mx/--my are lerped toward the real
-   cursor position in JS, which is what gives it a soft trailing feel
-   instead of snapping straight to the pointer. */
-.pane::after{
-  background-image:radial-gradient(closest-side, var(--mouse-blob-color,#22d3ee) 0%, transparent 70%);
-  background-size:38vmax 38vmax;
-  background-position:calc(var(--mx,50vw) - 19vmax) calc(var(--my,50vh) - 19vmax);
-  filter:blur(58px) saturate(1.4);
-  opacity:.24;
-}
-.pane > *{position:relative;z-index:1;}
-
-@media (prefers-reduced-motion: reduce){
-  .pane::before, .pane::after{ display:none; }
-}
-html.no-blobs .pane::before, html.no-blobs .pane::after{ display:none; }
 
 /* Tool pane */
 #tool-pane-wrap{left:0;width:0;}
@@ -1089,7 +1181,21 @@ html.no-blobs .pane::before, html.no-blobs .pane::after{ display:none; }
 
 /* Sidebar pane */
 #sidebar-pane-wrap{left:100%;width:0;}
-#sidebar-inner{flex:1;padding:14px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;}
+#sidebar-inner{flex:1;position:relative;overflow:hidden;display:flex;flex-direction:column;}
+#sidebar-main-view{flex:1;padding:14px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;}
+/* Settings overlay -- covers the ENTIRE sidebar pane (not just a strip)
+   while open, so it gets full room for theme/background/provider controls
+   instead of being squeezed under the workspace + history sections. */
+#sidebar-settings-overlay{
+  position:absolute;inset:0;background:var(--panel);z-index:5;
+  padding:14px;overflow-y:auto;display:none;flex-direction:column;gap:6px;
+}
+#sidebar-settings-overlay.open{display:flex;}
+#settings-back-btn{
+  width:26px;height:26px;border-radius:50%;border:none;background:var(--surface2);
+  color:var(--text);font-size:12px;display:flex;align-items:center;justify-content:center;
+}
+#settings-back-btn:hover{background:var(--border2);}
 .section-label{font-size:9px;font-weight:700;color:var(--subtext);letter-spacing:.5px;}
 .hdr-row{display:flex;align-items:center;justify-content:space-between;}
 select, .btn, .ghost-btn{
@@ -1220,10 +1326,82 @@ textarea.code-area{
 .arg-row{display:flex;align-items:center;gap:8px;padding:4px 0;}
 .arg-row label{font-size:11px;color:var(--subtext);width:110px;flex:0 0 auto;}
 .arg-row input, .arg-row select{flex:1;height:28px;}
+
+/* Custom dropdown component -- replaces native <select> popups (which
+   render with OS chrome and can't be height-limited/styled consistently)
+   with an in-app, theme-matched, scrollable list. The underlying <select>
+   stays in the DOM (hidden) so all existing code that reads/writes
+   `.value`, listens for 'change', or calls `.appendChild` on it keeps
+   working untouched -- enhanceSelect() just mirrors it visually. */
+.real-select-hidden{ display:none !important; }
+.dropdown-wrap{ position:relative; }
+.dropdown-trigger{
+  width:100%;text-align:left;display:flex;align-items:center;justify-content:space-between;gap:6px;
+  border-radius:16px;border:1px solid var(--border2);background:var(--surface);color:var(--text);
+  font-size:12px;height:32px;padding:0 10px;cursor:pointer;transition:background .15s,border-color .15s;
+  overflow:hidden;
+}
+.dropdown-trigger span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.dropdown-trigger::after{content:"\25BE";color:var(--subtext);font-size:10px;flex:0 0 auto;}
+.dropdown-trigger:hover{background:var(--surface2);}
+.dropdown-wrap.open .dropdown-trigger{border-color:var(--accent);}
+.arg-row .dropdown-wrap{flex:1;}
+.arg-row .dropdown-trigger{height:28px;}
+.dropdown-list{
+  position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:60;
+  background:var(--surface);border:1px solid var(--border2);border-radius:14px;
+  padding:4px;max-height:220px;overflow-y:auto;display:none;
+  box-shadow:0 12px 30px rgba(0,0,0,.4);
+}
+.dropdown-list.open{display:block;}
+.dropdown-option{
+  padding:7px 10px;border-radius:9px;font-size:12px;color:var(--text);cursor:pointer;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.dropdown-option:hover{background:var(--surface2);}
+.dropdown-option.selected{background:var(--accent-faint);color:var(--accent);font-weight:600;}
+.dropdown-empty{padding:8px 10px;font-size:11px;color:var(--subtext);}
+
+/* Native-style modal dialogs -- replaces browser confirm()/prompt()/alert()
+   with an in-app overlay that matches the rest of the GUI, instead of the
+   OS-chrome popup that broke the illusion of a single cohesive app. */
+#modal-overlay{
+  position:fixed;inset:0;z-index:1000;background:rgba(2,1,10,.55);
+  display:none;align-items:center;justify-content:center;
+}
+#modal-overlay.open{display:flex;}
+.modal-box{
+  background:var(--panel);border:1px solid var(--border2);border-radius:20px;
+  padding:20px;width:380px;max-width:90vw;max-height:80vh;overflow-y:auto;
+  box-shadow:0 20px 60px rgba(0,0,0,.5);
+  animation:modalIn .18s var(--ease) both;
+}
+@keyframes modalIn{ from{opacity:0;transform:scale(.96) translateY(6px);} to{opacity:1;transform:scale(1) translateY(0);} }
+.modal-title{font-weight:700;font-size:14px;margin-bottom:10px;color:var(--text);}
+.modal-msg{font-size:13px;color:var(--subtext);margin-bottom:12px;white-space:pre-wrap;line-height:1.5;}
+.modal-input, .modal-select{
+  width:100%;background:var(--surface);border:1px solid var(--border2);border-radius:12px;
+  height:36px;padding:0 12px;color:var(--text);margin-bottom:10px;outline:none;font-size:13px;
+}
+.modal-label{font-size:9px;font-weight:700;color:var(--subtext);letter-spacing:.5px;margin:0 0 4px;}
+.modal-radio-row{display:flex;gap:14px;margin-bottom:10px;}
+.modal-radio-row label{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text);}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:6px;}
+.modal-btn{
+  height:34px;padding:0 16px;border-radius:14px;border:none;font-size:12px;
+  background:var(--surface2);color:var(--text);transition:background .15s;
+}
+.modal-btn:hover{background:var(--border2);}
+.modal-btn.primary{background:var(--accent);color:#fff;}
+.modal-btn.primary:hover{background:var(--accent-dim);}
+.modal-btn.danger{background:transparent;color:var(--red);border:1px solid #3f0f0f;}
+.modal-btn.danger:hover{background:#2d1010;}
 </style>
 </head>
 <body>
 <div id="root">
+
+  <div id="bg-image-layer"></div>
 
   <div id="topbar-wrap">
     <div id="topbar">
@@ -1267,6 +1445,8 @@ textarea.code-area{
     </div>
   </div>
 </div>
+
+<div id="modal-overlay"><div class="modal-box" id="modal-box"></div></div>
 
 <script>
 const TABS = [
@@ -1759,42 +1939,191 @@ function appendLog(text){
   if (box){ box.textContent += text; box.scrollTop = box.scrollHeight; }
 }
 
+// ── Native modal dialogs (replaces confirm()/prompt()/alert()) -----------
+// Every dialog the OS would normally chrome-ify (session reset, project
+// creation, MCP add/remove, chat deletion, etc.) is rendered as an
+// in-app overlay instead, so it looks and feels like part of Midum rather
+// than a browser/Windows popup breaking the illusion.
+let _modalKeyHandler = null;
+
+function _closeModal(){
+  document.getElementById("modal-overlay").classList.remove("open");
+  document.getElementById("modal-box").innerHTML = "";
+  if (_modalKeyHandler){
+    document.removeEventListener("keydown", _modalKeyHandler);
+    _modalKeyHandler = null;
+  }
+}
+
+function _renderModal(title, bodyHtml, buttons, focusId){
+  const overlay = document.getElementById("modal-overlay");
+  const box = document.getElementById("modal-box");
+  const btnHtml = buttons.map((b, i)=>
+    `<button class="modal-btn${b.primary ? " primary" : ""}${b.danger ? " danger" : ""}" data-idx="${i}">${escapeHtml(b.label)}</button>`
+  ).join("");
+  box.innerHTML = `
+    <div class="modal-title">${escapeHtml(title)}</div>
+    ${bodyHtml}
+    <div class="modal-actions">${btnHtml}</div>
+  `;
+  buttons.forEach((b, i)=>{
+    box.querySelector(`[data-idx="${i}"]`).onclick = b.onClick;
+  });
+  overlay.classList.add("open");
+  if (focusId){
+    const el = document.getElementById(focusId);
+    if (el){ setTimeout(()=>{ el.focus(); el.select && el.select(); }, 30); }
+  }
+}
+
+function showAlert(message, title){
+  return new Promise(resolve=>{
+    _renderModal(title || "Notice", `<div class="modal-msg">${escapeHtml(String(message == null ? "" : message))}</div>`, [
+      { label: "OK", primary: true, onClick: ()=>{ _closeModal(); resolve(); } },
+    ]);
+    _modalKeyHandler = e=>{ if (e.key === "Enter" || e.key === "Escape"){ _closeModal(); resolve(); } };
+    document.addEventListener("keydown", _modalKeyHandler);
+  });
+}
+
+function showConfirm(message, title, opts){
+  opts = opts || {};
+  return new Promise(resolve=>{
+    _renderModal(title || "Confirm", `<div class="modal-msg">${escapeHtml(String(message == null ? "" : message))}</div>`, [
+      { label: opts.cancelLabel || "Cancel", onClick: ()=>{ _closeModal(); resolve(false); } },
+      { label: opts.okLabel || "OK", primary: !opts.danger, danger: !!opts.danger, onClick: ()=>{ _closeModal(); resolve(true); } },
+    ]);
+    _modalKeyHandler = e=>{
+      if (e.key === "Escape"){ _closeModal(); resolve(false); }
+      else if (e.key === "Enter"){ _closeModal(); resolve(true); }
+    };
+    document.addEventListener("keydown", _modalKeyHandler);
+  });
+}
+
+function showPrompt(message, title, defaultValue){
+  return new Promise(resolve=>{
+    const inputId = "modal-input-" + Math.random().toString(36).slice(2);
+    const msgHtml = message ? `<div class="modal-msg">${escapeHtml(message)}</div>` : "";
+    _renderModal(title || "Input", `${msgHtml}<input type="text" class="modal-input" id="${inputId}" value="${escapeHtml(defaultValue || "")}"/>`, [
+      { label: "Cancel", onClick: ()=>{ _closeModal(); resolve(null); } },
+      { label: "OK", primary: true, onClick: ()=>{ const v = document.getElementById(inputId).value; _closeModal(); resolve(v); } },
+    ], inputId);
+    _modalKeyHandler = e=>{
+      if (e.key === "Escape"){ _closeModal(); resolve(null); }
+      else if (e.key === "Enter"){ const el = document.getElementById(inputId); const v = el ? el.value : ""; _closeModal(); resolve(v); }
+    };
+    document.addEventListener("keydown", _modalKeyHandler);
+  });
+}
+
+// Multi-field modal used specifically for adding an MCP server (name +
+// transport choice + command-or-url), since that needs more than a single
+// text field.
+function showMcpAddModal(){
+  return new Promise(resolve=>{
+    const nameId = "mcp-name-" + Math.random().toString(36).slice(2);
+    const cmdId  = "mcp-cmd-"  + Math.random().toString(36).slice(2);
+    const urlId  = "mcp-url-"  + Math.random().toString(36).slice(2);
+    const radioName = "mcp-transport-" + Math.random().toString(36).slice(2);
+    const body = `
+      <div class="modal-label">SERVER NAME</div>
+      <input type="text" class="modal-input" id="${nameId}" placeholder="e.g. filesystem"/>
+      <div class="modal-label">TRANSPORT</div>
+      <div class="modal-radio-row">
+        <label><input type="radio" name="${radioName}" value="stdio" checked/> Command (stdio)</label>
+        <label><input type="radio" name="${radioName}" value="http"/> URL (http)</label>
+      </div>
+      <div class="modal-label" id="${cmdId}-label">COMMAND</div>
+      <input type="text" class="modal-input" id="${cmdId}" placeholder="e.g. npx -y @modelcontextprotocol/server-filesystem"/>
+      <div class="modal-label" id="${urlId}-label" style="display:none;">SERVER URL</div>
+      <input type="text" class="modal-input" id="${urlId}" placeholder="https://..." style="display:none;"/>
+    `;
+    _renderModal("Add MCP Server", body, [
+      { label: "Cancel", onClick: ()=>{ _closeModal(); resolve(null); } },
+      { label: "Connect", primary: true, onClick: ()=>{
+          const name = document.getElementById(nameId).value.trim();
+          const transport = document.querySelector(`input[name="${radioName}"]:checked`).value;
+          const command = document.getElementById(cmdId).value.trim();
+          const url = document.getElementById(urlId).value.trim();
+          _closeModal();
+          resolve({ name, transport, command, url });
+        } },
+    ], nameId);
+    document.querySelectorAll(`input[name="${radioName}"]`).forEach(r=>{
+      r.onchange = ()=>{
+        const isStdio = r.value === "stdio" && r.checked;
+        const anyChecked = document.querySelector(`input[name="${radioName}"]:checked`).value;
+        const showCmd = anyChecked === "stdio";
+        document.getElementById(cmdId).style.display = showCmd ? "" : "none";
+        document.getElementById(`${cmdId}-label`).style.display = showCmd ? "" : "none";
+        document.getElementById(urlId).style.display = showCmd ? "none" : "";
+        document.getElementById(`${urlId}-label`).style.display = showCmd ? "none" : "";
+      };
+    });
+    _modalKeyHandler = e=>{ if (e.key === "Escape"){ _closeModal(); resolve(null); } };
+    document.addEventListener("keydown", _modalKeyHandler);
+  });
+}
+
 // ── Sidebar -------------------------------------------------------------
 function buildSidebar(){
   const el = document.getElementById("sidebar-inner");
   el.innerHTML = `
-    <div class="hdr-row">
-      <div class="section-label">WORKSPACE</div>
-      <button class="icon-btn" style="width:26px;height:26px;font-size:11px;" id="sidebar-close">✕</button>
+    <div id="sidebar-main-view">
+      <div class="hdr-row">
+        <div class="section-label">WORKSPACE</div>
+        <button class="icon-btn" style="width:26px;height:26px;font-size:11px;" id="sidebar-close">✕</button>
+      </div>
+      <button class="btn" id="new-session-btn">+ New Session</button>
+      <select id="project-select"></select>
+      <div class="btn-row">
+        <button class="ghost-btn" id="proj-new">+ Project</button>
+        <button class="ghost-btn" id="proj-scan">📂 Scan</button>
+        <button class="ghost-btn" id="proj-code">💻 Code</button>
+      </div>
+      <div id="file-list"></div>
+      <div class="divider"></div>
+      <div class="section-label">CHAT HISTORY</div>
+      <div id="history-list"></div>
+      <div class="divider"></div>
+      <div class="hdr-row">
+        <div class="section-label">SETTINGS</div>
+        <button class="icon-btn" style="width:22px;height:22px;font-size:10px;" id="settings-toggle">⚙</button>
+      </div>
+      <div id="sidebar-footer">
+        <button class="ghost-btn" id="proj-term">🐚 Terminal</button>
+        <button class="ghost-btn" id="shutdown-btn" style="color:var(--red);">⏻ Shutdown</button>
+      </div>
     </div>
-    <button class="btn" id="new-session-btn">+ New Session</button>
-    <select id="project-select"></select>
-    <div class="btn-row">
-      <button class="ghost-btn" id="proj-new">+ Project</button>
-      <button class="ghost-btn" id="proj-scan">📂 Scan</button>
-      <button class="ghost-btn" id="proj-code">💻 Code</button>
-    </div>
-    <div id="file-list"></div>
-    <div class="divider"></div>
-    <div class="section-label">CHAT HISTORY</div>
-    <div id="history-list"></div>
-    <div class="divider"></div>
-    <div class="hdr-row">
-      <div class="section-label">SETTINGS</div>
-      <button class="icon-btn" style="width:22px;height:22px;font-size:10px;" id="settings-toggle">⚙</button>
-    </div>
-    <div id="settings-panel" style="display:none;flex-direction:column;gap:6px;">
+    <div id="sidebar-settings-overlay">
+      <div class="hdr-row">
+        <button id="settings-back-btn">←</button>
+        <div class="section-label">SETTINGS</div>
+        <div style="width:26px;"></div>
+      </div>
       <div class="field-label" style="margin:2px 0 0;">THEME</div>
       <div class="btn-row" id="settings-theme-toggle">
         <button class="ghost-btn" data-theme="dark" style="flex:1;">🌙 Dark</button>
         <button class="ghost-btn" data-theme="light" style="flex:1;">☀️ Light</button>
       </div>
       <div class="hdr-row" style="margin-top:4px;">
-        <div class="field-label" style="margin:0;">AMBIENT BLOBS</div>
+        <div class="field-label" style="margin:0;">BACKGROUND IMAGE</div>
         <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);">
-          <input type="checkbox" id="settings-blobs" checked style="width:14px;height:14px;"/> Enabled
+          <input type="checkbox" id="settings-bg-enabled" style="width:14px;height:14px;"/> Enabled
         </label>
       </div>
+      <div class="btn-row">
+        <button class="ghost-btn" id="bg-choose" style="flex:1;">🖼 Choose Image...</button>
+        <button class="ghost-btn" id="bg-clear" style="flex:0 0 auto;">✕</button>
+      </div>
+      <div id="bg-filename" style="font-size:9px;color:var(--subtext);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></div>
+      <div class="field-label" style="margin-top:2px;">Brightness</div>
+      <input type="range" id="bg-brightness" min="40" max="160" value="100" style="width:100%;"/>
+      <div class="field-label">Blur</div>
+      <input type="range" id="bg-blur" min="0" max="40" value="0" style="width:100%;"/>
+      <div class="field-label">Opacity</div>
+      <input type="range" id="bg-opacity" min="10" max="100" value="100" style="width:100%;"/>
       <div class="field-label">DEFAULT PROVIDER</div>
       <select id="settings-provider"></select>
       <div class="field-label">DEFAULT MODEL</div>
@@ -1814,14 +2143,11 @@ function buildSidebar(){
       </div>
       <div id="settings-status" style="font-size:9px;color:var(--subtext);"></div>
     </div>
-    <div id="sidebar-footer">
-      <button class="ghost-btn" id="proj-term">🐚 Terminal</button>
-      <button class="ghost-btn" id="shutdown-btn" style="color:var(--red);">⏻ Shutdown</button>
-    </div>
   `;
   document.getElementById("sidebar-close").onclick = toggleSidebar;
   document.getElementById("new-session-btn").onclick = async ()=>{
-    if (!confirm("Clear current session context and reset memories?")) return;
+    const ok = await showConfirm("Clear current session context and reset memories?", "New Session");
+    if (!ok) return;
     await api("new_session"); clearChat(); refreshHistory();
   };
   document.getElementById("project-select").onchange = async (e)=>{
@@ -1829,23 +2155,28 @@ function buildSidebar(){
     renderFileList(info);
   };
   document.getElementById("proj-new").onclick = async ()=>{
-    const name = prompt("Enter new Project/Workspace name:");
+    const name = await showPrompt("Enter new Project/Workspace name:", "New Project");
     if (!name) return;
     const r = await api("create_project", name);
-    if (!r.ok) alert(r.error); else populateProjects(r.projects);
+    if (!r.ok) showAlert(r.error, "Error"); else populateProjects(r.projects);
   };
   document.getElementById("proj-scan").onclick = async ()=>{ await api("change_base_work_directory"); };
   document.getElementById("proj-code").onclick = ()=>api("open_project_in_vscode");
   document.getElementById("proj-term").onclick = ()=>api("open_project_terminal");
   document.getElementById("shutdown-btn").onclick = async ()=>{
-    if (confirm("Shut down Midum engine?")) await api("shutdown");
+    const ok = await showConfirm("Shut down Midum engine?", "Shutdown", {danger:true, okLabel:"Shutdown"});
+    if (ok) await api("shutdown");
   };
 
   document.getElementById("settings-toggle").onclick = ()=>{
-    const panel = document.getElementById("settings-panel");
-    const open = panel.style.display !== "none";
-    panel.style.display = open ? "none" : "flex";
-    if (!open) loadSettingsPanel();
+    // Settings takes over the ENTIRE sidebar pane (an overlay covering the
+    // whole thing), rather than a small strip squeezed in below workspace
+    // + history -- there's a dedicated back button to return.
+    document.getElementById("sidebar-settings-overlay").classList.add("open");
+    loadSettingsPanel();
+  };
+  document.getElementById("settings-back-btn").onclick = ()=>{
+    document.getElementById("sidebar-settings-overlay").classList.remove("open");
   };
   document.getElementById("settings-save").onclick = saveSettingsPanel;
   document.getElementById("settings-reset").onclick = ()=>{
@@ -1863,9 +2194,34 @@ function buildSidebar(){
   document.querySelectorAll('#settings-theme-toggle [data-theme]').forEach(btn=>{
     btn.onclick = ()=>applyTheme(btn.dataset.theme);
   });
-  document.getElementById("settings-blobs").onchange = (e)=>{
-    document.documentElement.classList.toggle("no-blobs", !e.target.checked);
+  document.getElementById("settings-bg-enabled").onchange = (e)=>{
+    _bgState.cfg.enabled = e.target.checked;
+    applyBgImage(_bgState.cfg, _bgState.dataUrl);
   };
+  document.getElementById("bg-choose").onclick = async ()=>{
+    const r = await api("pick_background_image");
+    if (!r.ok){ if (r.error) showAlert(r.error, "Error"); return; }
+    _bgState.cfg = r.settings.bg_image;
+    _bgState.dataUrl = r.data_url;
+    applyBgImage(_bgState.cfg, _bgState.dataUrl);
+  };
+  document.getElementById("bg-clear").onclick = async ()=>{
+    const r = await api("clear_background_image");
+    if (!r.ok) return;
+    _bgState.cfg = r.settings.bg_image;
+    _bgState.dataUrl = null;
+    applyBgImage(_bgState.cfg, _bgState.dataUrl);
+  };
+  // Sliders trigger a debounced server-side re-bake (Pillow) rather than
+  // a live CSS filter -- the checkbox toggle just swaps the already-baked
+  // image in/out, which is instant and doesn't need a round trip.
+  ['bg-brightness','bg-blur','bg-opacity'].forEach(id=>{
+    document.getElementById(id).oninput = (e)=>{
+      const key = id === 'bg-brightness' ? 'brightness' : id === 'bg-blur' ? 'blur' : 'opacity';
+      _bgState.cfg[key] = Number(e.target.value);
+      _scheduleBgPreview();
+    };
+  });
 }
 
 const DEFAULT_COLORS = {accent:"#f97316", accent2:"#7c3aed", bg:"#02010a", panel:"#0a0916", text:"#e2e8f0"};
@@ -1917,10 +2273,41 @@ function applyColors(colors){
   if (colors.text) root.setProperty("--text", colors.text);
 }
 
-function applyBlobs(enabled){
-  document.documentElement.classList.toggle("no-blobs", !enabled);
-  const cb = document.getElementById("settings-blobs");
-  if (cb) cb.checked = !!enabled;
+function applyBgImage(cfg, dataUrl){
+  const layer = document.getElementById("bg-image-layer");
+  const on = !!(cfg && cfg.enabled && dataUrl);
+  document.documentElement.classList.toggle("has-bg-image", on);
+  if (layer){
+    // dataUrl already has brightness/blur/opacity baked into its pixels
+    // server-side -- no CSS filter or opacity assignment here, so there
+    // is nothing for the browser to recompute on repaint.
+    layer.style.backgroundImage = on ? `url("${dataUrl}")` : "";
+  }
+  const enabledCb = document.getElementById("settings-bg-enabled");
+  if (enabledCb) enabledCb.checked = !!(cfg && cfg.enabled);
+  if (cfg){
+    const b = document.getElementById("bg-brightness"); if (b) b.value = cfg.brightness != null ? cfg.brightness : 100;
+    const bl = document.getElementById("bg-blur"); if (bl) bl.value = cfg.blur != null ? cfg.blur : 0;
+    const o = document.getElementById("bg-opacity"); if (o) o.value = cfg.opacity != null ? cfg.opacity : 100;
+    const fn = document.getElementById("bg-filename");
+    if (fn) fn.textContent = cfg.path ? cfg.path.split(/[\\/]/).pop() : "No image selected";
+  }
+}
+
+// Cache of the current bg config + baked data url. Slider drags call a
+// debounced re-bake (Python does the Pillow work) rather than a live CSS
+// filter, since a live filter was the actual source of the flashing.
+let _bgState = { cfg: { enabled:false, path:"", brightness:100, blur:0, opacity:100 }, dataUrl: null };
+let _bgPreviewTimer = null;
+function _scheduleBgPreview(){
+  clearTimeout(_bgPreviewTimer);
+  _bgPreviewTimer = setTimeout(async ()=>{
+    const r = await api("preview_background_image", _bgState.cfg.brightness, _bgState.cfg.blur, _bgState.cfg.opacity);
+    if (r && r.ok){
+      _bgState.dataUrl = r.data_url;
+      applyBgImage(_bgState.cfg, _bgState.dataUrl);
+    }
+  }, 180);
 }
 
 function fillDatalist(id, values){
@@ -1930,10 +2317,97 @@ function fillDatalist(id, values){
   (values||[]).forEach(v=>{ const o=document.createElement("option"); o.value=v; dl.appendChild(o); });
 }
 
+// ── Custom dropdown enhancer -----------------------------------------------
+// Wraps a native <select> with a themed, scrollable custom dropdown so
+// every dropdown in the app looks and behaves consistently instead of
+// falling back to the OS's native popup styling. The underlying <select>
+// is kept (hidden) so all existing code that populates it with
+// `appendChild(option)`, reads/sets `.value`, or attaches `.onchange`
+// keeps working exactly as before -- this only changes what's rendered.
+function enhanceSelect(sel){
+  if (!sel || sel.dataset.enhanced) return;
+  sel.dataset.enhanced = "1";
+  sel.classList.add("real-select-hidden");
+
+  const wrap = document.createElement("div");
+  wrap.className = "dropdown-wrap";
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = "dropdown-trigger";
+  trigger.innerHTML = "<span></span>";
+  const list = document.createElement("div");
+  list.className = "dropdown-list";
+  wrap.appendChild(trigger);
+  wrap.appendChild(list);
+  sel.insertAdjacentElement("afterend", wrap);
+
+  function closeList(){ list.classList.remove("open"); wrap.classList.remove("open"); }
+  function openList(){
+    document.querySelectorAll(".dropdown-list.open").forEach(l=>{ if (l !== list) l.classList.remove("open"); });
+    document.querySelectorAll(".dropdown-wrap.open").forEach(w=>{ if (w !== wrap) w.classList.remove("open"); });
+    list.classList.add("open"); wrap.classList.add("open");
+    const sel_ = list.querySelector(".dropdown-option.selected");
+    if (sel_) sel_.scrollIntoView({ block: "nearest" });
+  }
+
+  function syncOptions(){
+    list.innerHTML = "";
+    if (!sel.options.length){
+      list.innerHTML = `<div class="dropdown-empty">No options</div>`;
+      return;
+    }
+    Array.from(sel.options).forEach((opt, i)=>{
+      const item = document.createElement("div");
+      item.className = "dropdown-option" + (i === sel.selectedIndex ? " selected" : "");
+      item.textContent = opt.textContent;
+      item.onclick = ()=>{
+        sel.selectedIndex = i;
+        sel.dispatchEvent(new Event("change", { bubbles: true }));
+        closeList();
+        syncTrigger();
+      };
+      list.appendChild(item);
+    });
+  }
+  function syncTrigger(){
+    const opt = sel.options[sel.selectedIndex];
+    trigger.querySelector("span").textContent = opt ? opt.textContent : "—";
+    list.querySelectorAll(".dropdown-option").forEach((el, i)=> el.classList.toggle("selected", i === sel.selectedIndex));
+  }
+
+  trigger.onclick = (e)=>{ e.stopPropagation(); list.classList.contains("open") ? closeList() : openList(); };
+  document.addEventListener("click", (e)=>{ if (!wrap.contains(e.target)) closeList(); });
+
+  // Options are usually populated dynamically after enhancement (project
+  // lists, model lists, file lists, etc.) -- watch for that and re-sync.
+  new MutationObserver(()=>{ syncOptions(); syncTrigger(); }).observe(sel, { childList: true });
+
+  // Programmatic `sel.value = ...` (used throughout to restore a saved
+  // selection) doesn't fire 'change' natively, and wouldn't update our
+  // custom trigger label either without this -- intercept the property so
+  // the visible label always matches the real underlying value.
+  const nativeDesc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
+  Object.defineProperty(sel, "value", {
+    get(){ return nativeDesc.get.call(sel); },
+    set(v){ nativeDesc.set.call(sel, v); syncTrigger(); },
+    configurable: true,
+  });
+
+  syncOptions();
+  syncTrigger();
+}
+
 async function loadSettingsPanel(){
   const s = await api("get_settings");
   applyTheme(s.theme || "dark");
-  applyBlobs(s.blobs !== false);
+  _bgState.cfg = s.bg_image || _bgState.cfg;
+  if (_bgState.cfg.enabled && _bgState.cfg.path){
+    const r = await api("get_background_image_data");
+    _bgState.dataUrl = r && r.ok ? r.data_url : null;
+  } else {
+    _bgState.dataUrl = null;
+  }
+  applyBgImage(_bgState.cfg, _bgState.dataUrl);
   const provSel = document.getElementById("settings-provider");
   if (provSel && !provSel.options.length){
     const info = await api("get_providers");
@@ -1954,18 +2428,24 @@ async function loadSettingsPanel(){
 async function saveSettingsPanel(){
   const provider = document.getElementById("settings-provider").value;
   const model = document.getElementById("settings-model").value;
-  const blobs = document.getElementById("settings-blobs").checked;
+  const bg_image = {
+    enabled: document.getElementById("settings-bg-enabled").checked,
+    brightness: Number(document.getElementById("bg-brightness").value),
+    blur: Number(document.getElementById("bg-blur").value),
+    opacity: Number(document.getElementById("bg-opacity").value),
+  };
   const colors = {};
   ["accent","accent2","bg","panel","text"].forEach(k=>{
     const el = document.getElementById(`settings-color-${k}`);
     if (el) colors[k] = el.value;
   });
-  const r = await api("save_settings", {provider, model, theme: _activeTheme, colors, blobs});
+  const r = await api("save_settings", {provider, model, theme: _activeTheme, colors, bg_image});
   const status = document.getElementById("settings-status");
   if (r.ok){
     applyTheme(r.settings.theme || "dark");
     applyColors(r.settings.colors);
-    applyBlobs(r.settings.blobs !== false);
+    _bgState.cfg = r.settings.bg_image;
+    applyBgImage(_bgState.cfg, _bgState.dataUrl);
     if (status) status.textContent = "Saved — will be remembered next launch.";
   } else if (status) {
     status.textContent = `Error: ${r.error}`;
@@ -2018,14 +2498,15 @@ async function refreshHistory(){
       </div>`;
     card.querySelector(".open").onclick = async ()=>{
       const r = await api("load_chat", chat.id);
-      if (!r.ok){ alert(r.error); return; }
+      if (!r.ok){ showAlert(r.error, "Error"); return; }
       clearChat();
       (r.display||[]).forEach(([tag,text])=>appendRow(tag, text));
       switchTab("Chat");
       refreshHistory();
     };
     card.querySelector(".del").onclick = async ()=>{
-      if (!confirm(`Permanently delete "${title}"?`)) return;
+      const ok = await showConfirm(`Permanently delete "${title}"?`, "Delete Chat", {danger:true, okLabel:"Delete"});
+      if (!ok) return;
       await api("delete_chat", chat.id);
       if (chat.current) clearChat();
       refreshHistory();
@@ -2132,7 +2613,7 @@ function buildSysCorePane(box){
   sel.onchange = load;
   document.getElementById("sc-save").onclick = async ()=>{
     const r = await api("save_sys_core", sel.value, box2.value);
-    if (!r.ok) alert(r.error);
+    if (!r.ok) showAlert(r.error, "Error");
   };
   load();
 }
@@ -2165,10 +2646,10 @@ function buildKnowledgePane(box){
     await api("save_knowledge_file", sel.value, box2.value);
   };
   document.getElementById("kb-new").onclick = async ()=>{
-    const name = prompt("Knowledge base name:"); if (!name) return;
-    const desc = prompt("Short description:") || "";
+    const name = await showPrompt("Knowledge base name:", "New Knowledge Base"); if (!name) return;
+    const desc = (await showPrompt("Short description:", "New Knowledge Base")) || "";
     const r = await api("create_knowledge", name, desc);
-    if (!r.ok) alert(r.error); else refresh(r.filename);
+    if (!r.ok) showAlert(r.error, "Error"); else refresh(r.filename);
   };
   refresh();
 }
@@ -2201,11 +2682,11 @@ function buildSkillsPane(box){
     await api("save_skill_file", sel.value, box2.value);
   };
   document.getElementById("sk-new").onclick = async ()=>{
-    const name = prompt("Skill name:"); if (!name) return;
-    const domain = prompt("Domain:") || "general";
-    const desc = prompt("Short description:") || "";
+    const name = await showPrompt("Skill name:", "New Skill"); if (!name) return;
+    const domain = (await showPrompt("Domain:", "New Skill", "general")) || "general";
+    const desc = (await showPrompt("Short description:", "New Skill")) || "";
     const r = await api("create_skill", name, domain, desc);
-    if (!r.ok) alert(r.error); else refresh(r.filename);
+    if (!r.ok) showAlert(r.error, "Error"); else refresh(r.filename);
   };
   refresh();
 }
@@ -2268,10 +2749,15 @@ function buildMcpPane(box){
     <div id="mcp-list" style="flex:1;overflow-y:auto;margin-top:4px;"></div>`;
   document.getElementById("mcp-refresh").onclick = refreshMcpList;
   document.getElementById("mcp-add").onclick = async ()=>{
-    const name = prompt("Server name:"); if (!name) return;
-    const command = prompt("Command (stdio transport) or leave blank for URL-based:") || "";
-    const url = command ? "" : (prompt("Server URL:") || "");
-    await api("connect_mcp", {name, transport: command ? "stdio" : "http", command: command || undefined, url: url || undefined, persist:true});
+    const result = await showMcpAddModal();
+    if (!result || !result.name) return;
+    await api("connect_mcp", {
+      name: result.name,
+      transport: result.transport,
+      command: result.transport === "stdio" ? (result.command || undefined) : undefined,
+      url: result.transport === "http" ? (result.url || undefined) : undefined,
+      persist: true,
+    });
   };
   refreshMcpList();
 }
@@ -2302,13 +2788,13 @@ async function refreshMcpList(){
           : `<button class="mini-btn" data-act="retry">Retry</button><button class="mini-btn del" data-act="remove">Remove</button>`}
       </div>`;
     const act = row.querySelector('[data-act=tools]');
-    if (act) act.onclick = async ()=>{ const r = await api("view_mcp_tools", s.name); alert(r.content); };
+    if (act) act.onclick = async ()=>{ const r = await api("view_mcp_tools", s.name); showAlert(r.content, `Tools — ${s.name}`); };
     const disc = row.querySelector('[data-act=disc]');
-    if (disc) disc.onclick = async ()=>{ if (confirm(`Disconnect '${s.name}'?`)) await api("disconnect_mcp", s.name, false); };
+    if (disc) disc.onclick = async ()=>{ const ok = await showConfirm(`Disconnect '${s.name}'?`, "Disconnect Server"); if (ok) await api("disconnect_mcp", s.name, false); };
     const retry = row.querySelector('[data-act=retry]');
     if (retry) retry.onclick = ()=>api("retry_mcp", s.name);
     const remove = row.querySelector('[data-act=remove]');
-    if (remove) remove.onclick = async ()=>{ if (confirm(`Remove '${s.name}' permanently?`)) await api("disconnect_mcp", s.name, true); };
+    if (remove) remove.onclick = async ()=>{ const ok = await showConfirm(`Remove '${s.name}' permanently?`, "Remove Server", {danger:true, okLabel:"Remove"}); if (ok) await api("disconnect_mcp", s.name, true); };
     listEl.appendChild(row);
   });
 }
@@ -2330,7 +2816,12 @@ window.addEventListener("pywebviewready", async ()=>{
     const s = await api("get_settings");
     applyTheme(s.theme || "dark");
     applyColors(s.colors);
-    applyBlobs(s.blobs !== false);
+    _bgState.cfg = s.bg_image || _bgState.cfg;
+    if (_bgState.cfg.enabled && _bgState.cfg.path){
+      const r = await api("get_background_image_data");
+      _bgState.dataUrl = r && r.ok ? r.data_url : null;
+    }
+    applyBgImage(_bgState.cfg, _bgState.dataUrl);
   } catch (e) { /* pywebview bridge not ready yet on some platforms — fine */ }
 
   await api("startup");
