@@ -328,8 +328,41 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "execute_python_code",
+            "description": (
+                "Run a snippet of Python code in an isolated sandbox subprocess (a "
+                "brand-new interpreter, NOT Midum's own process) and get back "
+                "whatever it printed to stdout/stderr. Use this for calculations, "
+                "data processing, quick algorithms, testing logic, or parsing/"
+                "transforming text — anything easier to solve with real code than "
+                "with a terminal one-liner. There is NO persistent state between "
+                "calls: each call starts a fresh interpreter, so print() whatever "
+                "you need to see. NOT for UI interaction, launching apps, or "
+                "anything needing Midum's own runtime — use the dedicated tools "
+                "for those (execute_terminal_command, click_ui_element, etc)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "The Python code to run. Use print() to produce output you want to see."},
+                    "timeout": {"type": "integer", "description": "Max seconds to allow before killing the process. Default 15, hard cap 60."}
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_internet",
-            "description": "Search the internet for real-time information or documentation.",
+            "description": (
+                "Search the internet for real-time information or documentation. "
+                "Returns a SIMPLE ANSWER (short, direct), a DETAILED ANSWER (aggregated "
+                "from the top sources' snippets), and a list of WEBSITES/SOURCES with "
+                "indices. Follow up with read_search_result(index) to pull the FULL text "
+                "of any source directly (no browser needed) if the snippets aren't enough, "
+                "or open_search_result(index) only if you need to actually view it in Chrome."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1383,13 +1416,38 @@ tools = [
             "description": (
                 "Open a web search result from the last search_internet call by index. "
                 "Much faster than typing the URL manually. "
-                "Call search_internet first, then open_search_result(index) to open the chosen result."
+                "Call search_internet first, then open_search_result(index) to open the chosen result. "
+                "Only use this if you need to VISUALLY view/interact with the page in Chrome — "
+                "if you just need to read its content, use read_search_result(index) instead, "
+                "which is much faster and doesn't require opening a browser window."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "index":   {"type": "integer", "description": "Result index from search_internet output (0-based)."},
                     "browser": {"type": "string",  "description": "Browser to open in: 'chrome' (default), 'brave', 'firefox', 'edge'."}
+                },
+                "required": ["index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_search_result",
+            "description": (
+                "Fetch and read the FULL text content of a web search result by index, "
+                "directly over HTTP — NO Chrome window, NO browser, NO CDP needed. "
+                "This is the PREFERRED way to read what's on a search result page: it's "
+                "much faster than open_search_result() + read_browser_page() and doesn't "
+                "disturb the user's desktop. Call search_internet(query) first to populate "
+                "the index. Large pages are chunked — pass chunk_index (1-based) for more."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index":       {"type": "integer", "description": "Result index from search_internet output (0-based)."},
+                    "chunk_index": {"type": "integer", "description": "1-based chunk number for large pages. Default 1."}
                 },
                 "required": ["index"],
             },

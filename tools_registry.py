@@ -7,6 +7,13 @@ from tools_schema import tools
 from ui_automation.linux_navigator import _run, ui_navigator
 from ui_automation.windows_uia import _TESSERACT_AVAILABLE, _UIA_AVAILABLE, _UIA_INIT_ERROR
 from ddgs import DDGS
+try:
+    import requests as _search_requests
+    _SEARCH_REQUESTS_AVAILABLE = True
+except ImportError:
+    _search_requests = None
+    _SEARCH_REQUESTS_AVAILABLE = False
+import html as _html_mod
 import base64
 import datetime
 import docx as _docx
@@ -16,6 +23,7 @@ import mammoth as _mammoth
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import win32gui
@@ -1035,6 +1043,10 @@ def search_internet(query):
         print(f" -> Searching the web for: '{query}'")
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=7))
+            try:
+                instant = list(ddgs.answers(query))
+            except Exception:
+                instant = []
         if not results:
             _last_search_results = []
             return "No web results found."
@@ -1045,21 +1057,47 @@ def search_internet(query):
             for r in results
         ])
 
+        # ── SIMPLE ANSWER — instant answer if DDG has one, else the top result's snippet ──
+        simple_answer = ""
+        if instant:
+            simple_answer = (instant[0].get("text") or "").strip()
+        if not simple_answer:
+            simple_answer = (results[0].get("body") or "").strip()
+        if len(simple_answer) > 300:
+            cut = simple_answer[:297].rsplit(" ", 1)[0]
+            simple_answer = cut + "..."
+
+        # ── DETAILED ANSWER — snippets from the top few sources, attributed ──
+        detail_parts = []
+        for r in results[:5]:
+            body  = (r.get("body")  or "").strip()
+            title = (r.get("title") or "").strip()
+            if body:
+                detail_parts.append(f"- ({title}) {body}")
+        detailed_answer = "\n".join(detail_parts) if detail_parts else ""
+
         lines = [
             f"Web results for '{query}' ({len(results)} results)",
-            "Use open_search_result(index) to open a result in Chrome.",
             "",
-            f"{'IDX':>4}  TITLE / SNIPPET",
-            "─" * 72,
+            "SIMPLE ANSWER:",
+            simple_answer or "(no concise answer found — see detailed answer / sources below)",
+            "",
+            "DETAILED ANSWER (aggregated from top sources):",
+            detailed_answer or "(no snippet content available — try read_search_result(index) on a source below)",
+            "",
+            "WEBSITES / SOURCES:",
         ]
         for i, r in enumerate(results):
-            title   = (r.get("title") or "")[:55]
-            snippet = (r.get("body")  or "")[:80]
-            url     = (r.get("href")  or "")[:60]
-            lines.append(f"{i:>4}  {title}")
+            title = (r.get("title") or "")[:70]
+            url   = (r.get("href")  or "")
+            lines.append(f"  [{i}] {title}")
             lines.append(f"      {url}")
-            lines.append(f"      {snippet}")
-            lines.append("")
+        lines.append("")
+        lines.append(
+            "Use read_search_result(index) to fetch and read a source's FULL page "
+            "text directly (no browser needed, fast). "
+            "Use open_search_result(index) only if you actually need to open it visually in Chrome."
+        )
         return "\n".join(lines)
     except Exception as e:
         return f"Error executing internet search: {str(e)}"
@@ -1074,6 +1112,82 @@ def open_search_result(index: int, browser: str = "chrome") -> str:
     if not url:
         return f"Result #{index} has no URL."
     return open_url(url, browser)
+
+
+# Cache of fetched full-page text for read_search_result, keyed by result
+# index — so re-reading a later chunk of the same page doesn't re-fetch it.
+_search_result_text_cache: dict[int, dict] = {}
+
+
+def read_search_result(index: int, chunk_index: int = 1) -> str:
+    """
+    Fetch and read the FULL text content of a web search result by index —
+    directly over HTTP (requests), with NO Chrome/browser/CDP required.
+    Much faster than open_search_result() + read_browser_page() when you just
+    need to read what's on the page rather than interact with it visually.
+
+    Call search_internet(query) first to populate the index. Large pages are
+    chunked at CHUNK_CHARS chars — pass chunk_index (1-based) to read more.
+    """
+    entry = _get_indexed("web_search", index)
+    if entry is None:
+        return f"Index {index} not found. Call search_internet first."
+    url = entry.get("url", "")
+    if not url:
+        return f"Result #{index} has no URL."
+
+    if not _SEARCH_REQUESTS_AVAILABLE:
+        return "Error: 'requests' package not installed. pip install requests"
+
+    from browser_cdp import CHUNK_CHARS
+    title = entry.get("title", "") or url
+
+    cached = _search_result_text_cache.get(index)
+    if cached is None:
+        try:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                )
+            }
+            resp = _search_requests.get(url, headers=headers, timeout=12)
+            resp.raise_for_status()
+            html_src = resp.text
+        except Exception as e:
+            return f"Error fetching '{url}': {e}"
+
+        # Strip <script>/<style>/comments, then all remaining tags, then
+        # unescape HTML entities and collapse whitespace into readable text.
+        text = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", html_src)
+        text = re.sub(r"(?s)<!--.*?-->", " ", text)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        text = _html_mod.unescape(text)
+        text = re.sub(r"[ \t\r\f\v]+", " ", text)
+        text = re.sub(r" *\n *", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = text.strip()
+
+        if not text:
+            return f"Result #{index} ({url}) returned no readable text content."
+
+        _search_result_text_cache[index] = {"url": url, "title": title, "text": text}
+        cached = _search_result_text_cache[index]
+
+    text = cached["text"]
+    total = (len(text) + CHUNK_CHARS - 1) // CHUNK_CHARS
+    if chunk_index < 1 or chunk_index > total:
+        return f"Chunk {chunk_index} out of range (1-{total}) for result #{index}."
+
+    start = (chunk_index - 1) * CHUNK_CHARS
+    header = f"[SEARCH RESULT #{index}: {title}]\nURL: {url}\n"
+    if total > 1:
+        header += (
+            f"({total} chunks of ~{CHUNK_CHARS} chars — this is chunk {chunk_index}/{total}. "
+            f"Call read_search_result(index={index}, chunk_index=N) for other chunks.)\n"
+        )
+    header += "─" * 60 + "\n"
+    return header + text[start:start + CHUNK_CHARS]
 
 
 def ocr_snapshot() -> str:
@@ -1220,6 +1334,47 @@ def execute_terminal_command(command, working_directory=None):
     except Exception as e:
         return f"Execution failed: {str(e)}"
     
+def execute_python_code(code: str, timeout: int = 15) -> str:
+    """
+    Run a snippet of Python code in an isolated subprocess — a brand-new
+    interpreter (`python -I -c <code>`), NOT Midum's own process — and
+    return whatever it printed to stdout/stderr. Use this for calculations,
+    data processing, quick algorithms, testing logic, or parsing/transforming
+    text. There is no persistent state between calls: each call starts a
+    fresh interpreter, so assign results to variables and print() them to
+    see the output.
+
+    NOT for interacting with the desktop UI, files outside what you pass
+    it, or Midum's own runtime — use the dedicated tools for those. `-I`
+    (isolated mode) keeps it from reading the user's site-packages
+    customizations or environment, and a hard timeout kills runaway loops.
+    """
+    code = (code or "").strip()
+    if not code:
+        return "Error: 'code' must contain the Python code to run."
+    try:
+        timeout = max(1, min(int(timeout or 15), 60))
+    except (TypeError, ValueError):
+        timeout = 15
+
+    python_exe = sys.executable or "python"
+    print(f"   [Python sandbox] Running {len(code)} chars (timeout={timeout}s)")
+    try:
+        result = subprocess.run(
+            [python_exe, "-I", "-c", code],
+            capture_output=True, text=True, timeout=timeout, cwd=STARTUP_DIR,
+        )
+        return (
+            f"[exit code {result.returncode}]\n"
+            f"STDOUT:\n{result.stdout}\n"
+            f"STDERR:\n{result.stderr}"
+        )
+    except subprocess.TimeoutExpired:
+        return f"Error: code timed out after {timeout}s — check for an infinite loop or blocking call."
+    except Exception as e:
+        return f"Execution failed: {str(e)}"
+
+
 def _uia_unavailable_message() -> str:
     """Shared diagnostic message for any tool that needs UIA but it's not up."""
     if _UIA_INIT_ERROR:

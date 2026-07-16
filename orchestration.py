@@ -16,7 +16,8 @@ from screen_capture import capture_screen_to_ram, fallback_click_grid, fallback_
 from skills import list_skills, load_skill
 from state import _abort_event
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
-from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_terminal_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, search_internet, write_docx_file, write_local_file, write_response_memory
+from permissions import enforce_tool_permission, mcp_permission_key
+from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
 from tools_schema import tools
 from ui_automation import ui_navigator
 from ui_automation.windows_uia import _UIA_AVAILABLE
@@ -1146,8 +1147,21 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 break   # exits the for-tool loop; then the while loop gets
                         # one more model call to produce the failure reply
 
+            # ── Permission enforcement ──────────────────────────────────────────
+            # Applied to every tool call (native or MCP) right before dispatch.
+            # MCP calls are keyed per-server-per-tool since the same tool name
+            # can exist on multiple connected servers.
+            _perm_key = func_name
+            if func_name == "call_mcp_tool":
+                _perm_key = mcp_permission_key(
+                    str(arguments.get("server", "")), str(arguments.get("tool_name", ""))
+                )
+            _perm_decision, _perm_blocked_msg = enforce_tool_permission(_perm_key, func_name, arguments)
+
             # ── Tool dispatch ──────────────────────────────────────────────────
-            if func_name == "list_more_tools":
+            if _perm_decision == "blocked":
+                tool_output = _perm_blocked_msg
+            elif func_name == "list_more_tools":
                 tool_output = list_more_tools()
 
             elif func_name == "load_tool_by_index":
@@ -1228,6 +1242,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 tool_output = open_search_result(
                     int(arguments.get("index", 0)),
                     arguments.get("browser", "chrome")
+                )
+
+            elif func_name == "read_search_result":
+                tool_output = read_search_result(
+                    int(arguments.get("index", 0)),
+                    int(arguments.get("chunk_index", 1))
                 )
 
             elif func_name == "ocr_snapshot":
@@ -1329,6 +1349,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                         tool_output = execute_terminal_command(
                             cmd, working_directory=arguments.get("working_directory")
                         )
+
+            elif func_name == "execute_python_code":
+                py_code = arguments.get("code", "")
+                py_timeout = arguments.get("timeout", 15)
+                print(f"   [Python sandbox] Executing {len(py_code)} chars")
+                tool_output = execute_python_code(py_code, int(py_timeout) if py_timeout else 15)
 
             elif func_name == "fallback_view_screen":
                 b64_img = capture_screen_to_ram()
@@ -1715,6 +1741,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     "execute command":      "execute_terminal_command",
                     "run command":          "execute_terminal_command",
                     "terminal command":     "execute_terminal_command",
+                    "run_python":           "execute_python_code",
+                    "python_sandbox":       "execute_python_code",
+                    "run_python_code":      "execute_python_code",
+                    "execute_python":       "execute_python_code",
+                    "python":               "execute_python_code",
+                    "run_code":             "execute_python_code",
                     "view screen":          "fallback_view_screen",
                     "click text":           "fallback_click_text",
                     "find text":            "fallback_find_text",
@@ -1790,6 +1822,8 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     "browse":               "open_url",
                     "open_browser":         "open_url",
                     "open_result":          "open_search_result",
+                    "read_result":          "read_search_result",
+                    "read_search":          "read_search_result",
                     "read_page":            "read_browser_page",
                     "read_browser":         "read_browser_page",
                     "read_browser_tab":     "read_browser_page",

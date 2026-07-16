@@ -10,6 +10,13 @@ if _PKG_ROOT not in sys.path:
 if _GUI_DIR not in sys.path:
     sys.path.insert(0, _GUI_DIR)
 
+# Window/titlebar icon -- drop an icon.ico (preferred on Windows, supports
+# multiple embedded resolutions) or icon.png here and it's picked up
+# automatically on next launch, no code changes needed.
+_ASSETS_DIR = os.path.join(_GUI_DIR, "assets")
+os.makedirs(_ASSETS_DIR, exist_ok=True)
+_ICON_CANDIDATES = [os.path.join(_ASSETS_DIR, name) for name in ("icon.ico", "icon.png")]
+
 import threading
 import datetime
 import queue
@@ -28,6 +35,7 @@ from gui.chat_store import ChatStore, MidumSession
 from gui.dispatch import _dispatch_midum_tool
 
 import main as midum
+import permissions
 
 CHATS_DIR = os.path.join(midum.STORAGE_DIR, "chats")
 
@@ -87,10 +95,30 @@ def _known_models_for_provider(provider_key: str) -> list:
     if provider_key == "gemini_api":
         return list(dict.fromkeys([midum.config.GEMINI_API_MODEL, "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"]))
     if provider_key == "gemini_web":
-        return list(dict.fromkeys([midum.config.GEMINI_WEB_MODEL or "(auto)", "(auto)", "gemini-3-flash"]))
+        return _list_gemini_web_model_options()
     if provider_key == "ollama_cloud":
         return list(dict.fromkeys(midum.config.OLLAMA_CLOUD_FALLBACK_MODELS))
     return [midum.config.MODEL_NAME]
+
+
+def _list_gemini_web_model_options() -> list:
+    """
+    Real, current model lineup for the logged-in Gemini web account (via
+    gemini_webapi's list_models()), with "(auto)" always offered first so
+    the user can go back to auto-selection. Falls back to a small
+    hardcoded guess if the account/session can't be reached yet (not
+    logged in, library missing, network hiccup, etc) instead of leaving
+    the dropdown looking broken.
+    """
+    try:
+        from providers.gemini_web_backend import list_gemini_web_models
+        models = list_gemini_web_models()
+    except Exception:
+        models = []
+    if not models:
+        fallback = [midum.config.GEMINI_WEB_MODEL, "gemini-3-flash"]
+        return list(dict.fromkeys(["(auto)"] + [m for m in fallback if m]))
+    return list(dict.fromkeys(["(auto)"] + models))
 
 
 def _list_ollama_cloud_models() -> list:
@@ -148,6 +176,7 @@ TAB_DEFS = [
     ("Skills",       "🛠"),
     ("Tools",        "🔧"),
     ("MCP",          "🔌"),
+    ("Permissions",  "🔐"),
 ]
 
 
@@ -167,6 +196,9 @@ class Api:
         self._current_chat_id  = uuid.uuid4().hex
         self._chat_title       = None
         self._display_log      = []
+        # Set when the window is closed while a reply is still being
+        # generated -- see _on_closing() / _run_turn()'s finally block.
+        self._close_requested   = False
 
         self._selected_provider = DEFAULT_PROVIDER_KEY
         self._selected_model    = _default_model_for_provider(DEFAULT_PROVIDER_KEY)
@@ -226,6 +258,14 @@ class Api:
 
             midum.memory._bootstrap_all_files()
 
+            # Every launch starts a genuinely new session -- the same reset
+            # the "New Session" button performs. Full continuity across
+            # restarts is already covered by the persisted chat history
+            # (sidebar -> open any past chat), so there's no need to
+            # silently carry the previous session's goal/notes forward
+            # into what the UI is showing as a brand-new, empty chat.
+            self._reset_session_memory_file()
+
             try:
                 sys_prompt = midum.get_system_prompt()
             except AttributeError:
@@ -235,9 +275,6 @@ class Api:
             master_ctx = midum.memory.load_memory_into_context(midum.MASTER_MEMORY, "master")
             if master_ctx:
                 memories.append(master_ctx)
-            session_ctx = midum.memory.load_memory_into_context(midum.SESSION_MEMORY, "session (continued)")
-            if session_ctx:
-                memories.append(session_ctx)
             try:
                 with open(midum.INSTRUCTIONS_FILE, "r", encoding="utf-8") as f:
                     _instr = f.read().strip()
@@ -279,7 +316,9 @@ class Api:
     def refresh_ollama_models(self):
         if self._selected_provider == "ollama_cloud":
             return _list_ollama_cloud_models()
-        return _list_ollama_models()
+        if self._selected_provider == "ollama":
+            return _list_ollama_models()
+        return _known_models_for_provider(self._selected_provider)
 
     def select_provider(self, label: str):
         provider_key = _PROVIDER_LABEL_TO_KEY.get(label, DEFAULT_PROVIDER_KEY)
@@ -659,20 +698,27 @@ class Api:
             self._start_new_chat_record()
         return {"ok": True, "chats": self.list_chats()}
 
+    def _reset_session_memory_file(self):
+        """(Re)creates a blank session-memory file with no active goal.
+        Shared by the explicit "New Session" button and by every app
+        launch (see _startup_worker) -- both cases mean the same thing:
+        start clean, don't carry the previous goal/notes forward."""
+        if os.path.exists(midum.SESSION_MEMORY):
+            os.remove(midum.SESSION_MEMORY)
+        midum.memory._current_goal = None
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        midum.write_local_file(
+            midum.SESSION_MEMORY,
+            f"# Midum Session Memory\nSession started: {ts}\n\n"
+            f"{midum.GOAL_SECTION_HEADER}\n_No active goal._\n\n"
+            f"{midum.GOAL_SECTION_END}\n",
+        )
+
     def new_session(self):
         if self._thinking:
             return {"ok": False, "error": "Busy — wait for the current run to finish or abort first."}
         try:
-            if os.path.exists(midum.SESSION_MEMORY):
-                os.remove(midum.SESSION_MEMORY)
-            midum.memory._current_goal = None
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            midum.write_local_file(
-                midum.SESSION_MEMORY,
-                f"# Midum Session Memory\nSession started: {ts}\n\n"
-                f"{midum.GOAL_SECTION_HEADER}\n_No active goal._\n\n"
-                f"{midum.GOAL_SECTION_END}\n",
-            )
+            self._reset_session_memory_file()
             self._session.reset()
             self._start_new_chat_record()
             return {"ok": True}
@@ -754,9 +800,19 @@ class Api:
         except Exception as e:
             self._push_event("error_line", {"text": f"[Engine error: {e}]"})
             self._push_event("status", {"text": "Error", "level": "err"})
+            self._persist_current_chat()
         finally:
             self._thinking = False
             self._push_event("done", {})
+            # The window was closed while this reply was still being
+            # generated (see _on_closing) -- the close was held off
+            # specifically so this reply wouldn't be lost. Now that it's
+            # persisted, actually close.
+            if self._close_requested:
+                self._close_requested = False
+                self._persist_current_chat()
+                if self.window:
+                    self.window.destroy()
 
     _VISUAL_FENCE_LANGS = ("image_data_json", "flowchart_json")
     _TOOL_VISUAL_FENCE_RE = re.compile(r"```(" + "|".join(_VISUAL_FENCE_LANGS) + r")\n(.*?)```", re.DOTALL)
@@ -1026,11 +1082,73 @@ class Api:
     def view_mcp_tools(self, name: str):
         return {"content": midum.show_server_tools(name)}
 
+    # ── Tool permissions ──────────────────────────────────────────────
+    def list_permission_targets(self):
+        """
+        Every gate-able tool, grouped into native tools + one group per
+        connected MCP server, each with the key used to look up/set its
+        permission level. MCP tools are re-enumerated live off the current
+        connections, so this always reflects what's actually callable
+        right now (not a stale snapshot).
+        """
+        native = []
+        for t in sorted(midum.tools, key=lambda t: t["function"]["name"]):
+            fn = t["function"]
+            desc = (fn.get("description") or "").strip().splitlines()[0] if fn.get("description") else ""
+            native.append({"key": fn["name"], "name": fn["name"], "desc": desc[:160]})
+
+        mcp_groups = []
+        for server_name in midum._MCP_SERVER_ORDER:
+            handle = midum._MCP_SERVERS.get(server_name)
+            if not handle:
+                continue
+            entries = []
+            for tdef in (handle.tools or []):
+                desc = (tdef.get("description") or "").strip().splitlines()[0] if tdef.get("description") else ""
+                entries.append({
+                    "key": permissions.mcp_permission_key(server_name, tdef["name"]),
+                    "name": tdef["name"],
+                    "desc": desc[:160],
+                })
+            mcp_groups.append({"server": server_name, "connected": bool(handle.connected), "tools": entries})
+
+        return {"native": native, "mcp_groups": mcp_groups}
+
+    def get_permissions(self):
+        return permissions.get_all_permissions()
+
+    def set_permission(self, key: str, level: str):
+        msg = permissions.set_permission(key, level)
+        return {"ok": not msg.lower().startswith("error"), "message": msg}
+
+    def reset_permissions(self):
+        msg = permissions.reset_all_permissions()
+        return {"ok": True, "message": msg}
+
     def shutdown(self):
+        self._persist_current_chat()
         self._stdout_redir.restore()
         if self.window:
             self.window.destroy()
         return {"ok": True}
+
+    def _on_closing(self):
+        """Registered on window.events.closing (fires for the titlebar X
+        too, not just the in-app Shutdown button). Always flush the
+        current chat first. Previously the window could close while a
+        reply was still being generated: the user's turn had already been
+        saved (send_message persists immediately), but the assistant's
+        reply is only written once _run_turn finishes -- closing before
+        that landed silently dropped the last reply from that chat's
+        history. If a turn is in flight, cancel this close (returning
+        False does that) and let _run_turn's own finally block finish the
+        close once the reply is actually saved."""
+        self._persist_current_chat()
+        if self._thinking:
+            self._close_requested = True
+            self._push_event("log", {"text": "⏳ Finishing the current response before closing...\n"})
+            return False
+        return None
 
 
 # =============================================================================
@@ -1263,6 +1381,12 @@ code.inline-code{background:var(--surface2);color:var(--tool-text);border-radius
   font-family:Consolas,"Cascadia Code",monospace;font-size:12.5px;}
 .bubble h1,.bubble h2,.bubble h3{margin:.4em 0;}
 .bubble a{color:var(--accent);}
+.bubble hr{border:none;border-top:1px solid var(--border2);margin:10px 0;}
+.md-table-wrap{overflow-x:auto;margin:10px 0;max-width:100%;}
+table.md-table{border-collapse:collapse;width:100%;font-size:13px;background:var(--surface);border-radius:8px;overflow:hidden;}
+table.md-table th,table.md-table td{border:1px solid var(--border2);padding:6px 12px;text-align:left;white-space:normal;}
+table.md-table th{background:var(--surface2);color:var(--text);font-weight:700;white-space:nowrap;}
+table.md-table tr:nth-child(even) td{background:color-mix(in srgb, var(--surface) 92%, var(--surface2));}
 
 /* Row + text entrance animation */
 @keyframes rowIn{ from{opacity:0;transform:translateY(10px);} to{opacity:1;transform:translateY(0);} }
@@ -1327,6 +1451,27 @@ textarea.code-area{
 .arg-row label{font-size:11px;color:var(--subtext);width:110px;flex:0 0 auto;}
 .arg-row input, .arg-row select{flex:1;height:28px;}
 
+/* Permissions pane */
+.perm-search{width:100%;height:32px;border-radius:16px;border:1px solid var(--border2);
+  background:var(--surface);color:var(--text);padding:0 12px;outline:none;font-size:12px;}
+.perm-group-title{font-size:10px;font-weight:700;color:var(--subtext);letter-spacing:.5px;
+  margin:14px 0 6px;text-transform:uppercase;}
+.perm-group:first-child .perm-group-title{margin-top:4px;}
+.perm-row{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:8px 10px;margin-bottom:6px;}
+.perm-info{min-width:0;flex:1;}
+.perm-name{font-size:12px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.perm-desc{font-size:10px;color:var(--subtext);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.perm-seg{display:flex;flex:0 0 auto;border-radius:12px;overflow:hidden;border:1px solid var(--border2);}
+.perm-opt{height:26px;padding:0 10px;font-size:10px;border:none;background:var(--surface);
+  color:var(--subtext);border-right:1px solid var(--border2);transition:background .15s,color .15s;}
+.perm-opt:last-child{border-right:none;}
+.perm-opt:hover{background:var(--surface2);}
+.perm-opt.active[data-level="always"]{background:var(--green);color:#fff;}
+.perm-opt.active[data-level="ask"]{background:var(--yellow);color:#1a1400;}
+.perm-opt.active[data-level="deny"]{background:var(--red);color:#fff;}
+.perm-empty{font-size:11px;color:var(--subtext);padding:10px;text-align:center;}
+
 /* Custom dropdown component -- replaces native <select> popups (which
    render with OS chrome and can't be height-limited/styled consistently)
    with an in-app, theme-matched, scrollable list. The underlying <select>
@@ -1335,6 +1480,7 @@ textarea.code-area{
    working untouched -- enhanceSelect() just mirrors it visually. */
 .real-select-hidden{ display:none !important; }
 .dropdown-wrap{ position:relative; }
+.hdr-row .dropdown-wrap{ flex:1 1 auto; min-width:0; }
 .dropdown-trigger{
   width:100%;text-align:left;display:flex;align-items:center;justify-content:space-between;gap:6px;
   border-radius:16px;border:1px solid var(--border2);background:var(--surface);color:var(--text);
@@ -1451,7 +1597,7 @@ textarea.code-area{
 <script>
 const TABS = [
   ["Chat","💬"], ["Log","📜"], ["Model","🧬"], ["Parameters","⚙"],
-  ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["MCP","🔌"]
+  ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["MCP","🔌"], ["Permissions","🔐"]
 ];
 
 let state = {
@@ -1535,6 +1681,7 @@ function escapeHtml(s){
 
 function renderInline(text){
   let t = escapeHtml(text);
+  t = renderTablesInText(t);
   t = t.replace(/```([\w_]*)\n([\s\S]*?)```/g, (m,lang,body)=>`<pre class="code-block">${body}</pre>`);
   t = t.replace(/`([^`]+)`/g, (m,c)=>`<code class="inline-code">${c}</code>`);
   t = t.replace(/\*\*\*(.+?)\*\*\*/g, "<b><i>$1</i></b>");
@@ -1544,8 +1691,95 @@ function renderInline(text){
   t = t.replace(/^### (.*)$/gm, "<h3>$1</h3>");
   t = t.replace(/^## (.*)$/gm, "<h2>$1</h2>");
   t = t.replace(/^# (.*)$/gm, "<h1>$1</h1>");
+  // Horizontal rule: a line that's ONLY 3+ hyphens/asterisks/underscores
+  // (optionally spaced out, e.g. "- - -"), not a table separator row
+  // (those always contain at least one "|" and are already consumed by
+  // renderTablesInText before this point runs).
+  t = t.replace(/^ {0,3}(?:-[ \t]*){3,}$/gm, "<hr>");
+  t = t.replace(/^ {0,3}(?:\*[ \t]*){3,}$/gm, "<hr>");
+  t = t.replace(/^ {0,3}(?:_[ \t]*){3,}$/gm, "<hr>");
   t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
   return t.replace(/\n/g, "<br>");
+}
+
+// ── Markdown table rendering (GFM-style pipe tables) ----------------------
+// Operates on already-HTML-escaped text (so pipe/dash chars are still
+// literal), BEFORE code-fence extraction and the final \n -> <br> pass,
+// so line-based table detection still sees real newlines. Emphasis/bold
+// regexes run afterwards and will still reach into cell text normally
+// since the table is just more inline HTML at that point.
+function _splitTableRow(line){
+  let s = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  // Split on unescaped pipes only (a cell can contain \| for a literal pipe)
+  const cells = [];
+  let cur = "", esc = false;
+  for (let i = 0; i < s.length; i++){
+    const ch = s[i];
+    if (esc){ cur += ch; esc = false; continue; }
+    if (ch === "\\"){ esc = true; continue; }
+    if (ch === "|"){ cells.push(cur); cur = ""; continue; }
+    cur += ch;
+  }
+  cells.push(cur);
+  return cells.map(c=>c.trim());
+}
+
+const _TABLE_ROW_RE = /^\s*\|?.*\|.*\|?\s*$/;
+const _TABLE_SEP_RE  = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+
+function _renderTableBlock(headerLine, sepLine, bodyLines){
+  const header = _splitTableRow(headerLine);
+  const aligns = _splitTableRow(sepLine).map(a=>{
+    const left = a.startsWith(":"), right = a.endsWith(":");
+    if (left && right) return "center";
+    if (right) return "right";
+    if (left) return "left";
+    return "";
+  });
+  const rows = bodyLines.map(_splitTableRow);
+
+  let html = '<div class="md-table-wrap"><table class="md-table"><thead><tr>';
+  header.forEach((h,i)=>{
+    const align = aligns[i] ? ` style="text-align:${aligns[i]}"` : "";
+    html += `<th${align}>${h}</th>`;
+  });
+  html += '</tr></thead><tbody>';
+  rows.forEach(r=>{
+    html += '<tr>';
+    header.forEach((_, i)=>{
+      const align = aligns[i] ? ` style="text-align:${aligns[i]}"` : "";
+      html += `<td${align}>${r[i] !== undefined ? r[i] : ""}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table></div>';
+  return html;
+}
+
+function renderTablesInText(text){
+  const lines = text.split("\n");
+  const out = [];
+  let i = 0;
+  while (i < lines.length){
+    if (_TABLE_ROW_RE.test(lines[i]) && lines[i].includes("|") &&
+        i + 1 < lines.length && _TABLE_SEP_RE.test(lines[i+1]) && lines[i+1].includes("-") && lines[i+1].includes("|")){
+      const headerLine = lines[i];
+      const sepLine = lines[i+1];
+      let j = i + 2;
+      const bodyLines = [];
+      while (j < lines.length && lines[j].trim() !== "" && lines[j].includes("|")){
+        bodyLines.push(lines[j]); j++;
+      }
+      out.push(_renderTableBlock(headerLine, sepLine, bodyLines));
+      i = j;
+    } else {
+      out.push(lines[i]);
+      i++;
+    }
+  }
+  return out.join("\n");
 }
 
 // ── Flowchart rendering (```flowchart_json``` blocks) --------------------
@@ -1931,7 +2165,7 @@ window.__midumEvent = function(evt){
   else if (kind === "projects"){ populateProjects(payload.projects); }
   else if (kind === "ask"){ appendAsk(payload.id, payload.kind, payload.payload); }
   else if (kind === "mcp_changed"){ if (state.activeTab === "MCP") refreshMcpList(); }
-  else if (kind === "tool_result"){ const box=document.getElementById("tool-output"); if(box) box.textContent = payload.output; }
+  else if (kind === "tool_result"){ const box=document.getElementById("tool-output"); if(box) box.value = payload.output; }
 };
 
 function appendLog(text){
@@ -2145,6 +2379,8 @@ function buildSidebar(){
     </div>
   `;
   document.getElementById("sidebar-close").onclick = toggleSidebar;
+  enhanceSelect(document.getElementById("project-select"));
+  enhanceSelect(document.getElementById("settings-provider"));
   document.getElementById("new-session-btn").onclick = async ()=>{
     const ok = await showConfirm("Clear current session context and reset memories?", "New Session");
     if (!ok) return;
@@ -2522,6 +2758,7 @@ function showToolPane(name){
     "Log": buildLogPane, "Model": buildModelPane, "Parameters": buildParamsPane,
     "System Core": buildSysCorePane, "Knowledge": buildKnowledgePane,
     "Skills": buildSkillsPane, "Tools": buildToolsPane, "MCP": buildMcpPane,
+    "Permissions": buildPermissionsPane,
   };
   box.innerHTML = "";
   box.style.display = "flex"; box.style.flexDirection = "column"; box.style.height = "100%";
@@ -2557,6 +2794,7 @@ function buildModelPane(box){
     document.getElementById("model-input").value = info.current_model;
     fillModelList(info.models);
   })();
+  enhanceSelect(document.getElementById("provider-select"));
   document.getElementById("provider-select").onchange = async (e)=>{
     const r = await api("select_provider", e.target.value);
     fillModelList(r.models); document.getElementById("model-input").value = r.default_model;
@@ -2609,6 +2847,7 @@ function buildSysCorePane(box){
     <textarea class="code-area" id="sc-box" style="margin-top:6px;"></textarea>`;
   const sel = document.getElementById("sc-select");
   const box2 = document.getElementById("sc-box");
+  enhanceSelect(sel);
   async function load(){ const r = await api("get_sys_core", sel.value); box2.value = r.content; }
   sel.onchange = load;
   document.getElementById("sc-save").onclick = async ()=>{
@@ -2628,6 +2867,7 @@ function buildKnowledgePane(box){
     <textarea class="code-area" id="kb-box" style="margin-top:6px;"></textarea>`;
   const sel = document.getElementById("kb-select");
   const box2 = document.getElementById("kb-box");
+  enhanceSelect(sel);
   async function refresh(selectName){
     const files = await api("list_knowledge_files");
     sel.innerHTML = "";
@@ -2664,6 +2904,7 @@ function buildSkillsPane(box){
     <textarea class="code-area" id="sk-box" style="margin-top:6px;"></textarea>`;
   const sel = document.getElementById("sk-select");
   const box2 = document.getElementById("sk-box");
+  enhanceSelect(sel);
   async function refresh(selectName){
     const files = await api("list_skill_files");
     sel.innerHTML = "";
@@ -2701,6 +2942,7 @@ function buildToolsPane(box){
     <textarea class="code-area" id="tool-output" readonly style="color:var(--tool-text);background:var(--tool-bg);"></textarea>`;
   const sel = document.getElementById("tool-select");
   const argsBox = document.getElementById("tool-args");
+  enhanceSelect(sel);
   let schemas = [];
   function buildArgs(name){
     const schema = schemas.find(s=>s.name===name);
@@ -2720,6 +2962,8 @@ function buildToolsPane(box){
       }
       row.innerHTML = `<label>${argName}${req}</label>${inputHtml}`;
       argsBox.appendChild(row);
+      const enumSel = row.querySelector("select[data-arg]");
+      if (enumSel) enhanceSelect(enumSel);
     });
   }
   (async ()=>{
@@ -2797,6 +3041,91 @@ async function refreshMcpList(){
     if (remove) remove.onclick = async ()=>{ const ok = await showConfirm(`Remove '${s.name}' permanently?`, "Remove Server", {danger:true, okLabel:"Remove"}); if (ok) await api("disconnect_mcp", s.name, true); };
     listEl.appendChild(row);
   });
+}
+
+// ── Permissions pane -------------------------------------------------------
+// Per-tool (native + MCP) permission control: Always Allow / Ask for
+// Approval / Don't Allow. Enforced server-side in orchestration.py right
+// before each tool call is dispatched -- this pane just edits the stored
+// overrides via get_permissions/set_permission/reset_permissions.
+async function buildPermissionsPane(box){
+  box.innerHTML = `
+    <div class="hdr-row">
+      <div class="section-label">TOOL PERMISSIONS</div>
+      <button class="ghost-btn" id="perm-reset" style="height:24px;font-size:10px;">Reset All to Always</button>
+    </div>
+    <input type="text" id="perm-search" placeholder="Search tools..." class="perm-search" style="margin-top:6px;"/>
+    <div id="perm-list" style="flex:1;overflow-y:auto;margin-top:8px;"></div>
+  `;
+  const listEl = document.getElementById("perm-list");
+  let targets = await api("list_permission_targets");
+  let overrides = await api("get_permissions");
+
+  function levelFor(key){ return overrides[key] || "always"; }
+
+  function rowHtml(entry){
+    const lvl = levelFor(entry.key);
+    const haystack = (entry.name + " " + (entry.desc||"")).toLowerCase();
+    return `<div class="perm-row" data-name="${escapeHtml(haystack)}">
+      <div class="perm-info">
+        <div class="perm-name">${escapeHtml(entry.name)}</div>
+        ${entry.desc ? `<div class="perm-desc">${escapeHtml(entry.desc)}</div>` : ""}
+      </div>
+      <div class="perm-seg" data-key="${escapeHtml(entry.key)}">
+        <button class="perm-opt${lvl==='always'?' active':''}" data-level="always">Always</button>
+        <button class="perm-opt${lvl==='ask'?' active':''}" data-level="ask">Ask</button>
+        <button class="perm-opt${lvl==='deny'?' active':''}" data-level="deny">Deny</button>
+      </div>
+    </div>`;
+  }
+
+  function renderAll(){
+    let html = `<div class="perm-group"><div class="perm-group-title">Native Tools (${targets.native.length})</div>`;
+    html += targets.native.map(rowHtml).join("") + `</div>`;
+    targets.mcp_groups.forEach(g=>{
+      const status = g.connected ? "connected" : "disconnected";
+      html += `<div class="perm-group"><div class="perm-group-title">MCP: ${escapeHtml(g.server)} (${status}, ${g.tools.length} tool(s))</div>`;
+      html += g.tools.length
+        ? g.tools.map(rowHtml).join("")
+        : `<div class="perm-empty">No tools reported for this server.</div>`;
+      html += `</div>`;
+    });
+    listEl.innerHTML = html || `<div class="perm-empty">No tools found.</div>`;
+  }
+  renderAll();
+
+  listEl.addEventListener("click", async (e)=>{
+    const btn = e.target.closest(".perm-opt");
+    if (!btn) return;
+    const seg = btn.closest(".perm-seg");
+    const key = seg.dataset.key;
+    const level = btn.dataset.level;
+    seg.querySelectorAll(".perm-opt").forEach(b=>b.classList.toggle("active", b===btn));
+    if (level === "always") delete overrides[key]; else overrides[key] = level;
+    await api("set_permission", key, level);
+  });
+
+  document.getElementById("perm-search").oninput = (e)=>{
+    const q = e.target.value.trim().toLowerCase();
+    listEl.querySelectorAll(".perm-group").forEach(group=>{
+      let anyVisible = false;
+      group.querySelectorAll(".perm-row").forEach(row=>{
+        const show = !q || row.dataset.name.includes(q);
+        row.style.display = show ? "" : "none";
+        if (show) anyVisible = true;
+      });
+      const emptyMsg = group.querySelector(".perm-empty");
+      group.style.display = (anyVisible || (emptyMsg && !q)) ? "" : "none";
+    });
+  };
+
+  document.getElementById("perm-reset").onclick = async ()=>{
+    const ok = await showConfirm("Reset ALL tool permissions to 'Always Allow'?", "Reset Permissions", {danger:true, okLabel:"Reset All"});
+    if (!ok) return;
+    await api("reset_permissions");
+    overrides = {};
+    renderAll();
+  };
 }
 
 // ── Boot -----------------------------------------------------------------
@@ -2881,6 +3210,7 @@ def main():
         background_color="#02010a",
     )
     api.window = window
+    window.events.closing += api._on_closing
     # gui="qt" renders through QtWebEngine (PySide6 or PyQt5), which
     # bundles its own Chromium build. Unlike gui="edgechromium" this has no
     # dependency on the Microsoft Edge WebView2 Runtime being installed on

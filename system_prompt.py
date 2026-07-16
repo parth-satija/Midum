@@ -87,6 +87,17 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
         else ""
     )
 
+    search_guidelines_hint = (
+        "\n\n━━━ INTERNET SEARCH GUIDELINES ━━━\n"
+        "- BALANCED SEARCH FREQUENCY: Use the `search_internet` tool frequently to maintain up-to-date accuracy, "
+        "but do not assume every single user message requires a web search. Evaluate whether you possess the core "
+        "information to prevent the conversation from unnecessarily diverging.\n"
+        "- DIRECT REPLIES VS OPENING RESULTS: When you execute a search for short, concise, or straightforward "
+        "queries, prioritize answering the user directly using the initial search results snippet. Do not invoke "
+        "`open_search_result` unless a comprehensive or deeply technical reading of the webpage content is strictly "
+        "necessary to complete the request.\n"
+    )
+
     return (
         f"You are Midum, a {'Linux' if _IS_LINUX else 'Windows'} desktop AI agent.\n"
         "\n"
@@ -290,6 +301,7 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
         "- Replies: Markdown.\n"
         f"{legacy_toolcall_hint}"
         f"{groq_tools_hint}"
+        f"{search_guidelines_hint}"
     )
 
 

@@ -1,6 +1,6 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
 from config import _IS_LINUX
-from providers.gemini_web_backend import _JS_GET_TEXT, _browser_element_cache, _get_gemini_web_client, _run_gemini_coro
+from providers.gemini_web_backend import _JS_GET_TEXT, _browser_element_cache, _clean_gemini_web_text, _get_gemini_web_client, _run_gemini_coro
 from tools_registry import _store_index
 from ui_automation.linux_navigator import _run
 import requests
@@ -710,6 +710,7 @@ def query_gemini_app(prompt: str, wait_for_response: int = 90) -> str:
     text = (getattr(response, "text", "") or "").strip()
     if not text:
         return "Gemini did not return any text in its response - try again."
+    text = _clean_gemini_web_text(text)
 
     # Run through the legacy tool-call JSON parser so any embedded
     # tool-call JSON is flagged/stripped instead of being shown raw.

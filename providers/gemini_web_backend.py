@@ -5,6 +5,7 @@ from system_prompt import get_system_prompt
 import asyncio
 import json
 import os
+import re
 import threading
 
 # --- from main.py, section 1 ---
@@ -283,6 +284,33 @@ def _gemini_web_persona_prompt() -> str:
     )
 
 
+def _clean_gemini_web_text(text: str) -> str:
+    """
+    Strip internal artifacts the gemini.google.com web app occasionally
+    leaks straight through gemini_webapi's parsed output.text.
+
+    The one we've actually observed: rich/canvas ("immersive") content
+    blocks are internally tagged with a "?chameleon" suffix on the code
+    fence's language marker (Google's internal codename for that render
+    surface) -- e.g. a JSON canvas block comes back as
+    "```json?chameleon\n...\n```" instead of a plain "```json". That's not
+    meaningful content, just leaked internal plumbing, and it breaks
+    downstream JSON/tool-call parsing (which expects a clean language tag)
+    as well as looking wrong if ever shown to the user. Strip the suffix
+    off any fence language tag, and drop it entirely if "chameleon" is the
+    whole tag.
+    """
+    if not text or "chameleon" not in text:
+        return text
+    # ```json?chameleon -> ```json   (keep the real language, drop the tag)
+    text = re.sub(r'```(\w+)\?chameleon\b', r'```\1', text)
+    # ```?chameleon or ```chameleon on its own -> ``` (no language)
+    text = re.sub(r'```\??chameleon\b', '```', text)
+    # Any other stray "<word>?chameleon" outside a fence context
+    text = re.sub(r'(\w+)\?chameleon\b', r'\1', text)
+    return text
+
+
 def _gemini_web_pick_model(client):
     """
     Resolve the model to drive the primary execution loop with.
@@ -482,6 +510,7 @@ def _call_gemini_web_primary(messages, result_q, model_override: str = None):
             output = _attempt()
 
         raw_text = output.text or ""   # NEVER read output.thoughts here (§3.3)
+        raw_text = _clean_gemini_web_text(raw_text)
 
         legacy_calls, cleaned_content = _extract_legacy_tool_calls(raw_text)
         if legacy_calls:
@@ -504,6 +533,37 @@ def _call_gemini_web_primary(messages, result_q, model_override: str = None):
             f"GEMINI_SECURE_1PSID/GEMINI_SECURE_1PSIDTS in the secrets file, "
             f"or re-login in the browser gemini_webapi pulls cookies from."
         )))
+
+
+def list_gemini_web_models() -> list:
+    """
+    Return every model name currently available on the logged-in Gemini web
+    account (via gemini_webapi's client.list_models()), for populating
+    model pickers with the real, current lineup instead of a hardcoded
+    guess. Falls back to an empty list if the client can't be reached
+    (library not installed, no valid session/cookies yet, network error,
+    etc) — callers should fall back to a small hardcoded list in that case.
+
+    Note: this may lazily initialise the Gemini web client (cookie
+    resolution + session init) the first time it's called, which can take
+    a couple of seconds — the same cost _gemini_web_pick_model already
+    pays on first use.
+    """
+    if not _GEMINI_WEBAPI_AVAILABLE:
+        return []
+    client, err = _get_gemini_web_client()
+    if client is None:
+        return []
+    try:
+        available = client.list_models() or []
+    except Exception:
+        return []
+    names = []
+    for m in available:
+        name = getattr(m, "model_name", None) or getattr(m, "display_name", None)
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 def set_gemini_web_model(model_name: str) -> str:

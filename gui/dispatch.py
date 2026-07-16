@@ -78,10 +78,15 @@ def _dispatch_midum_tool(tool_name: str, args: dict):
         return midum.ui_navigator.act_on_element_by_index(target, index, action, text_to_type)
 
     # ── Methods that live on ui_navigator, not the midum module itself ──────
-    if tool_name in ("read_aggregated_text", "query_gemini_app", "manage_gemini_chat"):
+    if tool_name in ("read_aggregated_text", "manage_gemini_chat"):
         if midum.ui_navigator is None:
             return "UI automation is currently unavailable."
         return getattr(midum.ui_navigator, tool_name)(**args)
+
+    # ── query_gemini_app lives in browser_cdp, re-exported straight onto
+    # the midum module (not ui_navigator) ────────────────────────────────
+    if tool_name == "query_gemini_app":
+        return midum.query_gemini_app(**args)
 
     # ── Screenshot — truncate the base64 payload so the textbox doesn't choke ─
     if tool_name == "fallback_view_screen":
@@ -90,6 +95,12 @@ def _dispatch_midum_tool(tool_name: str, args: dict):
             return (f"Screenshot captured to RAM ({len(out)} bytes of base64 data — "
                      f"hidden here to avoid GUI lag, but the tool itself is functional).")
         return out
+
+    # ── Python code execution ────────────────────────────────────────────────
+    if tool_name == "execute_python_code":
+        return midum.execute_python_code(
+            args.get("code", ""), int(args.get("timeout", 15))
+        )
 
     # ── Generic fallback — every remaining tool maps straight onto the
     # midum module or midum.ui_navigator by name. This is what makes new
@@ -108,4 +119,3 @@ def _dispatch_midum_tool(tool_name: str, args: dict):
 # =============================================================================
 # REDIRECT stdout → GUI log
 # =============================================================================
-
