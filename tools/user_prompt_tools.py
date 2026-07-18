@@ -130,9 +130,9 @@ def ask_user_approval(message: str, details: str = "") -> str:
     except Exception: pass
 
     _tk.Label(win, text=message, wraplength=420, justify="left",
-              padx=16, pady=(16, 4), font=("Segoe UI", 10, "bold")).pack()
+              padx=16, font=("Segoe UI", 10, "bold")).pack(pady=(16, 4))
     if details:
-        _tk.Label(win, text=details, wraplength=420, justify="left", padx=16, pady=(0, 8)).pack()
+        _tk.Label(win, text=details, wraplength=420, justify="left", padx=16).pack(pady=(0, 8))
 
     def approve():
         result["value"] = "APPROVED"
@@ -181,7 +181,7 @@ def ask_user_choice(question: str, choice_1: str = "", choice_2: str = "",
     except Exception: pass
 
     _tk.Label(win, text=question, wraplength=420, justify="left",
-              padx=16, pady=(16, 8), font=("Segoe UI", 10, "bold")).pack()
+              padx=16, font=("Segoe UI", 10, "bold")).pack(pady=(16, 8))
 
     def choose(opt):
         result["value"] = opt

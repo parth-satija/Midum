@@ -4,6 +4,7 @@ from config import _IS_LINUX, _IS_WINDOWS
 from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _gemini_webapi_load_msg, _get_gemini_web_client, _run_gemini_coro
 from screen_capture import _do_click, _grab_full_screenshot, ocr_screen
 from tools_schema import tools
+from permissions import get_permission
 from ui_automation.linux_navigator import _run, ui_navigator
 from ui_automation.windows_uia import _TESSERACT_AVAILABLE, _UIA_AVAILABLE, _UIA_INIT_ERROR
 from ddgs import DDGS
@@ -104,7 +105,10 @@ def list_more_tools() -> str:
     """Return a numbered index of every tool not already loaded for Groq."""
     global _groq_more_tools_index
     loaded_names = set(GROQ_CORE_TOOL_NAMES) | {t["function"]["name"] for t in _groq_extra_tools}
-    remaining = [n for n in _TOOLS_BY_NAME if n not in loaded_names]
+    remaining = [
+        n for n in _TOOLS_BY_NAME
+        if n not in loaded_names and get_permission(n) != "deny"
+    ]
     _groq_more_tools_index = remaining
     if not remaining:
         return "All tools are already loaded."

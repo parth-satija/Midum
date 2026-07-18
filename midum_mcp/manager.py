@@ -1,5 +1,6 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
 from config import MCP_SERVERS_FILE
+from config import MCP_PROMOTED_TOOLS_FILE
 from config import _MCP_SDK_AVAILABLE
 import asyncio
 import json
@@ -88,6 +89,97 @@ def _mcp_upsert_config(new_entry: dict):
 def _mcp_remove_config(name: str):
     configs = [c for c in _load_mcp_config() if c.get("name") != name]
     _save_mcp_config(configs)
+
+
+# =============================================================================
+# PROMOTED MCP TOOLS
+# =============================================================================
+#
+# A promoted tool is an MCP tool the user has explicitly marked (via the
+# Tools pane in the MCP tab) to have its full JSON schema included directly
+# alongside Midum's native tools -- so the model can call it straight away,
+# by its own name, like any native tool, instead of having to discover it
+# first via list_mcp_servers()/show_server_tools()/call_mcp_tool(). This is
+# an opt-in escape hatch from the on-demand-discovery design further up
+# this file: promoting a tool trades a little context budget (its schema is
+# now always present) for zero-friction, single-call invocation.
+#
+# Persisted as a flat list of {"server": ..., "tool": ...} objects in
+# storage/mcp_promoted_tools.json, independent of mcp_servers.json (a tool
+# can be promoted even while its server is briefly disconnected -- it just
+# won't contribute a schema entry until reconnected).
+_promoted_tools_cache: list | None = None
+
+
+def _load_promoted_tools() -> list:
+    """Read storage/mcp_promoted_tools.json. Returns [] if missing/invalid."""
+    global _promoted_tools_cache
+    if _promoted_tools_cache is not None:
+        return _promoted_tools_cache
+    items = []
+    try:
+        if os.path.exists(MCP_PROMOTED_TOOLS_FILE):
+            with open(MCP_PROMOTED_TOOLS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                items = [
+                    it for it in loaded
+                    if isinstance(it, dict) and it.get("server") and it.get("tool")
+                ]
+    except Exception as e:
+        print(f"⚠️ [MCP] Could not read {MCP_PROMOTED_TOOLS_FILE}: {e}")
+        items = []
+    _promoted_tools_cache = items
+    return items
+
+
+def _save_promoted_tools(items: list):
+    global _promoted_tools_cache
+    _promoted_tools_cache = items
+    try:
+        os.makedirs(os.path.dirname(MCP_PROMOTED_TOOLS_FILE), exist_ok=True)
+        with open(MCP_PROMOTED_TOOLS_FILE, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ [MCP] Could not save {MCP_PROMOTED_TOOLS_FILE}: {e}")
+
+
+def is_tool_promoted(server: str, tool_name: str) -> bool:
+    return any(
+        it["server"] == server and it["tool"] == tool_name
+        for it in _load_promoted_tools()
+    )
+
+
+def promote_mcp_tool(server: str, tool_name: str) -> str:
+    """Mark one MCP tool as promoted -- its schema will be included with the
+    native tools list from now on, and it becomes directly callable by name."""
+    if not server or not tool_name:
+        return "Error: both 'server' and 'tool_name' are required."
+    items = _load_promoted_tools()
+    if any(it["server"] == server and it["tool"] == tool_name for it in items):
+        return f"'{tool_name}' on '{server}' is already promoted."
+    items = list(items) + [{"server": server, "tool": tool_name}]
+    _save_promoted_tools(items)
+    return f"Promoted '{tool_name}' on '{server}' -- it will now be offered directly to the model."
+
+
+def demote_mcp_tool(server: str, tool_name: str) -> str:
+    """Unmark a promoted MCP tool -- it goes back to on-demand discovery only."""
+    items = _load_promoted_tools()
+    remaining = [
+        it for it in items
+        if not (it["server"] == server and it["tool"] == tool_name)
+    ]
+    if len(remaining) == len(items):
+        return f"'{tool_name}' on '{server}' was not promoted."
+    _save_promoted_tools(remaining)
+    return f"Demoted '{tool_name}' on '{server}' -- back to on-demand discovery only."
+
+
+def get_promoted_tools() -> list:
+    """Return the raw list of {"server", "tool"} promoted entries."""
+    return list(_load_promoted_tools())
 
 
 class _MCPManager:

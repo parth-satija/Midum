@@ -92,6 +92,48 @@ def get_all_permissions() -> dict:
     return dict(_load())
 
 
+def filter_tools_schema(tools_list: list) -> list:
+    """
+    Return `tools_list` with every entry whose permission is 'deny' removed,
+    PLUS the schemas of any promoted MCP tools appended at the end.
+
+    Promoted MCP tools (set via the Tools pane in the MCP tab -> Promote)
+    get their full JSON schema included right alongside the native tools
+    from here on, so the model can call them directly by name exactly like
+    a native tool -- no list_mcp_servers()/show_server_tools()/
+    call_mcp_tool() discovery hop needed. Dispatch already knows how to
+    route a bare MCP tool name transparently (see
+    _mcp_autoroute_tool_call in midum_mcp/tools.py), so no other wiring
+    is required for this to work end to end.
+
+    Lazy-imported to avoid a circular import (midum_mcp.tools imports
+    get_permission/mcp_permission_key from this module already).
+    """
+    perms = _load()
+    filtered = [
+        t for t in tools_list
+        if perms.get(t["function"]["name"], DEFAULT_LEVEL) != "deny"
+    ]
+
+    try:
+        from midum_mcp.tools import get_promoted_tool_schemas
+        native_names = {t["function"]["name"] for t in filtered}
+        for promoted in get_promoted_tool_schemas():
+            # A promoted tool whose name collides with a native tool (or a
+            # tool from another server also promoted under the same name)
+            # is skipped -- ambiguous direct-call names would be worse than
+            # just leaving it to on-demand discovery via call_mcp_tool.
+            name = promoted["function"]["name"]
+            if name in native_names:
+                continue
+            native_names.add(name)
+            filtered.append(promoted)
+    except Exception as e:
+        print(f"⚠️ [Permissions] Could not append promoted MCP tool schemas: {e}")
+
+    return filtered
+
+
 def reset_all_permissions() -> str:
     """Clear every override — everything goes back to 'Always Allow'."""
     _save({})

@@ -33,6 +33,8 @@ import webview  # pywebview — renders through the OS Chromium engine (WebView2
 
 from gui.chat_store import ChatStore, MidumSession
 from gui.dispatch import _dispatch_midum_tool
+from flows import classify_tool_kind
+import tools.user_prompt_tools as _user_prompt_tools
 
 import main as midum
 import permissions
@@ -175,6 +177,7 @@ TAB_DEFS = [
     ("Knowledge",    "📚"),
     ("Skills",       "🛠"),
     ("Tools",        "🔧"),
+    ("Flows",        "🔗"),
     ("MCP",          "🔌"),
     ("Permissions",  "🔐"),
 ]
@@ -215,7 +218,16 @@ class Api:
                 return
             self._push_event("say", {"text": text})
         midum._print_reply = _gui_say_intercept
-        midum._gui_ask_hook = self._handle_gui_ask
+        # IMPORTANT: this must be set on tools.user_prompt_tools itself, not
+        # on `midum` (main.py). main.py does `from tools.user_prompt_tools
+        # import _gui_ask_hook, ...`, which copies the value ONCE at import
+        # time into main's own namespace -- rebinding `midum._gui_ask_hook`
+        # afterwards only changes that copy, and every ask_user_* function
+        # in tools/user_prompt_tools.py checks ITS OWN module-level global,
+        # which would stay None forever. That silently sent every approval/
+        # question/input request through the raw Tkinter popup fallback
+        # instead of this app's inline chat card, no matter what.
+        _user_prompt_tools._gui_ask_hook = self._handle_gui_ask
 
         self._pending_ask = {}  # ask_id -> threading.Event / result box
 
@@ -812,7 +824,7 @@ class Api:
                 self._close_requested = False
                 self._persist_current_chat()
                 if self.window:
-                    self.window.destroy()
+                    self._destroy_window_safe()
 
     _VISUAL_FENCE_LANGS = ("image_data_json", "flowchart_json")
     _TOOL_VISUAL_FENCE_RE = re.compile(r"```(" + "|".join(_VISUAL_FENCE_LANGS) + r")\n(.*?)```", re.DOTALL)
@@ -1019,6 +1031,106 @@ class Api:
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True, "output": f"[Executing tool sandbox call: {tool_name}...]"}
 
+    # ── Flows (node-graph tab) ──────────────────────────────────────────
+    def save_flow(self, name: str, graph: dict, description: str = ""):
+        try:
+            msg = midum.save_flow(name, graph, description)
+            ok = not msg.lower().startswith("error")
+            self._push_event("log", {"text": f"{'🔗' if ok else '⚠️'} {msg}\n"})
+            return {"ok": ok, "message": msg}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
+    def list_flows(self):
+        try:
+            return midum.list_flows()
+        except Exception:
+            return []
+
+    def list_flow_schemas(self):
+        """Flow-tool schemas for the Tools tab's separate Flows dropdown."""
+        try:
+            return midum.list_flow_schemas()
+        except Exception:
+            return []
+
+    def run_flow(self, name: str):
+        """Run a saved flow the same way a native tool is run from the
+        Tools tab -- in a background thread, pushing the result back as a
+        'tool_result' event so the same output box can show it."""
+        def worker():
+            try:
+                out = midum.run_flow(name)
+                self._push_event("tool_result", {"output": str(out)})
+            except Exception as e:
+                self._push_event("tool_result", {"output": f"Flow exception:\n{e}\n\n{traceback.format_exc()}"})
+        threading.Thread(target=worker, daemon=True).start()
+        return {"ok": True, "output": f"[Running flow: {name}...]"}
+
+    def list_tool_node_defs(self):
+        """
+        Every native tool + every tool on every connected MCP server, in
+        the shape the Flows tab needs to build one Drawflow node type per
+        tool: {type, label, icon, group, params:[{name, type, enum,
+        description, required}]}. `type` is what gets embedded as the
+        Drawflow node's "name" (tool::<name> or mcp::<server>::<name>) so
+        flows.py's codegen can tell tool nodes apart from control-flow
+        nodes and from each other.
+        """
+        def params_from_schema(props: dict, required: list) -> list:
+            out = []
+            for pname, pdef in (props or {}).items():
+                out.append({
+                    "name": pname,
+                    "type": pdef.get("type", "string"),
+                    "enum": pdef.get("enum"),
+                    "description": pdef.get("description", ""),
+                    "required": pname in (required or []),
+                })
+            return out
+
+        defs = []
+        for t in sorted(midum.tools, key=lambda t: t["function"]["name"]):
+            fn = t["function"]
+            name = fn["name"]
+            props = fn.get("parameters", {}).get("properties", {})
+            required = fn.get("parameters", {}).get("required", [])
+            desc = (fn.get("description") or "").strip().splitlines()[0] if fn.get("description") else ""
+            defs.append({
+                "type": f"tool::{name}",
+                "label": name,
+                "icon": "🔧",
+                "group": "Native Tools",
+                "tool_name": name,
+                "mcp_server": None,
+                "desc": desc[:160],
+                "kind": classify_tool_kind(name, fn.get("description", "")),
+                "params": params_from_schema(props, required),
+            })
+
+        for server_name in midum._MCP_SERVER_ORDER:
+            handle = midum._MCP_SERVERS.get(server_name)
+            if not handle or not handle.connected:
+                continue
+            for tdef in (handle.tools or []):
+                name = tdef["name"]
+                schema = tdef.get("input_schema") or tdef.get("inputSchema") or {}
+                props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+                required = schema.get("required", []) if isinstance(schema, dict) else []
+                desc = (tdef.get("description") or "").strip().splitlines()[0] if tdef.get("description") else ""
+                defs.append({
+                    "type": f"mcp::{server_name}::{name}",
+                    "label": name,
+                    "icon": "🔌",
+                    "group": f"MCP: {server_name}",
+                    "tool_name": name,
+                    "mcp_server": server_name,
+                    "desc": desc[:160],
+                    "kind": classify_tool_kind(name, tdef.get("description", "")),
+                    "params": params_from_schema(props, required),
+                })
+        return defs
+
     # ── MCP servers ───────────────────────────────────────────────────────
     def list_mcp(self):
         names = list(midum._MCP_SERVER_ORDER)
@@ -1082,6 +1194,34 @@ class Api:
     def view_mcp_tools(self, name: str):
         return {"content": midum.show_server_tools(name)}
 
+    def list_mcp_tools_for_promotion(self, name: str):
+        """
+        Every tool on one connected MCP server, each with its promoted
+        status, for the Tools pane opened from the MCP tab.
+        """
+        handle = midum._MCP_SERVERS.get(name)
+        if not handle:
+            return {"ok": False, "error": f"Unknown server '{name}'.", "tools": []}
+        if not handle.connected:
+            return {"ok": False, "error": f"'{name}' is not connected ({handle.error}).", "tools": []}
+        out = []
+        for tdef in (handle.tools or []):
+            desc = (tdef.get("description") or "").strip().splitlines()[0] if tdef.get("description") else ""
+            out.append({
+                "name": tdef["name"],
+                "desc": desc[:200],
+                "promoted": bool(midum.is_tool_promoted(name, tdef["name"])),
+            })
+        return {"ok": True, "server": name, "tools": out}
+
+    def promote_mcp_tool(self, server: str, tool_name: str):
+        result = midum.promote_mcp_tool(server, tool_name)
+        return {"ok": True, "message": result}
+
+    def demote_mcp_tool(self, server: str, tool_name: str):
+        result = midum.demote_mcp_tool(server, tool_name)
+        return {"ok": True, "message": result}
+
     # ── Tool permissions ──────────────────────────────────────────────
     def list_permission_targets(self):
         """
@@ -1125,11 +1265,33 @@ class Api:
         msg = permissions.reset_all_permissions()
         return {"ok": True, "message": msg}
 
+    def _destroy_window_safe(self):
+        """window.destroy() tears down the QWebEngineView (Chromium's Qt
+        widget), and Qt widgets may only be destroyed on the GUI thread --
+        calling this from a background thread (as _run_turn's finally
+        block and shutdown() both can, since js_api calls and worker
+        threads run off the GUI thread) doesn't raise, it just leaves the
+        teardown half-finished and the whole window silently stops
+        responding. QTimer.singleShot(0, ...) marshals the actual
+        destroy() call onto the Qt event loop/GUI thread, which is the
+        supported way to schedule GUI work from elsewhere. Falls back to
+        a direct call only if Qt genuinely isn't available.
+        """
+        fn = self.window.destroy
+        try:
+            try:
+                from PySide6.QtCore import QTimer
+            except ImportError:
+                from PyQt5.QtCore import QTimer
+            QTimer.singleShot(0, fn)
+        except Exception:
+            fn()
+
     def shutdown(self):
         self._persist_current_chat()
         self._stdout_redir.restore()
         if self.window:
-            self.window.destroy()
+            self._destroy_window_safe()
         return {"ok": True}
 
     def _on_closing(self):
@@ -1324,6 +1486,8 @@ select, .btn, .ghost-btn{
 .btn:hover{background:var(--border2);}
 .ghost-btn{background:transparent;transition:background .15s;}
 .ghost-btn:hover{background:var(--surface2);}
+.ghost-btn:disabled{opacity:.4;cursor:default;}
+.ghost-btn:disabled:hover{background:transparent;}
 .btn-row{display:flex;gap:6px;}
 .btn-row .ghost-btn{flex:1;font-size:10px;height:26px;}
 #file-list{
@@ -1344,6 +1508,7 @@ select, .btn, .ghost-btn{
 .mini-btn{height:24px;padding:0 8px;font-size:10px;border-radius:12px;border:none;}
 .mini-btn.open{background:var(--accent);color:var(--text);}
 .mini-btn.del{background:transparent;color:var(--red);border:1px solid #3f0f0f;}
+.mini-btn:disabled{opacity:.35;cursor:default;pointer-events:none;}
 #sidebar-footer{display:flex;gap:6px;}
 #sidebar-footer .ghost-btn{flex:1;font-size:10px;}
 
@@ -1440,6 +1605,12 @@ textarea.code-area{
 .stat-row{padding:5px 4px 0 4px;}
 .stat-lbl{font-size:11px;color:var(--subtext);}
 .stat-val{font-size:13px;color:var(--text);margin:2px 0 6px;}
+.mcp-tool-row{display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);
+  border-radius:8px;padding:8px 10px;margin-bottom:6px;}
+.mcp-tool-info{flex:1;min-width:0;}
+.mcp-tool-name{font-weight:700;font-size:12px;font-family:monospace;}
+.mcp-tool-desc{font-size:10px;color:var(--subtext);margin-top:2px;}
+.mcp-tool-actions{display:flex;gap:6px;flex:0 0 auto;}
 .mcp-row{display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);
   border-radius:16px;padding:10px;margin-bottom:6px;}
 .mcp-dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto;}
@@ -1471,6 +1642,91 @@ textarea.code-area{
 .perm-opt.active[data-level="ask"]{background:var(--yellow);color:#1a1400;}
 .perm-opt.active[data-level="deny"]{background:var(--red);color:#fff;}
 .perm-empty{font-size:11px;color:var(--subtext);padding:10px;text-align:center;}
+
+/* Flows tab -- node-graph editor (Drawflow, loaded from CDN on first
+   visit). Left: grouped node drawer, drag items onto the canvas. Right:
+   the Drawflow canvas itself, full-bleed (no padding -- the graph needs
+   the whole area, unlike the text-editor tool panes). */
+#flows-root{display:flex;height:100%;width:100%;}
+#flow-drawer{width:170px;flex:0 0 170px;background:var(--panel);border-right:1px solid var(--border2);
+  overflow-y:auto;padding:12px 8px;}
+#flow-drawer-title{font-size:9px;font-weight:700;color:var(--subtext);letter-spacing:.5px;
+  text-transform:uppercase;padding:0 4px 10px;}
+.flow-drawer-group{margin-bottom:16px;}
+.flow-drawer-group-title{font-size:9px;font-weight:700;color:var(--subtext);letter-spacing:.5px;
+  text-transform:uppercase;margin-bottom:6px;padding:0 4px;}
+.flow-drawer-item{
+  display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:12px;
+  background:var(--surface);border:1px solid var(--border2);margin-bottom:6px;
+  cursor:grab;font-size:12px;color:var(--text);transition:background .15s,border-color .15s;
+}
+.flow-drawer-item:hover{background:var(--surface2);border-color:var(--accent);}
+.flow-drawer-item:active{cursor:grabbing;}
+.flow-drawer-item-icon{font-size:14px;flex:0 0 auto;width:18px;text-align:center;}
+#flow-canvas-wrap{flex:1;display:flex;flex-direction:column;min-width:0;height:100%;}
+#flow-toolbar{padding:10px 14px;border-bottom:1px solid var(--border2);flex:0 0 auto;}
+#flow-canvas{
+  flex:1;position:relative;overflow:hidden;background:var(--surface);
+  background-image:radial-gradient(circle, var(--border2) 1px, transparent 1px);
+  background-size:20px 20px;
+}
+#flow-canvas-loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  font-size:12px;color:var(--subtext);}
+/* Node body rendered inside each Drawflow node's html */
+.flow-node{display:flex;align-items:center;gap:8px;padding:11px 16px;}
+.flow-node-icon{font-size:16px;}
+.flow-node-label{font-size:12px;font-weight:700;color:var(--text);white-space:nowrap;}
+/* Tool nodes: header (icon + name) plus a param-entry body. Each
+   parameter now has a REAL Drawflow input pin (input_2, input_3, ...,
+   rendered by Drawflow itself along the node's left edge) -- the field
+   here is just the manual fallback value used when that pin isn't wired
+   to anything. A footer line (.flow-node-pin-hint) labels the pins in
+   order so it's clear what lines up with what. */
+.flow-node-tool{display:flex;flex-direction:column;padding:10px 12px;min-width:190px;gap:6px;}
+.flow-node-tool-hdr{display:flex;align-items:center;gap:8px;}
+.flow-node-tool-hdr .flow-node-icon{font-size:14px;}
+.flow-node-tool-hdr .flow-node-label{font-size:11px;flex:1;}
+.flow-node-kind-badge{font-size:8px;text-transform:uppercase;letter-spacing:.03em;padding:1px 6px;border-radius:8px;background:var(--surface2);color:var(--subtext);border:1px solid var(--border2);}
+.flow-node-kind-badge.flow-node-kind-output{color:var(--accent2);border-color:var(--accent2);}
+.flow-node-kind-badge.flow-node-kind-hybrid{color:var(--accent);border-color:var(--accent);}
+.flow-node-params{display:flex;flex-direction:column;gap:5px;}
+.flow-param-row{display:flex;align-items:center;gap:6px;}
+.flow-param-row.required .flow-param-label{color:var(--accent);}
+.flow-param-label{font-size:9px;color:var(--subtext);width:56px;flex:0 0 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.flow-node-pin-hint{display:flex;justify-content:space-between;font-size:8px;color:var(--subtext);opacity:.75;border-top:1px dashed var(--border2);padding-top:4px;margin-top:2px;}
+.flow-object-out{color:var(--accent2);}
+.flow-node-logic .flow-node-tool-hdr .flow-node-label{color:var(--accent);}
+.flow-node-variable .flow-node-tool-hdr .flow-node-label{color:var(--accent2);}
+.flow-param-input{
+  flex:1;height:22px;font-size:10px;border-radius:8px;border:1px solid var(--border2);
+  background:var(--surface);color:var(--text);padding:0 6px;min-width:0;
+}
+.flow-node-empty-params{font-size:9px;color:var(--subtext);font-style:italic;}
+/* Theming overrides for Drawflow's own default CSS -- !important since
+   drawflow.min.css loads dynamically, after this stylesheet, and its
+   selectors would otherwise win the cascade on equal specificity. */
+#flow-canvas .drawflow-node{
+  background:var(--panel) !important;border:1px solid var(--border2) !important;
+  border-radius:14px !important;color:var(--text) !important;
+  box-shadow:0 4px 14px rgba(0,0,0,.35) !important;min-width:0 !important;width:auto !important;
+}
+#flow-canvas .drawflow-node.selected{
+  border-color:var(--accent) !important;box-shadow:0 0 0 2px var(--accent-faint) !important;
+}
+#flow-canvas .drawflow-node .input, #flow-canvas .drawflow-node .output{
+  background:var(--surface2) !important;border:2px solid var(--border2) !important;
+  height:14px !important;width:14px !important;
+}
+#flow-canvas .drawflow-node .input:hover, #flow-canvas .drawflow-node .output:hover{
+  background:var(--accent) !important;border-color:var(--accent) !important;
+}
+#flow-canvas .connection .main-path{ stroke:var(--accent) !important;stroke-width:2.5px !important;cursor:pointer !important; }
+#flow-canvas .connection .main-path:hover{ stroke:var(--red) !important; }
+#flow-canvas .connection .main-path.selected{ stroke:var(--red) !important;stroke-dasharray:7,4 !important; }
+#flow-canvas .connection .point{ stroke:var(--border2) !important;fill:var(--surface2) !important; }
+#flow-canvas .drawflow-delete{
+  background:var(--red) !important;color:#fff !important;border-radius:50% !important;border:none !important;
+}
 
 /* Custom dropdown component -- replaces native <select> popups (which
    render with OS chrome and can't be height-limited/styled consistently)
@@ -1522,6 +1778,7 @@ textarea.code-area{
   box-shadow:0 20px 60px rgba(0,0,0,.5);
   animation:modalIn .18s var(--ease) both;
 }
+.modal-box.wide{width:640px;}
 @keyframes modalIn{ from{opacity:0;transform:scale(.96) translateY(6px);} to{opacity:1;transform:scale(1) translateY(0);} }
 .modal-title{font-weight:700;font-size:14px;margin-bottom:10px;color:var(--text);}
 .modal-msg{font-size:13px;color:var(--subtext);margin-bottom:12px;white-space:pre-wrap;line-height:1.5;}
@@ -1597,7 +1854,7 @@ textarea.code-area{
 <script>
 const TABS = [
   ["Chat","💬"], ["Log","📜"], ["Model","🧬"], ["Parameters","⚙"],
-  ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["MCP","🔌"], ["Permissions","🔐"]
+  ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["Flows","🔗"], ["MCP","🔌"], ["Permissions","🔐"]
 ];
 
 let state = {
@@ -2300,6 +2557,73 @@ function showMcpAddModal(){
   });
 }
 
+// Tools pane opened from the MCP tab's "Tools" button — lists every tool
+// on that server with Promote/Demote controls. Promoting a tool includes
+// its full schema alongside Midum's native tools so the model can call it
+// directly, without the usual show_server_tools()/call_mcp_tool() discovery
+// hop. Built as its own function (not via _renderModal) because it needs
+// live re-fetch-and-redraw on every Promote/Demote click, not a single
+// submit-and-close interaction.
+async function showMcpToolsPane(serverName){
+  const overlay = document.getElementById("modal-overlay");
+  const box = document.getElementById("modal-box");
+  box.classList.add("wide");
+  box.innerHTML = `
+    <div class="modal-title">Tools — ${escapeHtml(serverName)}</div>
+    <div id="mcp-tools-body" style="max-height:50vh;overflow-y:auto;margin:8px 0;"></div>
+    <div class="modal-actions"><button class="modal-btn primary" id="mcp-tools-close">Close</button></div>
+  `;
+  overlay.classList.add("open");
+  const bodyEl = document.getElementById("mcp-tools-body");
+  bodyEl.innerHTML = `<div style="font-size:11px;color:var(--subtext);padding:10px;">Loading tools...</div>`;
+
+  async function refresh(){
+    const r = await api("list_mcp_tools_for_promotion", serverName);
+    if (!r.ok){
+      bodyEl.innerHTML = `<div style="font-size:11px;color:var(--red);padding:10px;">${escapeHtml(r.error || "Failed to load tools.")}</div>`;
+      return;
+    }
+    if (!r.tools.length){
+      bodyEl.innerHTML = `<div style="font-size:11px;color:var(--subtext);padding:10px;">This server exposes no tools.</div>`;
+      return;
+    }
+    bodyEl.innerHTML = r.tools.map(t => `
+      <div class="mcp-tool-row" data-tool="${escapeHtml(t.name)}">
+        <div class="mcp-tool-info">
+          <div class="mcp-tool-name">${escapeHtml(t.name)}</div>
+          ${t.desc ? `<div class="mcp-tool-desc">${escapeHtml(t.desc)}</div>` : ""}
+        </div>
+        <div class="mcp-tool-actions">
+          <button class="mini-btn${t.promoted ? " open" : ""}" data-act="promote" ${t.promoted ? "disabled" : ""}>Promote</button>
+          <button class="mini-btn del" data-act="demote" ${t.promoted ? "" : "disabled"}>Demote</button>
+        </div>
+      </div>`).join("");
+  }
+  await refresh();
+
+  bodyEl.onclick = async (e)=>{
+    const btn = e.target.closest("[data-act]");
+    if (!btn || btn.disabled) return;
+    const row = btn.closest("[data-tool]");
+    const toolName = row.dataset.tool;
+    btn.disabled = true;
+    if (btn.dataset.act === "promote"){
+      await api("promote_mcp_tool", serverName, toolName);
+    } else {
+      await api("demote_mcp_tool", serverName, toolName);
+    }
+    await refresh();
+  };
+
+  function doClose(){
+    box.classList.remove("wide");
+    _closeModal();
+  }
+  document.getElementById("mcp-tools-close").onclick = doClose;
+  _modalKeyHandler = e=>{ if (e.key === "Escape" || e.key === "Enter"){ doClose(); } };
+  document.addEventListener("keydown", _modalKeyHandler);
+}
+
 // ── Sidebar -------------------------------------------------------------
 function buildSidebar(){
   const el = document.getElementById("sidebar-inner");
@@ -2757,11 +3081,12 @@ function showToolPane(name){
   const builders = {
     "Log": buildLogPane, "Model": buildModelPane, "Parameters": buildParamsPane,
     "System Core": buildSysCorePane, "Knowledge": buildKnowledgePane,
-    "Skills": buildSkillsPane, "Tools": buildToolsPane, "MCP": buildMcpPane,
+    "Skills": buildSkillsPane, "Tools": buildToolsPane, "Flows": buildFlowsPane, "MCP": buildMcpPane,
     "Permissions": buildPermissionsPane,
   };
   box.innerHTML = "";
   box.style.display = "flex"; box.style.flexDirection = "column"; box.style.height = "100%";
+  box.style.padding = "";  // reset any pane-specific override (e.g. Flows sets 0) before rebuilding
   (builders[name] || (()=>{}))(box);
 }
 
@@ -2938,11 +3263,17 @@ function buildToolsPane(box){
       <select id="tool-select" style="flex:1;margin-right:6px;"></select>
       <button class="btn" id="tool-run" style="background:var(--accent);color:#fff;">▶ Run</button>
     </div>
+    <div class="hdr-row" style="margin-top:6px;">
+      <select id="flow-select" style="flex:1;margin-right:6px;"></select>
+      <button class="btn" id="flow-run" style="background:var(--accent2);color:#fff;">▶ Run Flow</button>
+    </div>
     <div class="tools-args" id="tool-args"></div>
     <textarea class="code-area" id="tool-output" readonly style="color:var(--tool-text);background:var(--tool-bg);"></textarea>`;
   const sel = document.getElementById("tool-select");
+  const flowSel = document.getElementById("flow-select");
   const argsBox = document.getElementById("tool-args");
   enhanceSelect(sel);
+  enhanceSelect(flowSel);
   let schemas = [];
   function buildArgs(name){
     const schema = schemas.find(s=>s.name===name);
@@ -2971,6 +3302,12 @@ function buildToolsPane(box){
     sel.innerHTML = schemas.map(s=>`<option>${s.name}</option>`).join("");
     if (schemas.length) buildArgs(schemas[0].name);
   })();
+  (async ()=>{
+    const flowSchemas = await api("list_flow_schemas");
+    flowSel.innerHTML = flowSchemas.length
+      ? flowSchemas.map(s=>`<option title="${escapeHtml(s.description||'')}">${escapeHtml(s.name)}</option>`).join("")
+      : `<option>No saved flows</option>`;
+  })();
   sel.onchange = ()=>buildArgs(sel.value);
   document.getElementById("tool-run").onclick = async ()=>{
     const args = {};
@@ -2978,6 +3315,367 @@ function buildToolsPane(box){
     const r = await api("run_tool", sel.value, args);
     document.getElementById("tool-output").value = r.output;
   };
+  document.getElementById("flow-run").onclick = async ()=>{
+    if (!flowSel.value || flowSel.value === "No saved flows") return;
+    const r = await api("run_flow", flowSel.value);
+    document.getElementById("tool-output").value = r.output;
+  };
+}
+
+// ── Flows pane -------------------------------------------------------------
+// Node-graph editor, built on Drawflow (https://github.com/jerosoler/Drawflow,
+// MIT) rather than a from-scratch canvas system -- loaded lazily from CDN
+// the first time this tab is opened. Left: a grouped node drawer (drag an
+// item onto the canvas to place it). Right: the graph canvas itself, with
+// pan/zoom and draggable connectors between nodes built in by the library.
+// Currently seeded with just two node types (Start / End); more groups and
+// node types can be added to FLOW_NODE_GROUPS without touching anything else.
+const FLOW_NODE_GROUPS = [
+  {
+    group: "Control Flow",
+    nodes: [
+      { type: "start", label: "Start", icon: "▶", inputs: 0, outputs: 1 },
+      { type: "end",   label: "End",   icon: "⏹", inputs: 1, outputs: 0 },
+    ],
+  },
+  {
+    group: "Logic",
+    nodes: [
+      { type: "logic::if", label: "If", icon: "🔀", inputs: 2, outputs: 2, isLogic: true,
+        pinLabels: { in: ["Sequence", "Value"], out: ["True", "False"] } },
+      { type: "logic::loop", label: "Loop (For Each)", icon: "🔁", inputs: 2, outputs: 3, isLogic: true,
+        pinLabels: { in: ["Sequence", "Iterable"], out: ["Body", "Item", "After"] } },
+    ],
+  },
+  {
+    group: "Variables",
+    nodes: [
+      { type: "variable", label: "Variable", icon: "🧩", inputs: 1, outputs: 1, isVariable: true },
+    ],
+  },
+];
+const FLOW_NODE_DEFS = {};
+FLOW_NODE_GROUPS.forEach(g => g.nodes.forEach(def => { FLOW_NODE_DEFS[def.type] = def; }));
+
+const DRAWFLOW_CSS = "https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css";
+const DRAWFLOW_JS  = "https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js";
+
+function _loadStyleOnce(href){
+  if (document.querySelector(`link[href="${href}"]`)) return;
+  const l = document.createElement("link");
+  l.rel = "stylesheet"; l.href = href;
+  document.head.appendChild(l);
+}
+function _loadScriptOnce(src){
+  return new Promise((resolve, reject)=>{
+    if (window.Drawflow || document.querySelector(`script[src="${src}"]`)){ resolve(); return; }
+    const s = document.createElement("script");
+    s.src = src; s.onload = ()=>resolve(); s.onerror = ()=>reject(new Error("failed to load " + src));
+    document.head.appendChild(s);
+  });
+}
+
+// Every real DATA/SEQUENCE wire terminates at an actual Drawflow pin now
+// (rendered by Drawflow itself along the node's edges, evenly spaced by
+// pin count) -- the param rows below are just the manually-typed
+// fallback value for a pin that isn't wired to anything, plus a text
+// label kept in the same top-to-bottom order as the pins so the two line
+// up visually. flows.py reads `_flow_param_order` (set in initialData
+// below) to know which pin index maps to which parameter name.
+function _flowNodeHtml(def){
+  if (def.isVariable){
+    return `<div class="flow-node-tool flow-node-variable">`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">Variable</span></div>`
+         + `<div class="flow-node-params">`
+         + `<div class="flow-param-row"><span class="flow-param-label">name</span><input class="flow-param-input" type="text" df-name placeholder="my_variable"/></div>`
+         + `<div class="flow-param-row"><span class="flow-param-label">value</span><input class="flow-param-input" type="text" df-value placeholder="default (used if nothing wired in)"/></div>`
+         + `</div>`
+         + `<div class="flow-node-pin-hint"><span>in: value</span><span>out: value</span></div>`
+         + `</div>`;
+  }
+  if (def.isLogic && def.type === "logic::if"){
+    return `<div class="flow-node-tool flow-node-logic">`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">If</span></div>`
+         + `<div class="flow-node-params">`
+         + `<div class="flow-param-row"><span class="flow-param-label">op</span>`
+         + `<select class="flow-param-input" df-op>`
+         + `<option value="truthy">is truthy</option><option value="equals">equals</option>`
+         + `<option value="not_equals">not equals</option><option value="contains">contains</option>`
+         + `<option value="greater_than">&gt;</option><option value="less_than">&lt;</option>`
+         + `</select></div>`
+         + `<div class="flow-param-row"><span class="flow-param-label">value</span><input class="flow-param-input" type="text" df-value placeholder="fallback if Value pin unwired"/></div>`
+         + `<div class="flow-param-row"><span class="flow-param-label">compare</span><input class="flow-param-input" type="text" df-compare placeholder="compare against"/></div>`
+         + `</div>`
+         + `<div class="flow-node-pin-hint"><span>in: seq, value</span><span>out: true, false</span></div>`
+         + `</div>`;
+  }
+  if (def.isLogic && def.type === "logic::loop"){
+    return `<div class="flow-node-tool flow-node-logic">`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">Loop (For Each)</span></div>`
+         + `<div class="flow-node-params">`
+         + `<div class="flow-param-row"><span class="flow-param-label">item</span><input class="flow-param-input" type="text" df-item_var placeholder="item (label only)"/></div>`
+         + `</div>`
+         + `<div class="flow-node-pin-hint"><span>in: seq, iterable</span><span>out: body, item, after</span></div>`
+         + `</div>`;
+  }
+  if (!def.params){
+    return `<div class="flow-node flow-node-${def.type}">`
+         + `<div class="flow-node-icon">${def.icon}</div>`
+         + `<div class="flow-node-label">${escapeHtml(def.label)}</div>`
+         + `</div>`;
+  }
+  const paramsHtml = def.params.length
+    ? def.params.map(p=>{
+        const req = p.required ? " required" : "";
+        let field;
+        if (p.enum){
+          field = `<select class="flow-param-input" df-${escapeHtml(p.name)}>`
+            + p.enum.map(e=>`<option value="${escapeHtml(String(e))}">${escapeHtml(String(e))}</option>`).join("")
+            + `</select>`;
+        } else {
+          const inputType = (p.type === "integer" || p.type === "number") ? "number" : "text";
+          field = `<input class="flow-param-input" type="${inputType}" df-${escapeHtml(p.name)} placeholder="${escapeHtml(p.description||p.type||'')}"/>`;
+        }
+        return `<div class="flow-param-row${req}" title="${escapeHtml(p.description||'')}">`
+             + `<span class="flow-param-label">${escapeHtml(p.name)}</span>`
+             + field
+             + `</div>`;
+      }).join("")
+    : `<div class="flow-node-empty-params">No parameters</div>`;
+  const objectOutHtml = def.kind && def.kind !== "action"
+    ? `<div class="flow-node-pin-hint"><span>in: seq${def.params.length?', params':''}</span><span class="flow-object-out">out: seq, ⬤ object</span></div>`
+    : `<div class="flow-node-pin-hint"><span>in: seq${def.params.length?', params':''}</span><span>out: seq</span></div>`;
+  return `<div class="flow-node-tool">`
+       + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">${escapeHtml(def.label)}</span>`
+       + (def.kind ? `<span class="flow-node-kind-badge flow-node-kind-${def.kind}">${def.kind}</span>` : "")
+       + `</div>`
+       + `<div class="flow-node-params">${paramsHtml}</div>`
+       + objectOutHtml
+       + `</div>`;
+}
+
+let _drawflowEditor = null;
+
+async function buildFlowsPane(box){
+  box.style.padding = "0";
+  box.innerHTML = `
+    <div id="flows-root">
+      <div id="flow-drawer">
+        <div id="flow-drawer-title">Node Drawer</div>
+      </div>
+      <div id="flow-canvas-wrap">
+        <div class="hdr-row" id="flow-toolbar">
+          <div class="section-label" id="flow-hint">DRAG NODES ONTO THE CANVAS</div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <input id="flow-name-input" placeholder="flow_function_name" maxlength="64" autocomplete="off"
+              style="height:24px;width:140px;border-radius:12px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 8px;font-size:11px;font-family:Consolas,'Cascadia Code',monospace;"/>
+            <input id="flow-desc-input" placeholder="Description (for the Tools tab)" maxlength="300" autocomplete="off"
+              style="height:24px;width:200px;border-radius:12px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 8px;font-size:11px;"/>
+            <button class="btn" id="flow-save" style="height:24px;font-size:10px;background:var(--accent);color:#fff;">Save</button>
+            <button class="ghost-btn" id="flow-zoom-out" style="height:24px;width:28px;padding:0;">−</button>
+            <button class="ghost-btn" id="flow-zoom-reset" style="height:24px;font-size:10px;">Reset</button>
+            <button class="ghost-btn" id="flow-zoom-in" style="height:24px;width:28px;padding:0;">+</button>
+            <button class="ghost-btn" id="flow-delete-connection" style="height:24px;font-size:10px;color:var(--red);" disabled>✂ Break Connection</button>
+            <button class="ghost-btn" id="flow-clear" style="height:24px;font-size:10px;color:var(--red);">Clear</button>
+          </div>
+        </div>
+        <div id="flow-canvas"><div id="flow-canvas-loading">Loading node-graph engine…</div></div>
+      </div>
+    </div>
+  `;
+
+  // Pull every native + connected-MCP tool and fold each into its own
+  // drawer group/node def (Control Flow always comes first). This runs
+  // before Drawflow itself loads so the drawer content doesn't have to
+  // wait on the CDN fetch.
+  let toolDefs = [];
+  try {
+    toolDefs = await api("list_tool_node_defs");
+  } catch (e) {
+    toolDefs = [];
+  }
+  const groupsByName = {};
+  FLOW_NODE_GROUPS.forEach(g=>{ groupsByName[g.group] = { group: g.group, nodes: [...g.nodes] }; });
+  toolDefs.forEach(d=>{
+    const params = d.params || [];
+    const kind = d.kind || "action";
+    const def = {
+      type: d.type, label: d.label, icon: d.icon,
+      inputs: 1 + params.length,
+      outputs: kind === "action" ? 1 : 2,
+      kind, params, desc: d.desc || "",
+    };
+    FLOW_NODE_DEFS[def.type] = def;
+    if (!groupsByName[d.group]) groupsByName[d.group] = { group: d.group, nodes: [] };
+    groupsByName[d.group].nodes.push(def);
+  });
+  const allGroups = Object.values(groupsByName);
+
+  // Build the grouped node drawer up front -- it doesn't depend on Drawflow
+  // being loaded, so it's visible immediately even while the library fetches.
+  const drawer = document.getElementById("flow-drawer");
+  allGroups.forEach(g=>{
+    if (!g.nodes.length) return;
+    const groupEl = document.createElement("div");
+    groupEl.className = "flow-drawer-group";
+    const titleEl = document.createElement("div");
+    titleEl.className = "flow-drawer-group-title";
+    titleEl.textContent = g.group;
+    groupEl.appendChild(titleEl);
+    g.nodes.forEach(def=>{
+      const item = document.createElement("div");
+      item.className = "flow-drawer-item";
+      item.draggable = true;
+      item.title = def.desc || "";
+      item.innerHTML = `<span class="flow-drawer-item-icon">${def.icon}</span><span>${escapeHtml(def.label)}</span>`;
+      item.ondragstart = (e)=>{ e.dataTransfer.setData("application/midum-node", def.type); e.dataTransfer.effectAllowed = "copy"; };
+      groupEl.appendChild(item);
+    });
+    drawer.appendChild(groupEl);
+  });
+
+  let editor;
+  try {
+    _loadStyleOnce(DRAWFLOW_CSS);
+    await _loadScriptOnce(DRAWFLOW_JS);
+    const canvasEl = document.getElementById("flow-canvas");
+    if (!canvasEl) return;   // user already switched away from Flows before this resolved
+    canvasEl.innerHTML = "";
+
+    editor = new Drawflow(canvasEl);
+    editor.reroute = true;
+    editor.curvature = 0.4;
+    editor.zoom_max = 1.6;
+    editor.zoom_min = 0.4;
+    editor.start();
+    _drawflowEditor = editor;
+
+    // Name field: live-filtered to only characters legal in a Python
+    // identifier as the user types (letters, digits, underscore), and a
+    // leading digit is stripped since `def 1foo():` isn't valid Python
+    // either. Full validation (keyword collisions etc) happens
+    // server-side in flows.py when Save is clicked -- this is just to
+    // stop obviously-invalid characters from ever being typed.
+    const nameInput = document.getElementById("flow-name-input");
+    const descInput = document.getElementById("flow-desc-input");
+    nameInput.addEventListener("input", ()=>{
+      let v = nameInput.value.replace(/[^A-Za-z0-9_]/g, "");
+      v = v.replace(/^[0-9]+/, "");
+      if (v !== nameInput.value) nameInput.value = v;
+    });
+
+    document.getElementById("flow-save").onclick = async ()=>{
+      const name = nameInput.value.trim();
+      if (!name){ await showAlert("Enter a name for this flow first — it becomes the Python function name in flow_tools.py.", "Name Required"); nameInput.focus(); return; }
+      const graph = editor.export();
+      const btn = document.getElementById("flow-save");
+      btn.disabled = true; const oldLabel = btn.textContent; btn.textContent = "Saving…";
+      try {
+        const r = await api("save_flow", name, graph, descInput.value.trim());
+        if (!r.ok) await showAlert(r.message, "Save Failed");
+      } finally {
+        btn.disabled = false; btn.textContent = oldLabel;
+      }
+    };
+
+    // Break connections: click a connection line to select it (Drawflow
+    // highlights it red via the .selected CSS above), then either press
+    // Delete/Backspace or click "Break Connection". Right-click a
+    // connection removes it immediately, no selection step needed.
+    const deleteBtn = document.getElementById("flow-delete-connection");
+    const hintEl = document.getElementById("flow-hint");
+    canvasEl.tabIndex = 0;   // required for the container to receive keydown at all
+    canvasEl.style.outline = "none";
+    canvasEl.addEventListener("mousedown", ()=>canvasEl.focus());
+
+    editor.on("connectionSelected", ()=>{
+      deleteBtn.disabled = false;
+      if (hintEl) hintEl.textContent = "CONNECTION SELECTED — press Delete or click Break Connection";
+    });
+    editor.on("connectionUnselected", ()=>{
+      deleteBtn.disabled = true;
+      if (hintEl) hintEl.textContent = "DRAG NODES ONTO THE CANVAS";
+    });
+    editor.on("connectionRemoved", ()=>{
+      deleteBtn.disabled = true;
+      if (hintEl) hintEl.textContent = "DRAG NODES ONTO THE CANVAS";
+    });
+
+    deleteBtn.onclick = ()=>{
+      if (editor.connection_selected){
+        editor.removeConnection();
+        deleteBtn.disabled = true;
+      }
+    };
+
+    // Right-click a connection to break it immediately (Drawflow's own
+    // contextmenu handler already selects the connection under the
+    // cursor before this fires, so removeConnection() targets the right one).
+    canvasEl.addEventListener("contextmenu", (e)=>{
+      const onConnection = e.target.closest && e.target.closest(".main-path");
+      if (onConnection){
+        e.preventDefault();
+        editor.connection_selected = onConnection;
+        onConnection.classList.add("selected");
+        editor.removeConnection();
+        deleteBtn.disabled = true;
+      }
+    });
+
+    function addNodeAt(type, clientX, clientY){
+      const def = FLOW_NODE_DEFS[type];
+      if (!def) return;
+      const rect = canvasEl.getBoundingClientRect();
+      const zoom = editor.zoom || 1;
+      const x = (clientX - rect.left - editor.canvas_x) / zoom;
+      const y = (clientY - rect.top  - editor.canvas_y) / zoom;
+      // Seed node data with an empty string per parameter so Drawflow's
+      // df-<param> two-way binding has something to attach to from the
+      // start (an unset key would just never sync until first edited).
+      // `_flow_param_order` records which parameter lives at which extra
+      // input pin (input_2, input_3, ...) -- flows.py reads this straight
+      // back out of the saved graph, so it never needs to know the tool's
+      // schema itself to resolve wired-in vs manually-typed values.
+      const initialData = {};
+      if (def.isVariable){
+        initialData.name = ""; initialData.value = "";
+      } else if (def.type === "logic::if"){
+        initialData.op = "truthy"; initialData.value = ""; initialData.compare = "";
+      } else if (def.type === "logic::loop"){
+        initialData.item_var = "item";
+      } else {
+        (def.params || []).forEach(p=>{ initialData[p.name] = ""; });
+        initialData._flow_param_order = (def.params || []).map(p=>p.name);
+      }
+      editor.addNode(def.type, def.inputs, def.outputs, x, y, `flow-node-${def.type.replace(/[^A-Za-z0-9_]/g,'-')}`, initialData, _flowNodeHtml(def));
+    }
+
+    canvasEl.ondragover = (e)=>e.preventDefault();
+    canvasEl.ondrop = (e)=>{
+      e.preventDefault();
+      const type = e.dataTransfer.getData("application/midum-node");
+      if (type) addNodeAt(type, e.clientX, e.clientY);
+    };
+
+    document.getElementById("flow-zoom-in").onclick    = ()=>editor.zoom_in();
+    document.getElementById("flow-zoom-out").onclick   = ()=>editor.zoom_out();
+    document.getElementById("flow-zoom-reset").onclick = ()=>editor.zoom_reset();
+    document.getElementById("flow-clear").onclick = async ()=>{
+      const ok = await showConfirm("Clear every node and connection from the canvas?", "Clear Flow", {danger:true, okLabel:"Clear"});
+      if (ok) editor.clear();
+    };
+
+    // Seed the canvas with one Start and one End node so it isn't empty the
+    // very first time this tab is opened.
+    editor.addNode("start", 0, 1, 100, 160, "flow-node-start", {}, _flowNodeHtml(FLOW_NODE_DEFS.start));
+    editor.addNode("end",   1, 0, 480, 160, "flow-node-end",   {}, _flowNodeHtml(FLOW_NODE_DEFS.end));
+  } catch (e) {
+    const canvasEl = document.getElementById("flow-canvas");
+    if (canvasEl){
+      canvasEl.innerHTML = `<div style="padding:20px;font-size:12px;color:var(--red);">`
+        + `Failed to load the node-graph library (Drawflow) from the CDN — check your internet connection and retry by switching tabs.<br><br>${escapeHtml(String(e))}</div>`;
+    }
+  }
 }
 
 function buildMcpPane(box){
@@ -3032,7 +3730,7 @@ async function refreshMcpList(){
           : `<button class="mini-btn" data-act="retry">Retry</button><button class="mini-btn del" data-act="remove">Remove</button>`}
       </div>`;
     const act = row.querySelector('[data-act=tools]');
-    if (act) act.onclick = async ()=>{ const r = await api("view_mcp_tools", s.name); showAlert(r.content, `Tools — ${s.name}`); };
+    if (act) act.onclick = async ()=>{ showMcpToolsPane(s.name); };
     const disc = row.querySelector('[data-act=disc]');
     if (disc) disc.onclick = async ()=>{ const ok = await showConfirm(`Disconnect '${s.name}'?`, "Disconnect Server"); if (ok) await api("disconnect_mcp", s.name, false); };
     const retry = row.querySelector('[data-act=retry]');

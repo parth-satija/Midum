@@ -256,6 +256,7 @@ MASTER_MEMORY       = os.path.join(STORAGE_DIR, "master_memory.md")
 SESSION_MEMORY      = os.path.join(STORAGE_DIR, "session_memory.md")
 RESPONSE_MEMORY     = os.path.join(STORAGE_DIR, "response_memory.md")
 MCP_SERVERS_FILE    = os.path.join(STORAGE_DIR, "mcp_servers.json")
+MCP_PROMOTED_TOOLS_FILE = os.path.join(STORAGE_DIR, "mcp_promoted_tools.json")
 LOG_FILE            = os.path.join(TARGET_DIR, "chat_log.md")
 
 GOAL_SECTION_HEADER = "## Current Goal"

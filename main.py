@@ -5,7 +5,7 @@ from config import _MCP_SDK_AVAILABLE
 from knowledge_base import add_instruction, add_path, create_domain_knowledge, create_domain_skill, list_domain_knowledge, list_domain_skills, read_domain_knowledge, read_instructions, read_paths
 from midum_mcp.manager import _load_mcp_config, _mcp_manager, connect_mcp_server, disconnect_mcp_server, list_mcp_servers
 from midum_mcp.tools import call_mcp_tool, list_native_tools, show_native_tool_schema, show_server_tools
-from tools.user_prompt_tools import _gui_ask_hook, ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
+from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
 from tools_schema import tools
 from ui_automation import ui_navigator
 
@@ -19,7 +19,9 @@ import providers.groq_backend as providers_groq_backend
 import providers.openrouter_backend as providers_openrouter_backend
 from browser_cdp import _CDP_AVAILABLE, _cdp_get_tabs, act_on_browser_element, list_browser_tabs, query_gemini_app, read_browser_page, run_js_in_browser, snapshot_browser_elements
 from config import GOAL_SECTION_END, GOAL_SECTION_HEADER, LOG_FILE, MCP_SERVERS_FILE, MODEL_NAME, MODEL_PROVIDER, OPENROUTER_CONSULT_MODE, SCREEN_H, SCREEN_W, SECRETS_FILE, SESSION_MEMORY, TARGET_DIR
+from flows import compile_flow, list_flows, list_flow_schemas, run_flow, save_flow, validate_flow_name
 from midum_mcp.manager import _MCP_SERVERS, _MCP_SERVER_ORDER, init_mcp_servers_from_config
+from midum_mcp.manager import demote_mcp_tool, get_promoted_tools, is_tool_promoted, promote_mcp_tool
 from memory import init_memory_at_startup, python_trigger_memory_update, set_current_goal, update_memory
 from orchestration import _decompose_task, _is_trivial_input, get_gemini_reasoning, process_chat_turn, wait
 from providers.gemini_api_backend import _gemini_api_load_msg, consult_gemini_api, delegate_to_gemini_api, set_gemini_api_model

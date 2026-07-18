@@ -1,6 +1,8 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
-from midum_mcp.manager import _MCPManager, _mcp_normalize_name, _mcp_resolve_name
+from midum_mcp.manager import _MCPManager, _mcp_normalize_name, _mcp_resolve_name, get_promoted_tools
+from midum_mcp.manager import _MCP_SERVERS as _MANAGER_MCP_SERVERS
 from tools_schema import tools
+from permissions import get_permission, mcp_permission_key
 import json
 
 # --- from main.py, section 1 ---
@@ -115,6 +117,48 @@ def show_server_tools(server) -> str:
     )
 
 
+def get_promoted_tool_schemas() -> list:
+    """
+    Build native-style {"type":"function","function":{...}} schema entries
+    for every currently-promoted MCP tool whose server is connected and
+    which still actually exposes that tool. Names are kept EXACTLY as the
+    MCP server reports them (no server prefix) so that when the model
+    calls a promoted tool directly by name, the existing
+    _mcp_autoroute_tool_call()/_mcp_find_tool_matches() machinery (which
+    already resolves any bare MCP tool name it doesn't recognize as a
+    native tool into the equivalent call_mcp_tool(...) invocation)
+    transparently routes the call -- no separate dispatch path needed.
+
+    Tools set to "deny" in the Permissions tab are skipped entirely so a
+    blocked tool's schema never reaches the model. Entries whose server is
+    disconnected, or whose promoted tool no longer exists on that server,
+    are silently skipped too (they reappear automatically once the server
+    reconnects / re-lists that tool).
+    """
+    schemas = []
+    for entry in get_promoted_tools():
+        server_name = entry.get("server")
+        tool_name   = entry.get("tool")
+        handle = _MANAGER_MCP_SERVERS.get(server_name)
+        if not handle or not handle.connected:
+            continue
+        tdef = next((t for t in handle.tools if t["name"] == tool_name), None)
+        if tdef is None:
+            continue
+        if get_permission(mcp_permission_key(server_name, tool_name)) == "deny":
+            continue
+        desc = tdef.get("description") or ""
+        schemas.append({
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": f"[MCP:{server_name}] {desc}".strip(),
+                "parameters": tdef.get("input_schema") or {"type": "object", "properties": {}},
+            },
+        })
+    return schemas
+
+
 def call_mcp_tool(server, tool_name: str, arguments) -> str:
     """
     Uniform invocation for ANY tool on ANY connected MCP server — this is
@@ -152,6 +196,8 @@ def list_native_tools() -> str:
     for i, t in enumerate(tools):
         fn = t.get("function", {})
         name = fn.get("name", "?")
+        if get_permission(name) == "deny":
+            continue
         desc = (fn.get("description") or "").strip().splitlines()[0] if fn.get("description") else ""
         lines.append(f"[{i}] {name} — {desc}")
     return "\n".join(lines)
@@ -178,6 +224,12 @@ def show_native_tool_schema(tool_name: str) -> str:
         return (f"Unknown native tool '{tool_name}'. Call list_native_tools() first "
                 f"to see valid indices/names.")
     fn = match.get("function", {})
+    if get_permission(fn.get("name", "")) == "deny":
+        return (
+            f"[PERMISSION DENIED] '{fn.get('name')}' is set to \"Don't Allow\" in the "
+            f"Permissions tab. Its schema is not available. Tell the user this tool is "
+            f"blocked if they ask about it."
+        )
     return json.dumps(
         {
             "name": fn.get("name"),

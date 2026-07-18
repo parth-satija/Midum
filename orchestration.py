@@ -16,7 +16,7 @@ from screen_capture import capture_screen_to_ram, fallback_click_grid, fallback_
 from skills import list_skills, load_skill
 from state import _abort_event
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
-from permissions import enforce_tool_permission, mcp_permission_key
+from permissions import enforce_tool_permission, filter_tools_schema, mcp_permission_key
 from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
 from tools_schema import tools
 from ui_automation import ui_navigator
@@ -100,7 +100,7 @@ def get_gemini_reasoning(user_input: str, conversation_history: list) -> str | N
 
     os_name = "Linux (bash)" if _IS_LINUX else "Windows (PowerShell)"
     launch  = "nohup /path/to/app &" if _IS_LINUX else "Start-Process 'C:\\path\\to\\app.exe'"
-    tool_names   = [t["function"]["name"] for t in tools]
+    tool_names   = [t["function"]["name"] for t in filter_tools_schema(tools)]
     tool_summary = ", ".join(tool_names)
 
     prompt = f"""You are the planning brain of Midum, a {os_name} desktop AI agent.
@@ -381,7 +381,7 @@ def _extract_legacy_tool_calls(content: str):
 def _call_ollama(messages, result_q):
     """Run ollama.chat on a background thread and put the result in result_q."""
     try:
-        resp = ollama.chat(model=config.MODEL_NAME, messages=messages, tools=tools)
+        resp = ollama.chat(model=config.MODEL_NAME, messages=messages, tools=filter_tools_schema(tools))
 
         # ── Legacy fallback: only engages if native tool_calls is empty AND
         #    the active model is a known weak-tool-calling family. Modern
@@ -431,7 +431,7 @@ def _call_openrouter_primary(messages, result_q, model_override: str = None):
     """
     try:
         use_model = model_override or config.OPENROUTER_MODEL
-        resp = _openrouter_chat_with_fallback(messages, model=use_model, tools_schema=tools)
+        resp = _openrouter_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(tools))
 
         if not resp["message"].get("tool_calls"):
             raw_content = resp["message"].get("content") or ""
@@ -463,7 +463,7 @@ def _call_gemini_api_primary(messages, result_q, model_override: str = None):
     """
     try:
         use_model = model_override or config.GEMINI_API_MODEL
-        resp = _gemini_api_chat(messages, model=use_model, tools_schema=tools)
+        resp = _gemini_api_chat(messages, model=use_model, tools_schema=filter_tools_schema(tools))
 
         if not resp["message"].get("tool_calls"):
             raw_content = resp["message"].get("content") or ""
@@ -495,7 +495,7 @@ def _call_groq_primary(messages, result_q, model_override: str = None):
     """
     try:
         use_model = model_override or config.GROQ_MODEL
-        resp = _groq_chat_with_fallback(messages, model=use_model, tools_schema=_get_groq_tools_schema())
+        resp = _groq_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(_get_groq_tools_schema()))
 
         if not resp["message"].get("tool_calls"):
             raw_content = resp["message"].get("content") or ""
@@ -527,7 +527,7 @@ def _call_ollama_cloud_primary(messages, result_q, model_override: str = None):
     """
     try:
         use_model = model_override or config.OLLAMA_CLOUD_MODEL
-        resp = _ollama_cloud_chat_with_fallback(messages, model=use_model, tools_schema=tools)
+        resp = _ollama_cloud_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(tools))
 
         if not resp["message"].get("tool_calls"):
             raw_content = resp["message"].get("content") or ""
