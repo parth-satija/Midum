@@ -1054,6 +1054,23 @@ class Api:
         except Exception:
             return []
 
+    def get_flow_graph(self, name: str):
+        """The raw Drawflow graph JSON last saved for `name`, so the Flows
+        tab can reload an existing flow into the canvas for editing."""
+        try:
+            return midum.get_flow_graph(name)
+        except Exception:
+            return {}
+
+    def delete_flow(self, name: str):
+        try:
+            msg = midum.delete_flow(name)
+            ok = not msg.lower().startswith("error")
+            self._push_event("log", {"text": f"{'🗑️' if ok else '⚠️'} {msg}\n"})
+            return {"ok": ok, "message": msg}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
     def run_flow(self, name: str):
         """Run a saved flow the same way a native tool is run from the
         Tools tab -- in a background thread, pushing the result back as a
@@ -1869,8 +1886,12 @@ function api(name, ...args){ return window.pywebview.api[name](...args); }
 function targetGeo(){
   const showTool = state.activeTab !== "Chat";
   const showSide = state.sidebarOpen;
-  if (showTool && showSide)      return {tool:[0,30], chat:[30,50], side:[80,20]};
-  if (showTool && !showSide)     return {tool:[0,40], chat:[40,60], side:[100,0]};
+  // The Flows tab is a node-graph editor that needs real canvas space to
+  // be usable, so it's the one tab given a pane larger than the chat
+  // panel -- every other tab keeps the normal (smaller-than-chat) split.
+  const isFlows = state.activeTab === "Flows";
+  if (showTool && showSide)      return isFlows ? {tool:[0,55], chat:[55,25], side:[80,20]} : {tool:[0,30], chat:[30,50], side:[80,20]};
+  if (showTool && !showSide)     return isFlows ? {tool:[0,70], chat:[70,30], side:[100,0]} : {tool:[0,40], chat:[40,60], side:[100,0]};
   if (!showTool && showSide)     return {tool:[0,0],  chat:[0,80],  side:[80,20]};
   return {tool:[0,0], chat:[0,100], side:[100,0]};
 }
@@ -3467,11 +3488,17 @@ async function buildFlowsPane(box){
         <div class="hdr-row" id="flow-toolbar">
           <div class="section-label" id="flow-hint">DRAG NODES ONTO THE CANVAS</div>
           <div style="display:flex;gap:6px;align-items:center;">
+            <select id="flow-load-select" title="Load a saved flow into the canvas for editing"
+              style="height:24px;width:150px;border-radius:12px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 8px;font-size:11px;">
+              <option value="">New flow…</option>
+            </select>
+            <button class="ghost-btn" id="flow-new" style="height:24px;font-size:10px;">+ New</button>
             <input id="flow-name-input" placeholder="flow_function_name" maxlength="64" autocomplete="off"
               style="height:24px;width:140px;border-radius:12px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 8px;font-size:11px;font-family:Consolas,'Cascadia Code',monospace;"/>
             <input id="flow-desc-input" placeholder="Description (for the Tools tab)" maxlength="300" autocomplete="off"
               style="height:24px;width:200px;border-radius:12px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 8px;font-size:11px;"/>
             <button class="btn" id="flow-save" style="height:24px;font-size:10px;background:var(--accent);color:#fff;">Save</button>
+            <button class="ghost-btn" id="flow-delete" style="height:24px;font-size:10px;color:var(--red);" disabled>🗑 Delete</button>
             <button class="ghost-btn" id="flow-zoom-out" style="height:24px;width:28px;padding:0;">−</button>
             <button class="ghost-btn" id="flow-zoom-reset" style="height:24px;font-size:10px;">Reset</button>
             <button class="ghost-btn" id="flow-zoom-in" style="height:24px;width:28px;padding:0;">+</button>
@@ -3558,11 +3585,54 @@ async function buildFlowsPane(box){
     // stop obviously-invalid characters from ever being typed.
     const nameInput = document.getElementById("flow-name-input");
     const descInput = document.getElementById("flow-desc-input");
+    const loadSelect = document.getElementById("flow-load-select");
+    const deleteBtnFlow = document.getElementById("flow-delete");
     nameInput.addEventListener("input", ()=>{
       let v = nameInput.value.replace(/[^A-Za-z0-9_]/g, "");
       v = v.replace(/^[0-9]+/, "");
       if (v !== nameInput.value) nameInput.value = v;
     });
+
+    function seedBlankCanvas(){
+      editor.clear();
+      editor.addNode("start", 0, 1, 100, 160, "flow-node-start", {}, _flowNodeHtml(FLOW_NODE_DEFS.start));
+      editor.addNode("end",   1, 0, 480, 160, "flow-node-end",   {}, _flowNodeHtml(FLOW_NODE_DEFS.end));
+    }
+
+    async function refreshFlowLoadSelect(selectName){
+      let names = [];
+      try { names = await api("list_flows"); } catch (e) { names = []; }
+      loadSelect.innerHTML = `<option value="">New flow…</option>` +
+        names.map(n=>`<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join("");
+      loadSelect.value = selectName && names.includes(selectName) ? selectName : "";
+      deleteBtnFlow.disabled = !loadSelect.value;
+    }
+
+    loadSelect.onchange = async ()=>{
+      const name = loadSelect.value;
+      deleteBtnFlow.disabled = !name;
+      if (!name){
+        nameInput.value = ""; descInput.value = "";
+        seedBlankCanvas();
+        return;
+      }
+      nameInput.value = name;
+      let graph = null;
+      try { graph = await api("get_flow_graph", name); } catch (e) { graph = null; }
+      if (graph && graph.drawflow){
+        editor.clear();
+        editor.import(graph);
+      } else {
+        await showAlert(`'${name}' was saved before flow editing was added, so its node graph can't be reloaded. Rebuild it from scratch and Save to enable editing next time.`, "Graph Not Available");
+        seedBlankCanvas();
+      }
+    };
+
+    document.getElementById("flow-new").onclick = async ()=>{
+      loadSelect.value = ""; deleteBtnFlow.disabled = true;
+      nameInput.value = ""; descInput.value = "";
+      seedBlankCanvas();
+    };
 
     document.getElementById("flow-save").onclick = async ()=>{
       const name = nameInput.value.trim();
@@ -3573,10 +3643,31 @@ async function buildFlowsPane(box){
       try {
         const r = await api("save_flow", name, graph, descInput.value.trim());
         if (!r.ok) await showAlert(r.message, "Save Failed");
+        else await refreshFlowLoadSelect(name);
       } finally {
         btn.disabled = false; btn.textContent = oldLabel;
       }
     };
+
+    deleteBtnFlow.onclick = async ()=>{
+      const name = loadSelect.value;
+      if (!name) return;
+      const ok = await showConfirm(`Delete the flow '${name}'? This removes it from flow_tools.py and can't be undone.`, "Delete Flow", {danger:true, okLabel:"Delete"});
+      if (!ok) return;
+      deleteBtnFlow.disabled = true;
+      try {
+        const r = await api("delete_flow", name);
+        if (!r.ok){ await showAlert(r.message, "Delete Failed"); deleteBtnFlow.disabled = false; return; }
+        nameInput.value = ""; descInput.value = "";
+        seedBlankCanvas();
+        await refreshFlowLoadSelect("");
+      } catch (e) {
+        await showAlert(String(e), "Delete Failed");
+        deleteBtnFlow.disabled = false;
+      }
+    };
+
+    refreshFlowLoadSelect("");
 
     // Break connections: click a connection line to select it (Drawflow
     // highlights it red via the .selected CSS above), then either press
@@ -3667,8 +3758,7 @@ async function buildFlowsPane(box){
 
     // Seed the canvas with one Start and one End node so it isn't empty the
     // very first time this tab is opened.
-    editor.addNode("start", 0, 1, 100, 160, "flow-node-start", {}, _flowNodeHtml(FLOW_NODE_DEFS.start));
-    editor.addNode("end",   1, 0, 480, 160, "flow-node-end",   {}, _flowNodeHtml(FLOW_NODE_DEFS.end));
+    seedBlankCanvas();
   } catch (e) {
     const canvasEl = document.getElementById("flow-canvas");
     if (canvasEl){

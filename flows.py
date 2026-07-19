@@ -567,10 +567,47 @@ def save_flow(name: str, graph: dict, description: str = "") -> str:
         return f"Error: failed to write flow_tools.py: {e}"
 
     meta = _load_flow_meta()
-    meta[name] = {"description": (description or "").strip()}
+    meta[name] = {"description": (description or "").strip(), "graph": graph or {}}
     _save_flow_meta(meta)
 
     return f"Flow '{name}' {action} in flow_tools.py"
+
+
+def get_flow_graph(name: str) -> dict:
+    """The raw Drawflow graph JSON last saved for `name`, so the Flows tab
+    can reload it into the canvas for editing. Returns {} if the flow
+    doesn't exist or was saved before graphs were persisted (pre-existing
+    flow_meta.json entries only had a description)."""
+    meta = _load_flow_meta()
+    return (meta.get(name) or {}).get("graph") or {}
+
+
+def delete_flow(name: str) -> str:
+    """Remove `name`'s function block from flow_tools.py and its entry
+    from flow_meta.json. Returns a human-readable status message;
+    messages starting with "Error:" mean failure."""
+    if name not in list_flows():
+        return f"Error: no saved flow named '{name}'."
+
+    start_tag = _START_MARKER_TMPL.format(name=name)
+    end_tag = _END_MARKER_TMPL.format(name=name)
+    try:
+        with open(FLOW_TOOLS_FILE, "r", encoding="utf-8") as f:
+            content = f.read()
+        pattern = re.compile(re.escape(start_tag) + r".*?" + re.escape(end_tag) + r"\n?\n*", re.DOTALL)
+        new_content, n = pattern.subn("", content)
+        if n == 0:
+            return f"Error: could not find flow '{name}' in flow_tools.py."
+        with open(FLOW_TOOLS_FILE, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except Exception as e:
+        return f"Error: failed to update flow_tools.py: {e}"
+
+    meta = _load_flow_meta()
+    meta.pop(name, None)
+    _save_flow_meta(meta)
+
+    return f"Flow '{name}' deleted."
 
 
 def list_flows() -> list:
