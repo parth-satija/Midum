@@ -198,6 +198,20 @@ _VERIFY_TOOLS = {"fallback_view_screen", "fallback_find_text"}
 # Maximum consecutive verification tool calls allowed before we force a reply
 MAX_VERIFY_CALLS = 2
 
+# Optional hook the GUI installs to receive full structured detail --
+# (tool_name, arguments_dict, result_str) -- for every tool call executed
+# during a turn. Kept separate from the plain console log line ("-> Executing:
+# '<tool_name>'") printed just below, which is all a CLI session ever sees.
+# The GUI uses this to render an expandable chat card showing the exact call
+# + its result, instead of just the name. None (the default) means no one is
+# listening, e.g. plain CLI mode -- callers must guard for that.
+_tool_call_hook = None
+
+def set_tool_call_hook(fn):
+    """Install/replace the tool-call detail hook. Pass None to remove it."""
+    global _tool_call_hook
+    _tool_call_hook = fn
+
 def wait(seconds: float) -> str:
     """Pauses thread execution for the specified duration."""
     try:
@@ -1925,6 +1939,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
 
             # ── Record in TurnState ───────────────────────────────────────────
             state.record(func_name, arguments, tool_output)
+
+            if _tool_call_hook:
+                try:
+                    _tool_call_hook(func_name, arguments, tool_output)
+                except Exception as _hook_err:
+                    print(f"⚠️ [tool_call_hook failed: {_hook_err}]")
 
             # ──────────────────────────────────────────────────────────────────
 

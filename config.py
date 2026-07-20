@@ -261,6 +261,10 @@ MCP_PROMOTED_TOOLS_FILE = os.path.join(STORAGE_DIR, "mcp_promoted_tools.json")
 # MCP_PROMOTED_TOOLS_FILE above, but for saved Flows-tab flows instead of
 # MCP server tools. Just a flat JSON list of flow names.
 FLOW_PROMOTED_TOOLS_FILE = os.path.join(STORAGE_DIR, "flow_promoted_tools.json")
+# Saved Flow schedules (see scheduler.py) -- flat JSON list of schedule
+# dicts, persisted so schedule *configuration* survives an app restart
+# even though the actual firing only happens while the app is open.
+FLOW_SCHEDULES_FILE = os.path.join(STORAGE_DIR, "flow_schedules.json")
 LOG_FILE            = os.path.join(TARGET_DIR, "chat_log.md")
 
 GOAL_SECTION_HEADER = "## Current Goal"

@@ -189,6 +189,7 @@ def _pin_source(node: dict, pin_key: str):
 
 _TOOL_NODE_RE = re.compile(r"^tool::(.+)$")
 _MCP_NODE_RE = re.compile(r"^mcp::([^:]+)::(.+)$")
+_FLOW_NODE_RE = re.compile(r"^flow::(.+)$")
 
 
 def _data_source_ref(nodes: dict, node_id):
@@ -260,6 +261,20 @@ def _codegen_tool_call(node: dict, node_id: str, nodes: dict, tool_name: str, mc
     else:
         lines.append(f"_step = {call}")
         lines.append("_flow_results.append(_step)")
+    return lines
+
+
+def _codegen_flow_call(node: dict, node_id: str, nodes: dict, flow_name: str) -> list:
+    """'Flow' node -- calls another saved flow by name via run_flow(), same
+    shape as _codegen_tool_call for a tool/mcp node. Saved flows currently
+    take no external parameters (see list_flow_schemas()'s empty
+    properties), so unlike tool/mcp nodes there's no argument dict to
+    resolve -- just the flow name. Always given an Object-out pin (a flow's
+    return value is always potentially meaningful, unlike native tools
+    where only some are worth capturing), so a downstream node/variable can
+    consume the sub-flow's result."""
+    lines = [f"# --- Flow: {flow_name} ---", f"_out_{node_id} = _call_flow_step({flow_name!r})"]
+    lines.append(f"_flow_results.append(_out_{node_id})")
     return lines
 
 
@@ -443,6 +458,14 @@ def _emit_block(node_id, nodes: dict, indent: int, visited: set, out: list, warn
             node_id = (_pin_targets(node, "output_1") or [None])[0]
             continue
 
+        m = _FLOW_NODE_RE.match(ntype)
+        if m:
+            lines = _codegen_flow_call(node, node_id, nodes, m.group(1))
+            out.extend(pad + line for line in lines)
+            _emit_variable_captures(node, node_id, nodes, pad, out)
+            node_id = (_pin_targets(node, "output_1") or [None])[0]
+            continue
+
         m = _TOOL_NODE_RE.match(ntype)
         if m:
             lines = _codegen_tool_call(node, node_id, nodes, m.group(1))
@@ -486,6 +509,18 @@ def compile_flow(name: str, graph: dict) -> str:
     """
     nodes = _extract_nodes(graph)
     warnings = _CodegenWarnings()
+
+    # Flag direct self-reference up front -- a flow::<own name> node would
+    # make run_flow() recurse into itself every time this flow runs. Not
+    # blocked outright (an indirect cycle through other flows is still
+    # possible and much harder to detect statically here), just surfaced
+    # as a visible warning in the generated function, same treatment as
+    # every other codegen warning below.
+    if any(n.get("name") == f"flow::{name}" for n in nodes.values()):
+        warnings.add(
+            f"This flow contains a Flow node that calls itself ('{name}') -- "
+            f"running it will recurse until Python's recursion limit is hit."
+        )
 
     body_lines = ["    _flow_results = []"]
     body_lines.extend(_codegen_variable_declarations(nodes))
@@ -546,6 +581,13 @@ _FLOW_TOOLS_HEADER = (
     "import main as _midum\n\n\n"
     "def _call_mcp_tool_step(server, tool_name, args):\n"
     "    return _midum.call_mcp_tool(server, tool_name, args)\n\n\n"
+    "def _call_flow_step(flow_name):\n"
+    "    \"\"\"Run another saved flow by name, as a step of THIS flow -- lets\n"
+    "    flows compose. Beware self-reference (a flow calling itself, directly\n"
+    "    or through a cycle of other flows) -- flow_tools.py has no cycle\n"
+    "    detection at call time, so that will recurse until Python's own\n"
+    "    recursion limit kicks in, not fail gracefully.\"\"\"\n"
+    "    return _midum.run_flow(flow_name)\n\n\n"
     "def _flow_iter(value):\n"
     "    \"\"\"Best-effort coercion of a wired-in value into something a\n"
     "    `for` loop can iterate: a real list/tuple passes through, a JSON\n"
@@ -631,6 +673,7 @@ _REQUIRED_HEADER_SNIPPETS = (
     "from gui.dispatch import _dispatch_midum_tool",
     "import main as _midum",
     "def _call_mcp_tool_step(",
+    "def _call_flow_step(",
     "def _flow_iter(",
     "def _flow_num(",
     "def _flow_consult_ai(",

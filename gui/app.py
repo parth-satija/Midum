@@ -21,6 +21,7 @@ import threading
 import datetime
 import queue
 import json
+import time
 import base64
 import traceback
 import subprocess
@@ -190,6 +191,7 @@ TAB_DEFS = [
 class Api:
     def __init__(self):
         self.window = None
+        self._closing       = False   # set once real teardown has started -- see _push_event / _on_closing
 
         self._session      = MidumSession()
         self._thinking     = False
@@ -229,18 +231,45 @@ class Api:
         # instead of this app's inline chat card, no matter what.
         _user_prompt_tools._gui_ask_hook = self._handle_gui_ask
 
+        # Structured tool-call detail (name + args + result) for every tool
+        # executed during a turn -- powers the expandable tool-call cards in
+        # the chat pane. Separate from the plain-text log line the console
+        # already gets from _on_log_line's "-> Executing: ..." interception.
+        midum.set_tool_call_hook(self._handle_tool_call)
+
         self._pending_ask = {}  # ask_id -> threading.Event / result box
 
     # ── Low-level plumbing ──────────────────────────────────────────────
     def _push_event(self, kind: str, payload: dict):
-        """Push an async event to the frontend via window.evaluate_js."""
-        if not self.window:
+        """Push an async event to the frontend via window.evaluate_js.
+
+        Runs the actual evaluate_js call on a short-lived daemon thread and
+        waits on it with a timeout, instead of calling it directly on the
+        caller's own thread. This matters because _push_event is called from
+        background threads (the turn-execution thread, the scheduler tick
+        thread) as well as the GUI thread itself -- if evaluate_js ever
+        blocks (e.g. because the webview is mid-teardown while the titlebar
+        X is being clicked), a direct call would hang that thread forever.
+        For the turn thread specifically, that meant self._thinking never
+        got reset to False, which made _on_closing wait forever and the
+        whole app looked like it had frozen on close -- this bounds that.
+        """
+        if not self.window or self._closing:
             return
         try:
             data = json.dumps({"kind": kind, "payload": payload})
-            self.window.evaluate_js(f"window.__midumEvent && window.__midumEvent({data})")
         except Exception:
-            pass
+            return
+
+        def _do():
+            try:
+                self.window.evaluate_js(f"window.__midumEvent && window.__midumEvent({data})")
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_do, daemon=True)
+        t.start()
+        t.join(timeout=2.0)
 
     def _on_log_line(self, line: str):
         if line.startswith(_SAY_TAG):
@@ -249,6 +278,36 @@ class Api:
         self._push_event("log", {"text": line})
         if _is_tool_line(line):
             self._push_event("tool_line", {"text": line.strip()})
+
+    def _on_schedule_run(self, sched: dict, result: str):
+        """Called by scheduler.py (off the tick thread) whenever a
+        scheduled flow finishes running. Logs it to the Log pane and
+        tells the Schedule pane (if open) to refresh so next_run_at/
+        last_result reflect the fresh state."""
+        flow_name = sched.get("flow_name")
+        self._push_event("log", {"text": f"⏰ [Schedule '{sched.get('id')}'] ran flow '{flow_name}' -> {str(result)[:200]}\n"})
+        self._push_event("schedule_ran", {"schedule_id": sched.get("id"), "flow_name": flow_name, "result": str(result)[:500]})
+
+    def _handle_tool_call(self, name: str, args: dict, result: str):
+        """Called by orchestration.py right after every tool call executes,
+        with the exact arguments it ran and the raw (pre-HTML-escaped)
+        result. Pushed to the frontend as a 'tool_call' event so the chat
+        pane's tool-call row can be clicked open to show both."""
+        try:
+            safe_args = json.loads(json.dumps(args, default=str))
+        except Exception:
+            safe_args = {k: str(v) for k, v in (args or {}).items()}
+        # Trim any individual argument value that's absurdly long (e.g. a
+        # full base64 image or file blob) so the event stays light -- the
+        # full untruncated value already went to conversation history.
+        for k, v in list(safe_args.items()):
+            if isinstance(v, str) and len(v) > 4000:
+                safe_args[k] = v[:4000] + f"… [{len(v)} chars total]"
+        self._push_event("tool_call", {
+            "name": name,
+            "args": safe_args,
+            "result": str(result)[:8000],
+        })
 
     # ── Bootstrap ─────────────────────────────────────────────────────────
     def startup(self):
@@ -269,6 +328,16 @@ class Api:
                 self._push_event("mcp_changed", {})
 
             midum.memory._bootstrap_all_files()
+
+            # Scheduler: only fires while this app is open (see scheduler.py's
+            # module docstring) -- start the background tick thread now, once
+            # per app launch. Safe to call again; start_scheduler() is a no-op
+            # if a tick thread is already alive.
+            try:
+                midum.start_scheduler(on_run=self._on_schedule_run)
+                self._push_event("log", {"text": "⏰ [Scheduler started -- scheduled Flows will run while this app is open]\n"})
+            except Exception as e:
+                self._push_event("log", {"text": f"⚠️ Scheduler failed to start: {e}\n"})
 
             # Every launch starts a genuinely new session -- the same reset
             # the "New Session" button performs. Full continuity across
@@ -823,6 +892,11 @@ class Api:
             if self._close_requested:
                 self._close_requested = False
                 self._persist_current_chat()
+                try:
+                    midum.stop_scheduler()
+                except Exception:
+                    pass
+                self._closing = True
                 if self.window:
                     self._destroy_window_safe()
 
@@ -1103,6 +1177,53 @@ class Api:
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True, "output": f"[Running flow: {name}...]"}
 
+    # ── Flow Scheduler ────────────────────────────────────────────────
+    def list_schedules(self):
+        """Every saved schedule (each with a human-readable 'description'
+        field already folded in by scheduler.py) for the Schedule pane."""
+        try:
+            return midum.list_schedules()
+        except Exception:
+            return []
+
+    def create_schedule(self, flow_name: str, kind: str, run_at: str = None,
+                         every_minutes=None, at_time: str = None, days: list = None):
+        try:
+            result = midum.create_schedule(
+                flow_name, kind, run_at=run_at, every_minutes=every_minutes,
+                at_time=at_time, days=days,
+            )
+            ok = not str(result).lower().startswith("error")
+            self._push_event("log", {"text": f"{'⏰' if ok else '⚠️'} {'Schedule created for ' + flow_name if ok else result}\n"})
+            return {"ok": ok, "message": result if not ok else "Schedule created.", "id": result if ok else None}
+        except Exception as e:
+            return {"ok": False, "message": str(e), "id": None}
+
+    def update_schedule(self, schedule_id: str, patch: dict):
+        try:
+            msg = midum.update_schedule(schedule_id, patch or {})
+            ok = not msg.lower().startswith("error")
+            return {"ok": ok, "message": msg}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
+    def set_schedule_enabled(self, schedule_id: str, enabled: bool):
+        try:
+            msg = midum.set_schedule_enabled(schedule_id, enabled)
+            ok = not msg.lower().startswith("error")
+            return {"ok": ok, "message": msg}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
+    def delete_schedule(self, schedule_id: str):
+        try:
+            msg = midum.delete_schedule(schedule_id)
+            ok = not msg.lower().startswith("error")
+            self._push_event("log", {"text": f"{'🗑️' if ok else '⚠️'} {msg}\n"})
+            return {"ok": ok, "message": msg}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
     def list_tool_node_defs(self):
         """
         Every native tool + every tool on every connected MCP server, in
@@ -1165,6 +1286,29 @@ class Api:
                     "kind": classify_tool_kind(name, tdef.get("description", "")),
                     "params": params_from_schema(props, required),
                 })
+
+        # ── Saved Flows -- registered as nodes too, so a flow can be dropped
+        # into another flow's graph and run as one step (composable flows).
+        # Flows currently take no external parameters (see
+        # flows.list_flow_schemas()'s always-empty properties), so there's
+        # no params list to build -- just name + description. Always
+        # "hybrid" kind (Sequence-out AND Object-out) since a flow's return
+        # value is always potentially worth wiring into a variable or
+        # another node downstream, unlike native tools where only some are.
+        for fname in midum.list_flows():
+            desc = midum.flow_description(fname)
+            tag = " [PROMOTED]" if midum.is_flow_promoted(fname) else ""
+            defs.append({
+                "type": f"flow::{fname}",
+                "label": fname + tag,
+                "icon": "🔗",
+                "group": "Flows",
+                "tool_name": fname,
+                "mcp_server": None,
+                "desc": desc[:160],
+                "kind": "hybrid",
+                "params": [],
+            })
         return defs
 
     # ── MCP servers ───────────────────────────────────────────────────────
@@ -1326,6 +1470,11 @@ class Api:
     def shutdown(self):
         self._persist_current_chat()
         self._stdout_redir.restore()
+        try:
+            midum.stop_scheduler()
+        except Exception:
+            pass
+        self._closing = True
         if self.window:
             self._destroy_window_safe()
         return {"ok": True}
@@ -1340,13 +1489,46 @@ class Api:
         that landed silently dropped the last reply from that chat's
         history. If a turn is in flight, cancel this close (returning
         False does that) and let _run_turn's own finally block finish the
-        close once the reply is actually saved."""
+        close once the reply is actually saved.
+
+        A watchdog thread backs this up: if the in-flight turn hasn't
+        wrapped up within a bounded window (stuck tool call, a scheduled
+        Flow that never returns, etc), the app force-closes anyway instead
+        of leaving the window looking permanently frozen.
+        """
         self._persist_current_chat()
         if self._thinking:
             self._close_requested = True
             self._push_event("log", {"text": "⏳ Finishing the current response before closing...\n"})
+            threading.Thread(target=self._force_close_watchdog, daemon=True).start()
             return False
+        try:
+            midum.stop_scheduler()
+        except Exception:
+            pass
+        self._closing = True
         return None
+
+    def _force_close_watchdog(self, timeout: float = 20.0):
+        """Backstop for _on_closing: if a deferred close (because a turn
+        was still 'thinking') hasn't resolved itself within `timeout`
+        seconds, force the window closed anyway rather than leaving the
+        app stuck forever on a hung tool call or stalled background task.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self._thinking:
+                return   # _run_turn's own finally block will close it normally
+            time.sleep(0.5)
+        if self._thinking and self.window:
+            self._thinking = False
+            self._close_requested = False
+            self._closing = True
+            try:
+                midum.stop_scheduler()
+            except Exception:
+                pass
+            self._destroy_window_safe()
 
 
 # =============================================================================
@@ -1561,8 +1743,24 @@ select, .btn, .ghost-btn{
 .row.system .bubble{background:transparent;color:var(--subtext);font-size:12px;}
 .row.error .bubble{background:transparent;color:var(--red);font-size:12px;}
 .row.tool{align-items:flex-start;}
-.tool-line{display:flex;gap:6px;font-size:10px;color:var(--subtext);align-items:center;}
+.tool-line{display:flex;gap:6px;font-size:10px;color:var(--subtext);align-items:center;cursor:pointer;user-select:none;}
+.tool-line:hover{color:var(--text);}
 .tool-line .gear{color:var(--muted);}
+.tool-line .chevron{display:inline-block;transition:transform .15s;font-size:9px;opacity:.6;}
+.tool-line.expandable .chevron{opacity:1;}
+.tool-row.open .chevron{transform:rotate(90deg);}
+.tool-detail{
+  display:none;margin:6px 0 2px 15px;padding:8px 10px;border-radius:8px;
+  background:var(--tool-bg,var(--surface));border:1px solid var(--border2);
+  max-width:520px;
+}
+.tool-row.open .tool-detail{display:block;}
+.tool-detail .tool-detail-label{font-size:9px;font-weight:600;color:var(--subtext);text-transform:uppercase;letter-spacing:.03em;margin:6px 0 2px;}
+.tool-detail .tool-detail-label:first-child{margin-top:0;}
+.tool-detail pre{
+  margin:0;font-size:11px;font-family:Consolas,'Cascadia Code',monospace;color:var(--tool-text,var(--text));
+  white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto;
+}
 .tool-dot{
   width:7px;height:7px;border-radius:50%;background:var(--muted);flex:0 0 auto;
   transition:background .2s;
@@ -1753,10 +1951,31 @@ textarea.code-area{
 }
 #flow-canvas .drawflow-node .input, #flow-canvas .drawflow-node .output{
   background:var(--surface2) !important;border:2px solid var(--border2) !important;
-  height:14px !important;width:14px !important;
+  height:14px !important;width:14px !important;position:relative;
 }
 #flow-canvas .drawflow-node .input:hover, #flow-canvas .drawflow-node .output:hover{
   background:var(--accent) !important;border-color:var(--accent) !important;
+}
+/* Always-visible per-pin label, floating just outside the node's edge next
+   to its own dot -- data-pin-label is stamped onto each .input/.output
+   element by _applyPinLabels() in exact Drawflow pin order (input_1,
+   input_2, ... / output_1, output_2, ...), so this text is guaranteed to
+   line up with the correct dot regardless of node type. Kept subtle
+   (small, muted) by default; brightens on hover so it's easy to trace a
+   specific dot. The dot's native `title` attribute (also set by
+   _applyPinLabels) is the accessible/tooltip fallback. */
+#flow-canvas .drawflow-node .input[data-pin-label]::after,
+#flow-canvas .drawflow-node .output[data-pin-label]::after{
+  content:attr(data-pin-label);
+  position:absolute; top:50%; transform:translateY(-50%);
+  font-size:8px; line-height:1; white-space:nowrap; pointer-events:none;
+  color:var(--subtext); opacity:.8; letter-spacing:.01em;
+}
+#flow-canvas .drawflow-node .input[data-pin-label]::after{ right:20px; }
+#flow-canvas .drawflow-node .output[data-pin-label]::after{ left:20px; }
+#flow-canvas .drawflow-node .input:hover[data-pin-label]::after,
+#flow-canvas .drawflow-node .output:hover[data-pin-label]::after{
+  color:var(--text); opacity:1;
 }
 #flow-canvas .connection .main-path{ stroke:var(--accent) !important;stroke-width:2.5px !important;cursor:pointer !important; }
 #flow-canvas .connection .main-path:hover{ stroke:var(--red) !important; }
@@ -2289,6 +2508,29 @@ function setActiveToolDot(el){
   if (_activeToolDot) _activeToolDot.classList.add("active");
 }
 
+// FIFO queue of tool-call rows awaiting their 'tool_call' detail event
+// (name/args/result), pushed in appendRow() the instant a tool starts and
+// consumed by attachToolCallDetail() once the call finishes. Matched by
+// tool name first (handles the rare case of overlapping calls), otherwise
+// just the oldest unresolved row.
+let _pendingToolRows = [];
+
+function attachToolCallDetail(name, args, result){
+  let row = null;
+  const idx = _pendingToolRows.findIndex(r=>r.dataset.toolName === name);
+  if (idx !== -1){ row = _pendingToolRows[idx]; _pendingToolRows.splice(idx, 1); }
+  else if (_pendingToolRows.length){ row = _pendingToolRows.shift(); }
+  if (!row) return;
+  const detail = row.querySelector(".tool-detail");
+  if (!detail) return;
+  const argsStr = (args && Object.keys(args).length) ? JSON.stringify(args, null, 2) : "(no arguments)";
+  detail.innerHTML = `
+    <div class="tool-detail-label">Call</div>
+    <pre>${escapeHtml(name)}(${escapeHtml(argsStr)})</pre>
+    <div class="tool-detail-label">Result</div>
+    <pre>${escapeHtml(result || "(empty)")}</pre>`;
+}
+
 function animateWords(container){
   if (!container) return;
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null);
@@ -2341,10 +2583,19 @@ function appendRow(tag, text){
     row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
     setActiveToolDot(null);
   } else if (tag === "tool"){
-    row.className = "row tool";
-    row.innerHTML = `<div class="tool-line"><span class="tool-dot"></span><span class="gear">⚙</span><span>${escapeHtml(text)}</span></div>`;
+    row.className = "row tool tool-row";
+    const nameMatch = /-> Executing: '([^']+)'/.exec(text);
+    row.dataset.toolName = nameMatch ? nameMatch[1] : "";
+    row.innerHTML = `
+      <div class="tool-line expandable">
+        <span class="tool-dot"></span><span class="gear">⚙</span><span>${escapeHtml(text)}</span>
+        <span class="chevron">▶</span>
+      </div>
+      <div class="tool-detail"><div class="tool-detail-label">Waiting for result…</div></div>`;
+    row.querySelector(".tool-line").onclick = ()=>row.classList.toggle("open");
     col.appendChild(row);
     setActiveToolDot(row.querySelector(".tool-dot"));
+    _pendingToolRows.push(row);
     scrollToBottom();
     return;
   }
@@ -2357,7 +2608,7 @@ function scrollToBottom(){
   requestAnimationFrame(()=>{ sc.scrollTop = sc.scrollHeight; });
 }
 
-function clearChat(){ chatCol().innerHTML = ""; }
+function clearChat(){ chatCol().innerHTML = ""; _pendingToolRows = []; }
 
 // ── Ask cards --------------------------------------------------------------
 function appendAsk(id, kind, payload){
@@ -2459,11 +2710,13 @@ window.__midumEvent = function(evt){
   else if (kind === "system_line"){ appendRow("system", payload.text); }
   else if (kind === "error_line"){ appendRow("error", payload.text); }
   else if (kind === "tool_line"){ appendRow("tool", payload.text); }
+  else if (kind === "tool_call"){ attachToolCallDetail(payload.name, payload.args, payload.result); }
   else if (kind === "log"){ appendLog(payload.text); }
   else if (kind === "done"){ state.thinking = false; setActiveToolDot(null); }
   else if (kind === "projects"){ populateProjects(payload.projects); }
   else if (kind === "ask"){ appendAsk(payload.id, payload.kind, payload.payload); }
   else if (kind === "mcp_changed"){ if (state.activeTab === "MCP") refreshMcpList(); }
+  else if (kind === "schedule_ran"){ if (state.activeTab === "Schedule") showToolPane("Schedule"); }
   else if (kind === "tool_result"){ const box=document.getElementById("tool-output"); if(box) box.value = payload.output; }
 };
 
@@ -3123,7 +3376,7 @@ function showToolPane(name){
   const builders = {
     "Log": buildLogPane, "Model": buildModelPane, "Parameters": buildParamsPane,
     "System Core": buildSysCorePane, "Knowledge": buildKnowledgePane,
-    "Skills": buildSkillsPane, "Tools": buildToolsPane, "Flows": buildFlowsPane, "MCP": buildMcpPane,
+    "Skills": buildSkillsPane, "Tools": buildToolsPane, "Flows": buildFlowsPane, "Schedule": buildSchedulePane, "MCP": buildMcpPane,
     "Permissions": buildPermissionsPane,
   };
   box.innerHTML = "";
@@ -3364,6 +3617,145 @@ function buildToolsPane(box){
   };
 }
 
+// ── Schedule pane -------------------------------------------------------------
+// Lets the user schedule a saved Flow to run automatically while this app
+// is open (see midum_pkg/scheduler.py). Pure config UI over Api.list_schedules
+// / create_schedule / set_schedule_enabled / delete_schedule -- the actual
+// tick loop runs server-side and is started once at app launch.
+const SCHEDULE_WEEKDAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+
+async function buildSchedulePane(box){
+  box.innerHTML = `
+    <div class="hdr-row" id="sched-toolbar" style="flex-wrap:wrap;gap:6px;">
+      <select id="sched-flow-select" style="width:160px;" title="Flow to run"></select>
+      <select id="sched-kind-select" style="width:110px;" title="Schedule type">
+        <option value="once">Once</option>
+        <option value="interval">Interval</option>
+        <option value="daily">Daily</option>
+        <option value="weekly">Weekly</option>
+      </select>
+      <span id="sched-fields" style="display:flex;gap:6px;align-items:center;"></span>
+      <button class="btn" id="sched-create" style="background:var(--accent);color:#fff;">+ Schedule</button>
+      <button class="ghost-btn" id="sched-refresh" title="Refresh">↻</button>
+    </div>
+    <div style="font-size:11px;color:var(--subtext);padding:6px 14px 0;">
+      Scheduled Flows only run while Midum is open -- there's no background service. Missed runs while closed are not queued up; they just reschedule from whenever the app next opens.
+    </div>
+    <div id="sched-list" style="flex:1;overflow:auto;padding:10px 14px;display:flex;flex-direction:column;gap:8px;"></div>
+  `;
+
+  const flowSel = document.getElementById("sched-flow-select");
+  const kindSel = document.getElementById("sched-kind-select");
+  const fieldsBox = document.getElementById("sched-fields");
+  const listBox = document.getElementById("sched-list");
+  enhanceSelect(flowSel);
+  enhanceSelect(kindSel);
+
+  (async ()=>{
+    let names = [];
+    try { names = await api("list_flows"); } catch (e) { names = []; }
+    flowSel.innerHTML = names.length
+      ? names.map(n=>`<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join("")
+      : `<option value="">No saved flows</option>`;
+  })();
+
+  function renderKindFields(){
+    const kind = kindSel.value;
+    if (kind === "once"){
+      fieldsBox.innerHTML = `<input type="datetime-local" id="sched-run-at" style="height:24px;font-size:11px;"/>`;
+    } else if (kind === "interval"){
+      fieldsBox.innerHTML = `<input type="number" id="sched-every-min" min="1" value="60" style="height:24px;width:70px;font-size:11px;"/><span style="font-size:11px;color:var(--subtext);">min</span>`;
+    } else if (kind === "daily"){
+      fieldsBox.innerHTML = `<input type="time" id="sched-at-time" value="09:00" style="height:24px;font-size:11px;"/>`;
+    } else if (kind === "weekly"){
+      fieldsBox.innerHTML = `<input type="time" id="sched-at-time" value="09:00" style="height:24px;font-size:11px;"/>` +
+        SCHEDULE_WEEKDAYS.map((d,i)=>`<label style="font-size:10px;display:flex;gap:2px;align-items:center;"><input type="checkbox" class="sched-day" value="${i}" checked/>${d}</label>`).join("");
+    }
+  }
+  kindSel.onchange = renderKindFields;
+  renderKindFields();
+
+  function fmtWhen(iso){
+    if (!iso) return "—";
+    try { return new Date(iso).toLocaleString(); } catch (e) { return iso; }
+  }
+
+  async function refreshList(){
+    let scheds = [];
+    try { scheds = await api("list_schedules"); } catch (e) { scheds = []; }
+    if (!scheds.length){
+      listBox.innerHTML = `<div style="font-size:12px;color:var(--subtext);padding:20px;text-align:center;">No schedules yet -- pick a flow above and click + Schedule.</div>`;
+      return;
+    }
+    listBox.innerHTML = "";
+    scheds.forEach(s=>{
+      const card = document.createElement("div");
+      card.className = "mcp-tool-card";
+      card.style.cssText = "padding:10px 12px;border:1px solid var(--border2);border-radius:10px;background:var(--surface);";
+      card.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+          <div>
+            <div style="font-weight:600;font-size:12px;">🔗 ${escapeHtml(s.flow_name)}</div>
+            <div style="font-size:11px;color:var(--subtext);">${escapeHtml(s.description || s.kind)}</div>
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <label style="font-size:10px;display:flex;gap:4px;align-items:center;">
+              <input type="checkbox" class="sched-enabled" ${s.enabled ? "checked" : ""}/> enabled
+            </label>
+            <button class="mini-btn del" data-act="delete">🗑</button>
+          </div>
+        </div>
+        <div style="font-size:10px;color:var(--subtext);margin-top:6px;display:flex;gap:14px;flex-wrap:wrap;">
+          <span>Next: ${fmtWhen(s.next_run_at)}</span>
+          <span>Last run: ${fmtWhen(s.last_run_at)}</span>
+          ${s.last_result ? `<span title="${escapeHtml(s.last_result)}">Last result: ${escapeHtml((s.last_result||"").slice(0,60))}${(s.last_result||"").length>60?"…":""}</span>` : ""}
+        </div>`;
+      card.querySelector(".sched-enabled").onchange = async (e)=>{
+        e.target.disabled = true;
+        try { await api("set_schedule_enabled", s.id, e.target.checked); }
+        finally { await refreshList(); }
+      };
+      card.querySelector('[data-act="delete"]').onclick = async ()=>{
+        const ok = await showConfirm(`Delete this schedule for '${s.flow_name}'?`, "Delete Schedule", {danger:true, okLabel:"Delete"});
+        if (!ok) return;
+        await api("delete_schedule", s.id);
+        await refreshList();
+      };
+      listBox.appendChild(card);
+    });
+  }
+
+  document.getElementById("sched-create").onclick = async ()=>{
+    if (!flowSel.value){ await showAlert("No saved flow selected -- create a Flow first in the Flows tab.", "No Flow"); return; }
+    const kind = kindSel.value;
+    const args = { flow_name: flowSel.value, kind };
+    if (kind === "once"){
+      const v = document.getElementById("sched-run-at").value;
+      if (!v){ await showAlert("Pick a date/time first.", "Missing Time"); return; }
+      args.run_at = new Date(v).toISOString();
+    } else if (kind === "interval"){
+      args.every_minutes = parseInt(document.getElementById("sched-every-min").value, 10) || 1;
+    } else if (kind === "daily"){
+      args.at_time = document.getElementById("sched-at-time").value || "09:00";
+    } else if (kind === "weekly"){
+      args.at_time = document.getElementById("sched-at-time").value || "09:00";
+      args.days = Array.from(document.querySelectorAll(".sched-day:checked")).map(el=>parseInt(el.value, 10));
+    }
+    const btn = document.getElementById("sched-create");
+    btn.disabled = true;
+    try {
+      const r = await api("create_schedule", args.flow_name, args.kind, args.run_at || null, args.every_minutes || null, args.at_time || null, args.days || null);
+      if (!r.ok) await showAlert(r.message, "Schedule Failed");
+      await refreshList();
+    } finally {
+      btn.disabled = false;
+    }
+  };
+  document.getElementById("sched-refresh").onclick = refreshList;
+
+  refreshList();
+}
+
 // ── Flows pane -------------------------------------------------------------
 // Node-graph editor, built on Drawflow (https://github.com/jerosoler/Drawflow,
 // MIT) rather than a from-scratch canvas system -- loaded lazily from CDN
@@ -3409,6 +3801,59 @@ const FLOW_NODE_GROUPS = [
 ];
 const FLOW_NODE_DEFS = {};
 FLOW_NODE_GROUPS.forEach(g => g.nodes.forEach(def => { FLOW_NODE_DEFS[def.type] = def; }));
+
+// Per-pin labels so it's unambiguous which connection dot on a node maps
+// to which property, instead of only the aggregate "in: seq, params /
+// out: seq, object" summary line in the node body. Returns {in:[...],
+// out:[...]} in the exact same order Drawflow numbers a node's pins
+// (input_1, input_2, ... / output_1, output_2, ...) -- which is also the
+// exact order `inputs`/`outputs` were passed to addNode() for that node,
+// so index i here always lines up with the i-th dot Drawflow renders.
+function _flowPinLabels(def){
+  if (!def) return { in: [], out: [] };
+  if (def.pinLabels) return def.pinLabels;               // logic::if / logic::loop / ai::*
+  if (def.type === "start") return { in: [], out: ["Sequence"] };
+  if (def.type === "end")   return { in: ["Sequence"], out: [] };
+  if (def.isVariable)       return { in: ["Value"], out: ["Value"] };
+  // Generic tool::/mcp::/flow:: node -- Sequence pin first, then one pin
+  // per parameter (same order as `_flow_param_order`), matching how
+  // buildFlowsPane computed `inputs: 1 + params.length` for this def.
+  const paramLabels = (def.params || []).map(p => p.name);
+  const outLabels = (def.kind && def.kind !== "action") ? ["Sequence", "Object"] : ["Sequence"];
+  return { in: ["Sequence", ...paramLabels], out: outLabels };
+}
+
+// Stamps data-pin-label (+ a native title tooltip as a fallback) onto each
+// of a node's actual Drawflow-rendered dot elements, in pin order.
+function _applyPinLabels(nodeId, def){
+  const nodeEl = document.getElementById(`node-${nodeId}`);
+  if (!nodeEl) return;
+  const labels = _flowPinLabels(def);
+  const inputEls  = nodeEl.querySelectorAll(".inputs .input");
+  const outputEls = nodeEl.querySelectorAll(".outputs .output");
+  inputEls.forEach((el, i)=>{
+    const label = labels.in[i] || `in ${i+1}`;
+    el.setAttribute("data-pin-label", label);
+    el.title = label;
+  });
+  outputEls.forEach((el, i)=>{
+    const label = labels.out[i] || `out ${i+1}`;
+    el.setAttribute("data-pin-label", label);
+    el.title = label;
+  });
+}
+
+// Re-labels every node currently on the canvas -- called after any bulk
+// structural change (seeding a blank canvas, importing a saved flow's
+// graph) rather than tracking individual new-node ids through those paths.
+function _relabelAllPins(){
+  if (!_drawflowEditor) return;
+  const data = ((_drawflowEditor.drawflow || {}).drawflow || {}).Home?.data || {};
+  Object.entries(data).forEach(([id, node])=>{
+    const def = FLOW_NODE_DEFS[node.name];
+    if (def) _applyPinLabels(id, def);
+  });
+}
 
 const DRAWFLOW_CSS = "https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css";
 const DRAWFLOW_JS  = "https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js";
@@ -3664,6 +4109,7 @@ async function buildFlowsPane(box){
       editor.clear();
       editor.addNode("start", 0, 1, 100, 160, "flow-node-start", {}, _flowNodeHtml(FLOW_NODE_DEFS.start));
       editor.addNode("end",   1, 0, 480, 160, "flow-node-end",   {}, _flowNodeHtml(FLOW_NODE_DEFS.end));
+      _relabelAllPins();
     }
 
     // Reflects the currently-loaded saved flow's promoted state on the
@@ -3716,6 +4162,7 @@ async function buildFlowsPane(box){
       if (graph && graph.drawflow){
         editor.clear();
         editor.import(graph);
+        _relabelAllPins();
       } else {
         await showAlert(`'${name}' was saved before flow editing was added, so its node graph can't be reloaded. Rebuild it from scratch and Save to enable editing next time.`, "Graph Not Available");
         seedBlankCanvas();
@@ -3853,6 +4300,7 @@ async function buildFlowsPane(box){
         initialData._flow_param_order = (def.params || []).map(p=>p.name);
       }
       editor.addNode(def.type, def.inputs, def.outputs, x, y, `flow-node-${def.type.replace(/[^A-Za-z0-9_]/g,'-')}`, initialData, _flowNodeHtml(def));
+      _relabelAllPins();
     }
 
     canvasEl.ondragover = (e)=>e.preventDefault();
