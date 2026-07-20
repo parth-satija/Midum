@@ -4,6 +4,7 @@ _IS_LINUX   = _platform.system() == "Linux"
 _IS_WINDOWS = _platform.system() == "Windows"
 
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
+import json
 import ollama
 import os
 import re
@@ -246,6 +247,56 @@ else:
         os.path.expanduser("~"), "AppData", "Local", "JarvisSecrets", "jarvis_secrets.json"
     )
 
+# ── Auto-generated secrets file scaffold ───────────────────────────────────────
+# Every key any provider backend or integration in this package looks for
+# in SECRETS_FILE via secrets.get("..."), collected here in one place so a
+# brand-new install gets a ready-to-fill-in template on first launch
+# instead of a cryptic "secrets file not found" the first time something
+# tries to use it. Blank values are simply ignored by every reader (they
+# all do secrets.get(key, "").strip() and treat empty as "not configured"),
+# so it's always safe to ship every key here even if the user only ever
+# fills in one of them.
+SECRETS_TEMPLATE = {
+    # https://aistudio.google.com/app/apikey -- official Gemini API.
+    # Used by MODEL_PROVIDER="gemini_api" and by consult_gemini's Gemini
+    # API reasoning helper (providers/gemini_reasoning.py).
+    "GEMINI_API_KEY": "",
+    # https://openrouter.ai/keys -- used by MODEL_PROVIDER="openrouter".
+    "OPENROUTER_API_KEY": "",
+    # https://console.groq.com/keys (free tier) -- used by MODEL_PROVIDER="groq".
+    "GROQ_API_KEY": "",
+    # https://ollama.com/settings/keys -- used by MODEL_PROVIDER="ollama_cloud".
+    "OLLAMA_API_KEY": "",
+    # Browser session cookies (NOT an API key) for consult_gemini's
+    # web-chat path (gemini_webapi) -- both required together if used.
+    # Copy from your browser's DevTools -> Application -> Cookies for
+    # gemini.google.com; only needed if you'd rather use your Gemini
+    # account's web session than the official API above.
+    "GEMINI_SECURE_1PSID": "",
+    "GEMINI_SECURE_1PSIDTS": "",
+}
+
+
+def ensure_secrets_file() -> bool:
+    """Create SECRETS_FILE (with SECRETS_TEMPLATE, every key blank) the
+    first time it's called on a machine where it doesn't exist yet.
+    Returns True the moment it actually creates the file (so the caller --
+    gui/app.py's startup path -- knows this is a first launch and should
+    prompt the user to go fill it in), and False every time after that
+    (file already exists, left untouched -- never overwrites real keys).
+    """
+    path = os.path.abspath(SECRETS_FILE)
+    if os.path.exists(path):
+        return False
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(SECRETS_TEMPLATE, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"⚠️ [Secrets] Could not create {path}: {e}")
+        return False
+
 COMMANDS_FILE       = os.path.join(STORAGE_DIR, "commands.md")
 INSTRUCTIONS_FILE   = os.path.join(STORAGE_DIR, "instructions.md")
 PATHS_FILE          = os.path.join(STORAGE_DIR, "paths.md")
@@ -265,6 +316,11 @@ FLOW_PROMOTED_TOOLS_FILE = os.path.join(STORAGE_DIR, "flow_promoted_tools.json")
 # dicts, persisted so schedule *configuration* survives an app restart
 # even though the actual firing only happens while the app is open.
 FLOW_SCHEDULES_FILE = os.path.join(STORAGE_DIR, "flow_schedules.json")
+# User-configurable override for the active model's context window size
+# (in tokens), used by context_summarizer.py to decide when to compact
+# history. Set from the Model tab; None/absent means fall back to the
+# built-in per-model table there.
+CONTEXT_TOKENS_FILE = os.path.join(STORAGE_DIR, "context_tokens.json")
 LOG_FILE            = os.path.join(TARGET_DIR, "chat_log.md")
 
 GOAL_SECTION_HEADER = "## Current Goal"

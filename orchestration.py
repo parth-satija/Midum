@@ -23,6 +23,7 @@ from tools_schema import tools
 from ui_automation import ui_navigator
 from ui_automation.windows_uia import _UIA_AVAILABLE
 from utils.path_resolver import resolve_file_path
+from context_summarizer import summarize_context_if_needed
 import json
 import ollama
 import os
@@ -1015,6 +1016,14 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             print(f"\n🚫 {msg}")
             _accumulated_reply.append(msg)
             break
+
+        # ── Silent context compaction ────────────────────────────────────────
+        # If usage has crossed 80% of the active model's context window,
+        # this makes a separate, invisible call to the SAME model to
+        # compress the oldest 60% of turns before we go any further. The
+        # user never sees this call — it doesn't touch _accumulated_reply,
+        # say(), or _print_reply. Cheap no-op check on every other turn.
+        summarize_context_if_needed(conversation_history)
 
         sys_msgs = [m for m in conversation_history if m.get("role") == "system"]
         non_sys  = [m for m in conversation_history if m.get("role") != "system"]

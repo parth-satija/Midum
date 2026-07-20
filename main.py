@@ -19,6 +19,7 @@ import providers.groq_backend as providers_groq_backend
 import providers.openrouter_backend as providers_openrouter_backend
 from browser_cdp import _CDP_AVAILABLE, _cdp_get_tabs, act_on_browser_element, list_browser_tabs, query_gemini_app, read_browser_page, run_js_in_browser, snapshot_browser_elements
 from config import GOAL_SECTION_END, GOAL_SECTION_HEADER, LOG_FILE, MCP_SERVERS_FILE, MODEL_NAME, MODEL_PROVIDER, OPENROUTER_CONSULT_MODE, SCREEN_H, SCREEN_W, SECRETS_FILE, SESSION_MEMORY, TARGET_DIR
+from context_summarizer import get_context_window, get_user_context_tokens, set_user_context_tokens
 from flows import compile_flow, demote_flow, flow_description, get_promoted_flow_schemas, get_promoted_flows, is_flow_promoted, list_flows, list_flow_schemas, list_flows_formatted, promote_flow, run_flow, save_flow, validate_flow_name
 from scheduler import create_schedule, delete_schedule, describe_schedule, get_schedule, is_scheduler_running, list_schedules, set_schedule_enabled, start_scheduler, stop_scheduler, update_schedule
 from midum_mcp.manager import _MCP_SERVERS, _MCP_SERVER_ORDER, init_mcp_servers_from_config

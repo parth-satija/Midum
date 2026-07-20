@@ -394,6 +394,29 @@ class Api:
             "current_model": self._selected_model,
         }
 
+    def get_context_token_limit(self):
+        """Current context-token setting for the Model tab field. Returns
+        the saved override if the user has one, otherwise the effective
+        value the summarizer would use right now for the active model
+        (falls back to 32000 if that model isn't in the built-in table)."""
+        saved = midum.get_user_context_tokens()
+        return {
+            "saved": saved,
+            "effective": midum.get_context_window(),
+            "is_override": saved is not None,
+        }
+
+    def set_context_token_limit(self, max_tokens):
+        try:
+            n = int(max_tokens)
+            if n < 1000:
+                return {"ok": False, "error": "Must be at least 1000 tokens."}
+            new_val = midum.set_user_context_tokens(n)
+            self._push_event("log", {"text": f"🧠 [Context window set to {new_val:,} tokens — used by the summarizer to decide when to compact history]\n"})
+            return {"ok": True, "saved": new_val}
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Enter a whole number of tokens."}
+
     def refresh_ollama_models(self):
         if self._selected_provider == "ollama_cloud":
             return _list_ollama_cloud_models()
@@ -3404,6 +3427,15 @@ function buildModelPane(box){
     <button class="btn" id="model-apply" style="margin-top:10px;background:var(--accent);color:#fff;">Apply</button>
     <div id="model-active" style="font-size:10px;color:var(--subtext);margin-top:8px;"></div>
     <div class="divider"></div>
+    <div class="field-label">CONTEXT WINDOW (TOKENS)</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:4px;">
+      <input type="number" id="ctx-tokens-input" min="1000" step="1000" value="32000"
+        style="height:32px;flex:1;border-radius:16px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 10px;"/>
+      <button class="btn" id="ctx-tokens-save" style="background:var(--accent);color:#fff;">Save</button>
+    </div>
+    <div id="ctx-tokens-status" style="font-size:10px;color:var(--subtext);margin-top:6px;"></div>
+    <div style="font-size:10px;color:var(--muted);margin-top:4px;">How much context your model actually has. The summarizer uses this to know when it's approaching the limit and needs to compact older turns -- default 32000, raise it if your model supports a bigger window.</div>
+    <div class="divider"></div>
     <div style="font-size:10px;color:var(--muted);">Local (Ollama) runs fully offline and is the default on every launch. Switching providers here only affects this running session.</div>
   `;
   (async ()=>{
@@ -3428,6 +3460,28 @@ function buildModelPane(box){
     const model = document.getElementById("model-input").value;
     const status = await api("apply_model", label, model);
     document.getElementById("model-active").textContent = `Active: ${status.provider} — ${status.model}`;
+  };
+
+  const ctxInput  = document.getElementById("ctx-tokens-input");
+  const ctxStatus = document.getElementById("ctx-tokens-status");
+  (async ()=>{
+    const t = await api("get_context_token_limit");
+    ctxInput.value = t.saved != null ? t.saved : t.effective;
+    ctxStatus.textContent = t.is_override
+      ? `Custom value saved — overrides the built-in per-model default.`
+      : `Using the built-in default for the active model (${t.effective.toLocaleString()} tokens) — save a value to override it.`;
+  })();
+  document.getElementById("ctx-tokens-save").onclick = async ()=>{
+    const btn = document.getElementById("ctx-tokens-save");
+    btn.disabled = true;
+    try {
+      const r = await api("set_context_token_limit", parseInt(ctxInput.value, 10));
+      ctxStatus.textContent = r.ok
+        ? `Saved — the summarizer will now trigger around ${Math.round(r.saved * 0.8).toLocaleString()} tokens.`
+        : (r.error || "Failed to save.");
+    } finally {
+      btn.disabled = false;
+    }
   };
 }
 function fillModelList(models){
