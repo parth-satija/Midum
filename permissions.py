@@ -131,6 +131,22 @@ def filter_tools_schema(tools_list: list) -> list:
     except Exception as e:
         print(f"⚠️ [Permissions] Could not append promoted MCP tool schemas: {e}")
 
+    # Promoted Flows -- same idea as promoted MCP tools just above, but for
+    # saved Flows-tab flows (see flows.py's "PROMOTED FLOWS" section).
+    try:
+        from flows import get_promoted_flow_schemas
+        native_names = {t["function"]["name"] for t in filtered}
+        for promoted in get_promoted_flow_schemas():
+            name = promoted["function"]["name"]
+            if perms.get(name, DEFAULT_LEVEL) == "deny":
+                continue
+            if name in native_names:
+                continue
+            native_names.add(name)
+            filtered.append(promoted)
+    except Exception as e:
+        print(f"⚠️ [Permissions] Could not append promoted Flow schemas: {e}")
+
     return filtered
 
 

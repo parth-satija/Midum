@@ -1693,6 +1693,40 @@ tools = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_saved_flows",
+            "description": (
+                "List every saved Flow (a saved sequence of tool calls built visually "
+                "in the Flows tab) with a one-line description each -- cheap, on-demand "
+                "discovery, exactly mirroring list_mcp_servers() for MCP servers. Flows "
+                "tagged [PROMOTED] in this listing are ALSO directly callable by their "
+                "own name without this discovery step at all. Follow up with "
+                "run_flow(name) to execute one."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_flow",
+            "description": (
+                "Run a saved Flow by exact name (see list_saved_flows()). A Flow is a "
+                "sequence of tool calls built visually as a node graph in the Flows tab; "
+                "running it executes that whole sequence in order and returns the result "
+                "of its last step."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Exact flow name, from list_saved_flows()."}
+                },
+                "required": ["name"],
+            },
+        },
+    },
     # ── GUI user-interaction tools ─────────────────────────────────────────────
     # Optional, situational. Default is to call NONE of these. Use one only
     # when you actually need something specific from the user that you can't

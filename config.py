@@ -257,6 +257,10 @@ SESSION_MEMORY      = os.path.join(STORAGE_DIR, "session_memory.md")
 RESPONSE_MEMORY     = os.path.join(STORAGE_DIR, "response_memory.md")
 MCP_SERVERS_FILE    = os.path.join(STORAGE_DIR, "mcp_servers.json")
 MCP_PROMOTED_TOOLS_FILE = os.path.join(STORAGE_DIR, "mcp_promoted_tools.json")
+# Promoted Flows (see "PROMOTED FLOWS" in flows.py) -- mirrors
+# MCP_PROMOTED_TOOLS_FILE above, but for saved Flows-tab flows instead of
+# MCP server tools. Just a flat JSON list of flow names.
+FLOW_PROMOTED_TOOLS_FILE = os.path.join(STORAGE_DIR, "flow_promoted_tools.json")
 LOG_FILE            = os.path.join(TARGET_DIR, "chat_log.md")
 
 GOAL_SECTION_HEADER = "## Current Goal"

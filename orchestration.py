@@ -4,6 +4,7 @@ import providers.openrouter_backend as providers_openrouter_backend
 from config import COMMANDS_FILE, MODEL_CANVAS_H, MODEL_CANVAS_W, OPENROUTER_CONSULT_MODE, SCALE_X, SCALE_Y, STARTUP_DIR, _is_legacy_toolcall_model
 from knowledge_base import add_instruction, add_path, create_domain_knowledge, create_domain_skill, list_domain_knowledge, list_domain_skills, read_domain_knowledge, read_instructions, read_paths
 from config import _IS_LINUX
+from flows import get_promoted_flows, list_flows, list_flows_formatted, run_flow
 from midum_mcp.manager import _mcp_resolve_name, connect_mcp_server, disconnect_mcp_server, list_mcp_servers
 from midum_mcp.tools import _mcp_autoroute_tool_call, _mcp_find_tool_matches, call_mcp_tool, list_native_tools, show_native_tool_schema, show_server_tools
 from memory import set_current_goal, update_memory
@@ -1681,6 +1682,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     forget=arguments.get("forget", False)
                 )
 
+            elif func_name == "list_saved_flows":
+                tool_output = list_flows_formatted()
+
+            elif func_name == "run_flow":
+                tool_output = run_flow(arguments.get("name", ""))
+
             elif func_name == "ask_user_text":
                 print(f"   [GUI] Asking user for text input...")
                 tool_output = ask_user_text(
@@ -1712,6 +1719,17 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     arguments.get("choice_4", ""),
                     allow_custom=arguments.get("allow_custom", True)
                 )
+
+            elif func_name in list_flows():
+                # Direct-by-name flow call -- mirrors _mcp_autoroute_tool_call for
+                # MCP tools: a promoted flow's schema is offered under its own
+                # name (see flows.get_promoted_flow_schemas), so the model calls
+                # it exactly like a native tool. Any saved flow name is accepted
+                # here (not just promoted ones) for the same forgiving reason the
+                # MCP autoroute accepts any connected server's tool by bare name.
+                if func_name not in get_promoted_flows():
+                    print(f"   [Flow autoroute] '{func_name}' → run_flow('{func_name}')")
+                tool_output = run_flow(func_name, arguments)
 
             else:
                 # ── Fuzzy tool name resolver ──────────────────────────────────

@@ -80,6 +80,8 @@ import keyword
 import os
 import re
 
+from config import FLOW_PROMOTED_TOOLS_FILE
+
 _PKG_ROOT = os.path.dirname(os.path.abspath(__file__))
 FLOW_TOOLS_FILE = os.path.join(_PKG_ROOT, "flow_tools.py")
 FLOW_META_FILE = os.path.join(_PKG_ROOT, "flow_meta.json")
@@ -212,6 +214,12 @@ def _data_source_ref(nodes: dict, node_id):
         # currently wired to anything downstream.
         if "output_2" in (node.get("outputs") or {}):
             return f"_out_{node_id}"
+    if ntype in ("ai::prompt", "ai::summarize", "ai::choose"):
+        # Same Object-out convention as tool/mcp nodes -- these always have
+        # an output_2 (their AI result), so any wired data param can pull
+        # from the AI response of an upstream AI node too.
+        if "output_2" in (node.get("outputs") or {}):
+            return f"_out_{node_id}"
     return None
 
 
@@ -255,6 +263,60 @@ def _codegen_tool_call(node: dict, node_id: str, nodes: dict, tool_name: str, mc
     return lines
 
 
+def _codegen_ai_prompt(node: dict, node_id: str, nodes: dict) -> list:
+    """'Prompt AI' node -- sends a static instruction (typed in the node)
+    plus optional wired Context data to whichever provider is currently
+    configured (see _flow_consult_ai in the generated file's header), and
+    captures the plain-text reply as this node's Object-out."""
+    data = node.get("data") or {}
+    ctx_id = _pin_source(node, "input_2")
+    ctx_ref = _data_source_ref(nodes, ctx_id) if ctx_id else None
+    ctx_src = ctx_ref if ctx_ref else repr(data.get("context", ""))
+    prompt_src = repr(data.get("prompt", ""))
+    return [
+        "# --- Prompt AI ---",
+        f"_out_{node_id} = _flow_consult_ai({prompt_src}, context={ctx_src})",
+        f"_flow_results.append(_out_{node_id})",
+    ]
+
+
+def _codegen_ai_summarize(node: dict, node_id: str, nodes: dict) -> list:
+    """'Ask AI to Summarize' node -- summarizes wired-in Text (or the typed
+    fallback) at the chosen length, captures the summary as Object-out."""
+    data = node.get("data") or {}
+    text_id = _pin_source(node, "input_2")
+    text_ref = _data_source_ref(nodes, text_id) if text_id else None
+    text_src = text_ref if text_ref else repr(data.get("text", ""))
+    length = (data.get("length") or "medium").strip() or "medium"
+    instruction = (
+        f"Summarize the following text at a {length} length. "
+        f"Respond with only the summary, no preamble."
+    )
+    return [
+        "# --- Ask AI to Summarize ---",
+        f"_out_{node_id} = _flow_consult_ai({instruction!r}, context={text_src})",
+        f"_flow_results.append(_out_{node_id})",
+    ]
+
+
+def _codegen_ai_choose(node: dict, node_id: str, nodes: dict) -> list:
+    """'Ask AI to Choose' node -- asks the AI to pick exactly one option
+    (wired-in list/text, or the typed comma-separated fallback) for the
+    given question, and captures the chosen option's exact text as
+    Object-out (see _flow_ai_choose in the generated file's header for how
+    the reply gets snapped back to one of the real option strings)."""
+    data = node.get("data") or {}
+    opts_id = _pin_source(node, "input_2")
+    opts_ref = _data_source_ref(nodes, opts_id) if opts_id else None
+    opts_src = opts_ref if opts_ref else repr(data.get("options", ""))
+    question_src = repr(data.get("question", ""))
+    return [
+        "# --- Ask AI to Choose ---",
+        f"_out_{node_id} = _flow_ai_choose({question_src}, {opts_src})",
+        f"_flow_results.append(_out_{node_id})",
+    ]
+
+
 def _condition_src(node: dict, node_id: str, nodes: dict) -> str:
     data = node.get("data") or {}
     op = (data.get("op") or "truthy").strip()
@@ -278,6 +340,18 @@ def _condition_src(node: dict, node_id: str, nodes: dict) -> str:
 class _CodegenWarnings(list):
     def add(self, msg):
         self.append(msg)
+
+
+def _emit_variable_captures(node: dict, node_id: str, nodes: dict, pad: str, out: list):
+    """After a tool/mcp/ai node's Object-out (_out_<node_id>) is computed,
+    capture it into any Variable node(s) whose data-in pin is wired
+    directly to that Object-out pin -- otherwise a variable "fed from an
+    output" would only ever see its typed fallback, never the live wired
+    value, since Variable nodes sit outside the Sequence walk entirely."""
+    for target_id in _pin_targets(node, "output_2"):
+        target = nodes.get(target_id)
+        if target and target.get("name") == "variable":
+            out.append(pad + f"_var_{target_id} = _out_{node_id}")
 
 
 def _emit_block(node_id, nodes: dict, indent: int, visited: set, out: list, warnings: _CodegenWarnings):
@@ -340,10 +414,32 @@ def _emit_block(node_id, nodes: dict, indent: int, visited: set, out: list, warn
             node_id = (_pin_targets(node, "output_3") or [None])[0]
             continue
 
+        if ntype == "ai::prompt":
+            lines = _codegen_ai_prompt(node, node_id, nodes)
+            out.extend(pad + line for line in lines)
+            _emit_variable_captures(node, node_id, nodes, pad, out)
+            node_id = (_pin_targets(node, "output_1") or [None])[0]
+            continue
+
+        if ntype == "ai::summarize":
+            lines = _codegen_ai_summarize(node, node_id, nodes)
+            out.extend(pad + line for line in lines)
+            _emit_variable_captures(node, node_id, nodes, pad, out)
+            node_id = (_pin_targets(node, "output_1") or [None])[0]
+            continue
+
+        if ntype == "ai::choose":
+            lines = _codegen_ai_choose(node, node_id, nodes)
+            out.extend(pad + line for line in lines)
+            _emit_variable_captures(node, node_id, nodes, pad, out)
+            node_id = (_pin_targets(node, "output_1") or [None])[0]
+            continue
+
         m = _MCP_NODE_RE.match(ntype)
         if m:
             lines = _codegen_tool_call(node, node_id, nodes, m.group(2), mcp_server=m.group(1))
             out.extend(pad + line for line in lines)
+            _emit_variable_captures(node, node_id, nodes, pad, out)
             node_id = (_pin_targets(node, "output_1") or [None])[0]
             continue
 
@@ -351,6 +447,7 @@ def _emit_block(node_id, nodes: dict, indent: int, visited: set, out: list, warn
         if m:
             lines = _codegen_tool_call(node, node_id, nodes, m.group(1))
             out.extend(pad + line for line in lines)
+            _emit_variable_captures(node, node_id, nodes, pad, out)
             node_id = (_pin_targets(node, "output_1") or [None])[0]
             continue
 
@@ -475,6 +572,59 @@ _FLOW_TOOLS_HEADER = (
     "        return float(value)\n"
     "    except Exception:\n"
     "        return 0\n\n\n"
+    "def _flow_consult_ai(prompt, context=\"\"):\n"
+    "    \"\"\"Send a one-off prompt (optionally with extra context text) to\n"
+    "    whichever AI provider is currently configured as Midum's primary\n"
+    "    model (config.MODEL_PROVIDER), and return its plain-text reply.\n"
+    "    Shared by the Flows tab's Prompt AI / Ask AI to Summarize / Ask AI\n"
+    "    to Choose nodes -- falls back to GroqCloud if the configured\n"
+    "    provider is unrecognised.\"\"\"\n"
+    "    import config as _flow_cfg\n"
+    "    provider = getattr(_flow_cfg, 'MODEL_PROVIDER', 'groq')\n"
+    "    try:\n"
+    "        if provider == 'openrouter':\n"
+    "            from providers.openrouter_backend import consult_openrouter\n"
+    "            return consult_openrouter(prompt, context=context)\n"
+    "        if provider == 'gemini_api':\n"
+    "            from providers.gemini_api_backend import consult_gemini_api\n"
+    "            return consult_gemini_api(prompt, context=context)\n"
+    "        if provider == 'ollama_cloud':\n"
+    "            from providers.ollama_cloud_backend import consult_ollama_cloud\n"
+    "            return consult_ollama_cloud(prompt, context=context)\n"
+    "        if provider == 'gemini_web':\n"
+    "            from providers.gemini_reasoning import consult_gemini\n"
+    "            return consult_gemini(prompt, context=context)\n"
+    "        from providers.groq_backend import consult_groq\n"
+    "        return consult_groq(prompt, context=context)\n"
+    "    except Exception as e:\n"
+    "        return f'AI consult error: {e}'\n\n\n"
+    "def _flow_ai_choose(question, options):\n"
+    "    \"\"\"Ask the AI to pick exactly one option from `options` (a list,\n"
+    "    or a comma-separated string) for `question`, and return that\n"
+    "    option's exact text. Snaps the model's free-form reply back to the\n"
+    "    closest real option so downstream branching (e.g. an If node) can\n"
+    "    compare against a known value instead of loose AI phrasing.\"\"\"\n"
+    "    opts = options\n"
+    "    if isinstance(opts, str):\n"
+    "        opts = [o.strip() for o in opts.split(',') if o.strip()]\n"
+    "    elif not isinstance(opts, (list, tuple)):\n"
+    "        opts = [str(opts)] if opts not in (None, '') else []\n"
+    "    else:\n"
+    "        opts = [str(o) for o in opts]\n"
+    "    if not opts:\n"
+    "        return _flow_consult_ai(question)\n"
+    "    prompt = (\n"
+    "        f\"{question}\\n\\nChoose exactly ONE of the following options and reply \"\n"
+    "        f\"with ONLY that option's exact text, nothing else:\\n- \" + '\\n- '.join(opts)\n"
+    "    )\n"
+    "    raw = (_flow_consult_ai(prompt) or '').strip()\n"
+    "    for o in opts:\n"
+    "        if o.strip().lower() == raw.lower():\n"
+    "            return o\n"
+    "    for o in opts:\n"
+    "        if o.strip().lower() in raw.lower():\n"
+    "            return o\n"
+    "    return raw\n\n\n"
 )
 
 _REQUIRED_HEADER_SNIPPETS = (
@@ -483,6 +633,8 @@ _REQUIRED_HEADER_SNIPPETS = (
     "def _call_mcp_tool_step(",
     "def _flow_iter(",
     "def _flow_num(",
+    "def _flow_consult_ai(",
+    "def _flow_ai_choose(",
 )
 
 
@@ -632,11 +784,14 @@ def flow_description(name: str) -> str:
 
 
 def list_flow_schemas() -> list:
-    """One {"name","description","properties","required"} entry per saved
-    flow -- same shape as list_tool_schemas() for native tools, so the
+    """One {"name","description","properties","required","promoted"} entry per
+    saved flow -- same shape as list_tool_schemas() for native tools, so the
     Tools tab's Flows dropdown can list them uniformly. Flows take no
     external parameters (their steps get values from what was wired up /
-    typed into each node when the flow was built)."""
+    typed into each node when the flow was built). "promoted" reflects
+    whether this flow currently has its own always-on tool schema (see the
+    PROMOTED FLOWS section below) -- purely informational here, doesn't
+    change how run_flow(name) behaves."""
     out = []
     for name in list_flows():
         out.append({
@@ -644,6 +799,7 @@ def list_flow_schemas() -> list:
             "description": flow_description(name),
             "properties": {},
             "required": [],
+            "promoted": is_flow_promoted(name),
         })
     return out
 
@@ -667,3 +823,139 @@ def run_flow(name: str, args: dict = None) -> str:
         return str(result)
     except Exception as e:
         return f"Error: flow '{name}' raised an exception during execution: {e}"
+
+
+def list_flows_formatted() -> str:
+    """
+    On-demand discovery for saved Flows, mirroring list_mcp_servers() for
+    MCP servers: cheap (name + one-line description only, no schemas) so
+    it's safe to always include as a native tool. Follow up with
+    run_flow(name) to execute one -- exactly the same two-step shape as
+    list_mcp_servers() -> call_mcp_tool(...).
+
+    Flows marked [PROMOTED] are ALSO directly callable by their own name
+    without this discovery step at all (see get_promoted_flow_schemas()),
+    same as a promoted MCP tool.
+    """
+    names = list_flows()
+    if not names:
+        return "No saved flows yet. Build one in the Flows tab first."
+    lines = [f"Saved flows ({len(names)}):"]
+    for i, name in enumerate(names):
+        tag = " [PROMOTED]" if is_flow_promoted(name) else ""
+        lines.append(f"[{i}] {name}{tag} — {flow_description(name)}")
+    lines.append("\nCall run_flow(name=\"<flow name>\") to execute one.")
+    return "\n".join(lines)
+
+
+# =============================================================================
+# 5. PROMOTED FLOWS
+# =============================================================================
+#
+# A promoted flow is a saved Flow the user has explicitly marked (via the
+# Flows tab) to have a schema included directly alongside Midum's native
+# tools -- so the model can call it straight away, by its own name, like
+# any native tool, instead of having to discover it first via
+# list_flows()/run_flow(name). This exactly mirrors "promoted" MCP tools
+# (see midum_mcp/manager.py's PROMOTED MCP TOOLS section) -- same opt-in
+# escape hatch from on-demand discovery, same trade of a little context
+# budget for zero-friction single-call invocation.
+#
+# Persisted as a flat list of flow-name strings in
+# storage/flow_promoted_tools.json, independent of flow_meta.json (a flow
+# can be promoted even if it's since been deleted -- it just won't
+# contribute a schema entry until/unless a flow by that name exists again).
+_promoted_flows_cache: list | None = None
+
+
+def _load_promoted_flows() -> list:
+    """Read storage/flow_promoted_tools.json. Returns [] if missing/invalid."""
+    global _promoted_flows_cache
+    if _promoted_flows_cache is not None:
+        return _promoted_flows_cache
+    items = []
+    try:
+        if os.path.exists(FLOW_PROMOTED_TOOLS_FILE):
+            with open(FLOW_PROMOTED_TOOLS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                items = [n for n in loaded if isinstance(n, str) and n]
+    except Exception as e:
+        print(f"⚠️ [Flows] Could not read {FLOW_PROMOTED_TOOLS_FILE}: {e}")
+        items = []
+    _promoted_flows_cache = items
+    return items
+
+
+def _save_promoted_flows(items: list):
+    global _promoted_flows_cache
+    _promoted_flows_cache = items
+    try:
+        os.makedirs(os.path.dirname(FLOW_PROMOTED_TOOLS_FILE), exist_ok=True)
+        with open(FLOW_PROMOTED_TOOLS_FILE, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ [Flows] Could not save {FLOW_PROMOTED_TOOLS_FILE}: {e}")
+
+
+def is_flow_promoted(name: str) -> bool:
+    return name in _load_promoted_flows()
+
+
+def promote_flow(name: str) -> str:
+    """Mark one saved flow as promoted -- its schema will be included with
+    the native tools list from now on, and it becomes directly callable by
+    name."""
+    if not name:
+        return "Error: a flow 'name' is required."
+    if name not in list_flows():
+        return f"Error: no saved flow named '{name}'."
+    items = _load_promoted_flows()
+    if name in items:
+        return f"Flow '{name}' is already promoted."
+    _save_promoted_flows(list(items) + [name])
+    return f"Promoted flow '{name}' -- it will now be offered directly to the model."
+
+
+def demote_flow(name: str) -> str:
+    """Unmark a promoted flow -- it goes back to on-demand discovery only."""
+    items = _load_promoted_flows()
+    if name not in items:
+        return f"Flow '{name}' was not promoted."
+    _save_promoted_flows([n for n in items if n != name])
+    return f"Demoted flow '{name}' -- back to on-demand discovery only."
+
+
+def get_promoted_flows() -> list:
+    """Return the raw list of promoted flow names."""
+    return list(_load_promoted_flows())
+
+
+def get_promoted_flow_schemas() -> list:
+    """
+    Build native-style {"type":"function","function":{...}} schema entries
+    for every currently-promoted flow that still actually exists in
+    flow_tools.py. Mirrors midum_mcp.tools.get_promoted_tool_schemas() for
+    MCP tools -- names are kept exactly as the flow was saved (no prefix)
+    so a direct call by name dispatches straight to run_flow(name) (see
+    the flow-name fallback in orchestration.py's tool dispatch, which
+    mirrors _mcp_autoroute_tool_call for MCP tools).
+
+    Entries for flows that were promoted and later deleted are silently
+    skipped (they reappear automatically if a flow by that name is saved
+    again), same as a promoted MCP tool whose server/tool disappears.
+    """
+    schemas = []
+    valid_names = set(list_flows())
+    for name in get_promoted_flows():
+        if name not in valid_names:
+            continue
+        schemas.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": f"[FLOW] {flow_description(name)}".strip(),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        })
+    return schemas

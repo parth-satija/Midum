@@ -1071,6 +1071,25 @@ class Api:
         except Exception as e:
             return {"ok": False, "message": str(e)}
 
+    def is_flow_promoted(self, name: str):
+        try:
+            return {"ok": True, "promoted": bool(midum.is_flow_promoted(name))}
+        except Exception as e:
+            return {"ok": False, "promoted": False, "error": str(e)}
+
+    def promote_flow(self, name: str):
+        """Promote a saved flow -- mirrors promote_mcp_tool for MCP tools.
+        Gives the flow its own schema alongside native tools so the model
+        can call it directly by name, without list_saved_flows()/run_flow()
+        discovery."""
+        result = midum.promote_flow(name)
+        return {"ok": not result.lower().startswith("error"), "message": result}
+
+    def demote_flow(self, name: str):
+        """Demote a promoted flow back to on-demand discovery only."""
+        result = midum.demote_flow(name)
+        return {"ok": True, "message": result}
+
     def run_flow(self, name: str):
         """Run a saved flow the same way a native tool is run from the
         Tools tab -- in a background thread, pushing the result back as a
@@ -1714,6 +1733,8 @@ textarea.code-area{
 .flow-object-out{color:var(--accent2);}
 .flow-node-logic .flow-node-tool-hdr .flow-node-label{color:var(--accent);}
 .flow-node-variable .flow-node-tool-hdr .flow-node-label{color:var(--accent2);}
+.flow-node-ai .flow-node-tool-hdr .flow-node-label{color:var(--yellow);}
+.flow-node-ai .flow-node-tool-hdr .flow-node-icon{filter:saturate(1.2);}
 .flow-param-input{
   flex:1;height:22px;font-size:10px;border-radius:8px;border:1px solid var(--border2);
   background:var(--surface);color:var(--text);padding:0 6px;min-width:0;
@@ -3326,8 +3347,8 @@ function buildToolsPane(box){
   (async ()=>{
     const flowSchemas = await api("list_flow_schemas");
     flowSel.innerHTML = flowSchemas.length
-      ? flowSchemas.map(s=>`<option title="${escapeHtml(s.description||'')}">${escapeHtml(s.name)}</option>`).join("")
-      : `<option>No saved flows</option>`;
+      ? flowSchemas.map(s=>`<option value="${escapeHtml(s.name)}" title="${escapeHtml(s.description||'')}">${escapeHtml(s.name)}${s.promoted ? " [PROMOTED]" : ""}</option>`).join("")
+      : `<option value="">No saved flows</option>`;
   })();
   sel.onchange = ()=>buildArgs(sel.value);
   document.getElementById("tool-run").onclick = async ()=>{
@@ -3372,6 +3393,17 @@ const FLOW_NODE_GROUPS = [
     group: "Variables",
     nodes: [
       { type: "variable", label: "Variable", icon: "🧩", inputs: 1, outputs: 1, isVariable: true },
+    ],
+  },
+  {
+    group: "AI",
+    nodes: [
+      { type: "ai::prompt", label: "Prompt AI", icon: "🤖", inputs: 2, outputs: 2, isAI: true,
+        pinLabels: { in: ["Sequence", "Context"], out: ["Sequence", "Result"] } },
+      { type: "ai::summarize", label: "Ask AI to Summarize", icon: "📝", inputs: 2, outputs: 2, isAI: true,
+        pinLabels: { in: ["Sequence", "Text"], out: ["Sequence", "Summary"] } },
+      { type: "ai::choose", label: "Ask AI to Choose", icon: "🎯", inputs: 2, outputs: 2, isAI: true,
+        pinLabels: { in: ["Sequence", "Options"], out: ["Sequence", "Choice"] } },
     ],
   },
 ];
@@ -3439,6 +3471,39 @@ function _flowNodeHtml(def){
          + `<div class="flow-node-pin-hint"><span>in: seq, iterable</span><span>out: body, item, after</span></div>`
          + `</div>`;
   }
+  if (def.isAI && def.type === "ai::prompt"){
+    return `<div class="flow-node-tool flow-node-ai">`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">Prompt AI</span></div>`
+         + `<div class="flow-node-params">`
+         + `<div class="flow-param-row"><span class="flow-param-label">prompt</span><input class="flow-param-input" type="text" df-prompt placeholder="Instruction to send to the AI"/></div>`
+         + `<div class="flow-param-row"><span class="flow-param-label">context</span><input class="flow-param-input" type="text" df-context placeholder="fallback if Context pin unwired"/></div>`
+         + `</div>`
+         + `<div class="flow-node-pin-hint"><span>in: seq, context</span><span class="flow-object-out">out: seq, ⬤ result</span></div>`
+         + `</div>`;
+  }
+  if (def.isAI && def.type === "ai::summarize"){
+    return `<div class="flow-node-tool flow-node-ai">`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">Ask AI to Summarize</span></div>`
+         + `<div class="flow-node-params">`
+         + `<div class="flow-param-row"><span class="flow-param-label">text</span><input class="flow-param-input" type="text" df-text placeholder="fallback if Text pin unwired"/></div>`
+         + `<div class="flow-param-row"><span class="flow-param-label">length</span>`
+         + `<select class="flow-param-input" df-length>`
+         + `<option value="short">short</option><option value="medium" selected>medium</option><option value="long">long</option>`
+         + `</select></div>`
+         + `</div>`
+         + `<div class="flow-node-pin-hint"><span>in: seq, text</span><span class="flow-object-out">out: seq, ⬤ summary</span></div>`
+         + `</div>`;
+  }
+  if (def.isAI && def.type === "ai::choose"){
+    return `<div class="flow-node-tool flow-node-ai">`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">Ask AI to Choose</span></div>`
+         + `<div class="flow-node-params">`
+         + `<div class="flow-param-row"><span class="flow-param-label">question</span><input class="flow-param-input" type="text" df-question placeholder="What should the AI decide?"/></div>`
+         + `<div class="flow-param-row"><span class="flow-param-label">options</span><input class="flow-param-input" type="text" df-options placeholder="fallback: comma,separated,options"/></div>`
+         + `</div>`
+         + `<div class="flow-node-pin-hint"><span>in: seq, options</span><span class="flow-object-out">out: seq, ⬤ choice</span></div>`
+         + `</div>`;
+  }
   if (!def.params){
     return `<div class="flow-node flow-node-${def.type}">`
          + `<div class="flow-node-icon">${def.icon}</div>`
@@ -3498,6 +3563,7 @@ async function buildFlowsPane(box){
             <input id="flow-desc-input" placeholder="Description (for the Tools tab)" maxlength="300" autocomplete="off"
               style="height:24px;width:200px;border-radius:12px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 8px;font-size:11px;"/>
             <button class="btn" id="flow-save" style="height:24px;font-size:10px;background:var(--accent);color:#fff;">Save</button>
+            <button class="ghost-btn" id="flow-promote" title="Promote: give this flow its own tool schema so the model can call it directly by name, without discovery" style="height:24px;font-size:10px;" disabled>⭐ Promote</button>
             <button class="ghost-btn" id="flow-delete" style="height:24px;font-size:10px;color:var(--red);" disabled>🗑 Delete</button>
             <button class="ghost-btn" id="flow-zoom-out" style="height:24px;width:28px;padding:0;">−</button>
             <button class="ghost-btn" id="flow-zoom-reset" style="height:24px;font-size:10px;">Reset</button>
@@ -3587,6 +3653,7 @@ async function buildFlowsPane(box){
     const descInput = document.getElementById("flow-desc-input");
     const loadSelect = document.getElementById("flow-load-select");
     const deleteBtnFlow = document.getElementById("flow-delete");
+    const promoteBtnFlow = document.getElementById("flow-promote");
     nameInput.addEventListener("input", ()=>{
       let v = nameInput.value.replace(/[^A-Za-z0-9_]/g, "");
       v = v.replace(/^[0-9]+/, "");
@@ -3599,6 +3666,31 @@ async function buildFlowsPane(box){
       editor.addNode("end",   1, 0, 480, 160, "flow-node-end",   {}, _flowNodeHtml(FLOW_NODE_DEFS.end));
     }
 
+    // Reflects the currently-loaded saved flow's promoted state on the
+    // Promote button -- mirrors the Promote/Demote controls in the MCP
+    // tab's Tools pane. Disabled entirely when no saved flow is loaded
+    // (an unsaved/new flow has no name to promote yet).
+    async function refreshPromoteButton(name){
+      if (!name){
+        promoteBtnFlow.disabled = true;
+        promoteBtnFlow.classList.remove("open");
+        promoteBtnFlow.textContent = "⭐ Promote";
+        return;
+      }
+      promoteBtnFlow.disabled = false;
+      let promoted = false;
+      try {
+        const r = await api("is_flow_promoted", name);
+        promoted = !!(r && r.promoted);
+      } catch (e) { promoted = false; }
+      promoteBtnFlow.dataset.promoted = promoted ? "1" : "";
+      promoteBtnFlow.classList.toggle("open", promoted);
+      promoteBtnFlow.textContent = promoted ? "★ Promoted" : "⭐ Promote";
+      promoteBtnFlow.title = promoted
+        ? "This flow is promoted -- it has its own tool schema and can be called directly by name. Click to demote."
+        : "Promote: give this flow its own tool schema so the model can call it directly by name, without discovery. Click to promote.";
+    }
+
     async function refreshFlowLoadSelect(selectName){
       let names = [];
       try { names = await api("list_flows"); } catch (e) { names = []; }
@@ -3606,11 +3698,13 @@ async function buildFlowsPane(box){
         names.map(n=>`<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join("");
       loadSelect.value = selectName && names.includes(selectName) ? selectName : "";
       deleteBtnFlow.disabled = !loadSelect.value;
+      await refreshPromoteButton(loadSelect.value);
     }
 
     loadSelect.onchange = async ()=>{
       const name = loadSelect.value;
       deleteBtnFlow.disabled = !name;
+      refreshPromoteButton(name);
       if (!name){
         nameInput.value = ""; descInput.value = "";
         seedBlankCanvas();
@@ -3630,6 +3724,7 @@ async function buildFlowsPane(box){
 
     document.getElementById("flow-new").onclick = async ()=>{
       loadSelect.value = ""; deleteBtnFlow.disabled = true;
+      refreshPromoteButton("");
       nameInput.value = ""; descInput.value = "";
       seedBlankCanvas();
     };
@@ -3646,6 +3741,19 @@ async function buildFlowsPane(box){
         else await refreshFlowLoadSelect(name);
       } finally {
         btn.disabled = false; btn.textContent = oldLabel;
+      }
+    };
+
+    promoteBtnFlow.onclick = async ()=>{
+      const name = loadSelect.value;
+      if (!name) return;
+      promoteBtnFlow.disabled = true;
+      try {
+        const promoted = promoteBtnFlow.dataset.promoted === "1";
+        const r = promoted ? await api("demote_flow", name) : await api("promote_flow", name);
+        if (!r.ok) await showAlert(r.message, promoted ? "Demote Failed" : "Promote Failed");
+      } finally {
+        await refreshPromoteButton(name);
       }
     };
 
@@ -3734,6 +3842,12 @@ async function buildFlowsPane(box){
         initialData.op = "truthy"; initialData.value = ""; initialData.compare = "";
       } else if (def.type === "logic::loop"){
         initialData.item_var = "item";
+      } else if (def.type === "ai::prompt"){
+        initialData.prompt = ""; initialData.context = "";
+      } else if (def.type === "ai::summarize"){
+        initialData.text = ""; initialData.length = "medium";
+      } else if (def.type === "ai::choose"){
+        initialData.question = ""; initialData.options = "";
       } else {
         (def.params || []).forEach(p=>{ initialData[p.name] = ""; });
         initialData._flow_param_order = (def.params || []).map(p=>p.name);
