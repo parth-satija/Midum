@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Midum | Download Local AI Desktop Assistant</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Plus Jakarta Sans', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    },
+                    colors: {
+                        brand: {
+                            50: '#f0f7ff',
+                            100: '#e0effe',
+                            500: '#3b82f6',
+                            600: '#1d4ed8',
+                            900: '#0f172a',
+                            darkBg: '#05070c',
+                            cardBg: '#0b0f19',
+                            accent: '#60a5fa',
+                            glow: '#3b82f6'
+                        }
+                    },
+                    animation: {
+                        'float': 'float 6s ease-in-out infinite',
+                        'pulse-slow': 'pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                    },
+                    keyframes: {
+                        float: {
+                            '0%, 100%': { transform: 'translateY(0px)' },
+                            '50%': { transform: 'translateY(-10px)' },
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            background-color: #05070c;
+            color: #f3f4f6;
+            overflow-x: hidden;
+        }
+        /* Glassmorphism panel styling */
+        .glass-panel {
+            background: rgba(11, 15, 25, 0.7);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        /* Custom ambient glow overlays */
+        .ambient-glow {
+            filter: blur(130px);
+            opacity: 0.12;
+            pointer-events: none;
+            will-change: transform;
+        }
+    </style>
+</head>
+<body class="font-sans antialiased text-gray-200 min-h-screen flex flex-col justify-between">
+
+    <!-- Decorative Ambient Background Glows -->
+    <div class="fixed top-[-10%] left-1/4 w-[600px] h-[600px] bg-brand-glow rounded-full ambient-glow"></div>
+    <div class="fixed bottom-1/4 right-1/4 w-[500px] h-[500px] bg-indigo-500 rounded-full ambient-glow"></div>
+
+    <!-- Navigation Header -->
+    <nav class="w-full max-w-6xl mx-auto px-6 h-20 flex items-center justify-between z-50 relative">
+        <div class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded-lg bg-gradient-to-tr from-brand-500 to-indigo-600 flex items-center justify-center font-bold text-white shadow-md shadow-brand-500/10">
+                M
+            </div>
+            <div class="flex items-center">
+                <span class="text-lg font-bold tracking-tight text-white">Midum</span>
+                <!-- Dynamic Version Badge -->
+                <span id="version-badge" class="ml-2 text-[10px] font-semibold bg-blue-950/50 text-brand-accent px-2.5 py-0.5 rounded-full border border-blue-500/20 transition-all duration-300">
+                    loading...
+                </span>
+            </div>
+        </div>
+        <div>
+            <a href="https://github.com/parth-satija/Midum" target="_blank" rel="noopener noreferrer" class="text-sm font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1.5">
+                <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.483 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.579.688.481C19.137 20.162 22 16.418 22 12c0-5.523-4.477-10-10-10z"/></svg>
+                <span>GitHub</span>
+            </a>
+        </div>
+    </nav>
+
+    <!-- Main Content Section -->
+    <main class="flex-grow flex flex-col justify-center py-10 md:py-16 px-6 z-10 relative">
+        <div class="max-w-4xl mx-auto w-full text-center">
+            
+            <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-brand-accent/10 border border-brand-accent/20 text-xs text-brand-accent font-semibold mb-8 animate-pulse-slow">
+                ⚡ Premium Agentic Tool-calling Platform
+            </div>
+
+            <h1 class="text-4xl sm:text-6xl font-extrabold tracking-tight leading-tight text-white mb-6">
+                Your computer, driven by <br>
+                <span class="text-transparent bg-clip-text bg-gradient-to-r from-brand-accent via-indigo-400 to-teal-400">
+                    local agentic intelligence.
+                </span>
+            </h1>
+
+            <p class="max-w-2xl mx-auto text-base sm:text-lg text-gray-400 leading-relaxed font-light mb-10">
+                Midum is an open-source, local-first agent capable of complex UI automation, intelligent browser tasks, local document pipelines, and file system tasks directly from your desktop.
+            </p>
+
+            <!-- Download Action Buttons -->
+            <div class="flex flex-col sm:flex-row items-center justify-center gap-4 mb-16">
+                <!-- Windows Download -->
+                <a href="https://github.com/parth-satija/Midum/releases/latest/download/midum.exe" class="w-full sm:w-auto px-8 py-4 bg-gradient-to-r from-brand-500 to-indigo-600 hover:from-brand-600 hover:to-indigo-700 text-white font-semibold rounded-xl shadow-xl shadow-brand-500/10 hover:shadow-brand-500/25 transition-all flex items-center justify-center gap-3 text-base group border border-white/10">
+                    <svg class="w-5 h-5 text-white" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M0 3.449L9.75 2.1v9.451H0V3.449zM0 12.45h9.75v9.451L0 20.551V12.45zM11.25 1.9L24 0v11.55H11.25V1.9zM11.25 12.45H24v11.55l-12.75-1.9V12.45z"/>
+                    </svg>
+                    <span>Download for Windows</span>
+                    <span id="btn-subtext" class="text-xs text-brand-100/70 font-normal border-l border-white/20 pl-2">
+                        .exe executable
+                    </span>
+                </a>
+
+                <!-- GitHub Repo -->
+                <a href="https://github.com/parth-satija/Midum" target="_blank" rel="noopener noreferrer" class="w-full sm:w-auto px-8 py-4 bg-gray-900/60 hover:bg-gray-800 text-white font-semibold rounded-xl border border-gray-800 hover:border-gray-700 transition-all flex items-center justify-center gap-3 text-base">
+                    <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.483 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.579.688.481C19.137 20.162 22 16.418 22 12c0-5.523-4.477-10-10-10z"/></svg>
+                    <span>View Repository</span>
+                </a>
+            </div>
+
+            <!-- Dashboard Mockup Window -->
+            <div class="max-w-3xl mx-auto animate-float">
+                <div class="glass-panel rounded-xl overflow-hidden shadow-2xl border border-gray-800/80">
+                    <!-- Window Title Bar -->
+                    <div class="bg-gray-950/80 px-4 py-3 flex items-center justify-between border-b border-gray-800/60">
+                        <div class="flex items-center gap-2">
+                            <span class="w-3 h-3 rounded-full bg-red-500/40"></span>
+                            <span class="w-3 h-3 rounded-full bg-yellow-500/40"></span>
+                            <span class="w-3 h-3 rounded-full bg-green-500/40"></span>
+                            <span class="ml-2 text-xs font-mono text-gray-500">midum_control_centre (app.py)</span>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <span class="text-[10px] font-mono bg-blue-950/40 text-brand-accent px-2 py-0.5 rounded border border-brand-accent/25">Ollama: qwen2.5-coder:7b</span>
+                            <span class="text-[10px] font-mono bg-emerald-950/40 text-emerald-400 px-2 py-0.5 rounded border border-emerald-500/25">Active Goal Ready</span>
+                        </div>
+                    </div>
+                    <!-- Workspace Terminal Log Panel -->
+                    <div class="p-6 text-left font-mono text-xs sm:text-sm space-y-4 bg-gray-950/40">
+                        <div class="flex items-start gap-2.5">
+                            <span class="text-brand-accent">&gt;</span>
+                            <span class="text-gray-300">midum --agent-initiate</span>
+                        </div>
+                        <div class="text-gray-500 border-l-2 border-indigo-500/40 pl-3 py-1 space-y-1">
+                            <p>🤖 Engine initialized. Active provider: Ollama & Gemini Hybrid</p>
+                            <p>🖥️ Desktop UIA system loaded successfully.</p>
+                            <p>🌐 Chrome DevTools protocol active on remote debugging port 9222.</p>
+                        </div>
+                        <div class="flex items-start gap-2.5">
+                            <span class="text-brand-accent">&gt;</span>
+                            <span class="text-emerald-400">Current Goal: Automate layout inspection & create visual reports.</span>
+                        </div>
+                        <div class="text-gray-400">
+                            <span class="text-yellow-400">System Checklist:</span> CTRL+Q active to immediately terminate any current operations.
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Core Value Props -->
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-6 max-w-3xl mx-auto mt-16 pt-8 border-t border-gray-900 text-sm text-gray-400">
+                <div class="flex items-center justify-center gap-2.5">
+                    <span class="text-brand-accent text-base">🛡️</span>
+                    <span class="text-left leading-tight"><strong class="text-white block font-medium">100% Local option</strong> Fully secure offline setup</span>
+                </div>
+                <div class="flex items-center justify-center gap-2.5">
+                    <span class="text-brand-accent text-base">🔌</span>
+                    <span class="text-left leading-tight"><strong class="text-white block font-medium">MCP Native</strong> Unified plugin support</span>
+                </div>
+                <div class="flex items-center justify-center gap-2.5">
+                    <span class="text-brand-accent text-base">⚙️</span>
+                    <span class="text-left leading-tight"><strong class="text-white block font-medium">UI Automation</strong> System-level executions</span>
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="w-full border-t border-gray-900 bg-gray-950/40 py-8 z-10 relative">
+        <div class="max-w-6xl mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-gray-500">
+            <div>
+                <p>&copy; 2026 Midum. Open source under Apache 2.0. Built for local desktop assistance.</p>
+            </div>
+            <div class="flex items-center gap-4">
+                <a href="https://github.com/parth-satija/Midum" target="_blank" rel="noopener noreferrer" class="hover:text-white transition-colors">GitHub</a>
+                <span class="text-gray-800">&bull;</span>
+                <a href="https://github.com/parth-satija/Midum/releases" target="_blank" rel="noopener noreferrer" class="hover:text-white transition-colors">All Releases</a>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Dynamic Version Downloader Script -->
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const versionBadge = document.getElementById('version-badge');
+            const btnSubtext = document.getElementById('btn-subtext');
+            const fallbackVersion = 'v1.2';
+
+            // Fetch the latest release info from the public GitHub Repo
+            fetch('https://api.github.com/repos/parth-satija/Midum/releases/latest')
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (data && data.tag_name) {
+                        const cleanVersion = data.tag_name;
+                        // Update navigation badge
+                        versionBadge.textContent = cleanVersion;
+                        // Update button subtitle helper text
+                        btnSubtext.textContent = `${cleanVersion} executable`;
+                    } else {
+                        versionBadge.textContent = fallbackVersion;
+                    }
+                })
+                .catch(error => {
+                    console.warn('Could not retrieve latest tag from GitHub API, using fallback.', error);
+                    versionBadge.textContent = fallbackVersion;
+                });
+        });
+    </script>
+</body>
+</html>
