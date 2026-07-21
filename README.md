@@ -49,7 +49,19 @@ Midum isn't tied to a single model or provider — it can run its primary reason
   - **Gemini Web** — sign-in via your Google account cookies (no API key required, no per-token metering), driven through a persistent `gemini_webapi` chat session.
 - **OpenRouter** — run any OpenRouter-hosted model (including free-tier models) as the primary brain, with automatic fallback across a configurable list of models if one is rate-limited.
 - **GroqCloud** — fast inference on models like `llama-3.3-70b-versatile` and `qwen/qwen3-32b`, with a genuine free tier and automatic model fallback.
-- On-demand cross-consultation and delegation tools regardless of your primary provider: `consult_gemini`, `consult_gemini_api`, `consult_openrouter`, `consult_groq`, `delegate_to_gemini_api`, `delegate_to_openrouter`, `delegate_to_groq`, `delegate_to_gemini_web`, plus tools to list and switch models per-provider on the fly (`list_openrouter_models`, `set_openrouter_model`, `list_groq_models`, `set_groq_model`, `set_gemini_api_model`, `set_gemini_web_model`, etc.).
+- **Ollama Cloud** — the same `ollama` Python client as local Ollama, just pointed at Ollama's own hosted GPUs (`https://ollama.com`) with an API key instead of a local daemon — no GPU or model download required, with native tool-calling on models like `gpt-oss:120b-cloud` and `qwen3-coder:480b-cloud`, plus automatic fallback across a configurable model list.
+- On-demand cross-consultation and delegation tools regardless of your primary provider: `consult_gemini`, `consult_gemini_api`, `consult_openrouter`, `consult_groq`, `consult_ollama_cloud`, `delegate_to_gemini_api`, `delegate_to_openrouter`, `delegate_to_groq`, `delegate_to_gemini_web`, `delegate_to_ollama_cloud`, plus tools to list and switch models per-provider on the fly (`list_openrouter_models`, `set_openrouter_model`, `list_groq_models`, `set_groq_model`, `set_gemini_api_model`, `set_gemini_web_model`, `list_ollama_cloud_models`, `set_ollama_cloud_model`, etc.).
+
+### 🔗 Flows (visual automation builder)
+The GUI's **Flows** tab is a node-graph editor (built on Drawflow) for building repeatable, shareable automations without writing any Python by hand:
+- Drag out **Start**/**End** markers, native-tool nodes (`tool::<name>`), MCP-server tool nodes (`mcp::<server>::<tool>`), and nodes that call *other* saved flows (`flow::<name>`), then wire them together to define execution order.
+- **Variable** nodes hold a named piece of data that can feed into any downstream node's parameters.
+- **Logic nodes** — `if`/`else` branching and `for-each` loops — let a flow make decisions and iterate over lists instead of only running in a straight line.
+- **AI nodes** — Prompt AI, Ask AI to Summarize, and Ask AI to Choose — let a flow call out to whichever provider is currently configured (`config.MODEL_PROVIDER`) mid-run, for one-off reasoning, summarization, or picking between options, without a full tool call.
+- Saving a flow compiles the node graph straight into a real Python function, upserted into `flow_tools.py` between name-keyed markers (safe to re-save/edit repeatedly — resaving a flow only ever touches its own marked block), with its description and graph persisted to `flow_meta.json` so it can be reloaded into the canvas later.
+- Every saved flow is automatically discoverable and callable as a tool (`list_flows_formatted` → `run_flow(name)`) — the same two-step shape as calling an MCP tool.
+- **Promoted flows** — mark a flow as promoted from the Tools tab and it gets its own always-on tool schema, callable directly by name with no discovery step, exactly like a promoted MCP tool.
+- **Scheduling** — saved flows can be scheduled to run automatically (once, on an interval, daily, or weekly) via `scheduler.py`, as long as Midum's GUI is open. Schedule *configuration* persists across restarts even though firing only happens while the app is running.
 
 ### 🔌 MCP (Model Context Protocol) Support
 - Connect Midum to external MCP servers over stdio or HTTP/SSE (`connect_mcp_server`, `disconnect_mcp_server`).
@@ -70,13 +82,14 @@ Midum isn't tied to a single model or provider — it can run its primary reason
 ### 🖼️ Midum Control Centre (GUI)
 Running `gui.py` gives you the full **Midum Control Centre**, a desktop app (built with `customtkinter`) on top of the same agent engine, including:
 - A live chat interface with real-time activity/tool-call logging.
-- A **Model** tab to pick your provider (Ollama / OpenRouter / Gemini Web / Gemini API / Groq) and specific model, with live model list refreshing (e.g. querying your local Ollama installation).
+- A **Model** tab to pick your provider (Ollama / OpenRouter / Gemini Web / Gemini API / Groq / Ollama Cloud) and specific model, with live model list refreshing (e.g. querying your local Ollama installation).
 - A **Parameters** tab showing live agent state: active model, current goal, workspace, Gemini research status, OCR availability, UIA availability, and turn count.
 - A **System Core** tab for managing Midum's persistent instruction set.
 - A **Knowledge** tab and dialog for creating and browsing domain knowledge files.
 - A **Skills** tab and dialog for creating and browsing domain skills.
-- A **Tools** tab for inspecting Midum's manual/native tools.
+- A **Tools** tab for inspecting Midum's manual/native tools, and promoting/demoting saved Flows and MCP tools to always-on status.
 - An **MCP** tab for adding, viewing, and managing connected MCP servers and their tools, including a dedicated "Add MCP Server" dialog (stdio or HTTP/SSE, with command/args/env or URL/header fields) and a tool-viewer dialog.
+- A **Flows** tab: the node-graph editor described above, for visually building, saving, running, promoting, and scheduling automations (see 🔗 Flows above).
 - Full editing access to every underlying file Midum uses — skill files, knowledge bases, memory files, instructions, and more — directly from the GUI.
 
 This is the **recommended way to run Midum**, since it exposes everything the CLI does plus direct file editing.
@@ -123,14 +136,34 @@ MODEL_PROVIDER = "gemini_api"   # official Gemini API (API key from aistudio.goo
 MODEL_PROVIDER = "gemini_web"   # Gemini via browser-cookie sign-in, no API key
 MODEL_PROVIDER = "openrouter"   # any OpenRouter-hosted model
 MODEL_PROVIDER = "groq"         # GroqCloud (free tier, fast inference)
+MODEL_PROVIDER = "ollama_cloud" # Ollama's own hosted GPUs (API key from ollama.com, no local GPU needed)
 ```
 Fill in the matching model/key settings just below `MODEL_PROVIDER` for whichever provider you chose (e.g. `GEMINI_API_MODEL`, `OPENROUTER_MODEL`, `GROQ_MODEL`).
 
 ### Step 5
-Run `main.py` once, from inside the project folder. This creates all the necessary files:
+Create your secrets file — a local JSON file that holds your API keys (Gemini, OpenRouter, Groq, Ollama Cloud) and/or Gemini web cookies, so Midum never needs them hardcoded in `config.py`. Run this once from inside the project folder:
 ```PowerShell
-python main.py
+python -c "import config; created = config.ensure_secrets_file(); print('Created:' if created else 'Already exists:', config.SECRETS_FILE)"
 ```
+This writes a ready-to-fill-in template (every value blank) to the platform-appropriate location — `%LOCALAPPDATA%\JarvisSecrets\jarvis_secrets.json` on Windows, `~/.config/JarvisSecrets/jarvis_secrets.json` on Linux — with the following keys:
+```json
+{
+  "GEMINI_API_KEY": "",
+  "OPENROUTER_API_KEY": "",
+  "GROQ_API_KEY": "",
+  "OLLAMA_API_KEY": "",
+  "GEMINI_SECURE_1PSID": "",
+  "GEMINI_SECURE_1PSIDTS": ""
+}
+```
+Open the file and fill in only the key(s) your chosen `MODEL_PROVIDER` (and any providers you plan to consult/delegate to) actually needs — every reader treats a blank value as "not configured", so it's safe to leave the rest empty:
+- `GEMINI_API_KEY` — from [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey). Used by `MODEL_PROVIDER = "gemini_api"` and Gemini API consultation.
+- `OPENROUTER_API_KEY` — from [openrouter.ai/keys](https://openrouter.ai/keys). Used by `MODEL_PROVIDER = "openrouter"`.
+- `GROQ_API_KEY` — from [console.groq.com/keys](https://console.groq.com/keys) (free tier). Used by `MODEL_PROVIDER = "groq"`.
+- `OLLAMA_API_KEY` — from [ollama.com/settings/keys](https://ollama.com/settings/keys). Used by `MODEL_PROVIDER = "ollama_cloud"`.
+- `GEMINI_SECURE_1PSID` / `GEMINI_SECURE_1PSIDTS` — browser session cookies (not an API key) for `gemini.google.com`, copied from your browser's DevTools → Application → Cookies. Both are required together, and only needed if you'd rather use your Gemini account's web session (`MODEL_PROVIDER = "gemini_web"`) than the official API.
+
+This same file is also created automatically the first time you run `main.py` or `gui.py` if it doesn't exist yet (see Step 6 below), so this step is optional — but running it explicitly here lets you fill in your keys *before* first launch instead of stopping mid-startup to go find the file.
 
 ### Optional Step — OCR
 Download and install Tesseract, as it enables OCR-based screen reading and clicking. Midum is completely functional without OCR — it's only used as a fallback for UI interaction.
@@ -145,6 +178,19 @@ python gui.py
 # or
 python main.py
 ```
+
+---
+
+## Alternative Setup — Prebuilt Executable
+If you'd rather not install Python or any dependencies, Windows users can skip the full Setup Instructions above entirely and just:
+
+### Step 1
+Download `midum.exe` from the releases page and place it in its own empty folder (it will create `storage/` and other supporting files alongside itself on first run, so give it a dedicated folder rather than dropping it in `Downloads`).
+
+### Step 2
+Launch `midum.exe` once (double-click it, or run it from a terminal) and then close it again. On this first run it automatically creates your secrets file — the same blank-template JSON described in Step 5 above — at `%LOCALAPPDATA%\JarvisSecrets\jarvis_secrets.json`, with the `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `OLLAMA_API_KEY`, `GEMINI_SECURE_1PSID`, and `GEMINI_SECURE_1PSIDTS` placeholders ready for you to fill in. Open that file, fill in only the key(s) your chosen provider needs (see the key-by-key breakdown in Step 5 above), and save it.
+
+Relaunch `midum.exe` and you're straight into the Midum Control Centre — no `pip install`, no Ollama, no IDE required.
 
 ---
 
