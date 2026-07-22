@@ -117,6 +117,7 @@
             </div>
         </div>
         <div class="flex items-center gap-5">
+            <a href="#how-it-works" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">How It Works</a>
             <a href="#features" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">Features</a>
             <a href="#setup" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">Setup</a>
             <a href="business.html" class="text-sm font-medium text-gray-400 hover:text-white transition-colors">Business Model</a>
@@ -219,6 +220,121 @@
 
         </div>
     </div>
+
+    <!-- ============ HOW IT WORKS / LAYER DIAGRAM ============ -->
+    <section id="how-it-works" class="anchor-offset max-w-5xl mx-auto w-full px-6 py-16 border-t border-gray-900">
+        <div class="text-center mb-12">
+            <h2 class="text-3xl sm:text-4xl font-bold text-white mb-3">Where Midum Sits</h2>
+            <p class="text-gray-400 max-w-2xl mx-auto">
+                Midum is the middle layer: it takes what you ask for, decides what the model should reason about, and turns that reasoning into actual actions on your computer.
+            </p>
+        </div>
+
+        <div class="glass-panel rounded-xl p-6 sm:p-8 mb-10 overflow-x-auto">
+            <svg viewBox="0 0 900 460" xmlns="http://www.w3.org/2000/svg" class="w-full min-w-[640px] h-auto" role="img" aria-label="Diagram showing User, Midum, Model, and Computer layers">
+                <defs>
+                    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+                        <path d="M0,0 L0,6 L9,3 z" fill="#60a5fa" />
+                    </marker>
+                </defs>
+
+                <!-- User -->
+                <rect x="30" y="170" width="170" height="120" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5"/>
+                <text x="115" y="222" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="20" font-weight="700">You</text>
+                <text x="115" y="246" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Types a goal in</text>
+                <text x="115" y="262" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">plain language</text>
+
+                <!-- Midum (middle, spans more vertically to show it's the orchestration layer) -->
+                <rect x="290" y="90" width="220" height="300" rx="16" fill="rgba(59,130,246,0.08)" stroke="#3b82f6" stroke-width="2"/>
+                <text x="400" y="130" text-anchor="middle" fill="#60a5fa" font-family="Plus Jakarta Sans, sans-serif" font-size="22" font-weight="800">Midum</text>
+                <text x="400" y="152" text-anchor="middle" fill="#93c5fd" font-family="Plus Jakarta Sans, sans-serif" font-size="12">agent &amp; tool-calling loop</text>
+
+                <rect x="312" y="170" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b"/>
+                <text x="400" y="198" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12">Plans next step</text>
+
+                <rect x="312" y="224" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b"/>
+                <text x="400" y="252" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12">Calls a tool</text>
+
+                <rect x="312" y="278" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b"/>
+                <text x="400" y="306" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12">Reads the result</text>
+
+                <text x="400" y="358" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Repeats this loop until</text>
+                <text x="400" y="374" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">the goal is done</text>
+
+                <!-- Model -->
+                <rect x="600" y="60" width="270" height="130" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5"/>
+                <text x="735" y="100" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="18" font-weight="700">Model</text>
+                <text x="735" y="122" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Ollama · Gemini · OpenRouter</text>
+                <text x="735" y="140" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Groq · Ollama Cloud</text>
+                <text x="735" y="164" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11">Reasons about what to do next —</text>
+                <text x="735" y="178" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11">doesn't touch your machine directly</text>
+
+                <!-- Computer -->
+                <rect x="600" y="260" width="270" height="130" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5"/>
+                <text x="735" y="300" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="18" font-weight="700">Your Computer</text>
+                <text x="735" y="322" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Desktop apps · Browser</text>
+                <text x="735" y="340" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Files · MCP servers</text>
+                <text x="735" y="364" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11">Where the actual clicks, typing,</text>
+                <text x="735" y="378" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11">and file edits happen</text>
+
+                <!-- Arrows -->
+                <line x1="200" y1="230" x2="285" y2="230" stroke="#60a5fa" stroke-width="2" marker-end="url(#arrow)"/>
+                <text x="242" y="220" text-anchor="middle" fill="#60a5fa" font-family="Plus Jakarta Sans, sans-serif" font-size="11">goal</text>
+
+                <line x1="515" y1="180" x2="595" y2="130" stroke="#60a5fa" stroke-width="2" marker-end="url(#arrow)"/>
+                <text x="565" y="145" text-anchor="middle" fill="#60a5fa" font-family="Plus Jakarta Sans, sans-serif" font-size="11">asks</text>
+
+                <line x1="595" y1="150" x2="515" y2="200" stroke="#4ade80" stroke-width="2" marker-end="url(#arrow)"/>
+                <text x="565" y="215" text-anchor="middle" fill="#4ade80" font-family="Plus Jakarta Sans, sans-serif" font-size="11">decides</text>
+
+                <line x1="515" y1="290" x2="595" y2="330" stroke="#60a5fa" stroke-width="2" marker-end="url(#arrow)"/>
+                <text x="565" y="325" text-anchor="middle" fill="#60a5fa" font-family="Plus Jakarta Sans, sans-serif" font-size="11">acts on</text>
+
+                <line x1="595" y1="350" x2="515" y2="310" stroke="#4ade80" stroke-width="2" marker-end="url(#arrow)"/>
+                <text x="565" y="298" text-anchor="middle" fill="#4ade80" font-family="Plus Jakarta Sans, sans-serif" font-size="11">result</text>
+
+                <line x1="200" y1="260" x2="285" y2="340" stroke="#4ade80" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+                <text x="255" y="315" text-anchor="middle" fill="#4ade80" font-family="Plus Jakarta Sans, sans-serif" font-size="11">reports back</text>
+            </svg>
+
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-6 text-xs text-gray-500">
+                <div class="flex items-start gap-2"><span class="text-brand-accent">●</span><span><strong class="text-gray-300">You</strong> describe a goal — nothing more than plain language.</span></div>
+                <div class="flex items-start gap-2"><span class="text-brand-accent">●</span><span><strong class="text-gray-300">Midum</strong> is the loop in between: it plans, calls a tool, reads the result, and repeats.</span></div>
+                <div class="flex items-start gap-2"><span class="text-brand-accent">●</span><span>The <strong class="text-gray-300">model</strong> only reasons; the <strong class="text-gray-300">computer</strong> is where the action actually happens.</span></div>
+            </div>
+        </div>
+
+        <!-- Screenshot placeholders -->
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-6">
+            <div class="glass-panel rounded-xl overflow-hidden">
+                <div class="aspect-video flex items-center justify-center border-b border-gray-800/60 bg-gray-950/40">
+                    <span class="text-gray-600 text-sm">Screenshot — Control Centre</span>
+                </div>
+                <div class="p-4">
+                    <p class="text-sm text-white font-medium">Midum Control Centre</p>
+                    <p class="text-xs text-gray-500 mt-1">Add a screenshot of the GUI here.</p>
+                </div>
+            </div>
+            <div class="glass-panel rounded-xl overflow-hidden">
+                <div class="aspect-video flex items-center justify-center border-b border-gray-800/60 bg-gray-950/40">
+                    <span class="text-gray-600 text-sm">Screenshot — Flows Builder</span>
+                </div>
+                <div class="p-4">
+                    <p class="text-sm text-white font-medium">Flows Node Editor</p>
+                    <p class="text-xs text-gray-500 mt-1">Add a screenshot of the Flows tab here.</p>
+                </div>
+            </div>
+            <div class="glass-panel rounded-xl overflow-hidden">
+                <div class="aspect-video flex items-center justify-center border-b border-gray-800/60 bg-gray-950/40">
+                    <span class="text-gray-600 text-sm">Screenshot — Live Task</span>
+                </div>
+                <div class="p-4">
+                    <p class="text-sm text-white font-medium">Task in Progress</p>
+                    <p class="text-xs text-gray-500 mt-1">Add a screenshot of an active run here.</p>
+                </div>
+            </div>
+        </div>
+    </section>
 
     <!-- ============ FEATURES (from README) ============ -->
     <section id="features" class="anchor-offset max-w-5xl mx-auto w-full px-6 py-16 border-t border-gray-900">
