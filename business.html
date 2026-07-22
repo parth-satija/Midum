@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Midum | Business Model</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Plus Jakarta Sans', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    },
+                    colors: {
+                        brand: {
+                            500: '#3b82f6',
+                            600: '#1d4ed8',
+                            darkBg: '#05070c',
+                            cardBg: '#0b0f19',
+                            accent: '#60a5fa',
+                            glow: '#3b82f6'
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { background-color: #05070c; color: #f3f4f6; overflow-x: hidden; }
+        .glass-panel {
+            background: rgba(11, 15, 25, 0.7);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .ambient-glow { filter: blur(130px); opacity: 0.12; pointer-events: none; }
+    </style>
+</head>
+<body class="font-sans antialiased text-gray-200 min-h-screen flex flex-col justify-between">
+
+    <div class="fixed top-[-10%] left-1/4 w-[600px] h-[600px] bg-brand-glow rounded-full ambient-glow"></div>
+    <div class="fixed bottom-1/4 right-1/4 w-[500px] h-[500px] bg-indigo-500 rounded-full ambient-glow"></div>
+
+    <!-- Navigation Header -->
+    <nav class="w-full max-w-6xl mx-auto px-6 h-20 flex items-center justify-between z-50 relative">
+        <a href="index.html" class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded-lg bg-gradient-to-tr from-brand-500 to-indigo-600 flex items-center justify-center font-bold text-white shadow-md shadow-brand-500/10">
+                M
+            </div>
+            <span class="text-lg font-bold tracking-tight text-white">Midum</span>
+        </a>
+        <a href="index.html" class="text-sm font-medium text-gray-400 hover:text-white transition-colors">&larr; Back to Home</a>
+    </nav>
+
+    <main class="flex-grow z-10 relative px-6 py-8">
+        <div class="max-w-4xl mx-auto w-full">
+
+            <!-- Page-opening button/title -->
+            <div class="flex justify-center mb-10">
+                <button type="button" class="px-6 py-2.5 rounded-xl bg-gradient-to-r from-brand-500 to-indigo-600 text-white font-bold text-lg shadow-lg shadow-brand-500/20 cursor-default">
+                    Business Model
+                </button>
+            </div>
+
+            <!-- Runtime badge -->
+            <div class="flex justify-center mb-8">
+                <div class="px-5 py-2 rounded-full bg-brand-500 text-white text-sm font-semibold shadow-md shadow-brand-500/20">
+                    Midum Agentic Runtime
+                </div>
+            </div>
+
+            <!-- Two top columns -->
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-6 mb-6">
+                <div class="glass-panel rounded-xl p-6">
+                    <h3 class="text-brand-accent font-semibold text-sm mb-4 text-center">Free Users</h3>
+                    <ul class="space-y-2 text-sm text-gray-300">
+                        <li>&bull; Personal users &mdash; <span class="text-white font-medium">free core runtime</span></li>
+                        <li>&bull; Small businesses &mdash; <span class="text-white font-medium">free core runtime</span></li>
+                    </ul>
+                </div>
+                <div class="glass-panel rounded-xl p-6">
+                    <h3 class="text-emerald-400 font-semibold text-sm mb-4 text-center">Paying Customers &mdash; Commercial Editions</h3>
+                    <ul class="space-y-2 text-sm text-gray-300">
+                        <li>&bull; Enterprise accounts &mdash; <span class="text-white font-medium">commercial licensing</span></li>
+                        <li>&bull; Custom editions &mdash; <span class="text-white font-medium">tailored builds</span></li>
+                    </ul>
+                </div>
+            </div>
+
+            <!-- Two bottom breakdown cards, quantities removed -->
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-6 mb-16">
+                <div class="glass-panel rounded-xl p-6 border border-emerald-500/20">
+                    <h3 class="text-emerald-400 font-semibold text-sm mb-4">Enterprise Breakdown</h3>
+                    <ul class="space-y-2 text-sm text-gray-300">
+                        <li>License seats billed per user</li>
+                        <li>One-time onboarding fee per user</li>
+                        <li>Annual SaaS subscription per business</li>
+                    </ul>
+                </div>
+                <div class="glass-panel rounded-xl p-6 border border-yellow-500/20">
+                    <h3 class="text-yellow-400 font-semibold text-sm mb-4">Custom Builds</h3>
+                    <ul class="space-y-2 text-sm text-gray-300">
+                        <li>Teacher / student / niche editions</li>
+                        <li>Priced per custom build delivered</li>
+                    </ul>
+                </div>
+            </div>
+
+            <!-- Available custom builds -->
+            <div class="border-t border-gray-900 pt-10">
+                <h2 class="text-2xl font-bold text-white text-center mb-2">Available Custom Builds</h2>
+                <p class="text-sm text-gray-500 text-center mb-8">Custom editions available for download will be listed here.</p>
+
+                <!-- Populate #custom-builds-list programmatically -->
+                <div id="custom-builds-list" class="grid grid-cols-1 sm:grid-cols-2 gap-5">
+                    <!-- Example card markup for reference when populating later:
+                    <div class="glass-panel rounded-xl p-5 flex items-center justify-between">
+                        <div>
+                            <h4 class="text-white font-semibold text-sm"></h4>
+                            <p class="text-xs text-gray-500 mt-1"></p>
+                        </div>
+                        <a href="#" class="px-4 py-2 rounded-lg bg-brand-500 hover:bg-brand-600 text-white text-xs font-semibold transition-colors">Download</a>
+                    </div>
+                    -->
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="w-full border-t border-gray-900 bg-gray-950/40 py-8 z-10 relative">
+        <div class="max-w-6xl mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-gray-500">
+            <p>&copy; 2026 Midum. Open source under MIT license.</p>
+            <a href="index.html" class="hover:text-white transition-colors">Back to Home</a>
+        </div>
+    </footer>
+</body>
+</html>
