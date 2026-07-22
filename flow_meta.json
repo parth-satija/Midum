@@ -1,5 +1,211 @@
 {
   "Test1": {
     "description": ""
+  },
+  "team_updates_summarizer": {
+    "description": "Summarize the updates of the team for that day",
+    "graph": {
+      "drawflow": {
+        "Home": {
+          "data": {
+            "3": {
+              "id": 3,
+              "name": "start",
+              "data": {},
+              "class": "flow-node-start",
+              "html": "<div class=\"flow-node flow-node-start\"><div class=\"flow-node-icon\">\u25b6</div><div class=\"flow-node-label\">Start</div></div>",
+              "typenode": false,
+              "inputs": {},
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "5",
+                      "output": "input_1"
+                    }
+                  ]
+                }
+              },
+              "pos_x": -249.25,
+              "pos_y": 161
+            },
+            "4": {
+              "id": 4,
+              "name": "end",
+              "data": {},
+              "class": "flow-node-end",
+              "html": "<div class=\"flow-node flow-node-end\"><div class=\"flow-node-icon\">\u23f9</div><div class=\"flow-node-label\">End</div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "7",
+                      "input": "output_1"
+                    }
+                  ]
+                }
+              },
+              "outputs": {},
+              "pos_x": 875,
+              "pos_y": 178.25
+            },
+            "5": {
+              "id": 5,
+              "name": "mcp::filesystem::read_file",
+              "data": {
+                "path": "D:/team_updates.txt",
+                "tail": "",
+                "head": "",
+                "_flow_param_order": [
+                  "path",
+                  "tail",
+                  "head"
+                ]
+              },
+              "class": "flow-node-mcp--filesystem--read_file",
+              "html": "<div class=\"flow-node-tool\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\">\ud83d\udd0c</span><span class=\"flow-node-label\">read_file</span><span class=\"flow-node-kind-badge flow-node-kind-output\">output</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row required\" title=\"\"><span class=\"flow-param-label\">path</span><input class=\"flow-param-input\" type=\"text\" df-path placeholder=\"string\"/></div><div class=\"flow-param-row\" title=\"If provided, returns only the last N lines of the file\"><span class=\"flow-param-label\">tail</span><input class=\"flow-param-input\" type=\"number\" df-tail placeholder=\"If provided, returns only the last N lines of the file\"/></div><div class=\"flow-param-row\" title=\"If provided, returns only the first N lines of the file\"><span class=\"flow-param-label\">head</span><input class=\"flow-param-input\" type=\"number\" df-head placeholder=\"If provided, returns only the first N lines of the file\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: seq, params</span><span class=\"flow-object-out\">out: seq, \u2b24 object</span></div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "3",
+                      "input": "output_1"
+                    }
+                  ]
+                },
+                "input_2": {
+                  "connections": []
+                },
+                "input_3": {
+                  "connections": []
+                },
+                "input_4": {
+                  "connections": []
+                }
+              },
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "6",
+                      "output": "input_1"
+                    }
+                  ]
+                },
+                "output_2": {
+                  "connections": [
+                    {
+                      "node": "6",
+                      "output": "input_2"
+                    }
+                  ]
+                }
+              },
+              "pos_x": -32,
+              "pos_y": 100
+            },
+            "6": {
+              "id": 6,
+              "name": "ai::summarize",
+              "data": {
+                "text": "",
+                "length": "medium"
+              },
+              "class": "flow-node-ai--summarize",
+              "html": "<div class=\"flow-node-tool flow-node-ai\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\">\ud83d\udcdd</span><span class=\"flow-node-label\">Ask AI to Summarize</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row\"><span class=\"flow-param-label\">text</span><input class=\"flow-param-input\" type=\"text\" df-text placeholder=\"fallback if Text pin unwired\"/></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">length</span><select class=\"flow-param-input\" df-length><option value=\"short\">short</option><option value=\"medium\" selected>medium</option><option value=\"long\">long</option></select></div></div><div class=\"flow-node-pin-hint\"><span>in: seq, text</span><span class=\"flow-object-out\">out: seq, \u2b24 summary</span></div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "5",
+                      "input": "output_1"
+                    }
+                  ]
+                },
+                "input_2": {
+                  "connections": [
+                    {
+                      "node": "5",
+                      "input": "output_2"
+                    }
+                  ]
+                }
+              },
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "7",
+                      "output": "input_1"
+                    }
+                  ]
+                },
+                "output_2": {
+                  "connections": [
+                    {
+                      "node": "7",
+                      "output": "input_3"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 283.5,
+              "pos_y": 144
+            },
+            "7": {
+              "id": 7,
+              "name": "mcp::filesystem::write_file",
+              "data": {
+                "path": "D:/updates_summary.txt",
+                "content": "",
+                "_flow_param_order": [
+                  "path",
+                  "content"
+                ]
+              },
+              "class": "flow-node-mcp--filesystem--write_file",
+              "html": "<div class=\"flow-node-tool\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\">\ud83d\udd0c</span><span class=\"flow-node-label\">write_file</span><span class=\"flow-node-kind-badge flow-node-kind-action\">action</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row required\" title=\"\"><span class=\"flow-param-label\">path</span><input class=\"flow-param-input\" type=\"text\" df-path placeholder=\"string\"/></div><div class=\"flow-param-row required\" title=\"\"><span class=\"flow-param-label\">content</span><input class=\"flow-param-input\" type=\"text\" df-content placeholder=\"string\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: seq, params</span><span>out: seq</span></div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "6",
+                      "input": "output_1"
+                    }
+                  ]
+                },
+                "input_2": {
+                  "connections": []
+                },
+                "input_3": {
+                  "connections": [
+                    {
+                      "node": "6",
+                      "input": "output_2"
+                    }
+                  ]
+                }
+              },
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "4",
+                      "output": "input_1"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 579,
+              "pos_y": 18.25
+            }
+          }
+        }
+      }
+    }
   }
 }

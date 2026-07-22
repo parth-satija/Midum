@@ -14,6 +14,110 @@ def _call_mcp_tool_step(server, tool_name, args):
     return _midum.call_mcp_tool(server, tool_name, args)
 
 
+def _call_flow_step(flow_name):
+    """Run another saved flow by name, as a step of THIS flow -- lets
+    flows compose. Beware self-reference (a flow calling itself, directly
+    or through a cycle of other flows) -- flow_tools.py has no cycle
+    detection at call time, so that will recurse until Python's own
+    recursion limit kicks in, not fail gracefully."""
+    return _midum.run_flow(flow_name)
+
+
+def _flow_iter(value):
+    """Best-effort coercion of a wired-in value into something a
+    `for` loop can iterate: a real list/tuple passes through, a JSON
+    array-as-string gets parsed, anything else becomes a 1-item list
+    (or an empty list for None/empty string) so a Loop node never hard
+    crashes just because its Iterable turned out to be a scalar."""
+    if value is None or value == '':
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, str):
+        try:
+            import json as _json
+            parsed = _json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    return [value]
+
+
+def _flow_num(value):
+    """Best-effort numeric coercion for If-node greater/less-than
+    comparisons -- non-numeric input compares as 0 rather than raising."""
+    try:
+        return float(value)
+    except Exception:
+        return 0
+
+
+def _flow_consult_ai(prompt, context=""):
+    """Send a one-off prompt (optionally with extra context text) to
+    whichever AI provider is currently configured as Midum's primary
+    model (config.MODEL_PROVIDER), and return its plain-text reply.
+    Shared by the Flows tab's Prompt AI / Ask AI to Summarize / Ask AI
+    to Choose nodes -- falls back to GroqCloud if the configured
+    provider is unrecognised."""
+    import config as _flow_cfg
+    provider = getattr(_flow_cfg, 'MODEL_PROVIDER', 'groq')
+    try:
+        if provider == 'openrouter':
+            from providers.openrouter_backend import consult_openrouter
+            return consult_openrouter(prompt, context=context)
+        if provider == 'gemini_api':
+            from providers.gemini_api_backend import consult_gemini_api
+            return consult_gemini_api(prompt, context=context)
+        if provider == 'ollama_cloud':
+            from providers.ollama_cloud_backend import consult_ollama_cloud
+            return consult_ollama_cloud(prompt, context=context)
+        if provider == 'gemini_web':
+            from providers.gemini_reasoning import consult_gemini
+            return consult_gemini(prompt, context=context)
+        from providers.groq_backend import consult_groq
+        return consult_groq(prompt, context=context)
+    except Exception as e:
+        return f'AI consult error: {e}'
+
+
+def _flow_ai_choose(question, options):
+    """Ask the AI to pick exactly one option from `options` (a list,
+    or a comma-separated string) for `question`, and return that
+    option's exact text. Snaps the model's free-form reply back to the
+    closest real option so downstream branching (e.g. an If node) can
+    compare against a known value instead of loose AI phrasing."""
+    opts = options
+    if isinstance(opts, str):
+        opts = [o.strip() for o in opts.split(',') if o.strip()]
+    elif not isinstance(opts, (list, tuple)):
+        opts = [str(opts)] if opts not in (None, '') else []
+    else:
+        opts = [str(o) for o in opts]
+    if not opts:
+        return _flow_consult_ai(question)
+    prompt = (
+        f"{question}\n\nChoose exactly ONE of the following options and reply "
+        f"with ONLY that option's exact text, nothing else:\n- " + '\n- '.join(opts)
+    )
+    raw = (_flow_consult_ai(prompt) or '').strip()
+    for o in opts:
+        if o.strip().lower() == raw.lower():
+            return o
+    for o in opts:
+        if o.strip().lower() in raw.lower():
+            return o
+    return raw
+
+
+from gui.dispatch import _dispatch_midum_tool
+import main as _midum
+
+
+def _call_mcp_tool_step(server, tool_name, args):
+    return _midum.call_mcp_tool(server, tool_name, args)
+
+
 # === FLOW: Test1 ===
 def Test1():
     """
@@ -31,4 +135,27 @@ def Test1():
     # --- End ---
     return _flow_results[-1] if _flow_results else None
 # === END FLOW: Test1 ===
+
+# === FLOW: team_updates_summarizer ===
+def team_updates_summarizer():
+    """
+    Auto-generated from the Flows tab's node graph. Edit the graph in
+    the GUI and click Save to regenerate this function — manual edits
+    made directly to this function body will be OVERWRITTEN the next
+    time this flow is saved.
+    """
+    _flow_results = []
+    # --- Tool: read_file (MCP: filesystem) ---
+    _args = {'path': 'D:/team_updates.txt'}
+    _out_5 = _call_mcp_tool_step('filesystem', 'read_file', _args)
+    _flow_results.append(_out_5)
+    # --- Ask AI to Summarize ---
+    _out_6 = _flow_consult_ai('Summarize the following text at a medium length. Respond with only the summary, no preamble.', context=_out_5)
+    _flow_results.append(_out_6)
+    # --- Tool: write_file (MCP: filesystem) ---
+    _args = {'path': 'D:/updates_summary.txt', 'content': _out_6}
+    _step = _call_mcp_tool_step('filesystem', 'write_file', _args)
+    _flow_results.append(_step)
+    return _flow_results[-1] if _flow_results else None
+# === END FLOW: team_updates_summarizer ===
 
