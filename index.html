@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
 <head>
     <!-- Google tag (gtag.js) -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-QXP92KSRTE"></script>
@@ -20,6 +20,7 @@
 
     <script>
         tailwind.config = {
+            darkMode: 'class',
             theme: {
                 extend: {
                     fontFamily: {
@@ -54,19 +55,53 @@
         }
     </script>
     <style>
+        :root {
+            --bg-page: #05070c;
+            --text-primary: #f3f4f6;
+            --panel-bg: rgba(11, 15, 25, 0.7);
+            --panel-border: rgba(255, 255, 255, 0.05);
+            --glow-opacity: 0.12;
+            --code-bg: rgba(59,130,246,0.08);
+            --code-border: rgba(59,130,246,0.18);
+            --code-text: #93c5fd;
+            --pre-bg: #0a0e17;
+            --pre-border: rgba(255,255,255,0.06);
+            --pre-text: #cbd5e1;
+            --nav-link: #9ca3af;
+            --footer-bg: rgba(3, 7, 18, 0.4);
+        }
+
+        html.light {
+            --bg-page: #f7f9fc;
+            --text-primary: #10182b;
+            --panel-bg: rgba(255, 255, 255, 0.85);
+            --panel-border: rgba(15, 23, 42, 0.08);
+            --glow-opacity: 0.08;
+            --code-bg: rgba(29, 78, 216, 0.06);
+            --code-border: rgba(29, 78, 216, 0.18);
+            --code-text: #1d4ed8;
+            --pre-bg: #eef2f9;
+            --pre-border: rgba(15, 23, 42, 0.08);
+            --pre-text: #1f2937;
+            --nav-link: #4b5563;
+            --footer-bg: rgba(241, 245, 249, 0.6);
+        }
+
         body {
-            background-color: #05070c;
-            color: #f3f4f6;
+            background-color: var(--bg-page);
+            color: var(--text-primary);
             overflow-x: hidden;
+            transition: background-color 0.25s ease, color 0.25s ease;
         }
         .glass-panel {
-            background: rgba(11, 15, 25, 0.7);
+            background: var(--panel-bg);
             backdrop-filter: blur(16px);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--panel-border);
+            transition: background-color 0.25s ease, border-color 0.25s ease;
         }
         .ambient-glow {
             filter: blur(130px);
-            opacity: 0.12;
+            opacity: var(--glow-opacity);
             pointer-events: none;
             will-change: transform;
         }
@@ -76,25 +111,78 @@
         .chev { transition: transform 0.2s ease; }
         code, .inline-code {
             font-family: 'JetBrains Mono', monospace;
-            background: rgba(59,130,246,0.08);
-            border: 1px solid rgba(59,130,246,0.18);
+            background: var(--code-bg);
+            border: 1px solid var(--code-border);
             border-radius: 4px;
             padding: 0.1rem 0.4rem;
             font-size: 0.85em;
-            color: #93c5fd;
+            color: var(--code-text);
         }
         pre.code-block {
             font-family: 'JetBrains Mono', monospace;
-            background: #0a0e17;
-            border: 1px solid rgba(255,255,255,0.06);
+            background: var(--pre-bg);
+            border: 1px solid var(--pre-border);
             border-radius: 0.6rem;
             padding: 1rem 1.25rem;
             overflow-x: auto;
             font-size: 0.82rem;
             line-height: 1.6;
-            color: #cbd5e1;
+            color: var(--pre-text);
+            transition: background-color 0.25s ease, color 0.25s ease;
         }
         .anchor-offset { scroll-margin-top: 6rem; }
+
+        /* ---- Light-mode overrides for fixed Tailwind utility colors ---- */
+        html.light body { background-color: var(--bg-page); }
+        html.light .text-white { color: #10182b; }
+        html.light .text-gray-200 { color: #1f2937; }
+        html.light .text-gray-300 { color: #334155; }
+        html.light .text-gray-400 { color: #52606d; }
+        html.light .text-gray-500 { color: #6b7280; }
+        html.light .text-gray-600 { color: #9ca3af; }
+        html.light .border-gray-900 { border-color: rgba(15,23,42,0.08); }
+        html.light .border-gray-800 { border-color: rgba(15,23,42,0.12); }
+        html.light .border-gray-800\/60 { border-color: rgba(15,23,42,0.1); }
+        html.light .border-gray-700 { border-color: rgba(15,23,42,0.18); }
+        html.light .bg-gray-950\/40 { background-color: rgba(226,232,240,0.5); }
+        html.light .bg-gray-900\/60 { background-color: rgba(226,232,240,0.7); }
+        html.light .bg-gray-900\/60:hover,
+        html.light .hover\:bg-gray-800:hover { background-color: rgba(203,213,225,0.8); }
+        html.light .bg-gray-950\/40.border-t { border-color: rgba(15,23,42,0.08); }
+        html.light footer.bg-gray-950\/40 { background-color: var(--footer-bg); }
+        html.light nav a.text-gray-400 { color: var(--nav-link); }
+        html.light .bg-blue-950\/50 { background-color: rgba(219,234,254,0.8); }
+        html.light .border-blue-500\/20 { border-color: rgba(59,130,246,0.25); }
+        html.light .border-gray-800 { border-color: rgba(15,23,42,0.1); }
+        html.light .border-emerald-500\/20 { border-color: rgba(16,185,129,0.25); }
+        html.light .border-amber-500\/20 { border-color: rgba(245,158,11,0.3); }
+        html.light .bg-emerald-500\/5 { background-color: rgba(16,185,129,0.06); }
+        html.light .bg-amber-500\/5 { background-color: rgba(245,158,11,0.07); }
+        html.light .bg-emerald-500\/10 { background-color: rgba(16,185,129,0.08); }
+        html.light .from-emerald-600\/20 { --tw-gradient-from: rgba(5,150,105,0.12); }
+        html.light .to-teal-600\/10 { --tw-gradient-to: rgba(13,148,136,0.06); }
+        html.light table thead tr { border-color: rgba(15,23,42,0.1); }
+        html.light table tbody tr { border-color: rgba(15,23,42,0.06); }
+        html.light .bg-gray-900\/60.h-full { background-color: rgba(226,232,240,0.9); }
+
+        /* theme toggle button */
+        #theme-toggle {
+            width: 2.25rem;
+            height: 2.25rem;
+            border-radius: 9999px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--panel-border);
+            background: var(--panel-bg);
+            color: var(--text-primary);
+            transition: transform 0.15s ease, background-color 0.25s ease, border-color 0.25s ease;
+            cursor: pointer;
+        }
+        #theme-toggle:hover { transform: scale(1.06); }
+        #theme-toggle svg { width: 1.1rem; height: 1.1rem; }
+        html.light #icon-moon { display: none; }
+        html:not(.light) #icon-sun { display: none; }
     </style>
 </head>
 <body class="font-sans antialiased text-gray-200 min-h-screen flex flex-col justify-between">
@@ -117,14 +205,19 @@
             </div>
         </div>
         <div class="flex items-center gap-5">
+            <a href="#problem" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">The Problem</a>
             <a href="#how-it-works" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">How It Works</a>
             <a href="#features" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">Features</a>
             <a href="#setup" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">Setup</a>
-            <a href="business.html" class="text-sm font-medium text-gray-400 hover:text-white transition-colors">Business Model</a>
+            <a href="#business" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">Business Model</a>
             <a href="https://github.com/parth-satija/Midum" target="_blank" rel="noopener noreferrer" class="text-sm font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1.5">
                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.483 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.579.688.481C19.137 20.162 22 16.418 22 12c0-5.523-4.477-10-10-10z"/></svg>
                 <span>GitHub</span>
             </a>
+            <button id="theme-toggle" type="button" aria-label="Toggle light and dark mode">
+                <svg id="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path></svg>
+                <svg id="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"></path></svg>
+            </button>
         </div>
     </nav>
 
@@ -135,6 +228,15 @@
 
             <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-brand-accent/10 border border-brand-accent/20 text-xs text-brand-accent font-semibold mb-8">
                 Open-source · runs on your machine
+            </div>
+
+            <div class="relative mb-6 select-none">
+                <span class="absolute inset-0 flex items-center justify-center text-6xl sm:text-8xl font-extrabold tracking-tight bg-gradient-to-r from-brand-500 via-brand-accent to-teal-400 blur-2xl opacity-40" aria-hidden="true">
+                    Midum
+                </span>
+                <h2 class="relative text-6xl sm:text-8xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white via-brand-accent to-teal-300 drop-shadow-[0_0_35px_rgba(59,130,246,0.35)]">
+                    Midum
+                </h2>
             </div>
 
             <h1 class="text-4xl sm:text-6xl font-extrabold tracking-tight leading-tight text-white mb-6">
@@ -185,6 +287,34 @@
         </div>
     </div>
 
+    <!-- ============ THE PROBLEM ============ -->
+    <section id="problem" class="anchor-offset max-w-5xl mx-auto w-full px-6 py-16 border-t border-gray-900">
+        <div class="text-center mb-12">
+            <h2 class="text-3xl sm:text-4xl font-bold text-white mb-3">The Problem: AI is Trapped in the Browser</h2>
+            <p class="text-gray-400 max-w-2xl mx-auto">
+                Most AI assistants can talk about a task, but they can't actually do it on your machine.
+            </p>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
+            <div class="glass-panel rounded-xl p-6">
+                <div class="flex items-center gap-2.5 mb-3">
+                    <span class="text-red-400 text-xl">⚠️</span>
+                    <h3 class="text-white font-semibold text-lg">Chatbots Can't Act</h3>
+                </div>
+                <p class="text-sm text-gray-400 leading-relaxed">Traditional AI assistants are isolated web forms. They give instructions and generate text, but leave the heavy lifting of clicking, typing, file management, and workflow execution to human users.</p>
+                <p class="text-xs text-gray-500 mt-4">Result: High user fatigue &amp; manual overhead</p>
+            </div>
+            <div class="glass-panel rounded-xl p-6">
+                <div class="flex items-center gap-2.5 mb-3">
+                    <span class="text-red-400 text-xl">🔒</span>
+                    <h3 class="text-white font-semibold text-lg">Privacy &amp; Cloud Lock-in</h3>
+                </div>
+                <p class="text-sm text-gray-400 leading-relaxed">Most AI automation relies on sensitive desktop data being sent to proprietary cloud endpoints, raising security alarms for enterprises, businesses, and privacy-conscious users.</p>
+                <p class="text-xs text-gray-500 mt-4">Result: Enterprise adoption barriers</p>
+            </div>
+        </div>
+    </section>
+
     <!-- ============ HOW IT WORKS / LAYER DIAGRAM ============ -->
     <section id="how-it-works" class="anchor-offset max-w-5xl mx-auto w-full px-6 py-16 border-t border-gray-900">
         <div class="text-center mb-12">
@@ -203,43 +333,43 @@
                 </defs>
 
                 <!-- User -->
-                <rect x="30" y="170" width="170" height="120" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5"/>
-                <text x="115" y="222" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="20" font-weight="700">You</text>
-                <text x="115" y="246" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Types a goal in</text>
-                <text x="115" y="262" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">plain language</text>
+                <rect x="30" y="170" width="170" height="120" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5" class="diagram-box"/>
+                <text x="115" y="222" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="20" font-weight="700" class="diagram-title">You</text>
+                <text x="115" y="246" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Types a goal in</text>
+                <text x="115" y="262" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">plain language</text>
 
                 <!-- Midum (middle, spans more vertically to show it's the orchestration layer) -->
                 <rect x="290" y="90" width="220" height="300" rx="16" fill="rgba(59,130,246,0.08)" stroke="#3b82f6" stroke-width="2"/>
                 <text x="400" y="130" text-anchor="middle" fill="#60a5fa" font-family="Plus Jakarta Sans, sans-serif" font-size="22" font-weight="800">Midum</text>
                 <text x="400" y="152" text-anchor="middle" fill="#93c5fd" font-family="Plus Jakarta Sans, sans-serif" font-size="12">agent &amp; tool-calling loop</text>
 
-                <rect x="312" y="170" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b"/>
-                <text x="400" y="198" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12">Plans next step</text>
+                <rect x="312" y="170" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b" class="diagram-box"/>
+                <text x="400" y="198" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12" class="diagram-title">Plans next step</text>
 
-                <rect x="312" y="224" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b"/>
-                <text x="400" y="252" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12">Calls a tool</text>
+                <rect x="312" y="224" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b" class="diagram-box"/>
+                <text x="400" y="252" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12" class="diagram-title">Calls a tool</text>
 
-                <rect x="312" y="278" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b"/>
-                <text x="400" y="306" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12">Reads the result</text>
+                <rect x="312" y="278" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b" class="diagram-box"/>
+                <text x="400" y="306" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12" class="diagram-title">Reads the result</text>
 
-                <text x="400" y="358" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Repeats this loop until</text>
-                <text x="400" y="374" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">the goal is done</text>
+                <text x="400" y="358" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Repeats this loop until</text>
+                <text x="400" y="374" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">the goal is done</text>
 
                 <!-- Model -->
-                <rect x="600" y="60" width="270" height="130" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5"/>
-                <text x="735" y="100" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="18" font-weight="700">Model</text>
-                <text x="735" y="122" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Ollama · Gemini · OpenRouter</text>
-                <text x="735" y="140" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Groq · Ollama Cloud</text>
-                <text x="735" y="164" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11">Reasons about what to do next —</text>
-                <text x="735" y="178" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11">doesn't touch your machine directly</text>
+                <rect x="600" y="60" width="270" height="130" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5" class="diagram-box"/>
+                <text x="735" y="100" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="18" font-weight="700" class="diagram-title">Model</text>
+                <text x="735" y="122" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Ollama · Gemini · OpenRouter</text>
+                <text x="735" y="140" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Groq · Ollama Cloud</text>
+                <text x="735" y="164" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11" class="diagram-sub">Reasons about what to do next —</text>
+                <text x="735" y="178" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11" class="diagram-sub">doesn't touch your machine directly</text>
 
                 <!-- Computer -->
-                <rect x="600" y="260" width="270" height="130" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5"/>
-                <text x="735" y="300" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="18" font-weight="700">Your Computer</text>
-                <text x="735" y="322" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Desktop apps · Browser</text>
-                <text x="735" y="340" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Files · MCP servers</text>
-                <text x="735" y="364" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11">Where the actual clicks, typing,</text>
-                <text x="735" y="378" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11">and file edits happen</text>
+                <rect x="600" y="260" width="270" height="130" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5" class="diagram-box"/>
+                <text x="735" y="300" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="18" font-weight="700" class="diagram-title">Your Computer</text>
+                <text x="735" y="322" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Desktop apps · Browser</text>
+                <text x="735" y="340" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Files · MCP servers</text>
+                <text x="735" y="364" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11" class="diagram-sub">Where the actual clicks, typing,</text>
+                <text x="735" y="378" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11" class="diagram-sub">and file edits happen</text>
 
                 <!-- Arrows -->
                 <line x1="200" y1="230" x2="285" y2="230" stroke="#60a5fa" stroke-width="2" marker-end="url(#arrow)"/>
@@ -604,6 +734,162 @@ python main.py</pre>
         </div>
     </section>
 
+    <!-- ============ BUSINESS MODEL / MONETIZATION ============ -->
+    <section id="business" class="anchor-offset max-w-5xl mx-auto w-full px-6 py-16 border-t border-gray-900">
+        <div class="text-center mb-12">
+            <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-brand-accent/10 border border-brand-accent/20 text-xs text-brand-accent font-semibold mb-5">
+                Monetization &amp; Market Strategy
+            </div>
+            <h2 class="text-3xl sm:text-4xl font-bold text-white mb-3">The Business Architecture</h2>
+            <p class="text-gray-400 max-w-2xl mx-auto">
+                A hybrid freemium &amp; enterprise model designed for rapid developer adoption and high-margin recurring business revenue.
+            </p>
+        </div>
+
+        <!-- Two-tier structure -->
+        <div class="glass-panel rounded-xl p-6 sm:p-8 mb-8">
+            <div class="text-center mb-6">
+                <span class="inline-block px-5 py-2 rounded-lg bg-gradient-to-r from-brand-500 to-indigo-600 text-white text-sm font-semibold">Midum Agentic Runtime</span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+                <div class="rounded-lg border border-gray-800 p-5">
+                    <h4 class="text-brand-accent font-semibold mb-3 flex items-center gap-2">👤 Free Users <span class="text-xs text-gray-500 font-normal">&lt; ₹10L Revenue</span></h4>
+                    <ul class="text-sm text-gray-400 space-y-1.5 list-disc list-inside">
+                        <li>Personal users — free core runtime</li>
+                        <li>Small businesses — free core runtime</li>
+                    </ul>
+                </div>
+                <div class="rounded-lg border border-gray-800 p-5">
+                    <h4 class="text-emerald-400 font-semibold mb-3 flex items-center gap-2">🏛️ Paying Customers <span class="text-xs text-gray-500 font-normal">Commercial editions</span></h4>
+                    <ul class="text-sm text-gray-400 space-y-1.5 list-disc list-inside">
+                        <li>Enterprise accounts — commercial licensing</li>
+                        <li>Custom editions — tailored builds</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+                <div class="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-5">
+                    <h4 class="text-emerald-400 font-semibold mb-3">Enterprise Breakdown (10 Biz) — ₹6,40,000</h4>
+                    <ul class="text-sm text-gray-400 space-y-1.5">
+                        <li>10 businesses × 20 users: <strong class="text-gray-200">200 license seats</strong></li>
+                        <li>One-time onboarding fee: <strong class="text-gray-200">₹2,000 / user (₹4,00,000)</strong></li>
+                        <li>Annual SaaS subscription: <strong class="text-gray-200">₹2,000 / mo / biz (₹2,40,000)</strong></li>
+                    </ul>
+                </div>
+                <div class="rounded-lg border border-amber-500/20 bg-amber-500/5 p-5">
+                    <h4 class="text-amber-400 font-semibold mb-3">Custom Builds (20 Clients) — ₹1,00,000</h4>
+                    <ul class="text-sm text-gray-400 space-y-1.5">
+                        <li>Teacher / student / niche editions: <strong class="text-gray-200">20 deliveries</strong></li>
+                        <li>Average client cost: <strong class="text-gray-200">₹5,000 / build</strong></li>
+                        <li>Total custom revenue: <strong class="text-gray-200">₹1,00,000</strong></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="rounded-lg bg-gradient-to-r from-emerald-600/20 to-teal-600/10 border border-emerald-500/20 px-6 py-4 flex items-center justify-between">
+                <span class="text-emerald-400 font-semibold flex items-center gap-2">💰 Projected Year 1 Revenue</span>
+                <span class="text-white text-xl font-bold">₹7,40,000</span>
+            </div>
+            <p class="text-xs text-gray-500 italic text-center mt-4">* This is a projected financial estimate and not actual historical values.</p>
+        </div>
+
+        <!-- Financial targets -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-6 mb-10">
+            <div class="glass-panel rounded-xl p-8 flex flex-col items-center justify-center text-center bg-gradient-to-br from-emerald-500/10 to-transparent">
+                <span class="text-5xl font-extrabold text-emerald-400">₹7.4L</span>
+                <span class="text-gray-300 mt-2">Projected Year 1 Revenue</span>
+            </div>
+            <div class="glass-panel rounded-xl p-6">
+                <h4 class="text-brand-accent font-semibold mb-3">Scalable &amp; Capital Efficient</h4>
+                <p class="text-sm text-gray-400 mb-3">Because Midum leverages local execution and client-side hardware, server hosting overhead is virtually zero for core runtime operations.</p>
+                <ul class="text-sm text-gray-400 space-y-1.5 list-disc list-inside">
+                    <li><strong class="text-gray-200">86%+ enterprise contribution:</strong> high-margin SaaS subscriptions &amp; enterprise seat licenses</li>
+                    <li><strong class="text-gray-200">14% custom services:</strong> niche builds tailored for educators and specialist workflows</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Commercial tier matrix -->
+        <div class="glass-panel rounded-xl p-6 sm:p-8 overflow-x-auto mb-10">
+            <h3 class="text-white font-semibold text-lg mb-5">Commercial Tier Matrix</h3>
+            <table class="w-full text-sm min-w-[600px]">
+                <thead>
+                    <tr class="text-left text-brand-accent border-b border-gray-800">
+                        <th class="pb-3 pr-4 font-semibold">Segment</th>
+                        <th class="pb-3 pr-4 font-semibold">Target Audience</th>
+                        <th class="pb-3 pr-4 font-semibold">Pricing Model</th>
+                        <th class="pb-3 font-semibold">Year 1 Projected Yield</th>
+                    </tr>
+                </thead>
+                <tbody class="text-gray-400">
+                    <tr class="border-b border-gray-900">
+                        <td class="py-3 pr-4 text-gray-200 font-medium">Free Tier</td>
+                        <td class="py-3 pr-4">Personal users &amp; small businesses (&lt; ₹10L rev)</td>
+                        <td class="py-3 pr-4">₹0 (Community Edition)</td>
+                        <td class="py-3">Organic growth &amp; funnel creation</td>
+                    </tr>
+                    <tr class="border-b border-gray-900">
+                        <td class="py-3 pr-4 text-gray-200 font-medium">Enterprise Core</td>
+                        <td class="py-3 pr-4">10 companies (20 users each = 200 seats)</td>
+                        <td class="py-3 pr-4">₹2,000 / seat + ₹2,000 / mo per biz</td>
+                        <td class="py-3 text-white font-semibold">₹6,40,000</td>
+                    </tr>
+                    <tr>
+                        <td class="py-3 pr-4 text-gray-200 font-medium">Custom Builds</td>
+                        <td class="py-3 pr-4">Schools, teachers, specialized teams</td>
+                        <td class="py-3 pr-4">₹5,000 avg / build (20 builds)</td>
+                        <td class="py-3 text-white font-semibold">₹1,00,000</td>
+                    </tr>
+                </tbody>
+            </table>
+            <p class="text-xs text-gray-500 italic text-center mt-5">* This is a projected financial estimate and not actual historical values.</p>
+        </div>
+
+        <!-- Revenue composition bars -->
+        <div class="glass-panel rounded-xl p-6 sm:p-8">
+            <h3 class="text-white font-semibold text-lg mb-6">Revenue Stream Composition</h3>
+            <div class="space-y-4">
+                <div class="flex items-center gap-4">
+                    <span class="w-40 shrink-0 text-sm text-gray-300 font-medium">Enterprise One-Time</span>
+                    <div class="flex-1 h-8 rounded-md bg-gray-900/60 overflow-hidden">
+                        <div class="h-full rounded-md bg-gradient-to-r from-blue-500 to-brand-accent flex items-center justify-end pr-3 text-xs font-semibold text-white" style="width:54%">₹4,00,000 (54%)</div>
+                    </div>
+                </div>
+                <div class="flex items-center gap-4">
+                    <span class="w-40 shrink-0 text-sm text-gray-300 font-medium">Enterprise Recurring</span>
+                    <div class="flex-1 h-8 rounded-md bg-gray-900/60 overflow-hidden">
+                        <div class="h-full rounded-md bg-gradient-to-r from-emerald-500 to-teal-400 flex items-center justify-end pr-3 text-xs font-semibold text-white" style="width:32%">₹2,40,000 (32%)</div>
+                    </div>
+                </div>
+                <div class="flex items-center gap-4">
+                    <span class="w-40 shrink-0 text-sm text-gray-300 font-medium">Custom Editions</span>
+                    <div class="flex-1 h-8 rounded-md bg-gray-900/60 overflow-hidden">
+                        <div class="h-full rounded-md bg-gradient-to-r from-amber-500 to-amber-300 flex items-center justify-end pr-3 text-xs font-semibold text-white" style="width:14%">₹1,00,000 (14%)</div>
+                    </div>
+                </div>
+            </div>
+            <p class="text-sm text-gray-500 mt-6">Recurring enterprise subscriptions provide compounding cash flow, supplemented by upfront license sales and custom build services.</p>
+        </div>
+
+        <div class="text-center mt-10">
+            <a href="business.html" class="inline-flex items-center gap-2 text-sm font-medium text-brand-accent hover:text-white transition-colors">
+                View the full business model →
+            </a>
+        </div>
+    </section>
+
+    <!-- ============ CTA ============ -->
+    <section class="anchor-offset max-w-4xl mx-auto w-full px-6 py-20 border-t border-gray-900 text-center">
+        <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-brand-accent/10 border border-brand-accent/20 text-xs text-brand-accent font-semibold mb-6">
+            Join the evolution
+        </div>
+        <h2 class="text-4xl sm:text-5xl font-extrabold text-white mb-4">Invest in Midum</h2>
+        <p class="text-gray-400 text-lg mb-8">The future of AI is local, actionable, and autonomous.</p>
+        <div class="inline-flex items-center gap-2 px-6 py-3 rounded-full glass-panel text-brand-accent font-mono text-sm">
+            <span>&gt;_</span>
+            <span>midum.ai | Autonomous AI Desktop Runtime</span>
+        </div>
+    </section>
+
     </main>
 
     <!-- Footer -->
@@ -621,6 +907,43 @@ python main.py</pre>
             </div>
         </div>
     </footer>
+
+    <!-- Theme + diagram color handling -->
+    <script>
+        (function () {
+            const root = document.documentElement;
+            const toggle = document.getElementById('theme-toggle');
+
+            function applyDiagramTheme(isLight) {
+                document.querySelectorAll('.diagram-box').forEach(el => {
+                    el.setAttribute('fill', isLight ? '#f8fafc' : '#0b0f19');
+                    el.setAttribute('stroke', isLight ? '#cbd5e1' : '#334155');
+                });
+                document.querySelectorAll('.diagram-title').forEach(el => {
+                    el.setAttribute('fill', isLight ? '#0f172a' : '#f3f4f6');
+                });
+                document.querySelectorAll('.diagram-sub').forEach(el => {
+                    el.setAttribute('fill', isLight ? '#64748b' : '#9ca3af');
+                });
+            }
+
+            function setTheme(mode) {
+                const isLight = mode === 'light';
+                root.classList.toggle('light', isLight);
+                localStorage.setItem('midum-theme', mode);
+                applyDiagramTheme(isLight);
+            }
+
+            const stored = localStorage.getItem('midum-theme');
+            const prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+            setTheme(stored || (prefersLight ? 'light' : 'dark'));
+
+            toggle.addEventListener('click', () => {
+                const isCurrentlyLight = root.classList.contains('light');
+                setTheme(isCurrentlyLight ? 'dark' : 'light');
+            });
+        })();
+    </script>
 
     <!-- Dynamic Version Downloader Script -->
     <script>
