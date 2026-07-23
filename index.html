@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
 <head>
     <!-- Google tag (gtag.js) -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-QXP92KSRTE"></script>
@@ -20,6 +20,7 @@
 
     <script>
         tailwind.config = {
+            darkMode: 'class',
             theme: {
                 extend: {
                     fontFamily: {
@@ -54,19 +55,53 @@
         }
     </script>
     <style>
+        :root {
+            --bg-page: #05070c;
+            --text-primary: #f3f4f6;
+            --panel-bg: rgba(11, 15, 25, 0.7);
+            --panel-border: rgba(255, 255, 255, 0.05);
+            --glow-opacity: 0.12;
+            --code-bg: rgba(59,130,246,0.08);
+            --code-border: rgba(59,130,246,0.18);
+            --code-text: #93c5fd;
+            --pre-bg: #0a0e17;
+            --pre-border: rgba(255,255,255,0.06);
+            --pre-text: #cbd5e1;
+            --nav-link: #9ca3af;
+            --footer-bg: rgba(3, 7, 18, 0.4);
+        }
+
+        html.light {
+            --bg-page: #f7f9fc;
+            --text-primary: #10182b;
+            --panel-bg: rgba(255, 255, 255, 0.85);
+            --panel-border: rgba(15, 23, 42, 0.08);
+            --glow-opacity: 0.08;
+            --code-bg: rgba(29, 78, 216, 0.06);
+            --code-border: rgba(29, 78, 216, 0.18);
+            --code-text: #1d4ed8;
+            --pre-bg: #eef2f9;
+            --pre-border: rgba(15, 23, 42, 0.08);
+            --pre-text: #1f2937;
+            --nav-link: #4b5563;
+            --footer-bg: rgba(241, 245, 249, 0.6);
+        }
+
         body {
-            background-color: #05070c;
-            color: #f3f4f6;
+            background-color: var(--bg-page);
+            color: var(--text-primary);
             overflow-x: hidden;
+            transition: background-color 0.25s ease, color 0.25s ease;
         }
         .glass-panel {
-            background: rgba(11, 15, 25, 0.7);
+            background: var(--panel-bg);
             backdrop-filter: blur(16px);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--panel-border);
+            transition: background-color 0.25s ease, border-color 0.25s ease;
         }
         .ambient-glow {
             filter: blur(130px);
-            opacity: 0.12;
+            opacity: var(--glow-opacity);
             pointer-events: none;
             will-change: transform;
         }
@@ -76,25 +111,67 @@
         .chev { transition: transform 0.2s ease; }
         code, .inline-code {
             font-family: 'JetBrains Mono', monospace;
-            background: rgba(59,130,246,0.08);
-            border: 1px solid rgba(59,130,246,0.18);
+            background: var(--code-bg);
+            border: 1px solid var(--code-border);
             border-radius: 4px;
             padding: 0.1rem 0.4rem;
             font-size: 0.85em;
-            color: #93c5fd;
+            color: var(--code-text);
         }
         pre.code-block {
             font-family: 'JetBrains Mono', monospace;
-            background: #0a0e17;
-            border: 1px solid rgba(255,255,255,0.06);
+            background: var(--pre-bg);
+            border: 1px solid var(--pre-border);
             border-radius: 0.6rem;
             padding: 1rem 1.25rem;
             overflow-x: auto;
             font-size: 0.82rem;
             line-height: 1.6;
-            color: #cbd5e1;
+            color: var(--pre-text);
+            transition: background-color 0.25s ease, color 0.25s ease;
         }
         .anchor-offset { scroll-margin-top: 6rem; }
+
+        /* ---- Light-mode overrides for fixed Tailwind utility colors ---- */
+        html.light body { background-color: var(--bg-page); }
+        html.light .text-white { color: #10182b; }
+        html.light .text-gray-200 { color: #1f2937; }
+        html.light .text-gray-300 { color: #334155; }
+        html.light .text-gray-400 { color: #52606d; }
+        html.light .text-gray-500 { color: #6b7280; }
+        html.light .text-gray-600 { color: #9ca3af; }
+        html.light .border-gray-900 { border-color: rgba(15,23,42,0.08); }
+        html.light .border-gray-800 { border-color: rgba(15,23,42,0.12); }
+        html.light .border-gray-800\/60 { border-color: rgba(15,23,42,0.1); }
+        html.light .border-gray-700 { border-color: rgba(15,23,42,0.18); }
+        html.light .bg-gray-950\/40 { background-color: rgba(226,232,240,0.5); }
+        html.light .bg-gray-900\/60 { background-color: rgba(226,232,240,0.7); }
+        html.light .bg-gray-900\/60:hover,
+        html.light .hover\:bg-gray-800:hover { background-color: rgba(203,213,225,0.8); }
+        html.light .bg-gray-950\/40.border-t { border-color: rgba(15,23,42,0.08); }
+        html.light footer.bg-gray-950\/40 { background-color: var(--footer-bg); }
+        html.light nav a.text-gray-400 { color: var(--nav-link); }
+        html.light .bg-blue-950\/50 { background-color: rgba(219,234,254,0.8); }
+        html.light .border-blue-500\/20 { border-color: rgba(59,130,246,0.25); }
+
+        /* theme toggle button */
+        #theme-toggle {
+            width: 2.25rem;
+            height: 2.25rem;
+            border-radius: 9999px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--panel-border);
+            background: var(--panel-bg);
+            color: var(--text-primary);
+            transition: transform 0.15s ease, background-color 0.25s ease, border-color 0.25s ease;
+            cursor: pointer;
+        }
+        #theme-toggle:hover { transform: scale(1.06); }
+        #theme-toggle svg { width: 1.1rem; height: 1.1rem; }
+        html.light #icon-moon { display: none; }
+        html:not(.light) #icon-sun { display: none; }
     </style>
 </head>
 <body class="font-sans antialiased text-gray-200 min-h-screen flex flex-col justify-between">
@@ -125,6 +202,10 @@
                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.483 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.579.688.481C19.137 20.162 22 16.418 22 12c0-5.523-4.477-10-10-10z"/></svg>
                 <span>GitHub</span>
             </a>
+            <button id="theme-toggle" type="button" aria-label="Toggle light and dark mode">
+                <svg id="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path></svg>
+                <svg id="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"></path></svg>
+            </button>
         </div>
     </nav>
 
@@ -212,43 +293,43 @@
                 </defs>
 
                 <!-- User -->
-                <rect x="30" y="170" width="170" height="120" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5"/>
-                <text x="115" y="222" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="20" font-weight="700">You</text>
-                <text x="115" y="246" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Types a goal in</text>
-                <text x="115" y="262" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">plain language</text>
+                <rect x="30" y="170" width="170" height="120" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5" class="diagram-box"/>
+                <text x="115" y="222" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="20" font-weight="700" class="diagram-title">You</text>
+                <text x="115" y="246" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Types a goal in</text>
+                <text x="115" y="262" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">plain language</text>
 
                 <!-- Midum (middle, spans more vertically to show it's the orchestration layer) -->
                 <rect x="290" y="90" width="220" height="300" rx="16" fill="rgba(59,130,246,0.08)" stroke="#3b82f6" stroke-width="2"/>
                 <text x="400" y="130" text-anchor="middle" fill="#60a5fa" font-family="Plus Jakarta Sans, sans-serif" font-size="22" font-weight="800">Midum</text>
                 <text x="400" y="152" text-anchor="middle" fill="#93c5fd" font-family="Plus Jakarta Sans, sans-serif" font-size="12">agent &amp; tool-calling loop</text>
 
-                <rect x="312" y="170" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b"/>
-                <text x="400" y="198" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12">Plans next step</text>
+                <rect x="312" y="170" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b" class="diagram-box"/>
+                <text x="400" y="198" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12" class="diagram-title">Plans next step</text>
 
-                <rect x="312" y="224" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b"/>
-                <text x="400" y="252" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12">Calls a tool</text>
+                <rect x="312" y="224" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b" class="diagram-box"/>
+                <text x="400" y="252" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12" class="diagram-title">Calls a tool</text>
 
-                <rect x="312" y="278" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b"/>
-                <text x="400" y="306" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12">Reads the result</text>
+                <rect x="312" y="278" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b" class="diagram-box"/>
+                <text x="400" y="306" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12" class="diagram-title">Reads the result</text>
 
-                <text x="400" y="358" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Repeats this loop until</text>
-                <text x="400" y="374" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">the goal is done</text>
+                <text x="400" y="358" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Repeats this loop until</text>
+                <text x="400" y="374" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">the goal is done</text>
 
                 <!-- Model -->
-                <rect x="600" y="60" width="270" height="130" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5"/>
-                <text x="735" y="100" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="18" font-weight="700">Model</text>
-                <text x="735" y="122" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Ollama · Gemini · OpenRouter</text>
-                <text x="735" y="140" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Groq · Ollama Cloud</text>
-                <text x="735" y="164" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11">Reasons about what to do next —</text>
-                <text x="735" y="178" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11">doesn't touch your machine directly</text>
+                <rect x="600" y="60" width="270" height="130" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5" class="diagram-box"/>
+                <text x="735" y="100" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="18" font-weight="700" class="diagram-title">Model</text>
+                <text x="735" y="122" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Ollama · Gemini · OpenRouter</text>
+                <text x="735" y="140" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Groq · Ollama Cloud</text>
+                <text x="735" y="164" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11" class="diagram-sub">Reasons about what to do next —</text>
+                <text x="735" y="178" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11" class="diagram-sub">doesn't touch your machine directly</text>
 
                 <!-- Computer -->
-                <rect x="600" y="260" width="270" height="130" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5"/>
-                <text x="735" y="300" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="18" font-weight="700">Your Computer</text>
-                <text x="735" y="322" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Desktop apps · Browser</text>
-                <text x="735" y="340" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12">Files · MCP servers</text>
-                <text x="735" y="364" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11">Where the actual clicks, typing,</text>
-                <text x="735" y="378" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11">and file edits happen</text>
+                <rect x="600" y="260" width="270" height="130" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5" class="diagram-box"/>
+                <text x="735" y="300" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="18" font-weight="700" class="diagram-title">Your Computer</text>
+                <text x="735" y="322" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Desktop apps · Browser</text>
+                <text x="735" y="340" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Files · MCP servers</text>
+                <text x="735" y="364" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11" class="diagram-sub">Where the actual clicks, typing,</text>
+                <text x="735" y="378" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11" class="diagram-sub">and file edits happen</text>
 
                 <!-- Arrows -->
                 <line x1="200" y1="230" x2="285" y2="230" stroke="#60a5fa" stroke-width="2" marker-end="url(#arrow)"/>
@@ -630,6 +711,43 @@ python main.py</pre>
             </div>
         </div>
     </footer>
+
+    <!-- Theme + diagram color handling -->
+    <script>
+        (function () {
+            const root = document.documentElement;
+            const toggle = document.getElementById('theme-toggle');
+
+            function applyDiagramTheme(isLight) {
+                document.querySelectorAll('.diagram-box').forEach(el => {
+                    el.setAttribute('fill', isLight ? '#f8fafc' : '#0b0f19');
+                    el.setAttribute('stroke', isLight ? '#cbd5e1' : '#334155');
+                });
+                document.querySelectorAll('.diagram-title').forEach(el => {
+                    el.setAttribute('fill', isLight ? '#0f172a' : '#f3f4f6');
+                });
+                document.querySelectorAll('.diagram-sub').forEach(el => {
+                    el.setAttribute('fill', isLight ? '#64748b' : '#9ca3af');
+                });
+            }
+
+            function setTheme(mode) {
+                const isLight = mode === 'light';
+                root.classList.toggle('light', isLight);
+                localStorage.setItem('midum-theme', mode);
+                applyDiagramTheme(isLight);
+            }
+
+            const stored = localStorage.getItem('midum-theme');
+            const prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+            setTheme(stored || (prefersLight ? 'light' : 'dark'));
+
+            toggle.addEventListener('click', () => {
+                const isCurrentlyLight = root.classList.contains('light');
+                setTheme(isCurrentlyLight ? 'dark' : 'light');
+            });
+        })();
+    </script>
 
     <!-- Dynamic Version Downloader Script -->
     <script>
