@@ -152,6 +152,8 @@
         html.light footer.bg-gray-950\/40 { background-color: var(--footer-bg); }
         html.light nav a.text-gray-400 { color: var(--nav-link); }
         html.light .bg-blue-950\/50 { background-color: rgba(219,234,254,0.8); }
+        html.light .bg-brand-accent\/5 { background-color: rgba(59,130,246,0.06); }
+        html.light .border-brand-accent\/25 { border-color: rgba(59,130,246,0.3); }
         html.light .border-blue-500\/20 { border-color: rgba(59,130,246,0.25); }
         html.light .border-gray-800 { border-color: rgba(15,23,42,0.1); }
         html.light .border-emerald-500\/20 { border-color: rgba(16,185,129,0.25); }
@@ -209,6 +211,7 @@
             <a href="#how-it-works" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">How It Works</a>
             <a href="#features" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">Features</a>
             <a href="#setup" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">Setup</a>
+            <a href="#why-midum" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">Why Midum</a>
             <a href="#business" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">Business Model</a>
             <a href="https://github.com/parth-satija/Midum" target="_blank" rel="noopener noreferrer" class="text-sm font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1.5">
                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.483 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.579.688.481C19.137 20.162 22 16.418 22 12c0-5.523-4.477-10-10-10z"/></svg>
@@ -631,11 +634,42 @@
         </div>
     </section>
 
+    <!-- ============ WHY NOT JUST CHATGPT/GEMINI ============ -->
+    <section id="why-midum" class="anchor-offset max-w-4xl mx-auto w-full px-6 py-16 border-t border-gray-900">
+        <div class="text-center mb-12">
+            <h2 class="text-3xl sm:text-4xl font-bold text-white mb-3">Why not just use ChatGPT or Gemini?</h2>
+            <p class="text-2xl sm:text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-brand-accent via-indigo-400 to-teal-400 mt-4">
+                You can. Through Midum.
+            </p>
+        </div>
+
+        <div class="glass-panel rounded-xl p-6 sm:p-8">
+            <p class="text-base text-gray-300 leading-relaxed mb-6">
+                ChatGPT, Gemini, and every other frontier chatbot are just <strong class="text-white">models</strong> — extremely capable reasoning engines that live behind a chat window. They're brilliant at thinking, but on their own they have no hands: no way to click a button, edit a file, or drive your browser. Midum isn't a competitor to these models — it's the missing execution layer that lets you keep using them exactly as you already do, while giving them a body to act with.
+            </p>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-6 mb-6">
+                <div class="rounded-lg border border-gray-800 p-5">
+                    <h4 class="text-white font-semibold mb-2 flex items-center gap-2">🧠 The Model</h4>
+                    <p class="text-sm text-gray-400">ChatGPT, Gemini, or any other provider — unchanged reasoning, unchanged intelligence, unchanged quality of thought.</p>
+                </div>
+                <div class="rounded-lg border border-brand-accent/25 bg-brand-accent/5 p-5">
+                    <h4 class="text-brand-accent font-semibold mb-2 flex items-center gap-2">⚙️ Midum</h4>
+                    <p class="text-sm text-gray-400">The agentic runtime wrapped around that same model — giving it hands: UI automation, browser control, file access, memory, flows, and MCP tools.</p>
+                </div>
+            </div>
+            <p class="text-base text-gray-300 leading-relaxed">
+                Plug Gemini into Midum and Midum simply expands what Gemini can <em>do</em> by orders of magnitude — it doesn't touch how Gemini <em>thinks</em>. There's no loss of reasoning ability, no dumbed-down responses, no trade-off. You get the exact same model you already trust, now able to act on your computer instead of only talking about it.
+            </p>
+        </div>
+    </section>
+
     <!-- ============ SETUP ============ -->
     <section id="setup" class="anchor-offset max-w-4xl mx-auto w-full px-6 py-16 border-t border-gray-900">
-        <div class="text-center mb-12">
-            <h2 class="text-3xl sm:text-4xl font-bold text-white mb-3">Setup Instructions</h2>
-        </div>
+        <details class="group">
+        <summary class="flex items-center justify-center gap-3 mb-12 cursor-pointer select-none list-none">
+            <h2 class="text-3xl sm:text-4xl font-bold text-white text-center">Setup Instructions</h2>
+            <span class="chev text-brand-accent text-2xl group-open:rotate-90 transition-transform">›</span>
+        </summary>
 
         <div class="space-y-6">
             <div class="glass-panel rounded-xl p-6">
@@ -732,6 +766,7 @@ python main.py</pre>
                 <li><span class="inline-code">llama-3.3-70b-versatile</span> (Groq)</li>
             </ul>
         </div>
+        </details>
     </section>
 
     <!-- ============ BUSINESS MODEL / MONETIZATION ============ -->
