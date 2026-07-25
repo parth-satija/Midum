@@ -1903,16 +1903,39 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     "screenshot":           "fallback_view_screen",
                 }
 
+                # ── Check for a connected-MCP-server match FIRST ────────────────
+                # Must run before the native-only alias/fuzzy resolver below.
+                # difflib fuzzy-matching against _KNOWN_TOOLS has no idea MCP
+                # tools exist, so a real connected MCP tool name (e.g.
+                # 'read_text_file') can score high similarity against an
+                # unrelated native tool (e.g. 'read_local_file') on shared
+                # substrings and get misreported as nonexistent with the wrong
+                # tool suggested. Checking MCP first means a real, unambiguous
+                # MCP tool always wins over a coincidental native string match.
+                _pre_mcp_matches = _mcp_find_tool_matches(func_name)
+
                 normalised = func_name.lower().replace("-", "_")
                 resolved   = _TOOL_ALIASES.get(normalised)
 
-                if not resolved:
+                if not resolved and not _pre_mcp_matches:
                     # Fuzzy: find the real tool name with the most character overlap
                     from difflib import get_close_matches
                     close = get_close_matches(normalised, _KNOWN_TOOLS, n=1, cutoff=0.6)
                     resolved = close[0] if close else None
 
-                if resolved and resolved in _KNOWN_TOOLS:
+                if _pre_mcp_matches and not resolved:
+                    if len(_pre_mcp_matches) == 1:
+                        _mcp_server, _mcp_tool = _pre_mcp_matches[0]
+                        print(f"   [MCP resolver] '{func_name}' -> call_mcp_tool(server='{_mcp_server}', tool_name='{_mcp_tool}')")
+                        tool_output = call_mcp_tool(_mcp_server, _mcp_tool, arguments)
+                    else:
+                        options = "; ".join(f"server='{s}' tool_name='{t}'" for s, t in _pre_mcp_matches)
+                        tool_output = (
+                            f"[AMBIGUOUS MCP TOOL] '{func_name}' matches a tool on more than "
+                            f"one connected server: {options}. Call call_mcp_tool with the "
+                            f"specific server you meant."
+                        )
+                elif resolved and resolved in _KNOWN_TOOLS:
                     if resolved == func_name or resolved == normalised:
                         # Resolved to itself — tool exists but has no dispatch case
                         tool_output = (

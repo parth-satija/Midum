@@ -1,6 +1,7 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
 from midum_mcp.manager import _MCPManager, _mcp_normalize_name, _mcp_resolve_name, get_promoted_tools
 from midum_mcp.manager import _MCP_SERVERS as _MANAGER_MCP_SERVERS
+from midum_mcp.manager import _MCP_SERVER_ORDER as _MANAGER_MCP_SERVER_ORDER
 from tools_schema import tools
 from permissions import get_permission, mcp_permission_key
 import json
@@ -36,9 +37,18 @@ import json
 # INSTALL:
 #   pip install mcp
 #
-_MCP_SERVER_ORDER: list = []     # server names, in the order they were connected (gives indices)
-_MCP_SERVERS: dict      = {}     # name -> _MCPServerHandle
-
+# NOTE: server state (_MCP_SERVER_ORDER / _MCP_SERVERS) intentionally lives
+# ONLY in midum_mcp.manager (imported above as _MANAGER_MCP_SERVER_ORDER /
+# _MANAGER_MCP_SERVERS). This module used to declare its OWN empty
+# duplicates of these names, which silently shadowed the real ones and
+# made _mcp_find_tool_matches() below always see zero connected servers --
+# meaning autoroute could NEVER match a promoted (or unpromoted) MCP tool
+# called by its bare name, no matter what was actually connected. That bug
+# caused calls like read_text_file (Filesystem MCP) to fall through to the
+# native-tools-only fuzzy resolver in orchestration.py, which then wrongly
+# reported the tool as nonexistent and suggested an unrelated native tool
+# (e.g. read_local_file) purely on string-similarity grounds. Do not
+# reintroduce local _MCP_SERVER_ORDER / _MCP_SERVERS globals here.
 
 _mcp_manager = _MCPManager()
 
@@ -57,8 +67,8 @@ def _mcp_find_tool_matches(name: str) -> list:
     if not target:
         return []
     matches = []
-    for server_name in _MCP_SERVER_ORDER:
-        handle = _MCP_SERVERS.get(server_name)
+    for server_name in _MANAGER_MCP_SERVER_ORDER:
+        handle = _MANAGER_MCP_SERVERS.get(server_name)
         if not handle or not handle.connected:
             continue
         for t in handle.tools:

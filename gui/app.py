@@ -466,8 +466,8 @@ class Api:
     # ── Persisted GUI settings (default model + theme colors) ────────────
     _SETTINGS_FILENAME = "gui_settings.json"
     _DEFAULT_COLORS = {
-        "accent": "#f97316", "accent2": "#7c3aed",
-        "bg": "#02010a", "panel": "#0a0916", "text": "#e2e8f0",
+        "accent": "#60a5fa", "accent2": "#1d4ed8",
+        "bg": "#05070c", "panel": "#0b0f19", "text": "#f3f4f6",
     }
     _DEFAULT_THEME = "dark"
     _DEFAULT_BG_IMAGE = {
@@ -1564,13 +1564,13 @@ _HTML = r"""<!DOCTYPE html>
 <title>Midum Control Center</title>
 <style>
 :root{
-  --bg:#02010a; --panel:#0a0916; --surface:#100f1f; --surface2:#171629;
-  --border:#1c1a30; --border2:#2b2847;
-  --accent:#f97316; --accent-dim:#c2410c; --accent-faint:#3a1f0f;
-  --accent2:#7c3aed; --green:#10b981; --red:#ef4444; --yellow:#f59e0b;
-  --text:#e2e8f0; --subtext:#64748b; --muted:#38364f;
-  --user-msg:#2a1f12; --midum-msg:#0f1120;
-  --tool-bg:#040309; --tool-text:#fbbf24;
+  --bg:#05070c; --panel:#0b0f19; --surface:#0d1220; --surface2:#121a2c;
+  --border:#141a26; --border2:#1f2937;
+  --accent:#60a5fa; --accent-dim:#3b82f6; --accent-faint:#0f1e33;
+  --accent2:#1d4ed8; --green:#10b981; --red:#ef4444; --yellow:#f59e0b;
+  --text:#f3f4f6; --subtext:#9ca3af; --muted:#4b5563;
+  --user-msg:#0f1e33; --midum-msg:#0a0e17;
+  --tool-bg:#05070c; --tool-text:#93c5fd;
   --gap:14px; --radius:24px; --ease:cubic-bezier(.65,0,.35,1);
 }
 *{box-sizing:border-box;}
@@ -3058,8 +3058,11 @@ function buildSidebar(){
   };
   document.getElementById("settings-save").onclick = saveSettingsPanel;
   document.getElementById("settings-reset").onclick = ()=>{
-    applyColors(DEFAULT_COLORS);
-    Object.entries(DEFAULT_COLORS).forEach(([k,v])=>{
+    // Reset to the ACTIVE theme's defaults (not always Dark), so resetting
+    // while in Light mode gives back Light's real colors.
+    const defaults = THEME_VARS[_activeTheme] || DEFAULT_COLORS;
+    applyColors(defaults);
+    Object.entries(defaults).forEach(([k,v])=>{
       const el = document.getElementById(`settings-color-${k}`);
       if (el) el.value = v;
     });
@@ -3102,28 +3105,29 @@ function buildSidebar(){
   });
 }
 
-const DEFAULT_COLORS = {accent:"#f97316", accent2:"#7c3aed", bg:"#02010a", panel:"#0a0916", text:"#e2e8f0"};
+const DEFAULT_COLORS = {accent:"#60a5fa", accent2:"#1d4ed8", bg:"#05070c", panel:"#0b0f19", text:"#f3f4f6"};
 
-// Full palette per theme — covers every CSS var, not just the 5
+// Full palette per theme — mirrors the website's (index.html) light/dark
+// color scheme exactly, and covers every CSS var, not just the 5
 // user-editable swatches, so Light mode actually looks light (panes,
 // borders, bubbles, tool console, etc.) rather than just re-tinting a
 // couple of accent colors on a black background.
 const THEME_VARS = {
   dark: {
-    bg:"#02010a", panel:"#0a0916", surface:"#100f1f", surface2:"#171629",
-    border:"#1c1a30", border2:"#2b2847",
-    accent:"#f97316", "accent-dim":"#c2410c", "accent-faint":"#3a1f0f", accent2:"#7c3aed",
-    text:"#e2e8f0", subtext:"#64748b", muted:"#38364f",
-    "user-msg":"#2a1f12", "midum-msg":"#0f1120",
-    "tool-bg":"#040309", "tool-text":"#fbbf24",
+    bg:"#05070c", panel:"#0b0f19", surface:"#0d1220", surface2:"#121a2c",
+    border:"#141a26", border2:"#1f2937",
+    accent:"#60a5fa", "accent-dim":"#3b82f6", "accent-faint":"#0f1e33", accent2:"#1d4ed8",
+    text:"#f3f4f6", subtext:"#9ca3af", muted:"#4b5563",
+    "user-msg":"#0f1e33", "midum-msg":"#0a0e17",
+    "tool-bg":"#05070c", "tool-text":"#93c5fd",
   },
   light: {
-    bg:"#f4f3fb", panel:"#ffffff", surface:"#f0eef9", surface2:"#e6e3f5",
-    border:"#ddd9ee", border2:"#cfc9e6",
-    accent:"#f97316", "accent-dim":"#c2410c", "accent-faint":"#ffe4cc", accent2:"#7c3aed",
-    text:"#1c1a2e", subtext:"#5b5876", muted:"#b8b3d6",
-    "user-msg":"#ffe4cc", "midum-msg":"#f0eef9",
-    "tool-bg":"#1c1a2e", "tool-text":"#f59e0b",
+    bg:"#f7f9fc", panel:"#ffffff", surface:"#eef2f9", surface2:"#e2e8f0",
+    border:"#e4e7ec", border2:"#d7dbe3",
+    accent:"#1d4ed8", "accent-dim":"#1e40af", "accent-faint":"#dbeafe", accent2:"#3730a3",
+    text:"#10182b", subtext:"#4b5563", muted:"#94a3b8",
+    "user-msg":"#dbeafe", "midum-msg":"#eef2f9",
+    "tool-bg":"#eef2f9", "tool-text":"#1d4ed8",
   },
 };
 
@@ -3138,6 +3142,13 @@ function applyTheme(name){
     b.classList.toggle("active", b.dataset.theme === name);
     b.style.background = b.dataset.theme === name ? "var(--accent)" : "transparent";
     b.style.color = b.dataset.theme === name ? "#fff" : "var(--text)";
+  });
+  // Keep the custom color-picker swatches in the settings panel in sync
+  // with whichever theme is now active, so switching to Light mode shows
+  // that theme's real colors instead of stale values left over from Dark.
+  ["accent","accent2","bg","panel","text"].forEach(k=>{
+    const el = document.getElementById(`settings-color-${k}`);
+    if (el && vars[k]) el.value = vars[k];
   });
 }
 
@@ -4611,7 +4622,7 @@ def main():
         width=1600,
         height=950,
         min_size=(1200, 750),
-        background_color="#02010a",
+        background_color="#05070c",
     )
     api.window = window
     window.events.closing += api._on_closing
