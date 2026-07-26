@@ -165,7 +165,7 @@ Open the file and fill in only the key(s) your chosen `MODEL_PROVIDER` (and any 
 
 This same file is also created automatically the first time you run `main.py` or `gui.py` if it doesn't exist yet (see Step 6 below), so this step is optional — but running it explicitly here lets you fill in your keys *before* first launch instead of stopping mid-startup to go find the file.
 
-### Optional Step — OCR
+### Optional Step — OCR (Very Highly Recommended)
 Download and install Tesseract, as it enables OCR-based screen reading and clicking. Midum is completely functional without OCR — it's only used as a fallback for UI interaction.
 
 ### Step 6 — Launch Midum
