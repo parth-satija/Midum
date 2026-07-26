@@ -1,0 +1,541 @@
+# =============================================================================
+# VOICE OVERLAY -- a tiny ambient "heads-up" indicator for push-to-talk
+# =============================================================================
+# A second, tiny pywebview window (NOT the main Midum window): a small
+# rounded-corner square that sits near a corner of the primary monitor
+# (inset from the true corner, not flush against it) whenever push-to-talk
+# is active, and fades away again once the turn is fully finished. It shows
+# NO TEXT at all -- just one of three emoji plus a soft ambient glow around
+# the square's perimeter:
+#
+#   listening     -> mic pulsing,     green glow   (mic held, streaming audio)
+#   tool_calling  -> gear rotating,   blue glow    (a tool call is executing)
+#   responding    -> speaker pulsing, orange glow  (assistant reply streaming)
+#
+# Deliberately NOT a normal window: no taskbar entry, no alt-tab entry,
+# always-on-top, and it never takes keyboard focus away from whatever app
+# you're actually dictating into (a browser, an editor, a game, anything)
+# -- pressing PTT should never yank focus off what you were doing.
+#
+# Because Midum's main window is launched with webview.start(gui="qt")
+# (see gui/app.py:main()), this overlay window is *also* a Qt window under
+# the hood, which is what makes true no-focus-steal possible: after
+# pywebview creates it we reach into the live QWidget and set
+# Qt.WindowDoesNotAcceptFocus + Qt.Tool (hides it from the taskbar/alt-tab)
+# on top of the frameless/always-on-top flags pywebview already applied.
+# This is Qt-backend-specific by necessity -- there's no cross-backend way
+# to express "visible, on top, but never focusable" through pywebview's own
+# API surface.
+#
+# Persisted setting: storage/voice_overlay_settings.json ({"enabled": bool}),
+# toggled from the Voice tab. When disabled, no window is ever created and
+# every VoiceOverlay method below becomes a silent no-op.
+# =============================================================================
+
+import json
+import os
+import threading
+
+import webview
+
+
+def _make_dispatcher():
+    """Builds a tiny QObject that lives on whichever thread constructs it,
+    with a signal wired up via Qt.QueuedConnection. Qt's queued-connection
+    delivery always runs the connected slot on the *receiving object's own
+    thread* -- not the emitting thread -- regardless of what's running (or
+    not running) on the emitter's side. That's the key property needed
+    here: PTT press/release fires on pynput's own listener thread (see
+    hotkeys.py), which never runs a Qt event loop of its own, so a plain
+    QTimer.singleShot(0, fn) posted from that thread has nowhere to fire --
+    it just silently never executes (no crash, no overlay either, which is
+    exactly what happened). A queued signal/slot doesn't have that problem
+    because delivery is scheduled on the *receiver's* thread's event loop,
+    which -- as long as this dispatcher is constructed on the main thread,
+    same as VoiceOverlay itself (see get_overlay(), first called from
+    Api.__init__ before webview.start() spins up the Qt event loop there)
+    -- is the real GUI thread."""
+    try:
+        from PySide6.QtCore import QObject, Signal, Qt
+    except ImportError:
+        from PyQt5.QtCore import QObject, pyqtSignal as Signal, Qt
+
+    class _Dispatcher(QObject):
+        _run_signal = Signal(object)
+
+        def __init__(self):
+            super().__init__()
+            self._run_signal.connect(self._run, Qt.QueuedConnection)
+
+        def _run(self, fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+        def post(self, fn):
+            self._run_signal.emit(fn)
+
+    return _Dispatcher()
+
+
+_SETTINGS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "storage", "voice_overlay_settings.json"
+)
+
+DEFAULT_SETTINGS = {"enabled": True}
+
+OVERLAY_TITLE = "Midum Voice Overlay"
+OVERLAY_WIDTH = 132
+OVERLAY_HEIGHT = 132
+MARGIN_X = 90   # inset from the screen edge -- keeps the square off the
+MARGIN_Y = 110  # true corner rather than flush against it
+
+# Safety-net only: if the overlay is left sitting in some state with no
+# further activity event arriving and nothing has explicitly ended the
+# session, fade it out anyway rather than leaving it stuck on screen.
+IDLE_LINGER_SECONDS = 2.5
+FADE_ANIM_SECONDS = 0.45     # must match the CSS transition duration below
+
+_VALID_STATES = ("listening", "tool_calling", "responding")
+
+
+def _load_settings() -> dict:
+    try:
+        if os.path.exists(_SETTINGS_FILE):
+            with open(_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                merged = dict(DEFAULT_SETTINGS)
+                merged.update(data)
+                return merged
+    except Exception:
+        pass
+    return dict(DEFAULT_SETTINGS)
+
+
+def _save_settings(data: dict) -> bool:
+    try:
+        os.makedirs(os.path.dirname(_SETTINGS_FILE), exist_ok=True)
+        with open(_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+# Pure emoji + glow, no text anywhere. Three emoji are stacked in the same
+# spot and cross-fade between each other (opacity only, no layout shift) so
+# switching states never pops or jumps. The glow is a blurred box-shadow
+# ring living just outside the card's rounded border, colored per state and
+# cross-faded the same way. Everything (window show/hide, emoji swap, glow
+# color) rides on CSS opacity/filter transitions so it's all smooth fades,
+# never a hard cut.
+_OVERLAY_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<style>
+:root{
+  --green:#10b981; --blue:#3b82f6; --orange:#f59e0b;
+  --panel:#0b0f19; --border2:#1f2937;
+}
+html,body{
+  margin:0; padding:0; width:100%; height:100%; background:transparent;
+  overflow:hidden; display:flex; align-items:center; justify-content:center;
+}
+body{
+  opacity:0;
+  transition:opacity ${FADE_MS}ms ease;
+}
+body.visible{ opacity:1; }
+
+#glow{
+  position:absolute;
+  width:84px; height:84px;
+  border-radius:22px;
+  pointer-events:none;
+  box-shadow:0 0 0px 0px var(--glow, var(--green));
+  opacity:0;
+  transition:box-shadow ${FADE_MS}ms ease, opacity ${FADE_MS}ms ease;
+}
+#glow.on{
+  opacity:1;
+  box-shadow:0 0 22px 6px var(--glow, var(--green)), 0 0 42px 14px color-mix(in srgb, var(--glow, var(--green)) 45%, transparent);
+}
+
+#card{
+  position:relative;
+  width:84px; height:84px;
+  border-radius:22px;
+  background:color-mix(in srgb, var(--panel) 88%, transparent);
+  border:1px solid var(--border2);
+  box-shadow:0 10px 32px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.04);
+  display:flex; align-items:center; justify-content:center;
+  overflow:hidden;
+}
+
+.emoji{
+  position:absolute;
+  font-size:34px;
+  line-height:1;
+  opacity:0;
+  transform:scale(0.85);
+  transition:opacity ${FADE_MS}ms ease, transform ${FADE_MS}ms ease;
+  filter:drop-shadow(0 0 6px rgba(0,0,0,.35));
+}
+.emoji.active{
+  opacity:1;
+  transform:scale(1);
+}
+
+/* Mic / speaker: a gentle breathing pulse, opacity + scale, while the
+   emoji is the active one AND its state is currently "live" (pulsing
+   class only added for listening/responding, never tool_calling). */
+@keyframes pulseEmoji{
+  0%   { transform:scale(1);    opacity:1;   }
+  50%  { transform:scale(1.16); opacity:.72; }
+  100% { transform:scale(1);    opacity:1;   }
+}
+.emoji.pulsing{
+  animation:pulseEmoji 1.15s ease-in-out infinite;
+}
+
+/* Gear: continuous smooth rotation while tool-calling is active. */
+@keyframes spinEmoji{
+  from{ transform:rotate(0deg); }
+  to{ transform:rotate(360deg); }
+}
+.emoji.spinning{
+  animation:spinEmoji 1.6s linear infinite;
+}
+
+/* The glow ring also breathes gently in sync, independent of which
+   emoji/animation is active, so the whole square feels alive rather
+   than just the icon. */
+@keyframes pulseGlow{
+  0%   { filter:brightness(1);   }
+  50%  { filter:brightness(1.35);}
+  100% { filter:brightness(1);   }
+}
+#glow.pulsing{
+  animation:pulseGlow 1.15s ease-in-out infinite;
+}
+</style>
+</head>
+<body>
+  <div id="glow"></div>
+  <div id="card">
+    <div class="emoji" id="emoji-mic">🎙️</div>
+    <div class="emoji" id="emoji-gear">⚙️</div>
+    <div class="emoji" id="emoji-speaker">🔊</div>
+  </div>
+<script>
+function el(id){ return document.getElementById(id); }
+
+const GLOW_COLORS = { listening: "var(--green)", tool_calling: "var(--blue)", responding: "var(--orange)" };
+const EMOJI_IDS    = { listening: "emoji-mic", tool_calling: "emoji-gear", responding: "emoji-speaker" };
+
+let _currentState = null;
+
+function setState(state){
+  if (!state || !GLOW_COLORS[state]){
+    return;
+  }
+  _currentState = state;
+
+  // Swap which emoji is showing (cross-fade -- old one's opacity just
+  // transitions to 0 as the new one transitions to 1, no layout change).
+  Object.entries(EMOJI_IDS).forEach(([st, id])=>{
+    const node = el(id);
+    if (!node) return;
+    const isActive = (st === state);
+    node.classList.toggle("active", isActive);
+    node.classList.toggle("pulsing", isActive && (state === "listening" || state === "responding"));
+    node.classList.toggle("spinning", isActive && state === "tool_calling");
+  });
+
+  const glow = el("glow");
+  if (glow){
+    glow.style.setProperty("--glow", GLOW_COLORS[state]);
+    glow.classList.add("on");
+    glow.classList.toggle("pulsing", state !== "tool_calling");
+  }
+}
+
+function fadeIn(){
+  document.body.classList.add("visible");
+}
+
+function fadeOut(){
+  document.body.classList.remove("visible");
+}
+
+window.setState = setState;
+window.fadeIn = fadeIn;
+window.fadeOut = fadeOut;
+</script>
+</body>
+</html>
+""".replace("${FADE_MS}", str(int(FADE_ANIM_SECONDS * 1000)))
+
+
+class VoiceOverlay:
+    """One overlay window, lazily created the first time it's actually
+    needed (i.e. the first PTT press of the session) and reused after that
+    -- shown/hidden/updated, never destroyed and recreated.
+
+    Usage from the app's PTT/voice-event glue:
+        overlay.begin_session()          # mic pressed -- fades the square in
+        overlay.set_state("listening")   # green, mic pulsing
+        overlay.set_state("tool_calling")# blue, gear rotating
+        overlay.set_state("responding")  # orange, speaker pulsing
+        overlay.end_session()            # turn finished -- fades back out
+    """
+
+    def __init__(self):
+        settings = _load_settings()
+        self._enabled = bool(settings.get("enabled", True))
+        self._window = None
+        self._lock = threading.Lock()
+        self._linger_timer = None
+        self._fade_timer = None
+        self._visible = False
+        # Constructed here, on whatever thread instantiates VoiceOverlay --
+        # which must be (and is) the main/GUI thread, since get_overlay()
+        # is first called from Api.__init__, well before webview.start()
+        # hands this same thread over to the Qt event loop. If Qt bindings
+        # somehow aren't importable, fall back to best-effort QTimer
+        # posting in _post_to_gui_thread below.
+        try:
+            self._dispatcher = _make_dispatcher()
+        except Exception:
+            self._dispatcher = None
+
+    # ── Settings surface (called from Api's js_api methods) ──────────────
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    def set_enabled(self, enabled: bool) -> bool:
+        self._enabled = bool(enabled)
+        _save_settings({"enabled": self._enabled})
+        if not self._enabled:
+            self.hide_immediately()
+        return self._enabled
+
+    # ── GUI-thread marshaling ─────────────────────────────────────────
+    # PTT presses/releases fire on pynput's own background listener thread
+    # (see hotkeys.py), not the Qt GUI thread the main window's event loop
+    # runs on -- and every pywebview call here ultimately touches a live
+    # Qt widget (QtWebEngine backs pywebview's gui="qt" mode). Creating,
+    # showing, or evaluate_js-ing a Qt window from any thread other than
+    # the GUI thread is undefined behavior in Qt: at best it silently does
+    # nothing, at worst it crashes. Routes through self._dispatcher (see
+    # _make_dispatcher above), which delivers on the real GUI thread
+    # regardless of which thread calls post(). Only falls back to a raw
+    # QTimer.singleShot (or a direct call) if the dispatcher couldn't be
+    # built at all.
+    def _post_to_gui_thread(self, fn):
+        if self._dispatcher is not None:
+            try:
+                self._dispatcher.post(fn)
+                return
+            except Exception:
+                pass
+        try:
+            try:
+                from PySide6.QtCore import QTimer
+            except ImportError:
+                from PyQt5.QtCore import QTimer
+            QTimer.singleShot(0, fn)
+        except Exception:
+            try:
+                fn()
+            except Exception:
+                pass
+
+    # ── Window lifecycle (always runs on the Qt GUI thread) ─────────────
+    def _ensure_window(self):
+        if self._window is not None:
+            return self._window
+        with self._lock:
+            if self._window is not None:
+                return self._window
+            try:
+                screen = webview.screens[0]
+                sw, sh = int(screen.width), int(screen.height)
+            except Exception:
+                sw, sh = 1920, 1080
+            x = max(0, sw - OVERLAY_WIDTH - MARGIN_X)
+            y = max(0, sh - OVERLAY_HEIGHT - MARGIN_Y)
+
+            create_kwargs = dict(
+                html=_OVERLAY_HTML,
+                width=OVERLAY_WIDTH, height=OVERLAY_HEIGHT,
+                x=x, y=y,
+                frameless=True, easy_drag=False, resizable=False,
+                on_top=True, shadow=False,
+                background_color="#05070c",
+            )
+            try:
+                # `transparent` lets the rounded card + glow float with no
+                # rectangular window backdrop -- not supported on every
+                # pywebview backend/version, so fall back gracefully.
+                win = webview.create_window(OVERLAY_TITLE, transparent=True, **create_kwargs)
+            except TypeError:
+                win = webview.create_window(OVERLAY_TITLE, **create_kwargs)
+            win.events.shown += self._apply_no_activate_flags
+            self._window = win
+            try:
+                win.hide()
+            except Exception:
+                pass
+            return win
+
+    def _apply_no_activate_flags(self):
+        """Strip taskbar/alt-tab presence and focus-acceptance from the
+        overlay's native Qt window. Best-effort: if the Qt bindings can't be
+        found (shouldn't happen -- app.py requires PySide6 or PyQt5 to even
+        launch), the overlay still works, it just behaves like an ordinary
+        always-on-top window instead of a truly non-interactive one."""
+        try:
+            try:
+                from PySide6.QtCore import Qt
+                from PySide6.QtWidgets import QApplication
+            except ImportError:
+                from PyQt5.QtCore import Qt
+                from PyQt5.QtWidgets import QApplication
+
+            app = QApplication.instance()
+            if app is None:
+                return
+            for w in app.topLevelWidgets():
+                try:
+                    if w.windowTitle() == OVERLAY_TITLE:
+                        w.setWindowFlag(Qt.FramelessWindowHint, True)
+                        w.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+                        w.setWindowFlag(Qt.Tool, True)                     # no taskbar / alt-tab entry
+                        w.setWindowFlag(Qt.WindowDoesNotAcceptFocus, True)  # never steals keyboard focus
+                        w.show()
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # ── Session lifecycle, driven by Api (PTT state + VoiceSession events) ──
+    # Every public method here may be called from any thread (pynput's
+    # listener thread for PTT press/release, the voice-session's own
+    # background thread for tool-call/transcript events, a threading.Timer
+    # thread for the linger/fade timers) -- so each one only does plain
+    # Python bookkeeping directly, then posts the actual Qt/pywebview work
+    # to the GUI thread via _post_to_gui_thread.
+    def begin_session(self):
+        """A push-to-talk press just started (or resumed) an active turn.
+        Fades the square in if it isn't already showing. Idempotent --
+        safe to call on every press even if a session is already open."""
+        if not self._enabled:
+            return
+        self._cancel_timers()
+
+        def _do():
+            win = self._ensure_window()
+            try:
+                if not self._visible:
+                    win.show()
+                    win.evaluate_js("window.fadeIn && window.fadeIn()")
+                    self._visible = True
+            except Exception:
+                pass
+        self._post_to_gui_thread(_do)
+
+    def set_state(self, state: str):
+        """state in {'listening', 'tool_calling', 'responding'}. Cross-fades
+        the active emoji + ambient glow color; keeps the linger safety-net
+        timer refreshed so a stalled state doesn't stick around forever."""
+        if not self._enabled or state not in _VALID_STATES:
+            return
+        self.begin_session()  # posts its own GUI-thread work first
+
+        def _do():
+            win = self._window
+            if win is None:
+                return
+            try:
+                win.evaluate_js(f"window.setState && window.setState({json.dumps(state)})")
+            except Exception:
+                pass
+        self._post_to_gui_thread(_do)
+        self._arm_linger_timer()
+
+    def end_session(self):
+        """The turn is fully finished (response complete, interrupted, or
+        errored) -- fade the square back out."""
+        self._cancel_timers()
+        if not self._visible or self._window is None:
+            return
+        self._start_fade()
+
+    def hide_immediately(self):
+        self._cancel_timers()
+        self._visible = False
+
+        def _do():
+            if self._window is not None:
+                try:
+                    self._window.hide()
+                except Exception:
+                    pass
+        self._post_to_gui_thread(_do)
+
+    # ── Internals ──────────────────────────────────────────────────────
+    def _arm_linger_timer(self):
+        if self._linger_timer is not None:
+            self._linger_timer.cancel()
+        self._linger_timer = threading.Timer(IDLE_LINGER_SECONDS, self.end_session)
+        self._linger_timer.daemon = True
+        self._linger_timer.start()
+
+    def _start_fade(self):
+        if self._window is None:
+            return
+
+        def _do():
+            try:
+                self._window.evaluate_js("window.fadeOut && window.fadeOut()")
+            except Exception:
+                pass
+        self._post_to_gui_thread(_do)
+        self._visible = False
+        self._fade_timer = threading.Timer(FADE_ANIM_SECONDS + 0.1, self._hide_now)
+        self._fade_timer.daemon = True
+        self._fade_timer.start()
+
+    def _hide_now(self):
+        # Runs on a threading.Timer thread -- marshal onto the GUI thread
+        # the same as every other window-touching call here.
+        def _do():
+            if self._window is not None:
+                try:
+                    self._window.hide()
+                except Exception:
+                    pass
+        self._post_to_gui_thread(_do)
+
+    def _cancel_timers(self):
+        if self._linger_timer is not None:
+            self._linger_timer.cancel()
+            self._linger_timer = None
+        if self._fade_timer is not None:
+            self._fade_timer.cancel()
+            self._fade_timer = None
+
+
+_overlay_instance = None
+
+
+def get_overlay() -> VoiceOverlay:
+    global _overlay_instance
+    if _overlay_instance is None:
+        _overlay_instance = VoiceOverlay()
+    return _overlay_instance

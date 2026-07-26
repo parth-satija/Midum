@@ -37,6 +37,7 @@ from gui.dispatch import _dispatch_midum_tool
 from flows import classify_tool_kind
 import tools.user_prompt_tools as _user_prompt_tools
 
+import config
 import main as midum
 import permissions
 
@@ -201,6 +202,12 @@ class Api:
         self._current_chat_id  = uuid.uuid4().hex
         self._chat_title       = None
         self._display_log      = []
+        # Tracks the display-log/session-history entry currently being
+        # streamed into by voice transcripts, so consecutive fragments from
+        # the same speaker fold into one saved message instead of one saved
+        # message per fragment -- see _voice_record_transcript().
+        self._voice_stream_tag = None
+        self._voice_stream_idx = None
         # Set when the window is closed while a reply is still being
         # generated -- see _on_closing() / _run_turn()'s finally block.
         self._close_requested   = False
@@ -238,6 +245,24 @@ class Api:
         midum.set_tool_call_hook(self._handle_tool_call)
 
         self._pending_ask = {}  # ask_id -> threading.Event / result box
+
+        # ── Voice control (Gemini Live) ──────────────────────────────────
+        from providers.gemini_live_backend import get_voice_session
+        self._voice_session = get_voice_session(self._on_voice_event)
+
+        # ── Push-to-talk global hotkeys (Voice tab) ───────────────────────
+        # Drives self._voice_session directly (start-on-first-press,
+        # mute/unmute on press/release) -- see hotkeys.py. Passed a getter
+        # rather than the session object so hotkeys.py never has to import
+        # the voice-deps stack (google-genai/sounddevice) itself.
+        import hotkeys as _hotkeys_mod
+        self._ptt_manager = _hotkeys_mod.get_manager(
+            lambda: self._voice_session,
+            on_state_change=self._on_ptt_state_change,
+        )
+        _ptt_start_msg = self._ptt_manager.start()
+        if not _hotkeys_mod._PYNPUT_AVAILABLE:
+            self._push_event("log", {"text": f"⚠️ {_ptt_start_msg}\n"})
 
     # ── Low-level plumbing ──────────────────────────────────────────────
     def _push_event(self, kind: str, payload: dict):
@@ -393,6 +418,112 @@ class Api:
             "models": _known_models_for_provider(self._selected_provider),
             "current_model": self._selected_model,
         }
+
+    # ── Voice control (Gemini Live) ──────────────────────────────────────
+    def _on_voice_event(self, kind: str, payload: dict):
+        """Callback handed to VoiceSession -- relays every voice-session
+        event straight to the frontend over the same async event bridge
+        used for text-chat events (say/log/tool_call/etc), and also folds
+        spoken turns into the same persisted chat history/display log that
+        text chat uses (self._session.history / self._display_log), so a
+        voice conversation survives app restarts and replays in the chat
+        pane exactly like a normal typed conversation."""
+        if kind == "voice_transcript":
+            self._voice_record_transcript(payload.get("role"), payload.get("text") or "")
+        elif kind == "voice_tool_call":
+            # A tool call breaks whichever spoken bubble was streaming, same
+            # as the frontend does -- the next transcript fragment starts a
+            # fresh saved message instead of merging into the old one.
+            self._voice_stream_tag = None
+            self._voice_stream_idx = None
+        elif kind == "voice_tool_result":
+            self._voice_stream_tag = None
+            self._voice_stream_idx = None
+        elif kind in ("voice_turn_complete", "voice_interrupted", "voice_error"):
+            self._voice_stream_tag = None
+            self._voice_stream_idx = None
+            self._persist_current_chat()
+        elif kind == "voice_status" and payload.get("status") == "stopped":
+            self._voice_stream_tag = None
+            self._voice_stream_idx = None
+            self._persist_current_chat()
+        self._push_event(kind, payload)
+
+    def _voice_record_transcript(self, role: str, text: str):
+        """Folds one voice-transcript fragment into self._display_log (the
+        replayable chat bubbles) and self._session.history (the LLM-facing
+        context), merging consecutive fragments from the same speaker into
+        a single message the same way the chat pane merges them into a
+        single bubble -- Gemini Live streams transcription in small pieces,
+        not whole utterances, so without merging every fragment would save
+        as its own separate chat message."""
+        if not text:
+            return
+        tag = "user" if role == "user" else "midum"
+        session_role = "user" if role == "user" else "assistant"
+
+        if (self._voice_stream_tag == tag and self._voice_stream_idx is not None
+                and 0 <= self._voice_stream_idx < len(self._display_log)):
+            old_tag, old_text = self._display_log[self._voice_stream_idx]
+            self._display_log[self._voice_stream_idx] = (old_tag, old_text + text)
+            with self._session._lock:
+                if self._session.history and self._session.history[-1].get("role") == session_role:
+                    self._session.history[-1]["content"] += text
+        else:
+            self._display_log.append((tag, text))
+            self._voice_stream_idx = len(self._display_log) - 1
+            self._voice_stream_tag = tag
+            if not self._chat_title and tag == "user":
+                self._chat_title = text[:60] or None
+            with self._session._lock:
+                self._session.history.append({"role": session_role, "content": text})
+
+    def get_voice_status(self):
+        from providers.gemini_live_backend import voice_dependencies_status
+        return {
+            "running": self._voice_session.is_running(),
+            "dependencies": voice_dependencies_status(),
+            "model": config.GEMINI_LIVE_MODEL,
+            "voice": config.GEMINI_LIVE_VOICE,
+        }
+
+    def start_voice_session(self, model="", voice=""):
+        return self._voice_session.start(model or "", voice or "")
+
+    def stop_voice_session(self):
+        return self._voice_session.stop()
+
+    def set_voice_muted(self, muted: bool):
+        return self._voice_session.set_muted(bool(muted))
+
+    # ── Push-to-talk global hotkeys (Voice tab) ───────────────────────────
+    def _on_ptt_state_change(self, pressed_ids):
+        """Relayed to the frontend so the Voice tab can show a live
+        'currently talking' indicator while a PTT key/button is held."""
+        self._push_event("voice_ptt_state", {"pressed": list(pressed_ids)})
+
+    def get_ptt_hotkeys(self):
+        return self._ptt_manager.status()
+
+    def set_ptt_hotkey(self, slot_id: str, kind: str, value: str, label: str = ""):
+        ok = self._ptt_manager.set_hotkey(slot_id, kind, value, label)
+        return {"ok": ok, "hotkeys": self._ptt_manager.get_hotkeys()}
+
+    def reset_ptt_hotkeys(self):
+        return {"ok": True, "hotkeys": self._ptt_manager.reset_defaults()}
+
+    def start_ptt_capture(self, slot_id: str):
+        """Arms capture mode: the next global key press or mouse click
+        anywhere is bound to `slot_id` and pushed back as a 'ptt_captured'
+        event so the Voice tab's rebind button can update itself."""
+        def _cb(kind, value, label):
+            self._push_event("ptt_captured", {"slot_id": slot_id, "kind": kind, "value": value, "label": label})
+        self._ptt_manager.begin_capture(slot_id, _cb)
+        return {"ok": True}
+
+    def cancel_ptt_capture(self):
+        self._ptt_manager.cancel_capture()
+        return {"ok": True}
 
     def get_context_token_limit(self):
         """Current context-token setting for the Model tab field. Returns
@@ -794,6 +925,8 @@ class Api:
             self._session.history = history
             self._session.turn_counter = max(1, sum(1 for m in history if m.get("role") == "user"))
         self._display_log = list(data.get("display", []))
+        self._voice_stream_tag = None
+        self._voice_stream_idx = None
         return {"ok": True, "display": self._display_log}
 
     def delete_chat(self, chat_id: str):
@@ -833,6 +966,8 @@ class Api:
         self._current_chat_id = uuid.uuid4().hex
         self._chat_title = None
         self._display_log = []
+        self._voice_stream_tag = None
+        self._voice_stream_idx = None
 
     def _persist_current_chat(self):
         if not self._display_log:
@@ -1494,6 +1629,10 @@ class Api:
         self._persist_current_chat()
         self._stdout_redir.restore()
         try:
+            self._ptt_manager.stop()
+        except Exception:
+            pass
+        try:
             midum.stop_scheduler()
         except Exception:
             pass
@@ -1754,11 +1893,22 @@ select, .btn, .ghost-btn{
 #sidebar-footer .ghost-btn{flex:1;font-size:10px;}
 
 /* Chat bubbles */
-.row{display:flex;flex-direction:column;padding:6px 0;}
+.row{display:flex;flex-direction:column;padding:6px 0;position:relative;}
 .row.user{align-items:flex-end;}
 .row.midum{align-items:flex-start;}
-.row-label{font-size:11px;font-weight:700;color:var(--subtext);margin-bottom:4px;}
+.row-label-row{display:flex;align-items:center;gap:6px;margin-bottom:4px;}
+.row.user .row-label-row{flex-direction:row-reverse;}
+.row-label{font-size:11px;font-weight:700;color:var(--subtext);margin-bottom:0;}
 .row.midum .row-label{color:var(--accent);}
+.row-copy-btn{
+  opacity:0;transition:opacity .15s,background .15s,color .15s;
+  width:20px;height:20px;border-radius:50%;border:none;background:var(--surface2);
+  color:var(--subtext);font-size:10px;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;flex:0 0 auto;padding:0;
+}
+.row:hover .row-copy-btn{opacity:1;}
+.row-copy-btn:hover{background:var(--border2);color:var(--text);}
+.row-copy-btn.copied{opacity:1;color:var(--green);}
 .bubble{border-radius:18px;padding:10px 16px;font-size:14px;line-height:1.5;max-width:78%;white-space:pre-wrap;word-wrap:break-word;}
 .bubble.user{background:var(--user-msg);}
 .bubble.midum{background:transparent;max-width:100%;}
@@ -2110,6 +2260,8 @@ textarea.code-area{
 
     <div class="pane-wrap" id="chat-pane-wrap">
       <div class="pane">
+        <button class="icon-btn" id="copy-chat-btn" title="Copy full conversation"
+          style="position:absolute;top:10px;right:10px;z-index:5;">⧉</button>
         <div id="chat-scroll"><div id="chat-col"></div></div>
         <div id="input-row">
           <div style="width:100%;max-width:760px;">
@@ -2133,7 +2285,7 @@ textarea.code-area{
 
 <script>
 const TABS = [
-  ["Chat","💬"], ["Log","📜"], ["Model","🧬"], ["Parameters","⚙"],
+  ["Chat","💬"], ["Voice","🎤"], ["Log","📜"], ["Model","🧬"], ["Parameters","⚙"],
   ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["Flows","🔗"], ["MCP","🔌"], ["Permissions","🔐"]
 ];
 
@@ -2142,6 +2294,8 @@ let state = {
   sidebarOpen: false,
   thinking: false,
 };
+
+let voiceState = { running: false, connecting: false };
 
 function api(name, ...args){ return window.pywebview.api[name](...args); }
 
@@ -2589,10 +2743,12 @@ function appendRow(tag, text){
   const row = document.createElement("div");
   if (tag === "user"){
     row.className = "row user";
-    row.innerHTML = `<div class="row-label">You</div><div class="bubble user">${escapeHtml(text)}</div>`;
+    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">⧉</button></div><div class="bubble user">${escapeHtml(text)}</div>`;
+    wireRowCopyBtn(row);
   } else if (tag === "midum"){
     row.className = "row midum";
-    row.innerHTML = `<div class="row-label">Midum</div><div class="bubble midum">${renderMidumContent(text)}</div>`;
+    row.innerHTML = `<div class="row-label-row"><div class="row-label">Midum</div><button class="row-copy-btn" title="Copy response">⧉</button></div><div class="bubble midum">${renderMidumContent(text)}</div>`;
+    wireRowCopyBtn(row);
     setActiveToolDot(null);
     col.appendChild(row);
     animateWords(row.querySelector(".bubble"));
@@ -2613,9 +2769,14 @@ function appendRow(tag, text){
       <div class="tool-line expandable">
         <span class="tool-dot"></span><span class="gear">⚙</span><span>${escapeHtml(text)}</span>
         <span class="chevron">▶</span>
+        <button class="row-copy-btn" title="Copy tool call" style="margin-left:6px;">⧉</button>
       </div>
       <div class="tool-detail"><div class="tool-detail-label">Waiting for result…</div></div>`;
-    row.querySelector(".tool-line").onclick = ()=>row.classList.toggle("open");
+    row.querySelector(".tool-line").onclick = (e)=>{
+      if (e.target.closest(".row-copy-btn")) return;
+      row.classList.toggle("open");
+    };
+    wireRowCopyBtn(row);
     col.appendChild(row);
     setActiveToolDot(row.querySelector(".tool-dot"));
     _pendingToolRows.push(row);
@@ -2624,6 +2785,92 @@ function appendRow(tag, text){
   }
   col.appendChild(row);
   scrollToBottom();
+}
+
+// ── Copy support (individual rows + full conversation) --------------------
+// Renders a chat row back into plain text -- including tool calls, which
+// are expanded into a readable "Tool call: name(args) -> result" block
+// instead of raw JSON schemas -- so both the per-row copy button and the
+// "copy full conversation" button produce something a person can paste
+// into an email/doc/ticket as-is.
+function rowPlainText(row){
+  if (!row) return "";
+  if (row.classList.contains("user")){
+    const b = row.querySelector(".bubble");
+    return "You: " + (b ? b.innerText.trim() : "");
+  }
+  if (row.classList.contains("midum")){
+    if (row.querySelector(".ask-card")) return "";   // inline ask cards aren't transcript text
+    const b = row.querySelector(".bubble");
+    return "Midum: " + (b ? b.innerText.trim() : "");
+  }
+  if (row.classList.contains("tool")){
+    const name = row.dataset.toolName || "tool";
+    const pres = row.querySelectorAll(".tool-detail pre");
+    const callText = pres[0] ? pres[0].innerText.trim() : "";
+    const resultText = pres[1] ? pres[1].innerText.trim() : "";
+    let out = `[Tool call: ${name}]`;
+    if (callText) out += `\n${callText}`;
+    if (resultText) out += `\n-> ${resultText}`;
+    return out;
+  }
+  if (row.classList.contains("system")){
+    const b = row.querySelector(".bubble");
+    return "[System] " + (b ? b.innerText.trim() : "");
+  }
+  if (row.classList.contains("error")){
+    const b = row.querySelector(".bubble");
+    return "[Error] " + (b ? b.innerText.trim() : "");
+  }
+  return "";
+}
+
+async function copyTextToClipboard(text){
+  if (!text) return false;
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    // Fallback for environments where the async Clipboard API is blocked.
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      return true;
+    } catch (e2) {
+      return false;
+    }
+  }
+}
+
+function flashCopyFeedback(btn){
+  if (!btn) return;
+  const orig = btn.textContent;
+  btn.textContent = "✓";
+  btn.classList.add("copied");
+  setTimeout(()=>{ btn.textContent = orig; btn.classList.remove("copied"); }, 1000);
+}
+
+function wireRowCopyBtn(row){
+  const btn = row.querySelector(".row-copy-btn");
+  if (!btn) return;
+  btn.onclick = async (e)=>{
+    e.stopPropagation();
+    const ok = await copyTextToClipboard(rowPlainText(row));
+    if (ok) flashCopyFeedback(btn);
+  };
+}
+
+async function copyFullConversation(){
+  const rows = Array.from(chatCol().children);
+  const parts = rows.map(rowPlainText).map(t=>t.trim()).filter(Boolean);
+  const ok = await copyTextToClipboard(parts.join("\n\n"));
+  if (ok) flashCopyFeedback(document.getElementById("copy-chat-btn"));
 }
 
 function scrollToBottom(){
@@ -2741,6 +2988,15 @@ window.__midumEvent = function(evt){
   else if (kind === "mcp_changed"){ if (state.activeTab === "MCP") refreshMcpList(); }
   else if (kind === "schedule_ran"){ if (state.activeTab === "Schedule") showToolPane("Schedule"); }
   else if (kind === "tool_result"){ const box=document.getElementById("tool-output"); if(box) box.value = payload.output; }
+  else if (kind === "voice_status"){ handleVoiceStatus(payload); }
+  else if (kind === "voice_transcript"){ appendVoiceTranscript(payload.role, payload.text); }
+  else if (kind === "voice_tool_call"){ appendVoiceToolEvent("call", payload.name, payload.args); }
+  else if (kind === "voice_tool_result"){ appendVoiceToolEvent("result", payload.name, payload.result); }
+  else if (kind === "voice_interrupted"){ appendVoiceSystemNote("↺ interrupted"); }
+  else if (kind === "voice_turn_complete"){ _voiceStreamRow = null; }
+  else if (kind === "voice_error"){ appendVoiceSystemNote("⚠ " + payload.message); handleVoiceStatus({status:"stopped"}); }
+  else if (kind === "ptt_captured"){ handlePttCaptured(payload); }
+  else if (kind === "voice_ptt_state"){ handlePttState(payload); }
 };
 
 function appendLog(text){
@@ -3408,7 +3664,7 @@ async function refreshHistory(){
 function showToolPane(name){
   const box = document.getElementById("tool-content");
   const builders = {
-    "Log": buildLogPane, "Model": buildModelPane, "Parameters": buildParamsPane,
+    "Voice": buildVoicePane, "Log": buildLogPane, "Model": buildModelPane, "Parameters": buildParamsPane,
     "System Core": buildSysCorePane, "Knowledge": buildKnowledgePane,
     "Skills": buildSkillsPane, "Tools": buildToolsPane, "Flows": buildFlowsPane, "Schedule": buildSchedulePane, "MCP": buildMcpPane,
     "Permissions": buildPermissionsPane,
@@ -3425,6 +3681,216 @@ function buildLogPane(box){
       <button class="ghost-btn" id="log-clear" style="height:22px;font-size:10px;">Clear</button></div>
     <textarea class="code-area" id="log-box" readonly style="color:var(--tool-text);background:var(--tool-bg);margin-top:6px;"></textarea>`;
   document.getElementById("log-clear").onclick = ()=>{ document.getElementById("log-box").value=""; };
+}
+
+function buildVoicePane(box){
+  box.innerHTML = `
+    <div class="hdr-row"><div class="section-label">VOICE CONTROL — GEMINI LIVE</div></div>
+    <div id="voice-status-row" style="display:flex;align-items:center;gap:8px;margin-top:6px;">
+      <div id="voice-dot" style="width:10px;height:10px;border-radius:50%;background:var(--subtext);"></div>
+      <div id="voice-status-text" style="font-size:11px;color:var(--subtext);">Checking...</div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:10px;">
+      <button class="btn" id="voice-start-btn" style="background:var(--accent);color:#fff;flex:1;">🎤 Start talking</button>
+      <button class="ghost-btn" id="voice-mute-btn" style="display:none;">Mute</button>
+    </div>
+    <div id="voice-deps-warning" style="font-size:10px;color:var(--red);margin-top:6px;display:none;"></div>
+    <div class="divider"></div>
+    <div class="field-label">MODEL</div>
+    <input id="voice-model-input" placeholder="gemini-3.1-flash-live-preview"
+      style="height:32px;border-radius:16px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 10px;"/>
+    <div class="field-label" style="margin-top:8px;">VOICE</div>
+    <select id="voice-name-select">
+      ${["Puck","Charon","Kore","Fenrir","Aoede","Leda","Orus","Zephyr"].map(v=>`<option value="${v}">${v}</option>`).join("")}
+    </select>
+    <div class="divider"></div>
+    <div class="hdr-row">
+      <div class="field-label" style="margin:0;">PUSH-TO-TALK HOTKEYS</div>
+      <button class="ghost-btn" id="ptt-reset-btn" style="height:22px;font-size:10px;">Reset defaults</button>
+    </div>
+    <div style="font-size:10px;color:var(--muted);margin:2px 0 8px;line-height:1.5;">
+      Hold either key/button to talk -- connects to Gemini Live automatically on first press if not already connected, then just mutes the mic (not the connection) on release. Works globally, even when Midum isn't the focused window.
+    </div>
+    <div id="ptt-deps-warning" style="font-size:10px;color:var(--red);margin-bottom:6px;display:none;"></div>
+    <div id="ptt-slot-slot1" class="ptt-slot-row"></div>
+    <div id="ptt-slot-slot2" class="ptt-slot-row" style="margin-top:6px;"></div>
+  `;
+
+  document.getElementById("voice-start-btn").onclick = onVoiceStartStopClick;
+  document.getElementById("voice-mute-btn").onclick = onVoiceMuteClick;
+  document.getElementById("ptt-reset-btn").onclick = async ()=>{
+    await api("reset_ptt_hotkeys");
+    refreshPttHotkeys();
+  };
+
+  (async ()=>{
+    const status = await api("get_voice_status");
+    voiceState.running = !!status.running;
+    document.getElementById("voice-model-input").value = status.model || "";
+    document.getElementById("voice-name-select").value = status.voice || "Puck";
+    const warn = document.getElementById("voice-deps-warning");
+    if (status.dependencies !== "OK"){
+      warn.style.display = "block";
+      warn.textContent = "Setup needed: " + status.dependencies;
+    } else {
+      warn.style.display = "none";
+    }
+    handleVoiceStatus({status: voiceState.running ? "connected" : "stopped"});
+  })();
+
+  refreshPttHotkeys();
+}
+
+// ── Push-to-talk hotkey config UI ─────────────────────────────────────
+let _pttCaptureSlotId = null;
+
+function pttSlotRowHtml(slot){
+  const kindLabel = slot.kind === "mouse" ? "Mouse button" : "Keyboard key";
+  return `
+    <div style="flex:1;min-width:0;">
+      <div style="font-size:12px;font-weight:600;color:var(--text);">${escapeHtml(slot.label || slot.value)}</div>
+      <div style="font-size:10px;color:var(--subtext);">${kindLabel}</div>
+    </div>
+    <button class="mini-btn open" data-act="rebind">Change</button>`;
+}
+
+async function refreshPttHotkeys(){
+  const st = await api("get_ptt_hotkeys");
+  const warn = document.getElementById("ptt-deps-warning");
+  if (warn){
+    if (!st.available){
+      warn.style.display = "block";
+      warn.textContent = "Setup needed: pynput not installed (pip install pynput) -- global hotkeys are unavailable.";
+    } else {
+      warn.style.display = "none";
+    }
+  }
+  (st.hotkeys || []).forEach(slot=>{
+    const el = document.getElementById(`ptt-slot-${slot.id}`);
+    if (!el) return;
+    el.style.cssText = "display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:8px 10px;";
+    el.innerHTML = pttSlotRowHtml(slot);
+    const btn = el.querySelector('[data-act="rebind"]');
+    if (btn) btn.onclick = ()=>startPttCapture(slot.id, el);
+  });
+}
+
+async function startPttCapture(slotId, rowEl){
+  if (_pttCaptureSlotId) return;   // one capture at a time
+  _pttCaptureSlotId = slotId;
+  const btn = rowEl.querySelector('[data-act="rebind"]');
+  if (btn){ btn.textContent = "Press any key or click..."; btn.disabled = true; }
+  await api("start_ptt_capture", slotId);
+}
+
+function handlePttCaptured(payload){
+  if (!payload || payload.slot_id !== _pttCaptureSlotId) return;
+  _pttCaptureSlotId = null;
+  refreshPttHotkeys();
+}
+
+function handlePttState(payload){
+  const pressed = (payload && payload.pressed) || [];
+  const dot = document.getElementById("voice-dot");
+  if (!dot) return;
+  dot.style.boxShadow = pressed.length ? "0 0 0 4px var(--accent-faint)" : "none";
+}
+
+function onVoiceStartStopClick(){
+  if (voiceState.running || voiceState.connecting) {
+    api("stop_voice_session");
+    handleVoiceStatus({status: "stopping"});
+  } else {
+    const model = (document.getElementById("voice-model-input")||{}).value || "";
+    const voice = (document.getElementById("voice-name-select")||{}).value || "";
+    handleVoiceStatus({status: "connecting"});
+    api("start_voice_session", model, voice);
+  }
+}
+
+let voiceMuted = false;
+function onVoiceMuteClick(){
+  voiceMuted = !voiceMuted;
+  api("set_voice_muted", voiceMuted);
+  const btn = document.getElementById("voice-mute-btn");
+  if (btn) btn.textContent = voiceMuted ? "Unmute" : "Mute";
+}
+
+function handleVoiceStatus(payload){
+  const st = (payload && payload.status) || "stopped";
+  voiceState.running = (st === "connected");
+  voiceState.connecting = (st === "connecting" || st === "retrying");
+  const dot  = document.getElementById("voice-dot");
+  const text = document.getElementById("voice-status-text");
+  const startBtn = document.getElementById("voice-start-btn");
+  const muteBtn  = document.getElementById("voice-mute-btn");
+  if (!dot || !text) return; // pane not currently mounted
+  const colors = {connected:"var(--green)", connecting:"var(--yellow)", retrying:"var(--yellow)",
+                   stopping:"var(--yellow)", stopped:"var(--subtext)"};
+  dot.style.background = colors[st] || "var(--subtext)";
+  const labels = {connected:"Listening — speak naturally", connecting:"Connecting to Gemini Live...",
+                   retrying: (payload && payload.message) || "Retrying with fallback model...",
+                   stopping:"Stopping...", stopped:"Not connected"};
+  text.textContent = labels[st] || st;
+  if (startBtn) {
+    startBtn.textContent = voiceState.running ? "⏹ Stop" : "🎤 Start talking";
+    startBtn.style.background = voiceState.running ? "var(--red)" : "var(--accent)";
+  }
+  if (muteBtn) muteBtn.style.display = voiceState.running ? "inline-block" : "none";
+}
+
+// ── Voice → main chat rendering ──────────────────────────────────────
+// Voice-mode transcripts, tool calls, and system notes are rendered
+// straight into the main chat column (chatCol()) using the exact same
+// row/bubble/tool-row markup as text chat, so a voice conversation looks
+// like a normal conversation with tool calls and everything.
+//
+// Gemini Live streams transcription text in small fragments rather than
+// whole utterances, so consecutive fragments from the same speaker are
+// appended into one growing bubble (_voiceStreamRow) instead of spawning a
+// new bubble per fragment. Anything that interrupts the turn -- a tool
+// call, an interruption, or turn completion -- clears _voiceStreamRow so
+// the next fragment starts a fresh bubble, matching how tool calls break
+// up a normal streamed reply.
+let _voiceStreamRow = null;   // {role, bubbleEl} | null
+let _voiceToolArgs = {};      // name -> args, remembered between call/result events
+
+function appendVoiceTranscript(role, text){
+  if (!text) return;
+  const isUser = role === "user";
+
+  if (_voiceStreamRow && _voiceStreamRow.role === role){
+    _voiceStreamRow.bubbleEl.textContent += text;
+  } else {
+    const col = chatCol();
+    const row = document.createElement("div");
+    row.className = isUser ? "row user" : "row midum";
+    row.innerHTML = isUser
+      ? `<div class="row-label">You (voice)</div><div class="bubble user"></div>`
+      : `<div class="row-label">Midum (voice)</div><div class="bubble midum"></div>`;
+    row.querySelector(".bubble").textContent = text;
+    col.appendChild(row);
+    _voiceStreamRow = { role, bubbleEl: row.querySelector(".bubble") };
+  }
+  scrollToBottom();
+}
+
+function appendVoiceToolEvent(kind, name, data){
+  // A tool call always breaks the current streamed bubble, same as text chat.
+  _voiceStreamRow = null;
+
+  if (kind === "call"){
+    _voiceToolArgs[name] = data;
+    appendRow("tool", `-> Executing: '${name}'`);
+  } else {
+    const resStr = typeof data === "string" ? data : JSON.stringify(data);
+    attachToolCallDetail(name, _voiceToolArgs[name], resStr);
+  }
+}
+
+function appendVoiceSystemNote(text){
+  _voiceStreamRow = null;
+  appendRow("system", text);
 }
 
 function buildModelPane(box){

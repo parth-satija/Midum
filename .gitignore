@@ -11,3 +11,6 @@ dist/
 
 # Log files
 *.log
+
+# App data / runtime storage (chats, memory, settings, secrets scaffolding)
+storage/

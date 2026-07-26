@@ -124,6 +124,23 @@ OPENROUTER_CONSULT_MODE   = "always"
 GEMINI_API_MODEL = "gemini-3.1-flash-lite"   # exact model ID as listed at https://ai.google.dev/gemini-api/docs/models
 GEMINI_API_BASE  = "https://generativelanguage.googleapis.com/v1beta/openai"
 
+# ── Gemini Live (voice control) settings ──────────────────────────────────────
+# Used by providers/gemini_live_backend.py -- the real-time, bidirectional
+# speech-to-speech session behind the GUI's "Voice" tab. Same GEMINI_API_KEY
+# as GEMINI_API_MODEL above (https://aistudio.google.com/app/apikey), but a
+# totally separate transport: a persistent WebSocket session via the
+# `google-genai` SDK's `client.aio.live.connect(...)`, not the OpenAI-
+# compatible /chat/completions endpoint. Full native tool calling -- every
+# tool in tools_schema.tools is offered to the live session and dispatched
+# through the exact same gui/dispatch.py:_dispatch_midum_tool used by the
+# manual tool sandbox and every other provider, so voice control has 100%
+# tool parity with text chat.
+GEMINI_LIVE_MODEL       = "gemini-3.1-flash-live-preview"   # falls back to gemini-live-2.5-flash-preview if unavailable on your key
+GEMINI_LIVE_VOICE       = "Puck"    # prebuilt voice name: Puck, Charon, Kore, Fenrir, Aoede, Leda, Orus, Zephyr...
+GEMINI_LIVE_SEND_RATE   = 16000     # Hz -- mic audio sent to Gemini (fixed by the API)
+GEMINI_LIVE_RECV_RATE   = 24000     # Hz -- audio Gemini sends back (fixed by the API)
+GEMINI_LIVE_CHUNK_SIZE  = 1024      # frames per mic-capture callback
+
 # ── GroqCloud model selection ─────────────────────────────────────────────────
 # Used when MODEL_PROVIDER == "groq" (primary), and always available for
 # on-demand consultation/delegation regardless of MODEL_PROVIDER, exactly
@@ -233,15 +250,19 @@ def _is_legacy_toolcall_model(model_name: str) -> bool:
         return False
 
 # ── Platform-aware paths ──────────────────────────────────────────────────────
+# STORAGE_DIR always lives inside this package (midum_pkg/storage), regardless
+# of platform, so the app's data travels with the package instead of living
+# in some external, hardcoded location.
+_PKG_DIR        = os.path.dirname(os.path.abspath(__file__))
+STORAGE_DIR     = os.path.join(_PKG_DIR, "storage")
+
 if _IS_LINUX:
     _HOME           = os.path.expanduser("~")
     TARGET_DIR      = os.path.join(_HOME, "Jarvis")
-    STORAGE_DIR     = os.path.join(TARGET_DIR, "jarvis_project", "storage")
     SKILLS_INDEX    = os.path.join(TARGET_DIR, "jarvis_project", "skills.md")
     SECRETS_FILE    = os.path.join(_HOME, ".config", "JarvisSecrets", "jarvis_secrets.json")
 else:
     TARGET_DIR      = r"D:\Jarvis"
-    STORAGE_DIR     = r"D:\Jarvis\jarvis_project\storage"
     SKILLS_INDEX    = r"D:\Jarvis\jarvis_project\skills.md"
     SECRETS_FILE    = os.path.join(
         os.path.expanduser("~"), "AppData", "Local", "JarvisSecrets", "jarvis_secrets.json"

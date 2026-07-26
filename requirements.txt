@@ -7,9 +7,11 @@ google-genai
 keyboard
 mammoth
 mcp
+numpy
 pillow
 pyatspi
 pymupdf
+pynput
 pytesseract
 python-docx
 python-docx
@@ -17,6 +19,7 @@ pywin32
 requests
 rich
 run
+sounddevice
 then
 uiautomation
 websocket-client
