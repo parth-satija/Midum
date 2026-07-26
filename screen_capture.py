@@ -10,10 +10,52 @@ import pytesseract
 import subprocess
 import time
 import win32gui
-
+import os
+import sys
+import time
 # --- from main.py, section 1 ---
 # 3. SCREEN CAPTURE & OCR
 # =============================================================================
+
+_IS_LINUX = sys.platform.startswith("linux")
+_IS_WINDOWS = sys.platform == "win32"
+
+if _IS_WINDOWS:
+    import ctypes
+    # Crucial: Force process DPI awareness so physical OCR pixels match Windows screen coordinates
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-Monitor DPI Aware
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDpiAware()
+        except Exception:
+            pass
+
+    # Define C Structures for SendInput API
+    PUL = ctypes.POINTER(ctypes.c_ulong)
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", ctypes.c_long),
+            ("dy", ctypes.c_long),
+            ("mouseData", ctypes.c_ulong),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", PUL),
+        ]
+
+    class INPUT_UNION(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ulong), ("iu", INPUT_UNION)]
+
+    # Input Flags
+    INPUT_MOUSE = 0
+    MOUSEEVENTF_LEFTDOWN = 0x0002
+    MOUSEEVENTF_LEFTUP = 0x0004
+    MOUSEEVENTF_RIGHTDOWN = 0x0008
+    MOUSEEVENTF_RIGHTUP = 0x0010
 
 def _grab_full_screenshot():
     from main import _IMAGEGRAB_AVAILABLE
@@ -224,36 +266,79 @@ def fallback_find_text(text, _screenshot=None):
 
 def fallback_click_text(text, click_type="left_click", _screenshot=None):
     """
-    Find text on screen via OCR and click its center in one step.
-    Pass _screenshot to reuse an existing grab.
-    Returns a status string.
+    Find text on screen via OCR and click the geometric center of its 
+    bounding rectangle (handles multi-word phrases and line bounding boxes).
     """
     if not _TESSERACT_AVAILABLE:
         return (
             "Tesseract OCR is not installed. "
             "Use fallback_view_screen + fallback_click_grid instead."
         )
+
     words = ocr_screen(screenshot=_screenshot)
-    if words is None:
+    if not words:
         return "OCR failed — cannot locate text."
 
-    query   = text.strip().lower()
-    matches = [w for w in words if query in w["text"].lower()]
-    if not matches:
+    query_tokens = text.strip().lower().split()
+    if not query_tokens:
+        return "Empty search query provided."
+
+    matched_boxes = []
+
+    # Strategy 1: Match multi-word sequences across adjacent tokens
+    for i in range(len(words) - len(query_tokens) + 1):
+        sequence = words[i : i + len(query_tokens)]
+        seq_text = " ".join(w["text"].strip().lower() for w in sequence)
+        
+        if " ".join(query_tokens) in seq_text:
+            matched_boxes.append(sequence)
+
+    # Strategy 2: Single word / substring fallback if sequence match fails
+    if not matched_boxes:
+        query_str = " ".join(query_tokens)
+        single_matches = [w for w in words if query_str in w["text"].lower()]
+        if single_matches:
+            matched_boxes = [[w] for w in single_matches]
+
+    if not matched_boxes:
         all_words = sorted(set(w["text"] for w in words))
         return (
             f"Text '{text}' not found on screen. "
             f"Detected text includes: {', '.join(repr(w) for w in all_words[:40])}"
         )
 
-    matches.sort(key=lambda w: w["conf"], reverse=True)
-    best = matches[0]
-    sx, sy = best["screen_x"], best["screen_y"]
-    cx, cy = best["canvas_x"], best["canvas_y"]
+    # Sort grouped matches by average confidence
+    def get_avg_conf(group):
+        return sum(w.get("conf", 0) for w in group) / len(group)
 
-    print(f"   [OCR Click] '{best['text']}' conf={best['conf']}% "
-          f"canvas({cx},{cy}) → screen({sx},{sy})")
-    return _do_click(sx, sy, click_type, label=f"OCR '{best['text']}'")
+    matched_boxes.sort(key=get_avg_conf, reverse=True)
+    best_group = matched_boxes[0]
+
+    # Compute enclosing bounding rectangle across all tokens in the match group
+    min_x = min(w["screen_x"] for w in best_group)
+    min_y = min(w["screen_y"] for w in best_group)
+    
+    max_x = max(
+        w["screen_x"] + w.get("width", w.get("w", 0)) for w in best_group
+    )
+    max_y = max(
+        w["screen_y"] + w.get("height", w.get("h", 0)) for w in best_group
+    )
+
+    # Geometric center of the entire bounding box
+    center_x = min_x + (max_x - min_x) // 2
+    center_y = min_y + (max_y - min_y) // 2
+
+    matched_text_str = " ".join(w["text"] for w in best_group)
+    avg_conf = get_avg_conf(best_group)
+
+    print(
+        f"   [OCR Click] Match: '{matched_text_str}' (conf={avg_conf:.1f}%) "
+        f"| Box: ({min_x},{min_y})->({max_x},{max_y}) "
+        f"| Center Target: ({center_x}, {center_y})"
+    )
+
+    return _do_click(center_x, center_y, click_type, label=f"OCR '{matched_text_str}'")
 
 
 def fallback_click_grid(x, y, click_type="left_click"):
@@ -266,62 +351,83 @@ def fallback_click_grid(x, y, click_type="left_click"):
     return _do_click(real_x, real_y, click_type, label=f"grid ({x},{y})")
 
 
-def _do_click(screen_x, screen_y, click_type, label=""):
-    from tools_registry import execute_terminal_command
-    from ui_automation.linux_navigator import _run
+def _do_click(screen_x, screen_y, click_type="left_click", label=""):
     """
-    Perform a mouse click at real screen coordinates.
-    On Linux: uses xdotool. On Windows: uses PowerShell + user32.dll.
+    Perform a mouse click at physical screen coordinates without invoking slow subshells.
+    Handles Windows DPI scaling natively and supports both X11/Wayland on Linux.
     """
+    screen_x, screen_y = int(screen_x), int(screen_y)
+
+    # -------------------------------------------------------------------------
+    # LINUX PATH
+    # -------------------------------------------------------------------------
     if _IS_LINUX:
-        button = {"left_click": "1", "right_click": "3", "double_click": "1"}.get(click_type, "1")
-        _run(["xdotool", "mousemove", "--sync", str(screen_x), str(screen_y)])
-        if click_type == "double_click":
-            _, err = _run(["xdotool", "click", "--clearmodifiers", "--repeat", "2", button])
+        from ui_automation.linux_navigator import _run
+
+        is_wayland = os.environ.get("XDG_SESSION_TYPE") == "wayland"
+
+        if is_wayland:
+            # ydotool is required for Wayland display servers
+            btn = {"left_click": "0xC0", "right_click": "0xC1", "double_click": "0xC0"}.get(click_type, "0xC0")
+            _run(["ydotool", "mousemove", "-a", str(screen_x), str(screen_y)])
+            time.sleep(0.05)
+            if click_type == "double_click":
+                _run(["ydotool", "click", "--repeat", "2", btn])
+            else:
+                _run(["ydotool", "click", btn])
         else:
-            _, err = _run(["xdotool", "click", "--clearmodifiers", button])
-        if err:
-            return f"{click_type} at screen({screen_x},{screen_y}) [{label}] — warning: {err[:100]}"
+            # standard X11 fallback via xdotool
+            btn = {"left_click": "1", "right_click": "3", "double_click": "1"}.get(click_type, "1")
+            _run(["xdotool", "mousemove", "--sync", str(screen_x), str(screen_y)])
+            time.sleep(0.05)
+            if click_type == "double_click":
+                _run(["xdotool", "click", "--clearmodifiers", "--repeat", "2", btn])
+            else:
+                _run(["xdotool", "click", "--clearmodifiers", btn])
+
         return f"Success: {click_type} at screen({screen_x},{screen_y}) [{label}]"
 
-    # Windows path
-    try:
-        if click_type == "double_click":
-            events = (
-                "$m::mouse_event(0x0002,0,0,0,0)\n"
-                "$m::mouse_event(0x0004,0,0,0,0)\n"
-                "Start-Sleep -Milliseconds 50\n"
-                "$m::mouse_event(0x0002,0,0,0,0)\n"
-                "$m::mouse_event(0x0004,0,0,0,0)"
-            )
-        elif click_type == "right_click":
-            events = (
-                "$m::mouse_event(0x0008,0,0,0,0)\n"
-                "$m::mouse_event(0x0010,0,0,0,0)"
-            )
-        else:
-            events = (
-                "$m::mouse_event(0x0002,0,0,0,0)\n"
-                "$m::mouse_event(0x0004,0,0,0,0)"
-            )
+    # -------------------------------------------------------------------------
+    # WINDOWS PATH (Direct User32 API via ctypes — ultra-fast & DPI aware)
+    # -------------------------------------------------------------------------
+    if _IS_WINDOWS:
+        try:
+            # Step 1: Warp cursor to exact physical coordinates
+            ctypes.windll.user32.SetCursorPos(screen_x, screen_y)
+            time.sleep(0.05)  # Let UI thread process hover state
 
-        ps_script = (
-            f"Add-Type -AssemblyName System.Windows.Forms\n"
-            f"[System.Windows.Forms.Cursor]::Position = "
-            f"New-Object System.Drawing.Point({screen_x},{screen_y})\n"
-            f"Start-Sleep -Milliseconds 50\n"
-            f"$sig = '[DllImport(\"user32.dll\")] public static extern void "
-            f"mouse_event(int flags, int dx, int dy, int data, int extra);'\n"
-            f"$m = Add-Type -MemberDefinition $sig -Name 'Win32M' -Namespace W32 -PassThru\n"
-            f"{events}"
-        )
-        result  = execute_terminal_command(ps_script)
-        stderr  = result.split("STDERR:")[-1].strip() if "STDERR:" in result else ""
-        if stderr:
-            return f"{click_type} at screen({screen_x},{screen_y}) [{label}] — warning: {stderr[:150]}"
-        return f"Success: {click_type} at screen({screen_x},{screen_y}) [{label}]"
-    except Exception as e:
-        return f"Error simulating click: {str(e)}"
+            # Helper for low-level mouse events
+            def send_mouse_event(down_flag, up_flag):
+                extra = ctypes.c_ulong(0)
+                ii_down = INPUT(
+                    type=INPUT_MOUSE,
+                    iu=INPUT_UNION(mi=MOUSEINPUT(0, 0, 0, down_flag, 0, ctypes.pointer(extra)))
+                )
+                ii_up = INPUT(
+                    type=INPUT_MOUSE,
+                    iu=INPUT_UNION(mi=MOUSEINPUT(0, 0, 0, up_flag, 0, ctypes.pointer(extra)))
+                )
+                
+                ctypes.windll.user32.SendInput(1, ctypes.pointer(ii_down), ctypes.sizeof(ii_down))
+                time.sleep(0.03)  # 30ms hold time
+                ctypes.windll.user32.SendInput(1, ctypes.pointer(ii_up), ctypes.sizeof(ii_up))
+
+            # Step 2: Trigger requested click type
+            if click_type == "right_click":
+                send_mouse_event(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)
+            elif click_type == "double_click":
+                send_mouse_event(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
+                time.sleep(0.08)
+                send_mouse_event(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
+            else:
+                send_mouse_event(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)
+
+            return f"Success: {click_type} at screen({screen_x},{screen_y}) [{label}]"
+
+        except Exception as e:
+            return f"Error simulating click: {str(e)}"
+
+    return "Unsupported OS platform."
 
 
 def type_text(text, special_key=None, expected_window: str = ""):
