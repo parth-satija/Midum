@@ -3860,7 +3860,12 @@ function appendVoiceTranscript(role, text){
   const isUser = role === "user";
 
   if (_voiceStreamRow && _voiceStreamRow.role === role){
-    _voiceStreamRow.bubbleEl.textContent += text;
+    _voiceStreamRow.rawText += text;
+    if (isUser){
+      _voiceStreamRow.bubbleEl.textContent = _voiceStreamRow.rawText;
+    } else {
+      _voiceStreamRow.bubbleEl.innerHTML = renderMidumContent(_voiceStreamRow.rawText);
+    }
   } else {
     const col = chatCol();
     const row = document.createElement("div");
@@ -3868,9 +3873,14 @@ function appendVoiceTranscript(role, text){
     row.innerHTML = isUser
       ? `<div class="row-label">You (voice)</div><div class="bubble user"></div>`
       : `<div class="row-label">Midum (voice)</div><div class="bubble midum"></div>`;
-    row.querySelector(".bubble").textContent = text;
+    const bubbleEl = row.querySelector(".bubble");
+    if (isUser){
+      bubbleEl.textContent = text;
+    } else {
+      bubbleEl.innerHTML = renderMidumContent(text);
+    }
     col.appendChild(row);
-    _voiceStreamRow = { role, bubbleEl: row.querySelector(".bubble") };
+    _voiceStreamRow = { role, bubbleEl, rawText: text };
   }
   scrollToBottom();
 }

@@ -93,6 +93,27 @@ def _grab_full_screenshot():
         raise RuntimeError("PIL ImageGrab not available.")
 
 
+def capture_screen_frame_jpeg_bytes(max_w: int = 1024, quality: int = 70) -> bytes:
+    """
+    Grab the full screen and return raw JPEG bytes (NOT base64), downscaled so
+    the long edge is at most `max_w` px. No grid overlay, no OCR — this is the
+    lightweight per-frame capture used by the Gemini Live screen-share task
+    (providers/gemini_live_backend.py) to stream the desktop to the model as
+    realtime video while voice mode is active. Kept separate from
+    capture_screen_to_ram() (which is the on-demand, grid-annotated,
+    base64-encoded single-shot screenshot tool) since the live-share path
+    needs to run several times a second with minimal overhead.
+    """
+    screenshot = _grab_full_screenshot()
+    w, h = screenshot.size
+    if w > max_w:
+        new_h = int(h * (max_w / w))
+        screenshot = screenshot.resize((max_w, new_h), resample=_PILImage.LANCZOS)
+    buf = io.BytesIO()
+    screenshot.convert("RGB").save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
 def _scale_canvas_to_screen(cx, cy):
     """Convert canvas coordinates to real screen coordinates."""
     return int(round(cx * SCALE_X)), int(round(cy * SCALE_Y))

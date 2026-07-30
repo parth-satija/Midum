@@ -141,6 +141,17 @@ GEMINI_LIVE_SEND_RATE   = 16000     # Hz -- mic audio sent to Gemini (fixed by t
 GEMINI_LIVE_RECV_RATE   = 24000     # Hz -- audio Gemini sends back (fixed by the API)
 GEMINI_LIVE_CHUNK_SIZE  = 1024      # frames per mic-capture callback
 
+# ── Gemini Live screen-share (live screen viewing) settings ────────────────────────
+# Used by VoiceSession's screen-share task (start_screen_share/stop_screen_share
+# tools). While active, a downscaled JPEG screenshot is pushed into the same
+# Live session as a realtime video frame at roughly this rate -- Gemini's Live
+# API treats a slow stream of still frames as "video" just fine, which is
+# enough for the model to actually see the desktop while talking, without the
+# bandwidth of real screen-capture video.
+GEMINI_LIVE_SCREEN_FPS          = 1.0   # frames per second sent while sharing
+GEMINI_LIVE_SCREEN_MAX_W        = 1024  # downscale width cap (px) before JPEG encode
+GEMINI_LIVE_SCREEN_JPEG_QUALITY = 70    # JPEG quality (1-100)
+
 # ── GroqCloud model selection ─────────────────────────────────────────────────
 # Used when MODEL_PROVIDER == "groq" (primary), and always available for
 # on-demand consultation/delegation regardless of MODEL_PROVIDER, exactly

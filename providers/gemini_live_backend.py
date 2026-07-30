@@ -45,6 +45,7 @@ import threading
 
 import config
 from config import SECRETS_FILE
+from screen_capture import capture_screen_frame_jpeg_bytes
 from system_prompt import get_system_prompt
 from tools_schema import tools as _OPENAI_TOOLS
 
@@ -148,6 +149,12 @@ class VoiceSession:
         self._stop_evt = threading.Event()
         self._running = False
         self._muted = False           # mic muted but session stays open
+        # Live screen-share: set/cleared by start_screen_share()/stop_screen_share()
+        # (called via the start_screen_share/stop_screen_share tools, dispatched
+        # like any other tool call). The background _screen_share_task polls this
+        # flag rather than being started/stopped itself, so toggling it is a plain
+        # thread-safe Event set/clear -- no cross-thread asyncio scheduling needed.
+        self._screen_share_evt = threading.Event()
 
     # ── Public control surface (safe to call from the GUI/Qt thread) ──────
     def start(self, model: str = "", voice: str = "") -> str:
@@ -159,6 +166,7 @@ class VoiceSession:
 
         self._stop_evt.clear()
         self._muted = False
+        self._screen_share_evt.clear()
         self._thread = threading.Thread(
             target=self._thread_main, args=(model.strip(), voice.strip()), daemon=True
         )
@@ -179,6 +187,26 @@ class VoiceSession:
     def is_running(self) -> bool:
         return self._running
 
+    # ── Live screen-share control (safe to call from the GUI/Qt thread, or
+    # from the model's own tool-call dispatch, which also happens off the
+    # session's event-loop thread) ─────────────────────────────────────────
+    def start_screen_share(self) -> str:
+        if not self._running:
+            return "Cannot start screen share: voice session is not running."
+        if self._screen_share_evt.is_set():
+            return "Screen share is already live."
+        self._screen_share_evt.set()
+        return "Live screen viewing started -- streaming screenshots into the conversation until stop_screen_share is called."
+
+    def stop_screen_share(self) -> str:
+        if not self._screen_share_evt.is_set():
+            return "Screen share is not currently active."
+        self._screen_share_evt.clear()
+        return "Live screen viewing stopped."
+
+    def is_screen_sharing(self) -> bool:
+        return self._screen_share_evt.is_set()
+
     # ── Background thread entry point ──────────────────────────────────────
     def _thread_main(self, model: str, voice: str):
         loop = asyncio.new_event_loop()
@@ -189,6 +217,7 @@ class VoiceSession:
             self.on_event("voice_error", {"message": str(e)})
         finally:
             self._running = False
+            self._screen_share_evt.clear()
             self.on_event("voice_status", {"status": "stopped"})
             try:
                 loop.close()
@@ -279,6 +308,7 @@ class VoiceSession:
                     await asyncio.gather(
                         self._mic_drain_task(session, mic_queue, send_rate),
                         self._recv_task(session),
+                        self._screen_share_task(session),
                     )
         except Exception as e:
             # Retry once against the older-generation model name if the
@@ -345,6 +375,45 @@ class VoiceSession:
                 await session.send_realtime_input(activity_end=genai_types.ActivityEnd())
             except Exception:
                 pass
+
+    async def _screen_share_task(self, session):
+        """While self._screen_share_evt is set (toggled by start_screen_share() /
+        stop_screen_share()), grab a downscaled JPEG screenshot roughly every
+        1/GEMINI_LIVE_SCREEN_FPS seconds and push it into the live session as
+        a realtime video frame -- Gemini's Live API is happy to treat a slow
+        still-frame stream as "video", which is enough for the model to
+        actually see the desktop live while talking. Screen capture is a
+        blocking call (ImageGrab/scrot under the hood), so it's run in the
+        default executor to avoid blocking the event loop that also drives
+        mic streaming and audio playback.
+        """
+        loop = asyncio.get_event_loop()
+        fps = max(0.1, float(getattr(config, "GEMINI_LIVE_SCREEN_FPS", 1.0)))
+        interval = 1.0 / fps
+        max_w = int(getattr(config, "GEMINI_LIVE_SCREEN_MAX_W", 1024))
+        quality = int(getattr(config, "GEMINI_LIVE_SCREEN_JPEG_QUALITY", 70))
+
+        while not self._stop_evt.is_set():
+            if not self._screen_share_evt.is_set():
+                # Not sharing right now -- poll cheaply instead of busy-looping,
+                # so start_screen_share() takes effect within ~0.3s of being called.
+                await asyncio.sleep(0.3)
+                continue
+            try:
+                jpeg_bytes = await loop.run_in_executor(
+                    None, capture_screen_frame_jpeg_bytes, max_w, quality
+                )
+                await session.send_realtime_input(
+                    video=genai_types.Blob(data=jpeg_bytes, mime_type="image/jpeg")
+                )
+            except Exception as e:
+                if self._stop_evt.is_set():
+                    break
+                self.on_event("voice_error", {"message": f"Screen share frame failed: {e}"})
+                # Back off briefly rather than hammering a failing capture/send path.
+                await asyncio.sleep(1.0)
+                continue
+            await asyncio.sleep(interval)
 
     async def _recv_task(self, session):
         """Receive audio/text/tool-call events from Gemini and act on them."""
@@ -422,3 +491,22 @@ def get_voice_session(on_event) -> VoiceSession:
     if _voice_session_instance is None:
         _voice_session_instance = VoiceSession(on_event)
     return _voice_session_instance
+
+
+# ── Tool-facing entry points ────────────────────────────────────────────────
+# These are what the start_screen_share/stop_screen_share tool schemas in
+# tools_schema.py actually call, via _dispatch_midum_tool's generic fallback
+# (hasattr(midum, tool_name) -> getattr(midum, tool_name)(**args)). They act
+# on the single running VoiceSession singleton rather than needing the model
+# to hold a session handle -- there's only ever one live voice session per
+# process, exactly like start()/stop() on the Voice tab itself.
+def start_screen_share() -> str:
+    if _voice_session_instance is None:
+        return "Cannot start screen share: no voice session has been started yet."
+    return _voice_session_instance.start_screen_share()
+
+
+def stop_screen_share() -> str:
+    if _voice_session_instance is None:
+        return "Cannot stop screen share: no voice session has been started yet."
+    return _voice_session_instance.stop_screen_share()

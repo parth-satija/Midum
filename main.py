@@ -29,6 +29,7 @@ from orchestration import _decompose_task, _is_trivial_input, get_gemini_reasoni
 from providers.gemini_api_backend import _gemini_api_load_msg, consult_gemini_api, delegate_to_gemini_api, set_gemini_api_model
 from providers.gemini_reasoning import consult_gemini
 from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _gemini_webapi_load_msg, _get_gemini_web_client, delegate_to_gemini_web, set_gemini_web_model
+from providers.gemini_live_backend import start_screen_share, stop_screen_share
 from providers.groq_backend import _groq_load_msg, consult_groq, delegate_to_groq, list_groq_models, set_groq_model, set_groq_model_by_index
 from providers.ollama_cloud_backend import consult_ollama_cloud, delegate_to_ollama_cloud, list_ollama_cloud_models, set_ollama_cloud_model
 from providers.openrouter_backend import _openrouter_load_msg, consult_openrouter, delegate_to_openrouter, list_openrouter_models, set_openrouter_model, set_openrouter_model_by_index

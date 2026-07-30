@@ -375,6 +375,45 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "start_screen_share",
+            "description": (
+                "VOICE MODE ONLY. Start LIVE screen viewing: from this call until "
+                "stop_screen_share is called, a stream of screenshots is pushed "
+                "continuously (about 1 frame/sec) into this same voice conversation "
+                "as realtime video, so you can literally see the user's screen update "
+                "as they talk and act, without needing to call a screenshot tool "
+                "again for each glance. Use this when the user asks you to watch "
+                "their screen, follow along with what they're doing, help them "
+                "navigate a UI live, take notes on what's happening, or narrate/ "
+                "guide them through something in real time. "
+                "Call stop_screen_share as soon as live viewing is no longer needed "
+                "(e.g. the user says stop, or the task requiring live viewing is "
+                "done) — it keeps streaming until you explicitly stop it. "
+                "You can still take real actions (click_ui_element, type_text, "
+                "write_local_file for notes, etc.) while sharing is active; live "
+                "video is just an additional input stream, not a replacement."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_screen_share",
+            "description": (
+                "VOICE MODE ONLY. Stop the live screen viewing started by "
+                "start_screen_share — no more video frames are sent to this "
+                "conversation until start_screen_share is called again. Call this "
+                "once you no longer need to watch the screen live (task done, user "
+                "asked you to stop, or you're switching to something that doesn't "
+                "need visual follow-along) to save bandwidth and avoid stale context."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "fallback_view_screen",
             "description": (
                 "Capture a live screenshot of the desktop, downscaled to canvas size with a "
