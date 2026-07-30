@@ -599,8 +599,10 @@ class Api:
     _DEFAULT_COLORS = {
         "accent": "#60a5fa", "accent2": "#1d4ed8",
         "bg": "#05070c", "panel": "#0b0f19", "text": "#f3f4f6",
+        "blob_center": "#60a5fa", "blob_a": "#f472b6", "blob_b": "#34d399", "blob_cursor": "#a78bfa",
     }
     _DEFAULT_THEME = "dark"
+    _DEFAULT_BLOBS_ENABLED = True
     _DEFAULT_BG_IMAGE = {
         "enabled": False, "path": "",
         "brightness": 100, "blur": 0, "opacity": 100,
@@ -619,6 +621,7 @@ class Api:
             "model": _default_model_for_provider(DEFAULT_PROVIDER_KEY),
             "theme": self._DEFAULT_THEME,
             "colors": dict(self._DEFAULT_COLORS),
+            "blobs_enabled": self._DEFAULT_BLOBS_ENABLED,
             "bg_image": dict(self._DEFAULT_BG_IMAGE),
         }
         path = self._settings_path()
@@ -634,6 +637,8 @@ class Api:
                     defaults["theme"] = saved["theme"]
                 if isinstance(saved.get("colors"), dict):
                     defaults["colors"].update(saved["colors"])
+                if isinstance(saved.get("blobs_enabled"), bool):
+                    defaults["blobs_enabled"] = saved["blobs_enabled"]
                 if isinstance(saved.get("bg_image"), dict):
                     defaults["bg_image"].update(saved["bg_image"])
         except Exception as e:
@@ -651,6 +656,8 @@ class Api:
                 current["theme"] = settings["theme"]
             if isinstance(settings.get("colors"), dict):
                 current["colors"].update({k: v for k, v in settings["colors"].items() if v})
+            if isinstance(settings.get("blobs_enabled"), bool):
+                current["blobs_enabled"] = settings["blobs_enabled"]
             if isinstance(settings.get("bg_image"), dict):
                 # Path changes only ever come through pick_background_image /
                 # clear_background_image (which persist immediately), so
@@ -1711,6 +1718,10 @@ _HTML = r"""<!DOCTYPE html>
   --user-msg:#0f1e33; --midum-msg:#0a0e17;
   --tool-bg:#05070c; --tool-text:#93c5fd;
   --gap:14px; --radius:24px; --ease:cubic-bezier(.65,0,.35,1);
+  /* User-configurable ambient blob colors (SETTINGS → COLORS). Defaults
+     match the original hardcoded hex values each blob used to have baked
+     into its gradient/hue-rotate. */
+  --blob-center:#60a5fa; --blob-a:#f472b6; --blob-b:#34d399; --blob-cursor:#a78bfa;
 }
 *{box-sizing:border-box;}
 html,body{margin:0;padding:0;height:100%;background:var(--bg);color:var(--text);
@@ -1791,28 +1802,149 @@ input,textarea{font-family:inherit;}
 }
 html.has-bg-image #bg-image-layer{ display:block; }
 
+/* ── Ambient gradient blobs ──────────────────────────────────────────────
+   Purely decorative, always-on ambience layer sitting behind the panes
+   (z-index:0, same stacking context as #bg-image-layer) so it only ever
+   shows through the thin var(--gap) margins around the panes -- and, in
+   "liquid glass" mode, softly through the panes' translucent background.
+   pointer-events:none end-to-end so it can never intercept a click/drag,
+   and nothing here is ever laid out (all four blobs are absolutely
+   positioned circles animated via transform), so it cannot shift or
+   resize any real UI element. Each blob's color is user-configurable
+   (SETTINGS → COLORS) via its own --blob-* CSS custom property, plugged
+   straight into that blob's radial-gradient -- no filter/hue-rotate
+   trick needed, and nothing about changing it forces a repaint of the
+   others. */
+#blob-layer{
+  position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden;
+  /* isolation:isolate gives this layer its own stacking/blend context so
+     nothing outside it ever has to be recomposited when a blob repaints,
+     and contain:strict (paint+layout+size+style) tells the engine this
+     subtree's rendering is fully self-contained -- a resize, maximize, or
+     any change elsewhere on the page cannot force it to re-layout or
+     re-rasterize. transition:opacity is used to hide/show the whole layer
+     smoothly during a live window resize (see JS below) instead of letting
+     the browser visibly re-blur it mid-drag, which is what caused the
+     flash on maximize. */
+  isolation:isolate;contain:strict;
+  opacity:1;transition:opacity .25s linear;
+}
+html.blob-settling #blob-layer{opacity:0;}
+/* filter:blur() is set once, statically, per blob -- never animated. Animating
+   `filter` forces the compositor to fully re-rasterize these huge blurred
+   layers on every single frame, which is what caused the flashing/strobing
+   once the blob layer was added (same class of bug as the #bg-image-layer
+   note above). Only `transform` is ever animated here, which is
+   compositor-only and doesn't repaint. Each blob's actual color comes from
+   its own --blob-* custom property (see :root and SETTINGS → COLORS) baked
+   directly into the gradient -- a plain background-color-style value the
+   compositor resolves once at paint time, same as any other static color.
+     mix-blend-mode is deliberately NOT used: blending several huge blurred
+   layers together is expensive to recomposite and, in this embedded webview,
+   visibly flickers whenever the compositor has to rebuild layers -- on
+   resize/maximize, and on focus/blur when the cursor leaves the window.
+   Plain stacked, semi-transparent radial gradients (already fading to
+   `transparent` at their edge) give the same soft glow-through look without
+   ever needing a blend context.
+     Sizes are set from --blob-vw/--blob-vh (plain px, computed once in JS
+   from the window size and only updated on debounced resize) rather than
+   vmax/vw/vh units. Viewport-relative units force the engine to recompute
+   every blob's geometry and re-rasterize its blur continuously while a
+   window is actively being resized/maximized; static px doesn't. */
+.blob{
+  position:absolute;left:0;top:0;border-radius:50%;
+  opacity:.55;will-change:transform;
+  filter:blur(70px);
+  transform:translateZ(0);backface-visibility:hidden;
+  contain:paint;
+}
+#blob-center{
+  width:calc(var(--blob-vmax,900px)*0.56);height:calc(var(--blob-vmax,900px)*0.56);left:50%;top:50%;
+  background:radial-gradient(circle at 35% 35%, var(--blob-center) 0%, var(--accent2) 45%, transparent 72%);
+  opacity:.28;transform:translate(-50%,-50%);
+  animation:blobPulse 11s ease-in-out infinite;
+}
+#blob-a{
+  width:calc(var(--blob-vmax,900px)*0.3);height:calc(var(--blob-vmax,900px)*0.3);
+  background:radial-gradient(circle at 40% 40%, var(--blob-a) 0%, transparent 72%);
+  transform:translate(20vw,25vh) translate(-50%,-50%);
+  transition:transform 6s cubic-bezier(.45,0,.55,1);
+}
+#blob-b{
+  width:calc(var(--blob-vmax,900px)*0.3);height:calc(var(--blob-vmax,900px)*0.3);
+  background:radial-gradient(circle at 45% 35%, var(--blob-b) 0%, transparent 72%);
+  transform:translate(75vw,70vh) translate(-50%,-50%);
+  transition:transform 7s cubic-bezier(.45,0,.55,1);
+}
+#blob-cursor{
+  width:calc(var(--blob-vmax,900px)*0.2);height:calc(var(--blob-vmax,900px)*0.2);
+  background:radial-gradient(circle at 50% 50%, var(--blob-cursor) 0%, transparent 72%);
+  transform:translate(-100px,-100px) translate(-50%,-50%);
+}
+@keyframes blobPulse{
+  0%,100%{transform:translate(-50%,-50%) scale(1);}
+  50%{transform:translate(-50%,-50%) scale(1.08);}
+}
+
+/* Panes/topbar are translucent (flat color-mix tint, resolved once at
+   paint time like any normal background-color -- deliberately NOT
+   backdrop-filter, which would have to continuously re-blur the blob
+   layer running behind it every frame) so the ambient blob layer reads
+   as glowing up through the panel surface itself, not just in the
+   var(--gap) margins around it. #blob-layer sits at a lower paint layer
+   than .pane (z-index:0 vs 1) so it's always underneath; anything with
+   its own opaque background -- #input-box, buttons, message bubbles,
+   tab pills -- still paints solid on top of that tint as a normal child,
+   so the blobs never wash out real UI content, only the panel behind it.
+   When a background image is active the tint goes a bit more transparent
+   (via html.has-bg-image below) so the image shows through too.
+     The pane surface itself is fully transparent (no fill, no border) so
+   the blobs show straight through the whole window, not just the gap
+   margins -- only the elements *inside* a pane (input box, buttons,
+   message bubbles, tab pills, etc.) keep their own opaque/tinted
+   background and remain fully visible, since those are separate child
+   elements with their own background-color, not something painted by
+   .pane itself. */
 .pane{
   position:absolute;inset:calc(var(--gap)/2);border-radius:var(--radius);
-  background:var(--panel);border:1px solid var(--border2);
+  background:transparent;
+  border:none;
   display:flex;flex-direction:column;overflow:hidden;
   z-index:1;
 }
-/* "Liquid glass" look, only when a background image is active. This is a
-   flat translucent tint (color-mix, resolved once at paint time like any
-   normal background-color) with NO backdrop-filter: backdrop-filter has
-   to continuously re-blur whatever's behind it, and this UI has several
-   always-running animations behind the panes, so it was never actually
-   static in practice -- that mismatch between the comment's intent and
-   the compositor's real behavior was the root cause of the flashing. */
+#topbar{
+  /* #topbar's base rule (further up, in the "Top bar" block) still sets a
+     1px border for the no-blobs/no-bg-image case below -- background alone
+     was being cleared here, which left that border painting as a bare
+     rounded-rect outline floating over the transparent blob area. Clear
+     both together so there's nothing left to outline it. */
+  background:transparent !important;
+  border:none !important;
+}
 html.has-bg-image .pane{
   background:color-mix(in srgb, var(--panel) 62%, transparent);
   border:1px solid color-mix(in srgb, var(--text) 12%, transparent);
   box-shadow:inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent), 0 8px 30px rgba(0,0,0,.35);
 }
 html.has-bg-image #topbar{
-  background:color-mix(in srgb, var(--panel) 62%, transparent);
+  background:color-mix(in srgb, var(--panel) 62%, transparent) !important;
   border:1px solid color-mix(in srgb, var(--text) 12%, transparent);
   box-shadow:inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent), 0 8px 30px rgba(0,0,0,.35);
+}
+/* Ambient blobs are an optional setting (SETTINGS → AMBIENT BLOBS). When
+   turned off, hide the blob layer entirely and give the panes/topbar their
+   normal opaque surface back -- otherwise, with #blob-layer gone, they'd
+   just show flat var(--bg) through fully transparent panes. Skipped when a
+   background image is active (html.has-bg-image above already gives that
+   case its own tinted-panel treatment). */
+html.blobs-off #blob-layer{ display:none; }
+html.blobs-off:not(.has-bg-image) .pane{
+  background:var(--panel);
+  border:1px solid var(--border2);
+}
+html.blobs-off:not(.has-bg-image) #topbar{
+  background:var(--panel) !important;
+  border:1px solid var(--border2) !important;
 }
 .pane-hidden{opacity:0;pointer-events:none;}
 
@@ -2241,6 +2373,13 @@ textarea.code-area{
 <div id="root">
 
   <div id="bg-image-layer"></div>
+
+  <div id="blob-layer">
+    <div class="blob" id="blob-center"></div>
+    <div class="blob" id="blob-a"></div>
+    <div class="blob" id="blob-b"></div>
+    <div class="blob" id="blob-cursor"></div>
+  </div>
 
   <div id="topbar-wrap">
     <div id="topbar">
@@ -3317,6 +3456,12 @@ function buildSidebar(){
         <button class="ghost-btn" data-theme="light" style="flex:1;">☀️ Light</button>
       </div>
       <div class="hdr-row" style="margin-top:4px;">
+        <div class="field-label" style="margin:0;">AMBIENT BLOBS</div>
+        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);">
+          <input type="checkbox" id="settings-blobs-enabled" style="width:14px;height:14px;"/> Enabled
+        </label>
+      </div>
+      <div class="hdr-row" style="margin-top:4px;">
         <div class="field-label" style="margin:0;">BACKGROUND IMAGE</div>
         <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);">
           <input type="checkbox" id="settings-bg-enabled" style="width:14px;height:14px;"/> Enabled
@@ -3345,6 +3490,13 @@ function buildSidebar(){
         <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Background<input type="color" id="settings-color-bg" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
         <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Panel<input type="color" id="settings-color-panel" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
         <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Text<input type="color" id="settings-color-text" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
+      </div>
+      <div class="field-label">BLOB COLORS</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;">
+        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Center<input type="color" id="settings-color-blob_center" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
+        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Blob A<input type="color" id="settings-color-blob_a" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
+        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Blob B<input type="color" id="settings-color-blob_b" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
+        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Cursor<input type="color" id="settings-color-blob_cursor" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
       </div>
       <div class="btn-row" style="margin-top:4px;">
         <button class="ghost-btn" id="settings-reset">Reset defaults</button>
@@ -3392,8 +3544,10 @@ function buildSidebar(){
   document.getElementById("settings-save").onclick = saveSettingsPanel;
   document.getElementById("settings-reset").onclick = ()=>{
     // Reset to the ACTIVE theme's defaults (not always Dark), so resetting
-    // while in Light mode gives back Light's real colors.
-    const defaults = THEME_VARS[_activeTheme] || DEFAULT_COLORS;
+    // while in Light mode gives back Light's real colors. Blob colors
+    // aren't theme-dependent (THEME_VARS doesn't touch them), so they
+    // always come from DEFAULT_COLORS regardless of active theme.
+    const defaults = {...DEFAULT_COLORS, ...(THEME_VARS[_activeTheme] || {})};
     applyColors(defaults);
     Object.entries(defaults).forEach(([k,v])=>{
       const el = document.getElementById(`settings-color-${k}`);
@@ -3411,6 +3565,9 @@ function buildSidebar(){
   document.getElementById("settings-bg-enabled").onchange = (e)=>{
     _bgState.cfg.enabled = e.target.checked;
     applyBgImage(_bgState.cfg, _bgState.dataUrl);
+  };
+  document.getElementById("settings-blobs-enabled").onchange = (e)=>{
+    applyBlobsEnabled(e.target.checked);
   };
   document.getElementById("bg-choose").onclick = async ()=>{
     const r = await api("pick_background_image");
@@ -3438,7 +3595,10 @@ function buildSidebar(){
   });
 }
 
-const DEFAULT_COLORS = {accent:"#60a5fa", accent2:"#1d4ed8", bg:"#05070c", panel:"#0b0f19", text:"#f3f4f6"};
+const DEFAULT_COLORS = {
+  accent:"#60a5fa", accent2:"#1d4ed8", bg:"#05070c", panel:"#0b0f19", text:"#f3f4f6",
+  blob_center:"#60a5fa", blob_a:"#f472b6", blob_b:"#34d399", blob_cursor:"#a78bfa",
+};
 
 // Full palette per theme — mirrors the website's (index.html) light/dark
 // color scheme exactly, and covers every CSS var, not just the 5
@@ -3493,6 +3653,10 @@ function applyColors(colors){
   if (colors.bg) root.setProperty("--bg", colors.bg);
   if (colors.panel) root.setProperty("--panel", colors.panel);
   if (colors.text) root.setProperty("--text", colors.text);
+  if (colors.blob_center) root.setProperty("--blob-center", colors.blob_center);
+  if (colors.blob_a) root.setProperty("--blob-a", colors.blob_a);
+  if (colors.blob_b) root.setProperty("--blob-b", colors.blob_b);
+  if (colors.blob_cursor) root.setProperty("--blob-cursor", colors.blob_cursor);
 }
 
 function applyBgImage(cfg, dataUrl){
@@ -3514,6 +3678,19 @@ function applyBgImage(cfg, dataUrl){
     const fn = document.getElementById("bg-filename");
     if (fn) fn.textContent = cfg.path ? cfg.path.split(/[\\/]/).pop() : "No image selected";
   }
+}
+
+// Ambient blobs on/off. `_blobLayerCtl` is set once initBlobLayer() runs
+// (see boot below) and exposes pause()/resume() so the wander/cursor loops
+// actually stop doing work while hidden, not just get display:none'd.
+let _blobsEnabled = true;
+let _blobLayerCtl = null;
+function applyBlobsEnabled(enabled){
+  _blobsEnabled = !!enabled;
+  document.documentElement.classList.toggle("blobs-off", !_blobsEnabled);
+  if (_blobLayerCtl) (_blobsEnabled ? _blobLayerCtl.resume : _blobLayerCtl.pause)();
+  const cb = document.getElementById("settings-blobs-enabled");
+  if (cb) cb.checked = _blobsEnabled;
 }
 
 // Cache of the current bg config + baked data url. Slider drags call a
@@ -3622,6 +3799,7 @@ function enhanceSelect(sel){
 async function loadSettingsPanel(){
   const s = await api("get_settings");
   applyTheme(s.theme || "dark");
+  applyBlobsEnabled(s.blobs_enabled !== false);
   _bgState.cfg = s.bg_image || _bgState.cfg;
   if (_bgState.cfg.enabled && _bgState.cfg.path){
     const r = await api("get_background_image_data");
@@ -3657,15 +3835,17 @@ async function saveSettingsPanel(){
     opacity: Number(document.getElementById("bg-opacity").value),
   };
   const colors = {};
-  ["accent","accent2","bg","panel","text"].forEach(k=>{
+  ["accent","accent2","bg","panel","text","blob_center","blob_a","blob_b","blob_cursor"].forEach(k=>{
     const el = document.getElementById(`settings-color-${k}`);
     if (el) colors[k] = el.value;
   });
-  const r = await api("save_settings", {provider, model, theme: _activeTheme, colors, bg_image});
+  const blobs_enabled = document.getElementById("settings-blobs-enabled").checked;
+  const r = await api("save_settings", {provider, model, theme: _activeTheme, colors, bg_image, blobs_enabled});
   const status = document.getElementById("settings-status");
   if (r.ok){
     applyTheme(r.settings.theme || "dark");
     applyColors(r.settings.colors);
+    applyBlobsEnabled(r.settings.blobs_enabled !== false);
     _bgState.cfg = r.settings.bg_image;
     applyBgImage(_bgState.cfg, _bgState.dataUrl);
     if (status) status.textContent = "Saved — will be remembered next launch.";
@@ -5097,7 +5277,129 @@ async function buildPermissionsPane(box){
   };
 }
 
+// ── Ambient blob layer ----------------------------------------------------
+// blob-center is pure CSS (pulse, no JS). blob-a/blob-b wander to a new
+// random point every few seconds via a CSS transform transition (smooth
+// easing, true random targets picked in JS). blob-cursor tracks the mouse
+// with exponential smoothing (lerp) each animation frame so it glides
+// rather than snapping straight to the pointer.
+//
+// Three separate things used to cause visible flashing/flicker, all fixed
+// here rather than in CSS alone:
+//   1. Blob sizes were in vmax, so every pixel of a live window resize/
+//      maximize forced the engine to recompute geometry and re-rasterize
+//      the blur for four huge layers *continuously* while dragging. Fixed
+//      by only computing size once (as --blob-vmax, a plain px value) on
+//      load and on a *debounced* resize -- never mid-drag.
+//   2. Even with that fix, the moment of resize/maximize itself still
+//      forces one unavoidable re-layout of the whole page (panes, topbar,
+//      etc.), and re-compositing the blob layer at the same instant is
+//      what read as a flash. Fixed by fading #blob-layer's opacity to 0
+//      for the duration of the resize (html.blob-settling) and back in
+//      once things have settled, so that repaint never happens on-screen.
+//   3. The rAF loop driving blob-cursor ran unconditionally, including
+//      while the window/webview was unfocused (e.g. cursor left the
+//      window) -- pywebview/CEF can suspend and abruptly resume rAF in a
+//      way that produces a visible jump/flash on refocus. Fixed by
+//      pausing the loop on window "blur" and resuming cleanly on "focus".
+function initBlobLayer(){
+  const cursorBlob = document.getElementById("blob-cursor");
+  const blobA = document.getElementById("blob-a");
+  const blobB = document.getElementById("blob-b");
+
+  function setBlobScale(){
+    const vmax = Math.max(window.innerWidth, window.innerHeight);
+    document.documentElement.style.setProperty("--blob-vmax", vmax + "px");
+  }
+  setBlobScale();
+
+  let resizeSettleTimer = null;
+  let lastW = window.innerWidth, lastH = window.innerHeight;
+  window.addEventListener("resize", ()=>{
+    // Windows fires spurious "resize" events with no actual dimension change
+    // when the cursor hovers the native minimize/maximize/close caption
+    // buttons (DWM hit-testing / snap-layout preview on the title bar).
+    // Reacting to those no-op resizes by toggling blob-settling was what
+    // caused the blob layer to flash every time the pointer passed over
+    // those buttons. Only treat it as a real resize -- and only then fade
+    // the blob layer -- if the viewport size actually changed.
+    const w = window.innerWidth, h = window.innerHeight;
+    if (w === lastW && h === lastH) return;
+    lastW = w; lastH = h;
+
+    document.documentElement.classList.add("blob-settling");
+    clearTimeout(resizeSettleTimer);
+    resizeSettleTimer = setTimeout(()=>{
+      setBlobScale();
+      // next frame, so the size change above lands while still invisible
+      requestAnimationFrame(()=>{
+        document.documentElement.classList.remove("blob-settling");
+      });
+    }, 180);
+  }, { passive: true });
+
+  // cursorStart/cursorStop are also exposed on the returned handle (as
+  // resume/pause) so the settings toggle can fully stop this rAF loop --
+  // not just hide the layer -- when the user turns blobs off.
+  let cursorStart = ()=>{}, cursorStop = ()=>{};
+  if (cursorBlob){
+    let cx = window.innerWidth / 2, cy = window.innerHeight / 2;
+    let tx = cx, ty = cy;
+    let rafId = null;
+    window.addEventListener("mousemove", (e)=>{ tx = e.clientX; ty = e.clientY; }, { passive: true });
+
+    function tick(){
+      cx += (tx - cx) * 0.07;
+      cy += (ty - cy) * 0.07;
+      cursorBlob.style.transform = `translate(${cx}px, ${cy}px) translate(-50%, -50%)`;
+      rafId = requestAnimationFrame(tick);
+    }
+    function start(){ if (rafId === null) rafId = requestAnimationFrame(tick); }
+    function stop(){ if (rafId !== null){ cancelAnimationFrame(rafId); rafId = null; } }
+    cursorStart = start; cursorStop = stop;
+
+    start();
+    window.addEventListener("blur", stop);
+    window.addEventListener("focus", ()=>{
+      // re-sync target to wherever the pointer actually is before resuming,
+      // so it doesn't glide in from a stale position and look like a jump.
+      tx = cx; ty = cy;
+      if (blobsPaused) return; // stay off if the user disabled blobs while unfocused
+      start();
+    });
+  }
+
+  // `active` gates whether wander() actually moves the blobs each leg --
+  // the setTimeout chain itself keeps running either way (cheap), so
+  // resuming just flips a flag rather than having to re-kick anything.
+  let active = true;
+  let blobsPaused = false;
+  function wander(el){
+    if (!el) return;
+    (function step(){
+      if (active){
+        const x = window.innerWidth * (0.08 + Math.random() * 0.84);
+        const y = window.innerHeight * (0.08 + Math.random() * 0.84);
+        const dur = 5 + Math.random() * 5; // 5-10s per leg, so it never looks metronomic
+        el.style.transitionDuration = dur + "s";
+        el.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%)`;
+        setTimeout(step, dur * 1000);
+      } else {
+        setTimeout(step, 1000); // paused -- just poll for resume, don't move
+      }
+    })();
+  }
+  wander(blobA);
+  wander(blobB);
+
+  return {
+    pause(){ active = false; blobsPaused = true; cursorStop(); },
+    resume(){ active = true; blobsPaused = false; cursorStart(); },
+  };
+}
+
 // ── Boot -----------------------------------------------------------------
+_blobLayerCtl = initBlobLayer(); // pure DOM/CSS, doesn't need the pywebview bridge -- start immediately
 window.addEventListener("pywebviewready", async ()=>{
   buildTabbar();
   buildSidebar();
@@ -5114,6 +5416,7 @@ window.addEventListener("pywebviewready", async ()=>{
     const s = await api("get_settings");
     applyTheme(s.theme || "dark");
     applyColors(s.colors);
+    applyBlobsEnabled(s.blobs_enabled !== false);
     _bgState.cfg = s.bg_image || _bgState.cfg;
     if (_bgState.cfg.enabled && _bgState.cfg.path){
       const r = await api("get_background_image_data");
