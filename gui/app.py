@@ -1058,7 +1058,7 @@ class Api:
                 if self.window:
                     self._destroy_window_safe()
 
-    _VISUAL_FENCE_LANGS = ("image_data_json", "flowchart_json")
+    _VISUAL_FENCE_LANGS = ("image_data_json", "flowchart_json", "mermaid")
     _TOOL_VISUAL_FENCE_RE = re.compile(r"```(" + "|".join(_VISUAL_FENCE_LANGS) + r")\n(.*?)```", re.DOTALL)
     _ANY_FENCE_RE = re.compile(r"```([\w_]*)\n(.*?)```", re.DOTALL)
 
@@ -1970,6 +1970,12 @@ table.md-table tr:nth-child(even) td{background:color-mix(in srgb, var(--surface
 .flowchart-wrap{background:var(--surface);border:1px solid var(--border2);border-radius:16px;
   padding:14px;overflow:auto;margin:8px 0;max-width:100%;}
 .flowchart-wrap svg{display:block;margin:0 auto;}
+/* Mermaid diagrams render into a .mermaid placeholder inside the same
+   .flowchart-wrap card used for the legacy flowchart_json renderer -- the
+   card chrome (background/border/padding) is shared, only the innards
+   differ (Mermaid's own SVG vs the hand-rolled one above). */
+.mermaid{display:flex;justify-content:center;}
+.mermaid svg{max-width:100%;}
 
 /* Generated-image gallery + save button */
 .img-frame{position:relative;display:inline-block;margin-top:8px;max-width:100%;}
@@ -2622,7 +2628,71 @@ function renderFlowchartSVG(data){
   }
 }
 
-const FLOWCHART_FENCE_RE = /```(flowchart_json|image_data_json)\n([\s\S]*?)```/g;
+const FLOWCHART_FENCE_RE = /```(flowchart_json|mermaid|image_data_json)\n([\s\S]*?)```/g;
+
+// ── Mermaid rendering (```mermaid``` blocks) ------------------------------
+// Loaded lazily from CDN on first use, same lazy-load pattern as Drawflow.
+// Mermaid owns its own async rendering pipeline, so renderMidumContent just
+// drops a placeholder <div class="mermaid"> with the raw (HTML-escaped, so
+// it round-trips through innerHTML intact) source text, and the caller
+// (appendRow / appendVoiceTranscript) kicks off renderPendingMermaid()
+// afterwards to actually turn every such div into an SVG diagram in place.
+const MERMAID_JS = "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js";
+let _mermaidLoadPromise = null;
+function _loadMermaidOnce(){
+  if (_mermaidLoadPromise) return _mermaidLoadPromise;
+  _mermaidLoadPromise = new Promise((resolve, reject)=>{
+    if (window.mermaid){ resolve(); return; }
+    const s = document.createElement("script");
+    s.src = MERMAID_JS;
+    s.onload = ()=>{
+      try {
+        window.mermaid.initialize({
+          startOnLoad: false,
+          theme: "dark",
+          securityLevel: "strict",
+          fontFamily: "Segoe UI, -apple-system, sans-serif",
+        });
+      } catch (e) { /* fall through -- render call below will surface any real error */ }
+      resolve();
+    };
+    s.onerror = ()=>reject(new Error("failed to load " + MERMAID_JS));
+    document.head.appendChild(s);
+  });
+  return _mermaidLoadPromise;
+}
+
+// Renders every not-yet-rendered `.mermaid` placeholder currently in the
+// DOM. Safe to call repeatedly/concurrently -- each element is marked
+// data-mermaid-done once handled so a later call skips it. On parse/render
+// failure, replaces that one placeholder with a plain error note instead of
+// leaving a blank box or throwing across the whole batch.
+async function renderPendingMermaid(){
+  const pending = Array.from(document.querySelectorAll(".mermaid:not([data-mermaid-done])"));
+  if (!pending.length) return;
+  try {
+    await _loadMermaidOnce();
+  } catch (e) {
+    pending.forEach(el=>{
+      el.dataset.mermaidDone = "1";
+      el.outerHTML = `<pre class="code-block">${escapeHtml(el.textContent || "")}</pre>`;
+    });
+    return;
+  }
+  for (const el of pending){
+    el.dataset.mermaidDone = "1";
+    const src = el.textContent;
+    try {
+      const id = "mmd-" + Math.random().toString(36).slice(2);
+      const { svg } = await window.mermaid.render(id, src);
+      el.innerHTML = svg;
+    } catch (e) {
+      const wrap = el.closest(".flowchart-wrap") || el;
+      wrap.outerHTML = `<pre class="code-block">${escapeHtml(src)}</pre>`;
+    }
+  }
+}
+
 function renderMidumContent(text){
   FLOWCHART_FENCE_RE.lastIndex = 0;
   if (!FLOWCHART_FENCE_RE.test(text)) return renderInline(text);
@@ -2637,6 +2707,12 @@ function renderMidumContent(text){
     const lang = match[1];
     const body = match[2];
     let renderedBlock = null;
+    if (lang === 'mermaid') {
+      renderedBlock = `<div class="flowchart-wrap"><div class="mermaid">${escapeHtml(body.trim())}</div></div>`;
+      out += renderedBlock;
+      lastIndex = FLOWCHART_FENCE_RE.lastIndex;
+      continue;
+    }
     try {
       const payload = JSON.parse(body);
       if (lang === 'flowchart_json') {
@@ -2752,6 +2828,7 @@ function appendRow(tag, text){
     setActiveToolDot(null);
     col.appendChild(row);
     animateWords(row.querySelector(".bubble"));
+    renderPendingMermaid();
     scrollToBottom();
     return;
   } else if (tag === "system"){
@@ -3882,6 +3959,7 @@ function appendVoiceTranscript(role, text){
     col.appendChild(row);
     _voiceStreamRow = { role, bubbleEl, rawText: text };
   }
+  if (!isUser) renderPendingMermaid();
   scrollToBottom();
 }
 
