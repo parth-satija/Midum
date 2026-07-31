@@ -1830,6 +1830,7 @@ html.has-bg-image #bg-image-layer{ display:block; }
   opacity:1;transition:opacity .25s linear;
 }
 html.blob-settling #blob-layer{opacity:0;}
+html.blob-hidden #blob-layer{opacity:0;}
 /* filter:blur() is set once, statically, per blob -- never animated. Animating
    `filter` forces the compositor to fully re-rasterize these huge blurred
    layers on every single frame, which is what caused the flashing/strobing
@@ -5356,17 +5357,13 @@ function initBlobLayer(){
     }
     function start(){ if (rafId === null) rafId = requestAnimationFrame(tick); }
     function stop(){ if (rafId !== null){ cancelAnimationFrame(rafId); rafId = null; } }
-    cursorStart = start; cursorStop = stop;
+    // Re-sync the lerp target to the current position before every start,
+    // so resuming (whether from the settings toggle or a refocus) never
+    // glides in from a stale mouse position and looks like a jump.
+    function resyncStart(){ tx = cx; ty = cy; start(); }
+    cursorStart = resyncStart; cursorStop = stop;
 
     start();
-    window.addEventListener("blur", stop);
-    window.addEventListener("focus", ()=>{
-      // re-sync target to wherever the pointer actually is before resuming,
-      // so it doesn't glide in from a stale position and look like a jump.
-      tx = cx; ty = cy;
-      if (blobsPaused) return; // stay off if the user disabled blobs while unfocused
-      start();
-    });
   }
 
   // `active` gates whether wander() actually moves the blobs each leg --
@@ -5392,9 +5389,43 @@ function initBlobLayer(){
   wander(blobA);
   wander(blobB);
 
+  // Freeze + fully hide the blob layer whenever this window isn't the
+  // focused, visible foreground app -- not just during an actual resize.
+  // While some OTHER app is loading, opening, or animating on screen, the
+  // OS/GPU compositor does all sorts of churn around this window too (DWM
+  // thumbnail capture for Alt-Tab/taskbar previews, reclaiming/restoring
+  // the GPU surface on focus loss, etc.), and with isolation:isolate +
+  // contain:strict promoting #blob-layer to its own composited layer,
+  // that churn was showing up here as a visible flash even though nothing
+  // in this window itself had changed. Rather than chase every possible
+  // external trigger individually, just stop doing any work and hide the
+  // layer the moment focus or visibility is lost, and fade it back in
+  // only once this window is genuinely focused and visible again.
+  let hidden = false;
+  function setHidden(v){
+    if (v === hidden) return;
+    hidden = v;
+    document.documentElement.classList.toggle("blob-hidden", v);
+    if (v){
+      cursorStop();
+      active = false;
+    } else if (!blobsPaused){
+      active = true;
+      cursorStart();
+    }
+  }
+  window.addEventListener("blur", ()=> setHidden(true));
+  window.addEventListener("focus", ()=> setHidden(false));
+  document.addEventListener("visibilitychange", ()=>{
+    setHidden(document.hidden || !document.hasFocus());
+  });
+  // In case this boots already unfocused/occluded (e.g. opened in the
+  // background), start in the hidden state instead of flashing on first paint.
+  setHidden(document.hidden || !document.hasFocus());
+
   return {
     pause(){ active = false; blobsPaused = true; cursorStop(); },
-    resume(){ active = true; blobsPaused = false; cursorStart(); },
+    resume(){ active = true; blobsPaused = false; if (!hidden) cursorStart(); },
   };
 }
 
