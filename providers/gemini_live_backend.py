@@ -10,9 +10,12 @@
 # audio replies as they arrive, while ALSO getting full native tool calling
 # with Midum's entire tool catalogue -- every tool call the model requests
 # is executed through the exact same dispatcher the manual tool sandbox and
-# GUI chat pane already use (gui/dispatch.py:_dispatch_midum_tool), so voice
-# control has 100% tool parity with text chat: files, terminal, UI
-# automation, browser, MCP servers, everything.
+# GUI chat pane already use (gui/dispatch.py:_dispatch_midum_tool), gated by
+# the exact same Permissions-tab enforcement text chat uses
+# (permissions.py:enforce_tool_permission, called right before dispatch --
+# see _recv_task below), so voice control has 100% tool parity with text
+# chat: files, terminal, UI automation, browser, MCP servers, permissions,
+# everything.
 #
 # SETUP:
 #   1. Get a free key at https://aistudio.google.com/app/apikey
@@ -118,10 +121,15 @@ def voice_dependencies_status() -> str:
 # ── Tool schema conversion: Midum's OpenAI-shaped `tools` -> Gemini's
 #    FunctionDeclaration/Tool shape. Gemini's Live API accepts standard
 #    JSON-schema `parameters` dicts directly, so this is mostly a re-shape,
-#    not a re-write. ────────────────────────────────────────────────────────
+#    not a re-write. Also runs the schema through filter_tools_schema()
+#    first -- same as every text-mode provider backend does -- so a tool
+#    set to "Don't Allow" in the Permissions tab isn't even offered to the
+#    model here, matching text chat instead of just relying on the
+#    dispatch-time block in _recv_task to reject it after the fact. ───────
 def _build_live_tools():
+    from permissions import filter_tools_schema
     declarations = []
-    for t in _OPENAI_TOOLS:
+    for t in filter_tools_schema(_OPENAI_TOOLS):
         fn = t.get("function", {})
         name = fn.get("name")
         if not name:
@@ -456,11 +464,37 @@ class VoiceSession:
                         for fc in (tool_call.function_calls or []):
                             args = dict(fc.args or {})
                             self.on_event("voice_tool_call", {"name": fc.name, "args": args})
-                            try:
-                                from gui.dispatch import _dispatch_midum_tool
-                                result = _dispatch_midum_tool(fc.name, args)
-                            except Exception as e:
-                                result = f"Error executing '{fc.name}': {e}"
+
+                            # ── Permission enforcement -- mirrors orchestration.py's
+                            # process_chat_turn dispatch loop exactly, so a tool set to
+                            # "Ask" or "Don't Allow" in the Permissions tab is gated the
+                            # same way here as it is in text chat. MCP tools are keyed
+                            # per-server-per-tool, same convention as text mode.
+                            from permissions import enforce_tool_permission, mcp_permission_key
+                            perm_key = fc.name
+                            if fc.name == "call_mcp_tool":
+                                perm_key = mcp_permission_key(
+                                    str(args.get("server", "")), str(args.get("tool_name", ""))
+                                )
+                            # enforce_tool_permission's "ask" level pops a blocking
+                            # Approve/Decline dialog (the same ask_user_approval tool
+                            # text mode uses) and waits for the user's answer. Running
+                            # that synchronously here would stall this coroutine's event
+                            # loop -- which _mic_drain_task and audio playback also run
+                            # on -- so it's offloaded to a worker thread via
+                            # asyncio.to_thread instead of awaited inline.
+                            perm_decision, perm_blocked_msg = await asyncio.to_thread(
+                                enforce_tool_permission, perm_key, fc.name, args
+                            )
+
+                            if perm_decision == "blocked":
+                                result = perm_blocked_msg
+                            else:
+                                try:
+                                    from gui.dispatch import _dispatch_midum_tool
+                                    result = _dispatch_midum_tool(fc.name, args)
+                                except Exception as e:
+                                    result = f"Error executing '{fc.name}': {e}"
                             result_str = str(result)
                             self.on_event("voice_tool_result", {
                                 "name": fc.name,

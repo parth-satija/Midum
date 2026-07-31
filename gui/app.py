@@ -5440,6 +5440,7 @@ window.addEventListener("pywebviewready", async ()=>{
   document.getElementById("send-btn").onclick = sendMessage;
   document.getElementById("msg-input").addEventListener("keydown", e=>{ if (e.key==="Enter") sendMessage(); });
   document.getElementById("abort-btn").onclick = ()=>api("abort");
+  document.getElementById("copy-chat-btn").onclick = copyFullConversation;
 
   // Apply the remembered theme colors immediately, before the heavier
   // startup() call resolves, so the UI doesn't flash default colors first.
