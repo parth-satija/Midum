@@ -1,0 +1,45 @@
+name: Build and Attach Release Executable
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest  # Change to ubuntu-latest or macos-latest if target OS differs
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: 'pip' # Caches dependencies if a requirements.txt exists
+
+      - name: Install Dependencies & PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+          # Install your project dependencies if applicable:
+          # if (Test-Path requirements.txt) { pip install -r requirements.txt }
+
+      - name: Build Executable with PyInstaller
+        run: |
+          pyinstaller --onefile --noconsole --name "midum" gui/app.py
+        # Options used:
+        # --onefile : Bundles everything into a single binary
+        # --noconsole : Suppresses the command prompt window (remove if CLI tool)
+        # --name : Sets the output executable file name
+
+      - name: Upload Binary to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/midum.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
