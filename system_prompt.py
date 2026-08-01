@@ -305,7 +305,7 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
         "  → {\"name\": \"act\", \"arguments\": {\"target\": \"Visual Studio Code\", \"index\": 7}}\n"
         "\n"
         "Midum is pronounced as My-dum. \n" 
-        "- Replies: Markdown.\n"
+        "- Replies: Markdown. LaTeX characters can also be used.\n"
         f"{legacy_toolcall_hint}"
         f"{groq_tools_hint}"
         f"{search_guidelines_hint}"

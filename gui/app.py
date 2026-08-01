@@ -2110,6 +2110,15 @@ table.md-table tr:nth-child(even) td{background:color-mix(in srgb, var(--surface
 .mermaid{display:flex;justify-content:center;}
 .mermaid svg{max-width:100%;}
 
+/* LaTeX math rendering (KaTeX) -- .math-tex spans are inserted by
+   extractMath() during renderInline() with the raw TeX source as their
+   text content, then actually rendered in place (via katex.render) by
+   renderPendingMath() once the bubble is in the DOM -- same lazy-CDN-load
+   pattern as Mermaid above. */
+.math-tex[data-display="1"]{display:block;margin:10px 0;overflow-x:auto;overflow-y:hidden;text-align:center;}
+.math-tex .katex{font-size:1.05em;color:var(--text);}
+.math-tex .katex-display{margin:0;}
+
 /* Generated-image gallery + save button */
 .img-frame{position:relative;display:inline-block;margin-top:8px;max-width:100%;}
 .img-frame img{max-width:100%;border-radius:8px;display:block;}
@@ -2525,6 +2534,11 @@ function renderInline(text){
   t = renderTablesInText(t);
   t = t.replace(/```([\w_]*)\n([\s\S]*?)```/g, (m,lang,body)=>`<pre class="code-block">${body}</pre>`);
   t = t.replace(/`([^`]+)`/g, (m,c)=>`<code class="inline-code">${c}</code>`);
+  // LaTeX math ($$...$$, \[...\], \(...\), $...$) is swapped for a
+  // placeholder <span class="math-tex"> BEFORE the bold/italic/etc
+  // regexes below run, so things like x_i or a*b inside a formula never
+  // get misread as markdown emphasis -- see extractMath()'s docstring.
+  t = extractMath(t);
   t = t.replace(/\*\*\*(.+?)\*\*\*/g, "<b><i>$1</i></b>");
   t = t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
   t = t.replace(/(^|[^*])\*([^*]+)\*/g, "$1<i>$2</i>");
@@ -2833,6 +2847,75 @@ async function renderPendingMermaid(){
   }
 }
 
+// ── LaTeX math rendering (KaTeX) -------------------------------------
+// Loaded lazily from CDN on first use, same lazy-load pattern as Mermaid
+// and Drawflow. extractMath() (called from renderInline, after the text
+// has already been through escapeHtml so &/</> are entities) swaps every
+// recognised math span -- $$...$$, \[...\], \(...\), and inline $...$ --
+// for a <span class="math-tex"> placeholder holding the raw TeX source as
+// its text content, before any of the other inline markdown regexes run
+// (bold/italic/etc never get a chance to mangle underscores/asterisks
+// inside the TeX). renderPendingMath() (called by the same callers that
+// already call renderPendingMermaid()) then actually renders every
+// not-yet-rendered placeholder in place via katex.render().
+const KATEX_CSS = "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css";
+const KATEX_JS  = "https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js";
+let _katexLoadPromise = null;
+function _loadKatexOnce(){
+  if (_katexLoadPromise) return _katexLoadPromise;
+  _katexLoadPromise = new Promise((resolve, reject)=>{
+    if (window.katex){ resolve(); return; }
+    if (!document.querySelector(`link[href="${KATEX_CSS}"]`)){
+      const l = document.createElement("link");
+      l.rel = "stylesheet"; l.href = KATEX_CSS;
+      document.head.appendChild(l);
+    }
+    const s = document.createElement("script");
+    s.src = KATEX_JS;
+    s.onload = ()=>resolve();
+    s.onerror = ()=>reject(new Error("failed to load " + KATEX_JS));
+    document.head.appendChild(s);
+  });
+  return _katexLoadPromise;
+}
+
+// Matches, in order: display math ($$...$$ and \[...\]), then inline
+// math (\(...\) and $...$). Inline $...$ requires no whitespace right
+// after the opening $ or right before the closing $ (so "$5 and $10"
+// isn't misread as one giant math span) and stays on a single line.
+function extractMath(text){
+  text = text.replace(/\$\$([\s\S]+?)\$\$/g, (m, expr)=>
+    `<span class="math-tex" data-display="1">${expr}</span>`);
+  text = text.replace(/\\\[([\s\S]+?)\\\]/g, (m, expr)=>
+    `<span class="math-tex" data-display="1">${expr}</span>`);
+  text = text.replace(/\\\(([\s\S]+?)\\\)/g, (m, expr)=>
+    `<span class="math-tex" data-display="0">${expr}</span>`);
+  text = text.replace(/\$(?!\s)([^$\n]+?)(?<!\s)\$/g, (m, expr)=>
+    `<span class="math-tex" data-display="0">${expr}</span>`);
+  return text;
+}
+
+async function renderPendingMath(){
+  const pending = Array.from(document.querySelectorAll(".math-tex:not([data-math-done])"));
+  if (!pending.length) return;
+  try {
+    await _loadKatexOnce();
+  } catch (e) {
+    pending.forEach(el=>{ el.dataset.mathDone = "1"; });
+    return;
+  }
+  pending.forEach(el=>{
+    el.dataset.mathDone = "1";
+    const tex = el.textContent;
+    const displayMode = el.dataset.display === "1";
+    try {
+      window.katex.render(tex, el, { throwOnError: false, displayMode, output: "html" });
+    } catch (e) {
+      el.textContent = tex;
+    }
+  });
+}
+
 function renderMidumContent(text){
   FLOWCHART_FENCE_RE.lastIndex = 0;
   if (!FLOWCHART_FENCE_RE.test(text)) return renderInline(text);
@@ -2969,6 +3052,7 @@ function appendRow(tag, text){
     col.appendChild(row);
     animateWords(row.querySelector(".bubble"));
     renderPendingMermaid();
+    renderPendingMath();
     scrollToBottom();
     return;
   } else if (tag === "system"){
@@ -4140,7 +4224,7 @@ function appendVoiceTranscript(role, text){
     col.appendChild(row);
     _voiceStreamRow = { role, bubbleEl, rawText: text };
   }
-  if (!isUser) renderPendingMermaid();
+  if (!isUser){ renderPendingMermaid(); renderPendingMath(); }
   scrollToBottom();
 }
 
