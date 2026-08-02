@@ -5,6 +5,8 @@
 
 Midum is an agentic framework built for local AI desktop assistance. It can help you with code, UI automation, repetitive tasks, browsing, research, file management, and more — all driven by a tool-calling AI agent that runs on **your** machine.
 
+<img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/4e26d709-33fc-42f8-b23b-b07d18286efa" />
+
 
 ## What Midum Can Do
 
