@@ -14,8 +14,6 @@ pyatspi
 pymupdf
 pynput
 pyperclip
-PyQt5
-PySide6
 pytesseract
 python-docx
 pywebview

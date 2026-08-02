@@ -40,6 +40,9 @@ Midum is built around a large tool-calling loop, so it isn't limited to chatting
 - Manage a persistent instruction set that shapes Midum's behavior (`read_instructions`, `add_instruction`).
 - Manage saved filesystem paths/shortcuts for quick access (`read_paths`, `add_path`, `get_path`, `list_paths_indexed`).
 - Indexed listing variants for skills, knowledge, and paths keep large libraries easy to browse without flooding context.
+- **PDF Sources** — register a PDF (path/title/page-count only, via PyMuPDF), then manually tag heading lines in the Knowledge tab's PDF Heading Tagger (click a line on the real rendered page, assign it a heading level H1–H6). No structure is ever auto-detected; every heading comes from a line the user personally tagged. Once tagged, pick which heading level(s) act as "part" boundaries for that source.
+- **KB Only mode** — a toggle in the chat input's Knowledge Base popover that restricts a message to only the selected PDF source(s): internet search and browsing tools are disabled for that turn, and the model is told to answer strictly from the tagged source material (or say plainly that the sources don't cover it). Selection is in-memory only and resets on restart.
+- **Explain Mode** — rides on top of KB Only. Instead of just outlining headings, it walks the selected source(s) part-by-part (using the part-boundary levels set in the Knowledge tab), giving the model the exact real text of the *current* part only, with an explicit "part N of M" header. The model is instructed to narrate it like a guided walkthrough (NotebookLM-style "Deep Dive" narration) — synthesizing into flowing explanation rather than reading line-by-line — while guaranteeing every detail in that part surfaces somewhere. Hit **▶ Start Explanation** in the KB popover to kick it off, and either say "next"/"continue" or use the **Next Part →** button to advance; progress per source is tracked server-side for the current chat.
 
 ### 🤖 Multi-Model & Multi-Provider Support
 Midum isn't tied to a single model or provider — it can run its primary reasoning loop on any of the following, and can also consult or delegate sub-tasks to several of them side-by-side:
@@ -62,6 +65,14 @@ The GUI's **Flows** tab is a node-graph editor (built on Drawflow) for building 
 - Every saved flow is automatically discoverable and callable as a tool (`list_flows_formatted` → `run_flow(name)`) — the same two-step shape as calling an MCP tool.
 - **Promoted flows** — mark a flow as promoted from the Tools tab and it gets its own always-on tool schema, callable directly by name with no discovery step, exactly like a promoted MCP tool.
 - **Scheduling** — saved flows can be scheduled to run automatically (once, on an interval, daily, or weekly) via `scheduler.py`, as long as Midum's GUI is open. Schedule *configuration* persists across restarts even though firing only happens while the app is running.
+
+### 🎙️ Voice Control (Gemini Live)
+Talk to Midum out loud and have it talk back, with full tool-calling parity with text chat:
+- Real-time, bidirectional speech-to-speech control via Google's official **Gemini Live API** (`google-genai`'s `client.aio.live.connect`) — a persistent WebSocket session, separate from every other single-shot provider, that streams your microphone audio to Gemini continuously and plays back its spoken replies as they arrive.
+- Every tool call the model makes while in voice mode runs through the exact same dispatcher as text chat and the manual tool sandbox, so voice control has 100% tool parity — files, terminal, UI automation, browser, MCP servers, everything.
+- Two independently rebindable **global push-to-talk hotkeys** (keyboard key or mouse button, including side buttons) that work no matter which window has focus — hold to stream your mic, release to mute. The very first press opens the Gemini Live connection; the connection then stays open across presses so later ones resume instantly instead of reconnecting. Bindings persist to `storage/ptt_hotkeys.json` and default to **Right Alt** and **Mouse Button 4 (Side)**.
+- A small floating on-screen overlay indicator (`gui/voice_overlay.py`) that shows Midum's current voice state — listening 🎙️, running ⚙️, or responding 🔊.
+- Setup: `pip install google-genai sounddevice numpy pynput`, then add your `GEMINI_API_KEY` to the shared secrets file (the same key used by `MODEL_PROVIDER = "gemini_api"` — if that's already configured, voice control works with zero extra setup).
 
 ### 🔌 MCP (Model Context Protocol) Support
 - Connect Midum to external MCP servers over stdio or HTTP/SSE (`connect_mcp_server`, `disconnect_mcp_server`).
@@ -90,6 +101,7 @@ Running `gui.py` gives you the full **Midum Control Centre**, a desktop app (bui
 - A **Tools** tab for inspecting Midum's manual/native tools, and promoting/demoting saved Flows and MCP tools to always-on status.
 - An **MCP** tab for adding, viewing, and managing connected MCP servers and their tools, including a dedicated "Add MCP Server" dialog (stdio or HTTP/SSE, with command/args/env or URL/header fields) and a tool-viewer dialog.
 - A **Flows** tab: the node-graph editor described above, for visually building, saving, running, promoting, and scheduling automations (see 🔗 Flows above).
+- A **Voice** tab for enabling push-to-talk voice control, rebinding the two global hotkeys, and monitoring live connection status (see 🎙️ Voice Control above).
 - Full editing access to every underlying file Midum uses — skill files, knowledge bases, memory files, instructions, and more — directly from the GUI.
 
 This is the **recommended way to run Midum**, since it exposes everything the CLI does plus direct file editing.
@@ -114,6 +126,7 @@ If you'd rather install everything explicitly (or `requirements.txt` is ever out
 pip install ollama pillow ddgs keyboard pymupdf mammoth python-docx rich pytesseract pywin32 uiautomation customtkinter google-genai requests mcp
 pip install -U gemini_webapi
 pip install -U browser-cookie3   # optional but recommended
+pip install sounddevice numpy pynput   # optional, needed for Voice Control (Gemini Live push-to-talk)
 ```
 
 ### Step 3 (Optional — Ollama)
