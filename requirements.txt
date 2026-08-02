@@ -10,7 +10,6 @@ mcp
 numpy
 ollama
 pillow
-pyatspi
 pymupdf
 pynput
 pyperclip
