@@ -1863,6 +1863,105 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "add_pdf_source",
+            "description": (
+                "Register a PDF as a source for Explain Mode: just records its path, "
+                "title, and page count (no automatic structure detection). After adding, "
+                "the user must manually tag heading lines by opening the PDF Heading "
+                "Tagger window from the Source tab (clicking real lines of text in the "
+                "actual PDF and assigning each a heading level), then pick which of "
+                "those tagged levels count as 'part' boundaries (set_pdf_source_part_levels) "
+                "before Explain Mode can split it into parts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pdf_path": {"type": "string", "description": "Absolute path to the PDF file."},
+                    "description": {"type": "string", "description": "Optional one-line description of the source."}
+                },
+                "required": ["pdf_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_pdf_sources",
+            "description": "List every registered PDF source name. Follow up with list_pdf_source_parts(name) before explaining one.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_pdf_source_parts",
+            "description": (
+                "List the 'parts' a PDF source has been split into, based on the heading "
+                "level(s) the user selected for it from the Source tab (a ONE-TIME choice "
+                "per source, not per heading). Returns a numbered IDX | LEVEL | PAGE | HEADING "
+                "table. Follow up with explain_pdf_source_part(name, part_index) to actually "
+                "walk through and explain a part — always go in order, starting at index 0, "
+                "so every part (and therefore every line of the source) gets covered."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Source name, from list_pdf_sources()."}
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "explain_pdf_source_part",
+            "description": (
+                "Fetch ONE part of a PDF source (by index from list_pdf_source_parts) with its "
+                "full paragraph text, to actually explain to the user. The returned block tells "
+                "you exactly which part number you're on and how many remain — treat that as the "
+                "authoritative scope for this turn: explain everything in the returned part fully, "
+                "do not skip or summarize away any of it, and do not explain content from other "
+                "parts. Call again with the next index to continue until every part is covered."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Source name, from list_pdf_sources()."},
+                    "part_index": {"type": "integer", "description": "0-based part index, from list_pdf_source_parts()."}
+                },
+                "required": ["name", "part_index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_pdf_source_part_levels",
+            "description": (
+                "Set which heading level(s) act as 'part' boundaries for a PDF source — a "
+                "ONE-TIME choice for the whole source (not repeated per heading). Normally set "
+                "by the user from the GUI's Source tab checkboxes; only call this yourself if the "
+                "user explicitly tells you which levels to use in chat instead. Where levels are "
+                "nested (e.g. [1,3] selected), the active part at any point is always the deepest "
+                "selected level for that stretch of text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Source name, from list_pdf_sources()."},
+                    "levels": {
+                        "type": "array", "items": {"type": "integer"},
+                        "description": "Heading levels to treat as part boundaries, e.g. [1, 2]."
+                    }
+                },
+                "required": ["name", "levels"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_native_tools",
             "description": (
                 "List every built-in Midum tool by name + one-line description "

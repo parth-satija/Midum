@@ -202,6 +202,11 @@ class Api:
         self._current_chat_id  = uuid.uuid4().hex
         self._chat_title       = None
         self._display_log      = []
+        # Explain Mode's per-source progress: source name -> current part
+        # index (0-based, into knowledge_base.build_pdf_source_parts).
+        # Reset whenever the chat/session resets -- a walkthrough is scoped
+        # to one conversation, not persisted across chats.
+        self._explain_progress = {}
         # Tracks the display-log/session-history entry currently being
         # streamed into by voice transcripts, so consecutive fragments from
         # the same speaker fold into one saved message instead of one saved
@@ -395,6 +400,28 @@ class Api:
             self._push_event("status", {"text": f"Startup error: {e}", "level": "err"})
 
         self._scan_workspace_directory()
+
+        # Warm the PDF line-extraction cache for every registered source in
+        # the background, right after startup, so the Knowledge tab's
+        # FIRST open doesn't pay for a synchronous full-PDF text
+        # extraction there (see knowledge_base.extract_pdf_lines /
+        # _cached_extract_pdf_lines, which build_pdf_source_parts /
+        # get_pdf_source_parts depend on, and which the Knowledge pane
+        # calls on every load to render the Explain Mode parts preview).
+        # By the time the user actually switches to the tab, the cache is
+        # already populated (keyed on file mtime) and those calls return
+        # near-instantly instead of re-reading every page of every source.
+        threading.Thread(target=self._warm_pdf_source_cache, daemon=True).start()
+
+    def _warm_pdf_source_cache(self):
+        try:
+            for name in midum.list_pdf_sources():
+                try:
+                    midum.build_pdf_source_parts(name)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # ── Status / dashboard ───────────────────────────────────────────────
     def get_status(self):
@@ -934,6 +961,7 @@ class Api:
         self._display_log = list(data.get("display", []))
         self._voice_stream_tag = None
         self._voice_stream_idx = None
+        self._explain_progress = {}
         return {"ok": True, "display": self._display_log}
 
     def delete_chat(self, chat_id: str):
@@ -975,6 +1003,7 @@ class Api:
         self._display_log = []
         self._voice_stream_tag = None
         self._voice_stream_idx = None
+        self._explain_progress = {}
 
     def _persist_current_chat(self):
         if not self._display_log:
@@ -986,7 +1015,10 @@ class Api:
             self._push_event("log", {"text": f"⚠ Failed to save chat history: {e}\n"})
 
     # ── Send / receive ──────────────────────────────────────────────────
-    def send_message(self, user_input: str):
+    _KB_ONLY_MARKER = "[MIDUM KB-ONLY MODE]"
+    _EXPLAIN_MODE_MARKER = "[MIDUM EXPLAIN MODE]"
+
+    def send_message(self, user_input: str, kb_only: bool = False, kb_sources: list = None, explain_mode: bool = False):
         if self._thinking:
             return {"ok": False, "error": "busy"}
         user_input = (user_input or "").strip()
@@ -1013,19 +1045,174 @@ class Api:
 
         self._session.append({"role": "user", "content": payload})
         self._thinking = True
-        self._push_event("status", {"text": "Executing turns...", "level": "busy"})
 
-        threading.Thread(target=self._run_turn, args=(list(self._session.snapshot()),), daemon=True).start()
+        # KB Only: only takes effect if both the toggle is on AND at least
+        # one PDF source is selected -- otherwise this is a normal turn.
+        kb_only = bool(kb_only) and bool(kb_sources)
+        # Explain Mode rides on top of KB Only -- it only ever makes sense
+        # when there's a KB source to explain, so it's gated the same way.
+        explain_mode = bool(explain_mode) and kb_only
+        kb_context_msg = self._build_kb_only_context_message(kb_sources, explain_mode, user_input) if kb_only else None
+        if explain_mode:
+            self._push_event("status", {"text": "Executing turns... (Explaining)", "level": "busy"})
+        elif kb_only:
+            self._push_event("status", {"text": "Executing turns... (KB Only)", "level": "busy"})
+        else:
+            self._push_event("status", {"text": "Executing turns...", "level": "busy"})
+
+        threading.Thread(
+            target=self._run_turn,
+            args=(list(self._session.snapshot()), kb_only, kb_context_msg),
+            daemon=True,
+        ).start()
         return {"ok": True}
 
-    def _run_turn(self, history_snapshot: list):
+    def _build_kb_only_context_message(self, kb_sources: list, explain_mode: bool = False, user_input: str = "") -> str:
+        """Render the selected PDF sources into a single ephemeral system
+        message for KB Only mode. Tagged with _KB_ONLY_MARKER so _run_turn
+        can strip it back out afterwards -- it must act like a system
+        prompt (present every turn it's used) but never actually persist
+        into session/chat history.
+
+        Plain KB Only (not explaining) still uses the headings-only
+        outline (format_pdf_sources_for_prompt) -- fine for Q&A, cheap on
+        context.
+
+        Explain Mode is different: it walks the source(s) one PART at a
+        time, where a part is exactly what the user defined from the
+        Knowledge tab's Heading Tagger -- the heading level(s) they chose
+        as part boundaries, once per source (see
+        knowledge_base.build_pdf_source_parts / set_pdf_source_part_levels).
+        Progress through each source's parts is tracked server-side in
+        self._explain_progress (source name -> current 0-based part index)
+        so the runtime -- not the model's own judgement -- decides exactly
+        which part is being explained on any given turn; the model is only
+        ever given that one part's real text, with an explicit header
+        naming which part it is and how many remain. Every line PyMuPDF
+        extracted from the source lands in exactly one part (see
+        extract_pdf_lines / build_pdf_source_parts), so walking every part
+        in order guarantees nothing in the source gets skipped.
+
+        Advancing to the next part only happens when the user's message
+        looks like a plain continuation cue ("next", "continue", "go on",
+        etc) for a source that's already mid-walkthrough -- a real
+        follow-up question keeps the current part in context instead of
+        skipping ahead."""
+        if not explain_mode:
+            rendered = midum.format_pdf_sources_for_prompt(kb_sources)
+            if not rendered:
+                rendered = "(None of the selected PDF sources could be loaded.)"
+            header = (
+                f"{self._KB_ONLY_MARKER}\n"
+                "KB Only mode is active for this message. Answer using ONLY the "
+                "source material below. Do not call search_internet, open_url, or "
+                "any browser/internet tool -- those are unavailable right now. If "
+                "the sources don't contain a clear answer, say so plainly instead "
+                "of guessing or making things up.\n\n"
+            )
+            return f"{header}{rendered}"
+
+        continuation_re = re.compile(r"^\s*(next|continue|go on|proceed|keep going|carry on)\b", re.IGNORECASE)
+        is_continuation = bool(continuation_re.match((user_input or "").strip()))
+
+        source_blocks = []
+        for name in kb_sources or []:
+            parts = midum.build_pdf_source_parts(name)
+            if not parts:
+                source_blocks.append(f"### Source: {name}\n(No extractable parts -- check this source has headings tagged and part levels selected in the Knowledge tab.)")
+                continue
+            idx = self._explain_progress.get(name, 0)
+            if is_continuation and name in self._explain_progress:
+                idx = min(idx + 1, len(parts) - 1)
+            idx = max(0, min(idx, len(parts) - 1))
+            self._explain_progress[name] = idx
+            source_blocks.append(midum.format_pdf_source_part_for_prompt(name, idx))
+        rendered = "\n\n---\n\n".join(source_blocks) if source_blocks else "(None of the selected PDF sources could be loaded.)"
+
+        header = (
+            f"{self._KB_ONLY_MARKER}\n"
+            "KB Only mode is active for this message. Answer using ONLY the "
+            "source material below. Do not call search_internet, open_url, or "
+            "any browser/internet tool -- those are unavailable right now.\n\n"
+        )
+        explain_block = (
+            f"\n\n{self._EXPLAIN_MODE_MARKER}\n"
+            "EXPLAIN MODE is active. Below is the CURRENT PART of each selected "
+            "source, already picked out for you by the runtime based on the "
+            "user's own part-boundary choices for that source -- this is the "
+            "exact, real content of that part, not a summary. Walk the user "
+            "through it as a detailed, guided explanation -- like a knowledgeable "
+            "narrator walking someone through a chapter out loud, the way "
+            "NotebookLM's 'Deep Dive' narration does, not like someone citing a "
+            "document.\n"
+            "- Do NOT go line by line or explain what each individual line "
+            "'means' -- that produces a stilted, quote-by-quote commentary "
+            "instead of a real explanation. Instead, synthesize the part into a "
+            "flowing conceptual explanation: group related lines into the ideas "
+            "they form, explain those ideas in your own words, and move "
+            "naturally between them like a real lecture or narration would.\n"
+            "- 'No line skipped' means every DETAIL survives into your "
+            "explanation somewhere -- every name, number, term, example, "
+            "definition, cause/effect, and minor point in the part shown below "
+            "must show up in what you say, even the small or seemingly "
+            "throwaway ones. It does NOT mean restating or interpreting lines "
+            "one at a time in their original order and phrasing. Weave details "
+            "into the conceptual explanation at the point where they're "
+            "relevant, rather than tacking them on as a separate list.\n"
+            "- Go deep: explain why these ideas matter, connect them to parts "
+            "already covered, and use concrete specifics that are actually "
+            "present in the text -- instead of vague, generic filler that could "
+            "apply to any topic.\n"
+            "- Never write like you are reporting on a document. Do NOT use "
+            "phrases like 'the source says', 'the text explains', 'according to "
+            "the document'. Speak the content directly and confidently, as if you "
+            "are the one explaining the subject to the user.\n"
+            "- Use proper explanation structure and formatting: markdown "
+            "headings/subheadings, bold/italic emphasis, and bullet or numbered "
+            "lists where they genuinely help readability. Render any mathematical "
+            "notation, formulas, or equations with LaTeX math syntax rather than "
+            "plain text. If (and ONLY if) the part contains a process, sequence, "
+            "decision tree, hierarchy, or system with clear steps/branches that "
+            "are genuinely easier to follow as a diagram than as prose, render a "
+            "flowchart for it -- don't force a flowchart into parts that are "
+            "purely conceptual/narrative and don't need one.\n"
+            "- End by briefly naming which part you just covered and inviting the "
+            "user to say 'next' or 'continue' when ready -- the runtime (not you) "
+            "decides and injects which part comes next once they do.\n"
+            "- If this is the very first message of the walkthrough, start with a "
+            "brief one-line orientation of what the whole source covers, then "
+            "explain the current part shown below.\n"
+        )
+        return f"{header}{rendered}{explain_block}"
+
+    def _run_turn(self, history_snapshot: list, kb_only: bool = False, kb_context_msg: str = None):
         try:
             midum._abort_event.clear()
+            permissions.set_kb_only_mode(kb_only)
+            if kb_only and kb_context_msg:
+                # Insert right before the newest (user) message so it's the
+                # freshest context for this turn only. It gets stripped
+                # back out below before ever touching persisted history.
+                insert_at = len(history_snapshot)
+                if history_snapshot and history_snapshot[-1].get("role") == "user":
+                    insert_at = len(history_snapshot) - 1
+                history_snapshot.insert(insert_at, {"role": "system", "content": kb_context_msg})
+
             reply, tool_outputs = midum.process_chat_turn(
                 history_snapshot,
                 force_provider=self._selected_provider,
                 force_model=self._selected_model or None,
             )
+
+            if kb_only:
+                # Strip the ephemeral KB-only context back out -- it must
+                # never survive into future turns or the saved chat JSON,
+                # exactly like it was never added to begin with.
+                history_snapshot = [
+                    m for m in history_snapshot
+                    if not (m.get("role") == "system" and (m.get("content") or "").startswith(self._KB_ONLY_MARKER))
+                ]
+
             with self._session._lock:
                 self._session.history = history_snapshot
                 self._session.turn_counter += 1
@@ -1048,6 +1235,7 @@ class Api:
             self._push_event("status", {"text": "Error", "level": "err"})
             self._persist_current_chat()
         finally:
+            permissions.set_kb_only_mode(False)
             self._thinking = False
             self._push_event("done", {})
             # The window was closed while this reply was still being
@@ -1177,6 +1365,175 @@ class Api:
             safe = re.sub(r'[^a-zA-Z0-9_]', '_', name.strip().lower())
             return {"ok": True, "message": result, "filename": f"{safe}.md", "files": self.list_knowledge_files()}
         except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ── PDF Sources (Knowledge tab) ─────────────────────────────────────
+    # A PDF source is registered by picking a .pdf file -- only its path,
+    # title, and page count are recorded (via PyMuPDF), nothing about its
+    # structure. The heading hierarchy comes ONLY from what the user
+    # manually tags in the Heading Tagger modal (click a line of the real
+    # rendered PDF page, assign it a heading level) -- see
+    # get_pdf_page_image / save_pdf_headings below. The user then picks,
+    # once per source, which of those tagged levels count as "part"
+    # boundaries (set_pdf_source_part_levels) -- Explain Mode walks
+    # exactly those parts in order (see _build_kb_only_context_message).
+    def list_pdf_sources(self):
+        try:
+            return midum.list_pdf_sources()
+        except Exception:
+            return []
+
+    def get_pdf_source(self, name: str):
+        try:
+            record = midum.read_pdf_source(name)
+            if record is None:
+                return {"ok": False, "error": f"PDF source '{name}' not found."}
+            if "error" in record:
+                return {"ok": False, "error": record["error"]}
+            headings = sorted(record.get("headings") or [], key=lambda h: (h.get("page", 0), h.get("line_id", "")))
+            return {
+                "ok": True,
+                "title": record.get("title"),
+                "page_count": record.get("page_count"),
+                "headings": headings,
+                "part_levels": sorted(record.get("part_levels") or []),
+                "available_levels": midum.get_pdf_source_available_levels(name),
+                "source_path": record.get("source_path"),
+                "description": record.get("description", ""),
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def get_explain_next_part_name(self, kb_sources: list):
+        """Read-only lookup of the heading name of the NEXT explain-mode
+        part for each given source, for the frontend's 'Next Part' button
+        label/prompt -- mirrors the same advance-by-one logic used in
+        _build_kb_only_context_message but NEVER mutates
+        self._explain_progress or touches the session. Purely cosmetic;
+        the real advance still only happens through the normal
+        send_message -> _build_kb_only_context_message continuation-regex
+        path once the user actually sends a message."""
+        try:
+            names = []
+            for name in kb_sources or []:
+                parts = midum.build_pdf_source_parts(name)
+                if not parts:
+                    continue
+                idx = self._explain_progress.get(name, 0)
+                if name in self._explain_progress:
+                    idx = min(idx + 1, len(parts) - 1)
+                idx = max(0, min(idx, len(parts) - 1))
+                names.append(parts[idx]["heading"])
+            return {"ok": True, "name": " / ".join(n for n in names if n)}
+        except Exception as e:
+            return {"ok": False, "name": "", "error": str(e)}
+
+    def get_pdf_source_parts(self, name: str):
+        """Structured (not preformatted-text) parts list for the Knowledge
+        tab's preview table: every line from the raw PDF extraction is
+        guaranteed to land in exactly one part (see
+        knowledge_base.build_pdf_source_parts) -- this just exposes each
+        part's heading/level/page/line-count for display."""
+        try:
+            parts = midum.build_pdf_source_parts(name)
+            return {
+                "ok": True,
+                "parts": [
+                    {"index": i, "heading": p["heading"], "level": p.get("level"),
+                     "page": p.get("page"), "line_count": len(p.get("sections") or [])}
+                    for i, p in enumerate(parts)
+                ],
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e), "parts": []}
+
+    def set_pdf_source_part_levels(self, name: str, levels: list):
+        try:
+            msg = midum.set_pdf_source_part_levels(name, levels or [])
+            return {"ok": not msg.lower().startswith("pdf source") or "success" in msg.lower(), "message": msg}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
+    def get_pdf_page_image(self, name: str, page_index: int):
+        """Render one page of a registered PDF source (0-based page_index)
+        as a PNG data URL, plus every text line's bounding box on that
+        page (scaled to match the rendered image), for the frontend's
+        Heading Tagger modal to draw clickable overlays over the real
+        page image -- no structure detection, just what's literally on
+        the page."""
+        try:
+            record = midum.read_pdf_source(name)
+            if not record or "error" in record:
+                return {"ok": False, "error": f"PDF source '{name}' not found."}
+            path = record.get("source_path")
+            if not path or not os.path.exists(path):
+                return {"ok": False, "error": "Source PDF file not found on disk."}
+            import fitz
+            doc = fitz.open(path)
+            try:
+                page_count = doc.page_count
+                page_index = max(0, min(int(page_index), page_count - 1))
+                zoom = 1.6
+                page = doc[page_index]
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                png_bytes = pix.tobytes("png")
+                data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+
+                lines = []
+                page_dict = page.get_text("dict")
+                line_no = 0
+                for block in page_dict.get("blocks", []):
+                    for line in block.get("lines", []):
+                        text = "".join(s.get("text", "") for s in line.get("spans", [])).strip()
+                        if not text:
+                            continue
+                        x0, y0, x1, y1 = line.get("bbox")
+                        lines.append({
+                            "line_id": f"p{page_index + 1}_l{line_no}",
+                            "page": page_index + 1,
+                            "text": text,
+                            "x0": x0 * zoom, "y0": y0 * zoom, "x1": x1 * zoom, "y1": y1 * zoom,
+                        })
+                        line_no += 1
+                return {
+                    "ok": True, "data_url": data_url, "lines": lines,
+                    "width": pix.width, "height": pix.height,
+                    "page_index": page_index, "page_count": page_count,
+                }
+            finally:
+                doc.close()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def save_pdf_headings(self, name: str, headings: list):
+        try:
+            msg = midum.set_pdf_source_headings(name, headings or [])
+            return {"ok": "success" in msg.lower(), "message": msg}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
+    def add_pdf_source(self):
+        try:
+            result = self.window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                file_types=("PDF files (*.pdf)", "All files (*.*)"),
+            )
+        except Exception:
+            result = None
+        if not result:
+            return {"ok": False, "error": ""}   # user cancelled — no error banner needed
+        path = result[0] if isinstance(result, (list, tuple)) else result
+        self._push_event("log", {"text": f"📄 Registering PDF source: {path}\n"})
+        try:
+            safe, record = midum.add_pdf_source(path)
+            self._push_event("log", {"text": f"✅ PDF source registered: {safe}.json ({record.get('page_count')} pages) — tag headings from the Knowledge tab next.\n"})
+            # Warm this new source's line-extraction cache in the background
+            # too (same reasoning as _warm_pdf_source_cache at startup) so
+            # it doesn't reintroduce the first-open Knowledge tab lag later.
+            threading.Thread(target=midum.build_pdf_source_parts, args=(safe,), daemon=True).start()
+            return {"ok": True, "filename": safe, "files": self.list_pdf_sources()}
+        except Exception as e:
+            self._push_event("log", {"text": f"⚠️ PDF source registration failed: {e}\n"})
             return {"ok": False, "error": str(e)}
 
     def list_skill_files(self):
@@ -1972,6 +2329,29 @@ html.blobs-off:not(.has-bg-image) #topbar{
 #send-btn:hover{background:var(--accent-dim);}
 #send-hint{text-align:center;font-size:9px;color:var(--muted);padding-bottom:6px;}
 
+/* KB Only dropdown (prompt-box knowledge-base restriction toggle) */
+#kb-toggle-btn{flex:0 0 auto;font-size:11px;}
+#kb-toggle-btn.active{background:var(--accent);color:#fff;}
+#kb-popover{
+  position:absolute;bottom:calc(100% + 8px);left:0;width:300px;max-height:280px;overflow-y:auto;
+  background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:10px;
+  box-shadow:0 8px 24px rgba(0,0,0,.35);display:none;z-index:20;
+}
+#kb-popover.open{display:block;}
+.kb-only-row{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:var(--text);
+  padding-bottom:8px;border-bottom:1px solid var(--border);margin-bottom:8px;}
+.kb-only-row label{cursor:pointer;}
+.kb-only-hint{font-size:10px;color:var(--subtext);margin-bottom:8px;}
+.kb-src-row{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--subtext);padding:4px 0;}
+.kb-src-row label{cursor:pointer;color:var(--text);}
+#kb-only-badge{
+  display:none;align-items:center;gap:6px;font-size:10px;font-weight:700;color:var(--accent);
+  background:var(--accent-faint);border:1px solid var(--accent);border-radius:999px;padding:4px 12px;
+  margin:0 auto 8px auto;width:fit-content;
+}
+#kb-only-badge.show{display:flex;}
+#input-box.kb-only-active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent);}
+
 /* Sidebar pane */
 #sidebar-pane-wrap{left:100%;width:0;}
 #sidebar-inner{flex:1;position:relative;overflow:hidden;display:flex;flex-direction:column;}
@@ -2419,8 +2799,21 @@ textarea.code-area{
           style="position:absolute;top:10px;right:10px;z-index:5;">⧉</button>
         <div id="chat-scroll"><div id="chat-col"></div></div>
         <div id="input-row">
-          <div style="width:100%;max-width:760px;">
+          <div style="width:100%;max-width:760px;position:relative;">
+            <div id="kb-only-badge"><span>🔒</span><span id="kb-only-badge-text">KB Only — internet disabled, answering from selected PDF sources</span></div>
+            <button id="kb-next-part-btn" style="display:none;width:100%;margin-bottom:8px;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;">Next Part →</button>
+            <div id="kb-popover">
+              <div class="kb-only-row">
+                <input type="checkbox" id="kb-only-checkbox"/>
+                <label for="kb-only-checkbox">KB Only</label>
+              </div>
+              <div class="kb-only-hint">Restricts this session to the selected PDF sources below and disables internet search — resets when Midum restarts.</div>
+              <div id="kb-sources-list"></div>
+              <button id="kb-start-explanation-btn" style="display:none;width:100%;margin-top:8px;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;">▶ Start Explanation</button>
+              <div class="kb-only-hint" id="kb-explain-hint" style="display:none;">Walks through the selected source(s) part by part (one sub-sub-heading per response) — say "next" to continue.</div>
+            </div>
             <div id="input-box">
+              <button class="icon-btn" id="kb-toggle-btn" title="Knowledge Base options">▾</button>
               <input id="msg-input" placeholder="Message Midum..." />
               <button id="send-btn">↑</button>
             </div>
@@ -2448,6 +2841,9 @@ let state = {
   activeTab: "Chat",
   sidebarOpen: false,
   thinking: false,
+  kbOnly: false,
+  kbSources: [],
+  explainMode: false,
 };
 
 let voiceState = { running: false, connecting: false };
@@ -3262,7 +3658,9 @@ async function sendMessage(){
   setActiveToolDot(null);
   setStatus("Executing turns...", "busy");
   state.thinking = true;
-  await api("send_message", text);
+  const kbOnlyActive = !!(state.kbOnly && state.kbSources.length);
+  const explainActive = !!(kbOnlyActive && state.explainMode);
+  await api("send_message", text, kbOnlyActive, kbOnlyActive ? state.kbSources : [], explainActive);
 }
 
 function setStatus(text, level){
@@ -3270,6 +3668,127 @@ function setStatus(text, level){
   const dot = document.getElementById("status-dot");
   dot.style.background = level === "ok" ? "var(--green)" : level === "err" ? "var(--red)" :
                          level === "busy" ? "var(--yellow)" : "var(--subtext)";
+}
+
+// ── KB Only (prompt-box dropdown) ────────────────────────────────────────────
+// In-memory only (state.kbOnly / state.kbSources) -- never written to any
+// settings file, so it always starts unchecked on a fresh launch even
+// though the popover itself persists fine across tab switches within one
+// running session.
+function updateKbOnlyBadge(){
+  const active = !!(state.kbOnly && state.kbSources.length);
+  if (!active) state.explainMode = false;   // Explain Mode can't outlive KB Only being active
+  const explainActive = !!(active && state.explainMode);
+  document.getElementById("kb-only-badge").classList.toggle("show", active);
+  document.getElementById("kb-only-badge-text").textContent = explainActive
+    ? "Explaining — walking through the selected source(s), part by part"
+    : "KB Only — internet disabled, answering from selected PDF sources";
+  document.getElementById("input-box").classList.toggle("kb-only-active", active);
+  document.getElementById("kb-toggle-btn").classList.toggle("active", active);
+  const startBtn = document.getElementById("kb-start-explanation-btn");
+  const explainHint = document.getElementById("kb-explain-hint");
+  if (startBtn){
+    startBtn.style.display = active ? "block" : "none";
+    startBtn.textContent = explainActive ? "▶ Restart Explanation" : "▶ Start Explanation";
+  }
+  if (explainHint) explainHint.style.display = active ? "block" : "none";
+  const nextPartBtn = document.getElementById("kb-next-part-btn");
+  if (nextPartBtn){
+    nextPartBtn.style.display = explainActive ? "block" : "none";
+  }
+}
+
+// Fetches the upcoming part's heading name (read-only, doesn't advance
+// server-side progress) and drops "Next: {name}" straight into the
+// prompt box -- it's just text in the input, so sending it goes through
+// the exact same send_message() -> _build_kb_only_context_message path
+// as if the user had typed "next" themselves; nothing about the turn's
+// internal KB-only/Explain-mode prompt construction is touched here.
+async function fillNextPartPrompt(){
+  const explainActive = !!(state.kbOnly && state.kbSources.length && state.explainMode);
+  if (!explainActive || state.thinking) return;
+  const res = await api("get_explain_next_part_name", state.kbSources);
+  const name = (res && res.ok && res.name) ? res.name : "";
+  const input = document.getElementById("msg-input");
+  input.value = name ? `Next: ${name}` : "Next";
+  input.focus();
+}
+
+async function renderKbSourcesList(){
+  const list = document.getElementById("kb-sources-list");
+  const files = await api("list_pdf_sources");
+  if (!files.length){
+    list.innerHTML = `<div style="font-size:10px;color:var(--subtext);">No PDF sources yet — add one from the Knowledge tab first.</div>`;
+    state.kbSources = [];
+    updateKbOnlyBadge();
+    return;
+  }
+  // Default to every known source selected the first time the list is
+  // populated so checking "KB Only" alone is immediately useful; after
+  // that, respect whatever the user has (un)checked.
+  if (!state.kbSources.length) state.kbSources = files.slice();
+  list.innerHTML = files.map(f=>{
+    const id = "kb-src-" + f.replace(/[^a-zA-Z0-9_]/g, "_");
+    const checked = state.kbSources.includes(f) ? "checked" : "";
+    return `<div class="kb-src-row"><input type="checkbox" data-src="${f}" id="${id}" ${checked}/><label for="${id}">${f}</label></div>`;
+  }).join("");
+  list.querySelectorAll("input[data-src]").forEach(cb=>{
+    cb.onchange = ()=>{
+      const name = cb.dataset.src;
+      if (cb.checked){ if (!state.kbSources.includes(name)) state.kbSources.push(name); }
+      else { state.kbSources = state.kbSources.filter(n=>n!==name); }
+      updateKbOnlyBadge();
+    };
+  });
+  updateKbOnlyBadge();
+}
+
+function initKbOnlyControls(){
+  const toggleBtn = document.getElementById("kb-toggle-btn");
+  const popover = document.getElementById("kb-popover");
+  const onlyCheckbox = document.getElementById("kb-only-checkbox");
+
+  toggleBtn.onclick = (e)=>{
+    e.stopPropagation();
+    popover.classList.toggle("open");
+    if (popover.classList.contains("open")) renderKbSourcesList();
+  };
+  document.addEventListener("click", (e)=>{
+    if (popover.classList.contains("open") && !popover.contains(e.target) && e.target !== toggleBtn){
+      popover.classList.remove("open");
+    }
+  });
+  onlyCheckbox.onchange = ()=>{
+    state.kbOnly = onlyCheckbox.checked;
+    if (state.kbOnly) renderKbSourcesList(); else updateKbOnlyBadge();
+  };
+
+  const startExplainBtn = document.getElementById("kb-start-explanation-btn");
+  if (startExplainBtn){
+    startExplainBtn.onclick = (e)=>{
+      e.stopPropagation();
+      if (state.thinking || !state.kbSources.length) return;
+      state.explainMode = true;
+      updateKbOnlyBadge();
+      popover.classList.remove("open");
+      const kickoff = "Start the explanation.";
+      appendRow("user", kickoff);
+      setActiveToolDot(null);
+      setStatus("Executing turns... (Explaining)", "busy");
+      state.thinking = true;
+      api("send_message", kickoff, true, state.kbSources, true);
+    };
+  }
+
+  const nextPartBtn = document.getElementById("kb-next-part-btn");
+  if (nextPartBtn){
+    nextPartBtn.onclick = (e)=>{
+      e.stopPropagation();
+      fillNextPartPrompt();
+    };
+  }
+
+  updateKbOnlyBadge();
 }
 
 // ── Event bridge from Python (async pushes) -----------------------------
@@ -4361,6 +4880,141 @@ function buildSysCorePane(box){
   load();
 }
 
+// ── PDF Heading Tagger modal ────────────────────────────────────────────
+// Renders the REAL PDF page (server-side via PyMuPDF, sent as a PNG data
+// URL) with an invisible clickable overlay div per text line (positioned
+// from that line's real bounding box). Click a line, tap a heading level
+// button, and it's tagged -- Save calls save_pdf_headings, which
+// overwrites the source's tagging with exactly this list. No structure
+// is ever auto-detected; every heading comes from a line the user
+// personally clicked and tagged.
+function openPdfHeadingTagger(name){
+  return new Promise((resolve)=>{
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center;";
+    const modal = document.createElement("div");
+    modal.style.cssText = "width:92vw;height:88vh;background:var(--panel);border:1px solid var(--border2);border-radius:20px;display:flex;flex-direction:column;overflow:hidden;";
+    modal.innerHTML = `
+      <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);">
+        <button class="ghost-btn" id="pht-prev" style="height:28px;">◀ Prev</button>
+        <div id="pht-page-label" style="font-size:12px;color:var(--subtext);">Page 1</div>
+        <button class="ghost-btn" id="pht-next" style="height:28px;">Next ▶</button>
+        <div style="flex:1;font-size:11px;color:var(--subtext);">Click a line of text below, then tap a heading level to tag it.</div>
+        <button class="ghost-btn" id="pht-close" style="height:28px;">Cancel</button>
+        <button class="btn" id="pht-save" style="height:28px;background:var(--accent);color:#fff;">Save</button>
+      </div>
+      <div style="flex:1;display:flex;overflow:hidden;">
+        <div id="pht-canvas-wrap" style="flex:1;overflow:auto;background:#12161c;position:relative;text-align:center;padding:16px;">
+          <div id="pht-img-wrap" style="position:relative;display:inline-block;">
+            <img id="pht-img" style="display:block;max-width:none;"/>
+          </div>
+        </div>
+        <div style="width:260px;border-left:1px solid var(--border);padding:12px;display:flex;flex-direction:column;gap:8px;overflow-y:auto;">
+          <div id="pht-selected" style="font-size:11px;color:var(--subtext);">No line selected</div>
+          <div style="display:flex;gap:4px;flex-wrap:wrap;">
+            ${[1,2,3,4,5,6].map(l=>`<button class="ghost-btn pht-level-btn" data-level="${l}" style="width:38px;height:28px;padding:0;">H${l}</button>`).join("")}
+          </div>
+          <button class="ghost-btn" id="pht-untag" style="height:26px;font-size:10px;color:var(--red);">Untag selected line</button>
+          <div style="font-size:9px;font-weight:700;color:var(--subtext);margin-top:8px;">TAGGED HEADINGS</div>
+          <div id="pht-tagged-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;"></div>
+        </div>
+      </div>`;
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    let pageIndex = 0;
+    let pageCount = 1;
+    let currentLines = [];
+    let selectedLineId = null;
+    // line_id -> {page, line_id, text, level}
+    let headings = {};
+
+    (async ()=>{
+      const r = await api("get_pdf_source", name);
+      (r.headings || []).forEach(h=>{ headings[h.line_id] = h; });
+      await renderPage();
+    })();
+
+    function refreshTaggedList(){
+      const listEl = modal.querySelector("#pht-tagged-list");
+      const items = Object.values(headings).sort((a,b)=> a.page - b.page || a.line_id.localeCompare(b.line_id));
+      listEl.innerHTML = items.map(h=>`<div style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text);">
+          <span style="color:var(--accent);flex-shrink:0;">H${h.level}</span>
+          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(h.text)}</span>
+          <button class="pht-remove-tag" data-lid="${h.line_id}" style="background:none;border:none;color:var(--red);cursor:pointer;">✕</button>
+        </div>`).join("") || `<div style="color:var(--subtext);font-size:10px;">None yet.</div>`;
+      listEl.querySelectorAll(".pht-remove-tag").forEach(btn=>{
+        btn.onclick = ()=>{ delete headings[btn.dataset.lid]; refreshTaggedList(); renderOverlays(); };
+      });
+    }
+
+    function renderOverlays(){
+      const wrap = modal.querySelector("#pht-img-wrap");
+      wrap.querySelectorAll(".pht-line-box").forEach(el=>el.remove());
+      currentLines.forEach(line=>{
+        const box = document.createElement("div");
+        box.className = "pht-line-box";
+        const tagged = !!headings[line.line_id];
+        const selected = selectedLineId === line.line_id;
+        box.style.cssText = `position:absolute;left:${line.x0}px;top:${line.y0}px;width:${line.x1-line.x0}px;height:${line.y1-line.y0}px;
+          cursor:pointer;border:2px solid ${selected ? "var(--yellow)" : (tagged ? "var(--accent)" : "transparent")};
+          background:${selected ? "rgba(245,158,11,.15)" : (tagged ? "rgba(96,165,250,.12)" : "transparent")};`;
+        box.title = line.text;
+        box.onclick = ()=>{
+          selectedLineId = line.line_id;
+          modal.querySelector("#pht-selected").textContent = `Selected (p.${line.page}): ${line.text.slice(0,120)}`;
+          renderOverlays();
+        };
+        wrap.appendChild(box);
+      });
+    }
+
+    async function renderPage(){
+      const r = await api("get_pdf_page_image", name, pageIndex);
+      if (!r.ok){ modal.querySelector("#pht-page-label").textContent = "Failed to render page: " + (r.error||""); return; }
+      pageCount = r.page_count;
+      pageIndex = r.page_index;
+      currentLines = r.lines;
+      selectedLineId = null;
+      modal.querySelector("#pht-selected").textContent = "No line selected";
+      modal.querySelector("#pht-page-label").textContent = `Page ${pageIndex+1} / ${pageCount}`;
+      const img = modal.querySelector("#pht-img");
+      img.src = r.data_url;
+      img.style.width = r.width + "px";
+      img.style.height = r.height + "px";
+      renderOverlays();
+      refreshTaggedList();
+    }
+
+    modal.querySelector("#pht-prev").onclick = ()=>{ if (pageIndex>0){ pageIndex--; renderPage(); } };
+    modal.querySelector("#pht-next").onclick = ()=>{ if (pageIndex<pageCount-1){ pageIndex++; renderPage(); } };
+    modal.querySelectorAll(".pht-level-btn").forEach(btn=>{
+      btn.onclick = ()=>{
+        if (!selectedLineId) return;
+        const line = currentLines.find(l=>l.line_id===selectedLineId);
+        if (!line) return;
+        headings[selectedLineId] = { page: line.page, line_id: line.line_id, text: line.text, level: parseInt(btn.dataset.level,10) };
+        refreshTaggedList();
+        renderOverlays();
+      };
+    });
+    modal.querySelector("#pht-untag").onclick = ()=>{
+      if (!selectedLineId) return;
+      delete headings[selectedLineId];
+      refreshTaggedList();
+      renderOverlays();
+    };
+    modal.querySelector("#pht-close").onclick = ()=>{ overlay.remove(); resolve(false); };
+    modal.querySelector("#pht-save").onclick = async ()=>{
+      const list = Object.values(headings);
+      const res = await api("save_pdf_headings", name, list);
+      if (!res.ok){ await showAlert(res.message, "Error"); return; }
+      overlay.remove();
+      resolve(true);
+    };
+  });
+}
+
 function buildKnowledgePane(box){
   box.innerHTML = `
     <div class="hdr-row">
@@ -4368,7 +5022,17 @@ function buildKnowledgePane(box){
       <button class="btn" id="kb-save" style="background:var(--accent);color:#fff;margin-right:6px;">Save</button>
       <button class="ghost-btn" id="kb-new">+ New</button>
     </div>
-    <textarea class="code-area" id="kb-box" style="margin-top:6px;"></textarea>`;
+    <textarea class="code-area" id="kb-box" style="margin-top:6px;"></textarea>
+    <div class="hdr-row" style="margin-top:14px;">
+      <select id="pdf-select" style="flex:1;margin-right:6px;"></select>
+      <button class="ghost-btn" id="pdf-tag" style="margin-right:6px;">🏷️ Tag Headings</button>
+      <button class="ghost-btn" id="pdf-add">+ Add PDF Source</button>
+    </div>
+    <div id="pdf-levels" style="margin-top:6px;background:var(--surface);border:1px solid var(--border);
+         border-radius:14px;padding:8px 10px;font-size:11px;"></div>
+    <div class="pdf-tree" id="pdf-tree" style="margin-top:6px;overflow-y:auto;max-height:180px;
+         background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:8px 10px;
+         font-size:11px;"></div>`;
   const sel = document.getElementById("kb-select");
   const box2 = document.getElementById("kb-box");
   enhanceSelect(sel);
@@ -4396,6 +5060,108 @@ function buildKnowledgePane(box){
     if (!r.ok) showAlert(r.error, "Error"); else refresh(r.filename);
   };
   refresh();
+
+  // ── PDF Sources ──────────────────────────────────────────────────────
+  const pdfSel = document.getElementById("pdf-select");
+  const pdfTree = document.getElementById("pdf-tree");
+  const pdfLevels = document.getElementById("pdf-levels");
+  const pdfAddBtn = document.getElementById("pdf-add");
+  const pdfTagBtn = document.getElementById("pdf-tag");
+  enhanceSelect(pdfSel);
+
+  function renderHeadingsList(headings){
+    if (!headings || !headings.length){
+      return `<div style="color:var(--subtext);">No headings tagged yet -- click Tag Headings to open the PDF and tag some.</div>`;
+    }
+    return headings.map(h=>`<div style="padding:3px 0;display:flex;align-items:baseline;gap:6px;">
+      <span style="color:var(--accent);font-size:9px;font-weight:700;flex-shrink:0;">H${h.level}</span>
+      <span style="color:var(--text);">${escapeHtml(h.text||"(untitled)")}</span>
+      <span style="color:var(--subtext);font-size:9px;margin-left:auto;flex-shrink:0;">p.${h.page ?? "?"}</span>
+    </div>`).join("");
+  }
+
+  async function renderPartsPreview(name){
+    const r = await api("get_pdf_source_parts", name);
+    if (!r.ok || !r.parts || !r.parts.length) return "";
+    const rows = r.parts.map(p=>`<div style="padding:2px 0;display:flex;gap:6px;font-size:10px;color:var(--subtext);">
+        <span style="color:var(--accent);flex-shrink:0;">#${p.index}</span>
+        <span style="flex-shrink:0;">${p.level ? "H"+p.level : "-"}</span>
+        <span style="flex-shrink:0;">p.${p.page ?? "?"}</span>
+        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);">${escapeHtml(p.heading||"")}</span>
+        <span style="flex-shrink:0;">${p.line_count} line(s)</span>
+      </div>`).join("");
+    return `<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);">
+      <div style="font-size:9px;font-weight:700;color:var(--subtext);margin-bottom:4px;">EXPLAIN MODE PARTS (${r.parts.length})</div>
+      ${rows}</div>`;
+  }
+
+  async function refreshPdf(selectName){
+    const files = await api("list_pdf_sources");
+    pdfSel.innerHTML = "";
+    if (!files.length){
+      pdfSel.innerHTML = `<option>No PDF sources found</option>`;
+      pdfTree.innerHTML = `<div style="color:var(--subtext);">Add a PDF to tag its headings here.</div>`;
+      pdfLevels.innerHTML = "";
+      return;
+    }
+    files.forEach(f=>{ const o=document.createElement("option"); o.textContent=f; pdfSel.appendChild(o); });
+    pdfSel.value = selectName && files.includes(selectName) ? selectName : files[0];
+    await loadPdf();
+  }
+
+  async function loadPdf(){
+    if (pdfSel.value === "No PDF sources found") return;
+    pdfTree.innerHTML = `<div style="color:var(--subtext);">Loading...</div>`;
+    pdfLevels.innerHTML = "";
+    const r = await api("get_pdf_source", pdfSel.value);
+    if (!r.ok){ pdfTree.innerHTML = `<div style="color:#e5576c;">${escapeHtml(r.error||"Failed to load source.")}</div>`; return; }
+
+    const headerHtml = `<div style="font-weight:700;margin-bottom:6px;color:var(--text);">${escapeHtml(r.title||pdfSel.value)}
+      <span style="font-weight:400;color:var(--subtext);">(${r.page_count ?? "?"} pages)</span></div>`;
+    pdfTree.innerHTML = headerHtml + renderHeadingsList(r.headings) + await renderPartsPreview(pdfSel.value);
+
+    if (!r.available_levels || !r.available_levels.length){
+      pdfLevels.innerHTML = `<div style="color:var(--subtext);">Tag some headings first, then pick which level(s) split this source into Explain Mode parts.</div>`;
+      return;
+    }
+    const currentLevels = {};
+    (r.part_levels || []).forEach(l=>currentLevels[l]=true);
+    pdfLevels.innerHTML = `<div style="font-size:9px;font-weight:700;color:var(--subtext);margin-bottom:6px;">PART BOUNDARY LEVEL(S) -- set once for this source</div>`
+      + `<div style="display:flex;gap:12px;flex-wrap:wrap;">`
+      + r.available_levels.map(lvl=>`<label style="display:flex;align-items:center;gap:4px;cursor:pointer;color:var(--text);">
+          <input type="checkbox" class="pdf-level-cb" value="${lvl}" ${currentLevels[lvl]?"checked":""}/> H${lvl}
+        </label>`).join("")
+      + `</div><button class="ghost-btn" id="pdf-levels-save" style="margin-top:8px;height:24px;font-size:10px;">Save Part Levels</button>`;
+    document.getElementById("pdf-levels-save").onclick = async ()=>{
+      const levels = Array.from(pdfLevels.querySelectorAll(".pdf-level-cb:checked")).map(el=>parseInt(el.value, 10));
+      const res = await api("set_pdf_source_part_levels", pdfSel.value, levels);
+      if (!res.ok) showAlert(res.message, "Error"); else loadPdf();
+    };
+  }
+  pdfSel.onchange = loadPdf;
+
+  pdfTagBtn.onclick = async ()=>{
+    if (pdfSel.value === "No PDF sources found") { await showAlert("Add a PDF source first.", "No Source"); return; }
+    await openPdfHeadingTagger(pdfSel.value);
+    await loadPdf();
+  };
+
+  pdfAddBtn.onclick = async ()=>{
+    pdfAddBtn.disabled = true;
+    const prevLabel = pdfAddBtn.textContent;
+    pdfAddBtn.textContent = "Registering...";
+    try {
+      const r = await api("add_pdf_source");
+      if (!r.ok){ if (r.error) showAlert(r.error, "Error"); return; }
+      await refreshPdf(r.filename);
+      await openPdfHeadingTagger(r.filename);
+      await loadPdf();
+    } finally {
+      pdfAddBtn.disabled = false;
+      pdfAddBtn.textContent = prevLabel;
+    }
+  };
+  refreshPdf();
 }
 
 function buildSkillsPane(box){
@@ -5525,6 +6291,7 @@ window.addEventListener("pywebviewready", async ()=>{
   document.getElementById("msg-input").addEventListener("keydown", e=>{ if (e.key==="Enter") sendMessage(); });
   document.getElementById("abort-btn").onclick = ()=>api("abort");
   document.getElementById("copy-chat-btn").onclick = copyFullConversation;
+  initKbOnlyControls();
 
   // Apply the remembered theme colors immediately, before the heavier
   // startup() call resolves, so the UI doesn't flash default colors first.

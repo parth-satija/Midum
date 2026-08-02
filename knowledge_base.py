@@ -1,6 +1,7 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
-from config import DOMAIN_INDEX, DOMAIN_SKILLS_INDEX, INSTRUCTIONS_FILE, PATHS_FILE, SKILLS_DIR, SKILLS_INDEX, STORAGE_DIR
+from config import DOMAIN_INDEX, DOMAIN_SKILLS_INDEX, INSTRUCTIONS_FILE, PATHS_FILE, PDF_SOURCES_DIR, PDF_SOURCES_INDEX, SKILLS_DIR, SKILLS_INDEX, STORAGE_DIR
 import datetime
+import json
 import os
 import re
 
@@ -34,6 +35,13 @@ def _ensure_kb_files():
             "Registered domain-specific skill files.\n"
             "Format: [domain] `filename_without_ext` - description\n\n"
             "## Skills\n")
+    os.makedirs(PDF_SOURCES_DIR, exist_ok=True)
+    if not os.path.exists(PDF_SOURCES_INDEX):
+        write_local_file(PDF_SOURCES_INDEX,
+            "# Midum PDF Sources Index\n"
+            "Registered PDF sources (heading/sub-heading structure only, no body content).\n"
+            "Format: `filename_without_ext` - description\n\n"
+            "## Files\n")
 
 
 def read_instructions():
@@ -126,6 +134,437 @@ def list_domain_skills():
     from tools_registry import read_local_file
     _ensure_kb_files()
     return read_local_file(DOMAIN_SKILLS_INDEX)
+
+
+# =============================================================================
+# 5. PDF SOURCES — no automatic structure detection at all (no pdfstructx
+#    anywhere in this module). Registering a source just records its path
+#    and page count via PyMuPDF (fitz); the heading hierarchy comes ONLY
+#    from what the user manually tags in the PDF Heading Tagger window
+#    (see gui/legacy/dialogs.py: PdfHeadingTaggerDialog), which opens the
+#    real PDF, lets the user click a line of text and assign it a heading
+#    level, and saves that list via set_pdf_source_headings().
+# =============================================================================
+
+def add_pdf_source(pdf_path, description=""):
+    """Register a new PDF source: just its path, title (from PDF metadata
+    if present) and page count, via PyMuPDF -- NOT via any structure/
+    heading auto-detection. `headings` starts empty; the user tags them
+    manually afterwards from the Source tab. Returns (safe_name, record)."""
+    from tools_registry import append_local_file, write_local_file
+    _ensure_kb_files()
+    pdf_path = os.path.abspath(pdf_path.strip())
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    base = os.path.splitext(os.path.basename(pdf_path))[0]
+    safe = re.sub(r'[^a-zA-Z0-9_]', '_', base.strip().lower())
+    fpath = os.path.join(PDF_SOURCES_DIR, f"{safe}.json")
+    if os.path.exists(fpath):
+        return safe, json.loads(open(fpath, encoding="utf-8").read())
+
+    import fitz
+    doc = fitz.open(pdf_path)
+    page_count = doc.page_count
+    title = (doc.metadata or {}).get("title") or base
+    doc.close()
+
+    record = {
+        "name": safe,
+        "source_path": pdf_path,
+        "description": description.strip(),
+        "added": datetime.datetime.now().strftime('%Y-%m-%d %H:%M'),
+        "title": title,
+        "page_count": page_count,
+        "headings": [],       # manually tagged: [{page, line_id, text, level}, ...]
+        "part_levels": [],    # subset of tagged levels chosen as part boundaries
+    }
+    write_local_file(fpath, json.dumps(record, indent=2, ensure_ascii=False))
+    desc_part = f" - {description.strip()}" if description.strip() else ""
+    append_local_file(PDF_SOURCES_INDEX, f"- `{safe}`{desc_part} (`{pdf_path}`)")
+    print(f"📄 [PDF source added]: {safe}.json ({page_count} pages, from {pdf_path}) — tag headings manually next.")
+    return safe, record
+
+
+def list_pdf_sources():
+    """Return sorted list of registered PDF source names (without .json)."""
+    _ensure_kb_files()
+    names = []
+    if os.path.exists(PDF_SOURCES_DIR):
+        for f in os.listdir(PDF_SOURCES_DIR):
+            if f.endswith(".json") and os.path.isfile(os.path.join(PDF_SOURCES_DIR, f)):
+                names.append(f[:-5])
+    return sorted(names)
+
+
+def read_pdf_source(name):
+    """Return the stored heading-hierarchy record for a registered PDF
+    source (dict with title/page_count/outline/etc.), or None if missing."""
+    _ensure_kb_files()
+    safe = re.sub(r'[^a-zA-Z0-9_]', '_', name.strip().lower())
+    fpath = os.path.join(PDF_SOURCES_DIR, f"{safe}.json")
+    if not os.path.exists(fpath):
+        return None
+    try:
+        return json.loads(open(fpath, encoding="utf-8").read())
+    except Exception as e:
+        return {"error": f"Failed to read PDF source '{safe}': {e}"}
+
+
+def format_pdf_sources_for_prompt(names):
+    """Render the user-tagged heading list of one or more registered PDF
+    sources as a single markdown block, for injecting into a turn's
+    prompt (KB Only mode). Skips names that can't be resolved; never
+    raises. Headings here are exactly what the user manually tagged in
+    the PDF Heading Tagger window -- nothing auto-detected."""
+    blocks = []
+    for name in names or []:
+        record = read_pdf_source(name)
+        if not record or "error" in record:
+            continue
+        title = record.get("title") or name
+        page_count = record.get("page_count", "?")
+        headings = sorted(record.get("headings") or [], key=lambda h: (h.get("page", 0), h.get("line_id", "")))
+        if headings:
+            outline_md = "\n".join(f"- (H{h.get('level')}, p.{h.get('page','?')}) {h.get('text','(untitled)')}" for h in headings)
+        else:
+            outline_md = "(No headings tagged yet — open the Source tab and tag headings manually.)"
+        blocks.append(f"### Source: {title} ({page_count} pages)\n{outline_md}")
+    return "\n\n".join(blocks)
+
+
+# =============================================================================
+# 6. PDF LINE-LEVEL TEXT (PyMuPDF, no pdfstructx) — used by Explain Mode
+#    and as the coverage guarantee for part-building.
+#
+# extract_pdf_lines() opens the PDF directly with PyMuPDF (fitz) and reads
+# out literally every text line on every page, in reading order, each
+# tagged with a stable line_id ('p{page}_l{n}'). This is deliberately the
+# most primitive possible reading of the PDF's content -- no structure
+# detection, no paragraph grouping, no heading guessing. It exists so that
+# (a) the PDF Heading Tagger window can show the user real lines to click
+# on and tag, and (b) build_pdf_source_parts() below has a literal,
+# complete line-by-line transcript to walk, so "not a single line in any
+# source should be skipped" is a guarantee about this raw extraction, not
+# about anyone's guess at the document's structure.
+# =============================================================================
+
+_PDF_LINES_CACHE = {}   # pdf_path -> (mtime, lines) -- avoids re-parsing on every Explain Mode turn
+
+
+def extract_pdf_lines(pdf_path):
+    """Open `pdf_path` with PyMuPDF and return a flat, ordered list of
+    every non-empty text line in the document: [{page, line_id, text,
+    bbox}, ...], in reading order (page by page, top to bottom within
+    each page). Raises on missing file / open failure."""
+    import fitz
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    doc = fitz.open(pdf_path)
+    lines = []
+    try:
+        for page_index in range(doc.page_count):
+            page = doc[page_index]
+            page_dict = page.get_text("dict")
+            line_no = 0
+            for block in page_dict.get("blocks", []):
+                for line in block.get("lines", []):
+                    text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
+                    if not text:
+                        continue
+                    bbox = line.get("bbox")
+                    lines.append({
+                        "page": page_index + 1,
+                        "line_id": f"p{page_index + 1}_l{line_no}",
+                        "text": text,
+                        "bbox": list(bbox) if bbox else None,
+                    })
+                    line_no += 1
+    finally:
+        doc.close()
+    return lines
+
+
+def _cached_extract_pdf_lines(pdf_path):
+    """Same as extract_pdf_lines() but keeps the last parse per path in
+    memory (keyed on mtime) so Explain Mode doesn't re-read the whole PDF
+    on every single turn."""
+    try:
+        mtime = os.path.getmtime(pdf_path)
+    except OSError:
+        mtime = None
+    cached = _PDF_LINES_CACHE.get(pdf_path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    lines = extract_pdf_lines(pdf_path)
+    _PDF_LINES_CACHE[pdf_path] = (mtime, lines)
+    return lines
+
+
+# =============================================================================
+# 6b. PART SELECTION — user-chosen heading levels that define "parts" for
+#    Explain Mode, set ONCE per source (not per heading) from the GUI's
+#    Source tab.
+#
+# A "part" is a contiguous run of the source's flat, ordered section list
+# that starts at a heading whose level is one of the user's selected
+# levels. If several selected levels are nested inside one another (e.g.
+# the user picked both H1 and H3), the ACTIVE part at any point in the
+# document is always the most recently opened selected heading — i.e. the
+# lowest (most specific/deepest) selected heading level for that stretch
+# of text, exactly matching how a reader would expect "part" boundaries
+# to nest. Every section's text is attached to exactly one part and
+# nothing is ever dropped: if a heading isn't itself a selected level, its
+# text is simply folded into whichever part is currently open, and the
+# very first section always opens part 1 even if its own level was not
+# selected — so the walk covers the source from its first line to its
+# last with no gaps.
+# =============================================================================
+
+def get_pdf_source_available_levels(name):
+    """Return the sorted list of heading levels the user has actually
+    tagged for this source (e.g. [1, 2, 3]), for the GUI to render one
+    checkbox per real tagged level instead of a blind H1-H6 guess."""
+    record = read_pdf_source(name)
+    if not record or "error" in record:
+        return []
+    return sorted({h.get("level") for h in (record.get("headings") or []) if h.get("level")})
+
+
+def _heading_sort_key(h):
+    try:
+        _, lpart = h["line_id"].split("_l")
+        return (h.get("page", 0), int(lpart))
+    except Exception:
+        return (h.get("page", 0), 0)
+
+
+def set_pdf_source_headings(name, headings):
+    """
+    Persist the user's manually-tagged heading lines for this source —
+    overwrites any previous tagging. `headings` is a list of
+    {page, line_id, text, level} dicts, exactly as produced by the PDF
+    Heading Tagger window (each one a line the user clicked on and
+    assigned a heading level to). Returns a confirmation string, or an
+    error string if the source isn't found.
+    """
+    _ensure_kb_files()
+    safe = re.sub(r'[^a-zA-Z0-9_]', '_', name.strip().lower())
+    fpath = os.path.join(PDF_SOURCES_DIR, f"{safe}.json")
+    if not os.path.exists(fpath):
+        return f"PDF source '{safe}.json' not found. Call list_pdf_sources."
+    try:
+        record = json.loads(open(fpath, encoding="utf-8").read())
+    except Exception as e:
+        return f"Failed to read PDF source '{safe}': {e}"
+
+    clean = []
+    for h in headings or []:
+        try:
+            level = int(h.get("level"))
+        except (TypeError, ValueError):
+            continue
+        line_id = h.get("line_id")
+        if not line_id:
+            continue
+        clean.append({
+            "page": int(h.get("page", 0) or 0),
+            "line_id": line_id,
+            "text": (h.get("text") or "").strip(),
+            "level": level,
+        })
+    clean.sort(key=_heading_sort_key)
+
+    record["headings"] = clean
+    # drop any previously-selected part levels that are no longer tagged at all
+    tagged_levels = {h["level"] for h in clean}
+    record["part_levels"] = sorted(l for l in (record.get("part_levels") or []) if l in tagged_levels)
+
+    from tools_registry import write_local_file
+    write_local_file(fpath, json.dumps(record, indent=2, ensure_ascii=False))
+    print(f"🏷️ [PDF source headings tagged]: {safe} -> {len(clean)} heading(s)")
+    return f"Success: saved {len(clean)} manually-tagged heading(s) for '{safe}'."
+
+
+def set_pdf_source_part_levels(name, levels):
+    """
+    Persist the heading levels (list of ints, e.g. [1, 3]) the user picked
+    as "part" boundaries for this source, set once for the whole source
+    (not per heading). Overwrites any previous selection. Returns a
+    confirmation string, or an error string if the source isn't found.
+    """
+    _ensure_kb_files()
+    safe = re.sub(r'[^a-zA-Z0-9_]', '_', name.strip().lower())
+    fpath = os.path.join(PDF_SOURCES_DIR, f"{safe}.json")
+    if not os.path.exists(fpath):
+        return f"PDF source '{safe}.json' not found. Call list_pdf_sources."
+    try:
+        record = json.loads(open(fpath, encoding="utf-8").read())
+    except Exception as e:
+        return f"Failed to read PDF source '{safe}': {e}"
+
+    clean_levels = sorted({int(l) for l in (levels or []) if str(l).strip()})
+    record["part_levels"] = clean_levels
+    from tools_registry import write_local_file
+    write_local_file(fpath, json.dumps(record, indent=2, ensure_ascii=False))
+    print(f"🧩 [PDF source part levels set]: {safe} -> {clean_levels or '(none — whole doc is one part)'}")
+    return f"Success: '{safe}' will now be split into parts at heading level(s) {clean_levels or '(none — treated as a single part)'}."
+
+
+def get_pdf_source_part_levels(name):
+    """Return the list of heading levels registered for this source (may be empty)."""
+    record = read_pdf_source(name)
+    if not record or "error" in record:
+        return []
+    return sorted(record.get("part_levels") or [])
+
+
+def build_pdf_source_parts(name):
+    """
+    Split a registered PDF source's full, literal line-by-line text (see
+    extract_pdf_lines) into an ordered list of "parts", using ONLY the
+    user's own manually-tagged headings restricted to the saved
+    part_levels. Returns a list of dicts:
+        {"heading": str, "level": int|None, "page": int, "sections": [...]}
+    where `sections` is the exact slice of the flat {page, line_id, text}
+    line list that belongs to that part, in original document order.
+
+    Guarantees full coverage: EVERY line from the source's raw PyMuPDF
+    extraction is placed into exactly one part, in order — nothing is
+    ever skipped or duplicated, regardless of which levels were selected
+    (including none, or a source with no tagged headings at all — then
+    the whole document is simply one part). Returns [] if the source
+    can't be resolved.
+    """
+    record = read_pdf_source(name)
+    if not record or "error" in record:
+        return []
+    source_path = record.get("source_path")
+    if not source_path or not os.path.exists(source_path):
+        return []
+    try:
+        lines = _cached_extract_pdf_lines(source_path)
+    except Exception:
+        return []
+    if not lines:
+        return []
+
+    heading_by_key = {(h.get("page"), h.get("line_id")): h for h in (record.get("headings") or [])}
+    part_levels = set(record.get("part_levels") or [])
+
+    parts = []
+    current = None
+    for line in lines:
+        tagged = heading_by_key.get((line["page"], line["line_id"]))
+        is_boundary = current is None or (
+            tagged is not None and (not part_levels or tagged["level"] in part_levels)
+        )
+        if is_boundary:
+            current = {
+                "heading": tagged["text"] if tagged else (line["text"][:100] or "(untitled)"),
+                "level": tagged["level"] if tagged else None,
+                "page": line["page"],
+                "sections": [],
+            }
+            parts.append(current)
+        current["sections"].append(line)
+    return parts
+
+
+def list_pdf_source_parts(name):
+    """
+    Return a numbered, human-readable index of the parts built from this
+    source's saved part_levels — for the runtime to tell the model which
+    parts exist, and for the GUI/tools to pick one by index. Format:
+    'IDX | Level | Page | Heading'. Returns a message if no source/levels.
+    """
+    record = read_pdf_source(name)
+    if not record or "error" in record:
+        return f"PDF source '{name}' not found. Call list_pdf_sources."
+    parts = build_pdf_source_parts(name)
+    if not parts:
+        return f"No extractable parts found for '{name}'."
+    levels = record.get("part_levels") or []
+    header = (
+        f"Source: {record.get('title') or name} — {len(parts)} part(s)"
+        + (f", split at heading level(s) {sorted(levels)}" if levels
+           else " (no part levels set — whole source is one part; "
+                "set part levels from the Source tab for finer-grained Explain Mode)")
+        + "\n"
+    )
+    lines = [header, "IDX | LEVEL | PAGE | HEADING"]
+    for i, p in enumerate(parts):
+        lvl = f"H{p['level']}" if p.get("level") else "-"
+        lines.append(f"{i} | {lvl} | {p.get('page', '?')} | {p.get('heading', '(untitled)')}")
+    return "\n".join(lines)
+
+
+def format_pdf_source_part_for_prompt(name, part_index):
+    """
+    Render ONE part (by index into list_pdf_source_parts/build_pdf_source_parts)
+    as a markdown block for Explain Mode, with an explicit header telling
+    the model exactly which part of the source it is now explaining and
+    how many parts remain — this is the "runtime clarifies to the model
+    what part they have to explain" step. Every heading in the part is
+    followed immediately by its own full paragraph text, in flat
+    top-to-bottom order, so nothing inside the part is skipped or
+    summarized away. Returns an error string if name/index don't resolve.
+    """
+    record = read_pdf_source(name)
+    if not record or "error" in record:
+        return f"PDF source '{name}' not found. Call list_pdf_sources."
+    parts = build_pdf_source_parts(name)
+    if not parts:
+        return f"No extractable parts found for '{name}'."
+    if not (0 <= part_index < len(parts)):
+        return f"Part index {part_index} out of range — '{name}' has {len(parts)} part(s) (0-{len(parts)-1})."
+
+    part = parts[part_index]
+    title = record.get("title") or name
+    level = part.get("level")
+    hashes = "#" * min(max(level, 1), 6) if level else "##"
+    body = "\n".join(l["text"] for l in part["sections"])
+    body_block = f"{hashes} {part['heading']} (p.{part.get('page', '?')})\n{body or '(No text found in this part.)'}"
+
+    header = (
+        f"### EXPLAIN MODE — Source: {title}\n"
+        f"You are now explaining PART {part_index + 1} of {len(parts)}: "
+        f"\"{part['heading']}\" (starting p.{part.get('page', '?')}).\n"
+        f"Explain this part as flowing, connected concepts, not a line-by-line "
+        f"reading — but every detail below (names, numbers, terms, examples, "
+        f"minor points included) must surface somewhere in your explanation "
+        f"before moving on. Don't skip, summarize away, or guess at content not "
+        f"shown below. "
+        + (f"After this, {len(parts) - part_index - 1} part(s) remain."
+           if part_index + 1 < len(parts) else "This is the LAST part of this source.")
+        + "\n\n"
+    )
+    return header + body_block
+
+
+def format_pdf_sources_full_text_for_prompt(names):
+    """Render the FULL raw line-by-line text of one or more registered
+    PDF sources for Explain Mode -- literally every line PyMuPDF read
+    from the PDF, in document order, no heading-based grouping. Skips
+    names that can't be resolved or whose source file has moved/been
+    deleted; never raises."""
+    blocks = []
+    for name in names or []:
+        record = read_pdf_source(name)
+        if not record or "error" in record:
+            continue
+        source_path = record.get("source_path")
+        if not source_path or not os.path.exists(source_path):
+            continue
+        try:
+            lines = _cached_extract_pdf_lines(source_path)
+        except Exception:
+            continue
+        title = record.get("title") or name
+        page_count = record.get("page_count", "?")
+        body = "\n".join(l["text"] for l in lines)
+        block = f"### SOURCE: {title} ({page_count} pages)\n\n" + (body or "(No extractable text found in this PDF.)")
+        blocks.append(block)
+    return "\n\n---\n\n".join(blocks)
 
 
 # =============================================================================

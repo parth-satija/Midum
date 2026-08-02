@@ -1,5 +1,6 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
 from tkinter import messagebox, filedialog
+import tkinter as tk
 import customtkinter as ctk
 
 # --- from gui.py, section 1 ---
@@ -439,6 +440,267 @@ PROVIDER_OPTIONS = [
 _PROVIDER_LABEL_TO_KEY = {label: key for label, key in PROVIDER_OPTIONS}
 _PROVIDER_KEY_TO_LABEL = {key: label for label, key in PROVIDER_OPTIONS}
 DEFAULT_PROVIDER_KEY = "ollama"
+
+
+# =============================================================================
+# PDF HEADING TAGGER
+# =============================================================================
+# Opens the ACTUAL PDF (rendered via PyMuPDF) so the user can click a real
+# line of text and assign it a heading level directly -- no automatic
+# structure detection anywhere in this flow. Every heading that ends up in
+# the source's saved record is a line the user personally clicked and
+# tagged. Saving calls midum.set_pdf_source_headings(name, headings), which
+# overwrites the source's previous tagging with exactly this list.
+class PdfHeadingTaggerDialog(ctk.CTkToplevel):
+    def __init__(self, parent, midum_module, source_name: str, pdf_path: str, existing_headings: list, on_saved=None):
+        from gui.legacy.app import C, FONT_SMALL, FONT_TITLE
+        super().__init__(parent)
+        self._midum = midum_module
+        self._source_name = source_name
+        self._on_saved = on_saved
+        self._C = C
+
+        self.title(f"🏷️ Tag Headings — {source_name}")
+        self.geometry("1100x760")
+        self.minsize(760, 480)
+        self.configure(fg_color=C["bg"])
+
+        import fitz
+        self._doc = fitz.open(pdf_path)
+        self._page_index = 0
+        self._zoom = 1.6
+        self._img_ref = None
+        self._line_boxes = []                 # this page's clickable lines
+        self._selected_line = None
+        # line_id -> {page, line_id, text, level}
+        self._headings = {h["line_id"]: dict(h) for h in (existing_headings or []) if h.get("line_id")}
+
+        self._build_layout()
+        self._render_page()
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.lift()
+        self.focus_force()
+        self.grab_set()
+
+    # ── layout ───────────────────────────────────────────────────────────────
+    def _build_layout(self):
+        C = self._C
+        main = ctk.CTkFrame(self, fg_color=C["panel"], corner_radius=0)
+        main.pack(fill="both", expand=True)
+        main.grid_columnconfigure(0, weight=3)
+        main.grid_columnconfigure(1, weight=1)
+        main.grid_rowconfigure(1, weight=1)
+
+        nav = ctk.CTkFrame(main, fg_color="transparent")
+        nav.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=8)
+        ctk.CTkButton(nav, text="◀ Prev", width=70, height=28, font=FONT_SMALL,
+                      fg_color=C["surface2"], hover_color=C["accent"],
+                      command=self._prev_page).pack(side="left")
+        self._page_lbl = ctk.CTkLabel(nav, text="", font=FONT_SMALL, text_color=C["text"])
+        self._page_lbl.pack(side="left", padx=10)
+        ctk.CTkButton(nav, text="Next ▶", width=70, height=28, font=FONT_SMALL,
+                      fg_color=C["surface2"], hover_color=C["accent"],
+                      command=self._next_page).pack(side="left")
+        ctk.CTkLabel(
+            nav, text="Click a line of text below, then tap a heading level to tag it.",
+            font=FONT_SMALL, text_color=C["subtext"]
+        ).pack(side="left", padx=20)
+
+        canvas_frame = ctk.CTkFrame(main, fg_color=C["surface"], corner_radius=0)
+        canvas_frame.grid(row=1, column=0, sticky="nsew", padx=(10, 4), pady=(0, 10))
+        canvas_frame.grid_rowconfigure(0, weight=1)
+        canvas_frame.grid_columnconfigure(0, weight=1)
+
+        self._canvas = tk.Canvas(canvas_frame, bg="#12161c", highlightthickness=0)
+        vbar = tk.Scrollbar(canvas_frame, orient="vertical", command=self._canvas.yview)
+        hbar = tk.Scrollbar(canvas_frame, orient="horizontal", command=self._canvas.xview)
+        self._canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+        self._canvas.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar.grid(row=1, column=0, sticky="ew")
+        self._canvas.bind("<Button-1>", self._on_canvas_click)
+
+        self._build_side_panel(main)
+
+    def _build_side_panel(self, main):
+        C = self._C
+        from gui.legacy.app import FONT_SMALL
+
+        side = ctk.CTkFrame(main, fg_color=C["surface"], corner_radius=12,
+                             border_width=1, border_color=C["border2"])
+        side.grid(row=1, column=1, sticky="nsew", padx=(4, 10), pady=(0, 10))
+        side.grid_rowconfigure(4, weight=1)
+        side.grid_columnconfigure(0, weight=1)
+
+        self._selected_lbl = ctk.CTkLabel(
+            side, text="No line selected", wraplength=260,
+            font=FONT_SMALL, text_color=C["subtext"], justify="left"
+        )
+        self._selected_lbl.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+
+        lvl_row = ctk.CTkFrame(side, fg_color="transparent")
+        lvl_row.grid(row=1, column=0, sticky="ew", padx=10)
+        for lvl in range(1, 7):
+            ctk.CTkButton(
+                lvl_row, text=f"H{lvl}", width=36, height=28, font=FONT_SMALL,
+                fg_color=C["surface2"], hover_color=C["accent"],
+                command=lambda l=lvl: self._tag_selected(l)
+            ).pack(side="left", padx=2, pady=6)
+
+        ctk.CTkButton(
+            side, text="Untag selected line", height=26, font=FONT_SMALL,
+            fg_color="transparent", hover_color="#2d1010", text_color=C["red"],
+            border_width=1, border_color="#3f0f0f", corner_radius=13,
+            command=self._untag_selected
+        ).grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
+
+        ctk.CTkLabel(
+            side, text="TAGGED HEADINGS", font=("Segoe UI", 9, "bold"),
+            text_color=C["subtext"]
+        ).grid(row=3, column=0, sticky="nw", padx=10)
+
+        self._tagged_list = ctk.CTkScrollableFrame(side, fg_color=C["panel"], corner_radius=10)
+        self._tagged_list.grid(row=4, column=0, sticky="nsew", padx=10, pady=(4, 10))
+
+        btn_row = ctk.CTkFrame(side, fg_color="transparent")
+        btn_row.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 10))
+        ctk.CTkButton(
+            btn_row, text="Cancel", fg_color="transparent", hover_color=C["surface2"],
+            border_width=1, border_color=C["border2"], command=self._close
+        ).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        ctk.CTkButton(
+            btn_row, text="Save", fg_color=C["accent"], hover_color=C["accent_dim"],
+            command=self._save
+        ).pack(side="left", expand=True, fill="x", padx=(4, 0))
+
+        self._refresh_tagged_list()
+
+    # ── page rendering ───────────────────────────────────────────────────────
+    def _render_page(self):
+        import fitz
+        page = self._doc[self._page_index]
+        mat = fitz.Matrix(self._zoom, self._zoom)
+        pix = page.get_pixmap(matrix=mat)
+        mode = "RGB" if pix.alpha == 0 else "RGBA"
+        from PIL import Image as _PILImage, ImageTk as _ImageTk
+        img = _PILImage.frombytes(mode, (pix.width, pix.height), pix.samples)
+        self._img_ref = _ImageTk.PhotoImage(img)
+        self._canvas.delete("all")
+        self._canvas.create_image(0, 0, anchor="nw", image=self._img_ref)
+        self._canvas.configure(scrollregion=(0, 0, pix.width, pix.height))
+
+        self._line_boxes = []
+        page_dict = page.get_text("dict")
+        line_no = 0
+        for block in page_dict.get("blocks", []):
+            for line in block.get("lines", []):
+                text = "".join(s.get("text", "") for s in line.get("spans", [])).strip()
+                if not text:
+                    continue
+                x0, y0, x1, y1 = line.get("bbox")
+                rect = (x0 * self._zoom, y0 * self._zoom, x1 * self._zoom, y1 * self._zoom)
+                line_id = f"p{self._page_index + 1}_l{line_no}"
+                self._line_boxes.append({
+                    "line_id": line_id, "text": text,
+                    "page": self._page_index + 1, "rect": rect,
+                })
+                line_no += 1
+                if line_id in self._headings:
+                    self._canvas.create_rectangle(*rect, outline=self._C["accent"], width=2)
+
+        if self._selected_line and self._selected_line["page"] == self._page_index + 1:
+            match = next((lb for lb in self._line_boxes if lb["line_id"] == self._selected_line["line_id"]), None)
+            if match:
+                self._canvas.create_rectangle(*match["rect"], outline=self._C["yellow"], width=3)
+
+        self._page_lbl.configure(text=f"Page {self._page_index + 1} / {self._doc.page_count}")
+
+    def _on_canvas_click(self, event):
+        x = self._canvas.canvasx(event.x)
+        y = self._canvas.canvasy(event.y)
+        for lb in self._line_boxes:
+            x0, y0, x1, y1 = lb["rect"]
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                self._selected_line = lb
+                self._selected_lbl.configure(text=f"Selected (p.{lb['page']}): {lb['text'][:120]}")
+                self._render_page()
+                return
+        self._selected_line = None
+        self._selected_lbl.configure(text="No line selected")
+
+    # ── tagging ──────────────────────────────────────────────────────────────
+    def _tag_selected(self, level):
+        if not self._selected_line:
+            return
+        lb = self._selected_line
+        self._headings[lb["line_id"]] = {
+            "page": lb["page"], "line_id": lb["line_id"], "text": lb["text"], "level": level
+        }
+        self._refresh_tagged_list()
+        self._render_page()
+
+    def _untag_selected(self):
+        if not self._selected_line:
+            return
+        self._headings.pop(self._selected_line["line_id"], None)
+        self._refresh_tagged_list()
+        self._render_page()
+
+    def _remove_tag(self, line_id):
+        self._headings.pop(line_id, None)
+        self._refresh_tagged_list()
+        self._render_page()
+
+    def _refresh_tagged_list(self):
+        from gui.legacy.app import FONT_SMALL
+        for w in self._tagged_list.winfo_children():
+            w.destroy()
+        items = sorted(self._headings.values(), key=lambda h: (h["page"], h["line_id"]))
+        for h in items:
+            row = ctk.CTkFrame(self._tagged_list, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(
+                row, text=f"H{h['level']} · p{h['page']} · {h['text'][:40]}",
+                font=FONT_SMALL, text_color=self._C["text"], anchor="w"
+            ).pack(side="left", fill="x", expand=True)
+            ctk.CTkButton(
+                row, text="✕", width=22, height=22, fg_color="transparent",
+                hover_color="#2d1010", text_color=self._C["red"],
+                command=lambda lid=h["line_id"]: self._remove_tag(lid)
+            ).pack(side="right")
+
+    # ── navigation ───────────────────────────────────────────────────────────
+    def _prev_page(self):
+        if self._page_index > 0:
+            self._page_index -= 1
+            self._selected_line = None
+            self._render_page()
+
+    def _next_page(self):
+        if self._page_index < self._doc.page_count - 1:
+            self._page_index += 1
+            self._selected_line = None
+            self._render_page()
+
+    # ── save / close ─────────────────────────────────────────────────────────
+    def _save(self):
+        headings = list(self._headings.values())
+        try:
+            result = self._midum.set_pdf_source_headings(self._source_name, headings)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save headings: {e}")
+            return
+        if self._on_saved:
+            self._on_saved(result)
+        self._close()
+
+    def _close(self):
+        try:
+            self._doc.close()
+        except Exception:
+            pass
+        self.destroy()
 
 
 

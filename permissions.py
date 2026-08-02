@@ -34,6 +34,31 @@ VALID_LEVELS = ("always", "ask", "deny")
 
 _permissions_cache: dict | None = None
 
+# ── KB Only mode ──────────────────────────────────────────────────────────
+# Set for the duration of a single turn (see gui/app.py's _run_turn) when
+# the prompt-box "KB Only" toggle is active for that message. While active,
+# filter_tools_schema() strips internet/browser-access tools out of the
+# schema offered to the model, so it can only answer from the PDF-source
+# context injected into that turn's prompt. Deliberately a plain module
+# global rather than anything persisted to disk -- it must NOT survive a
+# restart, and this app only ever runs one turn at a time.
+_KB_ONLY_ACTIVE = False
+_KB_ONLY_BLOCKED_TOOLS = {
+    "search_internet", "open_search_result", "read_search_result", "open_url",
+    "run_js_in_browser", "read_browser_page", "list_browser_tabs",
+    "snapshot_browser_elements", "act_on_browser_element", "query_gemini_app",
+}
+
+
+def set_kb_only_mode(active: bool) -> None:
+    """Turn KB Only tool-filtering on/off for the current (single) turn."""
+    global _KB_ONLY_ACTIVE
+    _KB_ONLY_ACTIVE = bool(active)
+
+
+def is_kb_only_mode() -> bool:
+    return _KB_ONLY_ACTIVE
+
 
 def _load() -> dict:
     global _permissions_cache
@@ -114,6 +139,13 @@ def filter_tools_schema(tools_list: list) -> list:
         t for t in tools_list
         if perms.get(t["function"]["name"], DEFAULT_LEVEL) != "deny"
     ]
+
+    if _KB_ONLY_ACTIVE:
+        filtered = [t for t in filtered if t["function"]["name"] not in _KB_ONLY_BLOCKED_TOOLS]
+        # Promoted MCP/Flow tools are arbitrary external integrations (many
+        # are themselves internet-connected), so KB Only skips appending
+        # them altogether rather than trying to vet each one individually.
+        return filtered
 
     try:
         from midum_mcp.tools import get_promoted_tool_schemas

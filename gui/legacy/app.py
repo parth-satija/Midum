@@ -502,7 +502,7 @@ class MidumGUI(ctk.CTk):
         )
         self._tabs.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 
-        for tab in ("Log", "Model", "Parameters", "System Core", "Knowledge", "Skills", "Tools", "MCP"):
+        for tab in ("Log", "Model", "Parameters", "System Core", "Knowledge", "Source", "Skills", "Tools", "MCP"):
             self._tabs.add(tab)
 
         # The segmented button is the actual row of tab labels — style it
@@ -521,6 +521,7 @@ class MidumGUI(ctk.CTk):
         self._build_status_tab()
         self._build_system_core_tab()
         self._build_knowledge_bases_tab()
+        self._build_source_tab()
         self._build_skills_tab()
         self._build_manual_tools_tab()
         self._build_mcp_tab()
@@ -983,6 +984,202 @@ class MidumGUI(ctk.CTk):
             self._load_file_into_box(self._sys_core_box, self._sys_core_active_file)
         except Exception as e:
             messagebox.showerror("Error", f"Failed creating knowledge base: {e}")
+
+    # ── Source Tab ───────────────────────────────────────────────────────────
+    # Lets the user register PDF sources for Explain Mode and choose, ONCE
+    # per source (not per heading), which heading level(s) act as "part"
+    # boundaries. The deepest selected level covering any given stretch of
+    # text is what splits it into a part at runtime (see
+    # knowledge_base.build_pdf_source_parts) -- every line of the source
+    # always lands in exactly one part, whatever is picked, including
+    # nothing picked at all (whole doc = one part).
+    def _build_source_tab(self):
+        tab = self._tabs.tab("Source")
+        tab.grid_rowconfigure(4, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+
+        control_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        control_frame.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 4))
+        control_frame.grid_columnconfigure(0, weight=1)
+
+        self._source_dropdown = ctk.CTkOptionMenu(
+            control_frame, values=["Loading..."],
+            command=self._on_source_selected,
+            fg_color=C["surface"], button_color=C["border2"],
+            button_hover_color=C["accent"], dropdown_fg_color=C["surface"],
+            dropdown_hover_color=C["surface2"], text_color=C["text"], font=FONT_SMALL,
+            corner_radius=20
+        )
+        self._source_dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        ctk.CTkButton(
+            control_frame, text="+ Add PDF", width=80, height=28, font=FONT_SMALL,
+            fg_color="transparent", hover_color=C["surface2"],
+            border_width=1, border_color=C["border2"],
+            corner_radius=20, command=self._add_pdf_source_dialog
+        ).grid(row=0, column=1, padx=(0, 6))
+
+        ctk.CTkButton(
+            control_frame, text="🏷️ Tag Headings", width=110, height=28, font=FONT_SMALL,
+            fg_color=C["accent"], hover_color=C["accent_dim"],
+            corner_radius=20, command=self._open_heading_tagger
+        ).grid(row=0, column=2)
+
+        ctk.CTkLabel(
+            tab, text="PART BOUNDARY HEADING LEVEL(S) — set once per source",
+            font=("Segoe UI", 9, "bold"), text_color=C["subtext"]
+        ).grid(row=1, column=0, sticky="w", padx=4, pady=(6, 2))
+
+        self._source_levels_frame = ctk.CTkFrame(
+            tab, fg_color=C["surface"], corner_radius=12,
+            border_width=1, border_color=C["border"]
+        )
+        self._source_levels_frame.grid(row=2, column=0, sticky="new", padx=0, pady=(0, 8))
+        self._source_level_vars = {}
+
+        ctk.CTkButton(
+            tab, text="Save Part Levels", height=30, font=FONT_SMALL,
+            fg_color=C["accent"], hover_color=C["accent_dim"], corner_radius=20,
+            command=self._save_source_part_levels
+        ).grid(row=3, column=0, sticky="ew", padx=4, pady=(0, 8))
+
+        self._source_parts_box = ctk.CTkTextbox(
+            tab, font=FONT_MONO, fg_color=C["tool_bg"],
+            text_color=C["text"], wrap="word", corner_radius=12,
+            border_width=1, border_color=C["border"], height=140
+        )
+        self._source_parts_box.grid(row=4, column=0, sticky="nsew", padx=0, pady=(0, 4))
+        self._source_parts_box._textbox.configure(spacing1=3, spacing2=2, padx=8, pady=8)
+        self._source_parts_box.configure(state="disabled")
+
+        self._source_active_name = None
+        self._refresh_source_dropdown()
+
+    def _refresh_source_dropdown(self, select_name=None):
+        try:
+            names = midum.list_pdf_sources()
+            if not names:
+                names = ["No PDF sources yet"]
+                self._source_active_name = None
+                self._source_dropdown.configure(values=names)
+                self._source_dropdown.set(names[0])
+                self._clear_source_levels("(Add a PDF source to configure its parts)")
+                return
+            self._source_dropdown.configure(values=names)
+            target = select_name if select_name in names else names[0]
+            self._source_dropdown.set(target)
+            self._on_source_selected(target)
+        except Exception as e:
+            self._activity_append(f"⚠️ Source scan failed: {e}\n")
+
+    def _clear_source_levels(self, message: str):
+        for w in self._source_levels_frame.winfo_children():
+            w.destroy()
+        self._source_level_vars = {}
+        ctk.CTkLabel(
+            self._source_levels_frame, text=message, font=FONT_SMALL,
+            text_color=C["subtext"]
+        ).pack(anchor="w", padx=12, pady=10)
+        self._update_source_parts_preview(None)
+
+    def _on_source_selected(self, name: str):
+        if name == "No PDF sources yet":
+            return
+        self._source_active_name = name
+
+        for w in self._source_levels_frame.winfo_children():
+            w.destroy()
+        self._source_level_vars = {}
+
+        available = midum.get_pdf_source_available_levels(name)
+        if not available:
+            ctk.CTkLabel(
+                self._source_levels_frame,
+                text="No headings detected in this source — it will be treated as one part.",
+                font=FONT_SMALL, text_color=C["subtext"]
+            ).pack(anchor="w", padx=12, pady=10)
+        else:
+            current = set(midum.get_pdf_source_part_levels(name))
+            row = ctk.CTkFrame(self._source_levels_frame, fg_color="transparent")
+            row.pack(anchor="w", padx=8, pady=8, fill="x")
+            for lvl in available:
+                var = ctk.BooleanVar(value=(lvl in current))
+                self._source_level_vars[lvl] = var
+                ctk.CTkCheckBox(
+                    row, text=f"H{lvl}", variable=var,
+                    font=FONT_SMALL, text_color=C["text"], fg_color=C["accent"],
+                    hover_color=C["accent_dim"], border_color=C["border2"], corner_radius=6
+                ).pack(side="left", padx=(0, 14), pady=4)
+
+        self._update_source_parts_preview(name)
+
+    def _update_source_parts_preview(self, name):
+        self._source_parts_box.configure(state="normal")
+        self._source_parts_box.delete("1.0", "end")
+        if name:
+            try:
+                self._source_parts_box.insert("end", midum.list_pdf_source_parts(name))
+            except Exception as e:
+                self._source_parts_box.insert("end", f"Error loading parts: {e}")
+        else:
+            self._source_parts_box.insert("end", "(No source selected)")
+        self._source_parts_box.configure(state="disabled")
+
+    def _save_source_part_levels(self):
+        if not self._source_active_name:
+            messagebox.showwarning("Save Blocked", "No PDF source selected.")
+            return
+        levels = sorted(lvl for lvl, var in self._source_level_vars.items() if var.get())
+        try:
+            result = midum.set_pdf_source_part_levels(self._source_active_name, levels)
+            self._activity_append(f"🧩 {result}\n")
+            self._update_source_parts_preview(self._source_active_name)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save part levels: {e}")
+
+    def _add_pdf_source_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Select a PDF to register as a source",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        dialog = ctk.CTkInputDialog(text="Optional one-line description:", title="✡ Add PDF Source")
+        description = dialog.get_input() or ""
+        try:
+            safe_name, record = midum.add_pdf_source(path, description)
+            self._activity_append(f"📄 [PDF source added]: {safe_name} ({record.get('page_count','?')} pages)\n")
+            self._refresh_source_dropdown(select_name=safe_name)
+            # No structure was auto-detected -- go straight into the tagger so
+            # the source is immediately useful instead of sitting untagged.
+            self._open_heading_tagger()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to add PDF source: {e}")
+
+    def _open_heading_tagger(self):
+        if not self._source_active_name:
+            messagebox.showwarning("No Source Selected", "Add or select a PDF source first.")
+            return
+        record = midum.read_pdf_source(self._source_active_name)
+        if not record or "error" in record:
+            messagebox.showerror("Error", f"Could not read source '{self._source_active_name}'.")
+            return
+        pdf_path = record.get("source_path")
+        if not pdf_path or not os.path.exists(pdf_path):
+            messagebox.showerror("Error", f"Source PDF file not found on disk:\n{pdf_path}")
+            return
+        from gui.legacy.dialogs import PdfHeadingTaggerDialog
+        PdfHeadingTaggerDialog(
+            self, midum, self._source_active_name, pdf_path,
+            record.get("headings") or [],
+            on_saved=self._on_headings_saved
+        )
+
+    def _on_headings_saved(self, result_message: str):
+        self._activity_append(f"🏷️ {result_message}\n")
+        # Re-render the level checkboxes (tagged levels may have changed) and
+        # the parts preview for whichever source is still active.
+        self._on_source_selected(self._source_active_name)
 
     # ── Skills Tab ────────────────────────────────────────────────────────────
     def _build_skills_tab(self):

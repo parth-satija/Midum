@@ -335,6 +335,12 @@ PATHS_FILE          = os.path.join(STORAGE_DIR, "paths.md")
 DOMAIN_INDEX        = os.path.join(STORAGE_DIR, "domain_index.md")
 SKILLS_DIR          = os.path.join(STORAGE_DIR, "skills")
 DOMAIN_SKILLS_INDEX = os.path.join(STORAGE_DIR, "domain_skills_index.md")
+# PDF Sources — PDFs whose heading/sub-heading hierarchy (no body content) is
+# extracted via the pdfstructx library and stored as JSON, so the Knowledge
+# Bases tab can show a structural outline of an uploaded PDF without pulling
+# its full text into context.
+PDF_SOURCES_DIR      = os.path.join(STORAGE_DIR, "pdf_sources")
+PDF_SOURCES_INDEX    = os.path.join(STORAGE_DIR, "pdf_sources_index.md")
 MASTER_MEMORY       = os.path.join(STORAGE_DIR, "master_memory.md")
 SESSION_MEMORY      = os.path.join(STORAGE_DIR, "session_memory.md")
 RESPONSE_MEMORY     = os.path.join(STORAGE_DIR, "response_memory.md")
