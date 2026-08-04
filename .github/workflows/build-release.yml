@@ -31,11 +31,20 @@ jobs:
 
       - name: Build Executable with PyInstaller
         run: |
-          pyinstaller --onefile --noconsole --name "midum" gui/app.py
+          pyinstaller --onefile --noconsole --name "midum" --collect-all PyQt5 gui/app.py
         # Options used:
         # --onefile : Bundles everything into a single binary
         # --noconsole : Suppresses the command prompt window (remove if CLI tool)
         # --name : Sets the output executable file name
+        # --collect-all PyQt5 : Forces PyInstaller to pull in every PyQt5/
+        #   PyQtWebEngine data file, binary, and plugin (Qt platform plugins,
+        #   QtWebEngineProcess.exe, translations/resources/icudtl.dat). The
+        #   app's GUI (gui/app.py) is a pywebview window rendered through
+        #   QtWebEngine -- without --collect-all, PyInstaller's static
+        #   analysis often misses these non-Python resources in --onefile
+        #   mode, which is why the UI silently failed to start (main() calls
+        #   sys.exit(1) when QtWebEngineWidgets isn't importable, invisible
+        #   under --noconsole) and the exe came out a fraction of its real size.
 
       - name: Upload Binary to Release
         uses: softprops/action-gh-release@v2

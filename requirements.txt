@@ -17,6 +17,7 @@ pytesseract
 python-docx
 pywebview
 PyQt5
+PyQtWebEngine
 pywin32
 qtpy
 requests
