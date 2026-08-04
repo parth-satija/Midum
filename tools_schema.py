@@ -1937,6 +1937,32 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "explain_pdf_source_page",
+            "description": (
+                "Page-by-Page counterpart to explain_pdf_source_part. Fetch the FULL "
+                "text of a PDF source (with '[--- PAGE N ---]' markers) plus a marker "
+                "telling you exactly which raw PDF page number to explain right now. "
+                "Needs NO heading tagging or part-level selection at all -- unlike "
+                "explain_pdf_source_part, this works immediately on any registered "
+                "source since page numbers are inherent to the PDF. Explain ONLY the "
+                "named page; a little forward bleed into the next page (finishing a "
+                "sentence/paragraph that spans the boundary) or leaving a small amount "
+                "for next time is fine, but do not drift further than that. Call again "
+                "with the next page number to continue until every page is covered."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Source name, from list_pdf_sources()."},
+                    "page_number": {"type": "integer", "description": "1-based page number to explain."}
+                },
+                "required": ["name", "page_number"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_pdf_source_part_levels",
             "description": (
                 "Set which heading level(s) act as 'part' boundaries for a PDF source — a "

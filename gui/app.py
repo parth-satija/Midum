@@ -205,8 +205,26 @@ class Api:
         # Explain Mode's per-source progress: source name -> current part
         # index (0-based, into knowledge_base.build_pdf_source_parts).
         # Reset whenever the chat/session resets -- a walkthrough is scoped
-        # to one conversation, not persisted across chats.
+        # to one conversation, not persisted across chats. Used by the
+        # Part-by-Part mode only.
         self._explain_progress = {}
+        # Page-by-Page mode's per-source progress: source name -> current
+        # page number (1-based). Separate from _explain_progress above
+        # since the two modes track position completely differently (part
+        # index vs raw page number) and a source could in principle be
+        # walked in either mode across a session.
+        self._explain_page_progress = {}
+        # Current KB Only / Explain Mode toggle state, kept in sync with the
+        # frontend's own `state.kbOnly` / `state.kbSources` / `state.explainMode`
+        # / `state.explainModeType` on every send_message() call (see below).
+        # Persisted alongside the chat (_persist_current_chat) and restored on
+        # load_chat() so reopening a chat mid-explanation resumes with KB Only
+        # (and Explain Mode, and the correct source selection) already active
+        # instead of the user having to re-enable everything by hand.
+        self._kb_state = {
+            "kb_only": False, "kb_sources": [],
+            "explain_mode": False, "explain_mode_type": "part",
+        }
         # Tracks the display-log/session-history entry currently being
         # streamed into by voice transcripts, so consecutive fragments from
         # the same speaker fold into one saved message instead of one saved
@@ -961,8 +979,22 @@ class Api:
         self._display_log = list(data.get("display", []))
         self._voice_stream_tag = None
         self._voice_stream_idx = None
-        self._explain_progress = {}
-        return {"ok": True, "display": self._display_log}
+        # Restore KB Only / Explain Mode toggle state + walkthrough progress
+        # exactly as they were when this chat was last saved, so an
+        # in-progress KB/Explain walkthrough can be continued seamlessly
+        # instead of the user having to re-toggle everything and losing
+        # their place in the source. Falls back to "off" defaults for chats
+        # saved before this feature existed (no "kb_state" key on disk).
+        saved_kb_state = data.get("kb_state") or {}
+        self._kb_state = {
+            "kb_only": bool(saved_kb_state.get("kb_only", False)),
+            "kb_sources": list(saved_kb_state.get("kb_sources") or []),
+            "explain_mode": bool(saved_kb_state.get("explain_mode", False)),
+            "explain_mode_type": saved_kb_state.get("explain_mode_type") or "part",
+        }
+        self._explain_progress = dict(data.get("explain_progress") or {})
+        self._explain_page_progress = dict(data.get("explain_page_progress") or {})
+        return {"ok": True, "display": self._display_log, "kb_state": self._kb_state}
 
     def delete_chat(self, chat_id: str):
         self._chat_store.delete(chat_id)
@@ -1004,13 +1036,23 @@ class Api:
         self._voice_stream_tag = None
         self._voice_stream_idx = None
         self._explain_progress = {}
+        self._explain_page_progress = {}
+        self._kb_state = {
+            "kb_only": False, "kb_sources": [],
+            "explain_mode": False, "explain_mode_type": "part",
+        }
 
     def _persist_current_chat(self):
         if not self._display_log:
             return
         try:
             title = self._chat_title or "Untitled chat"
-            self._chat_store.save(self._current_chat_id, title, self._session.snapshot(), list(self._display_log))
+            self._chat_store.save(
+                self._current_chat_id, title, self._session.snapshot(), list(self._display_log),
+                kb_state=dict(self._kb_state),
+                explain_progress=dict(self._explain_progress),
+                explain_page_progress=dict(self._explain_page_progress),
+            )
         except Exception as e:
             self._push_event("log", {"text": f"⚠ Failed to save chat history: {e}\n"})
 
@@ -1018,7 +1060,7 @@ class Api:
     _KB_ONLY_MARKER = "[MIDUM KB-ONLY MODE]"
     _EXPLAIN_MODE_MARKER = "[MIDUM EXPLAIN MODE]"
 
-    def send_message(self, user_input: str, kb_only: bool = False, kb_sources: list = None, explain_mode: bool = False):
+    def send_message(self, user_input: str, kb_only: bool = False, kb_sources: list = None, explain_mode: bool = False, explain_mode_type: str = "part"):
         if self._thinking:
             return {"ok": False, "error": "busy"}
         user_input = (user_input or "").strip()
@@ -1052,7 +1094,31 @@ class Api:
         # Explain Mode rides on top of KB Only -- it only ever makes sense
         # when there's a KB source to explain, so it's gated the same way.
         explain_mode = bool(explain_mode) and kb_only
-        kb_context_msg = self._build_kb_only_context_message(kb_sources, explain_mode, user_input) if kb_only else None
+        explain_mode_type = "page" if str(explain_mode_type or "part").lower() == "page" else "part"
+        # Keep the persisted KB/Explain toggle state in sync with what the
+        # frontend is actually sending for this turn, so reopening this chat
+        # later restores exactly this configuration (see
+        # _persist_current_chat / load_chat) instead of defaulting to off.
+        self._kb_state = {
+            "kb_only": kb_only,
+            "kb_sources": list(kb_sources or []),
+            "explain_mode": explain_mode,
+            "explain_mode_type": explain_mode_type,
+        }
+        try:
+            kb_context_msg = self._build_kb_only_context_message(kb_sources, explain_mode, user_input, explain_mode_type) if kb_only else None
+        except Exception as e:
+            # Building the KB/Explain context is the last thing that can fail
+            # BEFORE the background thread (and its `finally: self._thinking
+            # = False`) starts -- if it raises here instead, self._thinking
+            # would stay True forever with no 'done' event ever pushed, and
+            # the UI would look permanently stuck "Executing turns..." for
+            # every future message too. Fail the turn cleanly instead.
+            self._thinking = False
+            self._push_event("error_line", {"text": f"[Engine error building KB/Explain context: {e}]"})
+            self._push_event("status", {"text": "Error", "level": "err"})
+            self._push_event("done", {})
+            return {"ok": False, "error": str(e)}
         if explain_mode:
             self._push_event("status", {"text": "Executing turns... (Explaining)", "level": "busy"})
         elif kb_only:
@@ -1067,7 +1133,7 @@ class Api:
         ).start()
         return {"ok": True}
 
-    def _build_kb_only_context_message(self, kb_sources: list, explain_mode: bool = False, user_input: str = "") -> str:
+    def _build_kb_only_context_message(self, kb_sources: list, explain_mode: bool = False, user_input: str = "", explain_mode_type: str = "part") -> str:
         """Render the selected PDF sources into a single ephemeral system
         message for KB Only mode. Tagged with _KB_ONLY_MARKER so _run_turn
         can strip it back out afterwards -- it must act like a system
@@ -1086,12 +1152,16 @@ class Api:
         Progress through each source's parts is tracked server-side in
         self._explain_progress (source name -> current 0-based part index)
         so the runtime -- not the model's own judgement -- decides exactly
-        which part is being explained on any given turn; the model is only
-        ever given that one part's real text, with an explicit header
-        naming which part it is and how many remain. Every line PyMuPDF
-        extracted from the source lands in exactly one part (see
-        extract_pdf_lines / build_pdf_source_parts), so walking every part
-        in order guarantees nothing in the source gets skipped.
+        which part is being narrated on any given turn. The model is given
+        the FULL raw text of the source every turn (see
+        format_pdf_sources_full_text_for_prompt), plus an explicit marker
+        naming which part it should actually explain right now and how
+        many remain -- so it always has complete context (no reason to go
+        looking for the source elsewhere) while still being steered
+        through one part at a time. Every line PyMuPDF extracted from the
+        source lands in exactly one part (see extract_pdf_lines /
+        build_pdf_source_parts), so walking every part in order guarantees
+        nothing in the source gets skipped.
 
         Advancing to the next part only happens when the user's message
         looks like a plain continuation cue ("next", "continue", "go on",
@@ -1105,12 +1175,20 @@ class Api:
             header = (
                 f"{self._KB_ONLY_MARKER}\n"
                 "KB Only mode is active for this message. Answer using ONLY the "
-                "source material below. Do not call search_internet, open_url, or "
-                "any browser/internet tool -- those are unavailable right now. If "
-                "the sources don't contain a clear answer, say so plainly instead "
-                "of guessing or making things up.\n\n"
+                "source material below -- it is already the complete, real "
+                "content you need. Do not call search_internet, open_url, or any "
+                "browser/internet tool, and do not try to read_local_file, "
+                "read_file_smart, list_directory, find_file, or any other local "
+                "file-reading/discovery tool to go look at the source yourself -- "
+                "none of those are available right now, and everything relevant "
+                "has already been given to you above. If the sources don't "
+                "contain a clear answer, say so plainly instead of guessing or "
+                "making things up.\n\n"
             )
             return f"{header}{rendered}"
+
+        if explain_mode_type == "page":
+            return self._build_page_explain_message(kb_sources, user_input)
 
         continuation_re = re.compile(r"^\s*(next|continue|go on|proceed|keep going|carry on)\b", re.IGNORECASE)
         is_continuation = bool(continuation_re.match((user_input or "").strip()))
@@ -1126,25 +1204,55 @@ class Api:
                 idx = min(idx + 1, len(parts) - 1)
             idx = max(0, min(idx, len(parts) - 1))
             self._explain_progress[name] = idx
-            source_blocks.append(midum.format_pdf_source_part_for_prompt(name, idx))
+            part = parts[idx]
+            record = midum.read_pdf_source(name)
+            title = (record or {}).get("title") or name
+            # Full raw text of the WHOLE source, every turn -- not just the
+            # current part -- so the model always has complete context and
+            # never has a reason to go look for more content elsewhere
+            # (e.g. by trying a file-reading tool). The part marker below
+            # tells it which part to actually narrate right now; the rest
+            # of the text is there for continuity/context only.
+            full_text = midum.format_pdf_sources_full_text_for_prompt([name])
+            current_marker = (
+                f"### EXPLAIN MODE \u2014 Source: {title}\n"
+                f"You are now explaining PART {idx + 1} of {len(parts)}: "
+                f"\"{part['heading']}\" (starting p.{part.get('page', '?')}). "
+                f"The FULL text of this source is included below so you always "
+                f"have complete context, but explain ONLY the current part named "
+                f"above right now \u2014 don't jump ahead to later parts or "
+                f"re-explain earlier ones unless the user asks."
+                + (f" After this, {len(parts) - idx - 1} part(s) remain."
+                   if idx + 1 < len(parts) else " This is the LAST part of this source.")
+                + "\n\n"
+            )
+            source_blocks.append(current_marker + full_text)
         rendered = "\n\n---\n\n".join(source_blocks) if source_blocks else "(None of the selected PDF sources could be loaded.)"
 
         header = (
             f"{self._KB_ONLY_MARKER}\n"
             "KB Only mode is active for this message. Answer using ONLY the "
-            "source material below. Do not call search_internet, open_url, or "
-            "any browser/internet tool -- those are unavailable right now.\n\n"
+            "source material below -- it is already the complete, real content "
+            "you need. Do not call search_internet, open_url, or any "
+            "browser/internet tool, and do not try to read_local_file, "
+            "read_file_smart, list_directory, find_file, or any other local "
+            "file-reading/discovery tool to go look at the source yourself -- "
+            "none of those are available right now, and everything relevant has "
+            "already been given to you above.\n\n"
         )
         explain_block = (
             f"\n\n{self._EXPLAIN_MODE_MARKER}\n"
-            "EXPLAIN MODE is active. Below is the CURRENT PART of each selected "
-            "source, already picked out for you by the runtime based on the "
-            "user's own part-boundary choices for that source -- this is the "
-            "exact, real content of that part, not a summary. Walk the user "
-            "through it as a detailed, guided explanation -- like a knowledgeable "
-            "narrator walking someone through a chapter out loud, the way "
-            "NotebookLM's 'Deep Dive' narration does, not like someone citing a "
-            "document.\n"
+            "EXPLAIN MODE is active. Below is the FULL text of each selected "
+            "source, exact and complete, followed by a marker telling you which "
+            "PART of it the runtime wants you to explain right now (picked based "
+            "on the user's own part-boundary choices for that source) -- walk "
+            "the user through ONLY that current part as a detailed, guided "
+            "explanation -- like a knowledgeable narrator walking someone "
+            "through a chapter out loud, the way NotebookLM's 'Deep Dive' "
+            "narration does, not like someone citing a document. The rest of "
+            "the full text is there purely for your own context/continuity "
+            "(e.g. references to earlier or later material) -- don't narrate "
+            "parts other than the current one unless the user explicitly asks.\n"
             "- Do NOT go line by line or explain what each individual line "
             "'means' -- that produces a stilted, quote-by-quote commentary "
             "instead of a real explanation. Instead, synthesize the part into a "
@@ -1182,6 +1290,110 @@ class Api:
             "- If this is the very first message of the walkthrough, start with a "
             "brief one-line orientation of what the whole source covers, then "
             "explain the current part shown below.\n"
+        )
+        return f"{header}{rendered}{explain_block}"
+
+    def _build_page_explain_message(self, kb_sources: list, user_input: str = "") -> str:
+        """Page-by-Page counterpart to the Part-by-Part walkthrough built
+        above. Instead of the user-tagged heading/part structure, this
+        walks each selected source one raw PDF PAGE at a time -- no
+        heading tagging or part-level selection required at all, since
+        page_count is already known the moment a source is registered
+        (see knowledge_base.add_pdf_source). Progress is tracked
+        server-side in self._explain_page_progress (source name -> current
+        1-based page number), advanced on the same "next/continue/..."
+        cue used by Part-by-Part mode. The model still gets the FULL text
+        of the source every turn (with page markers, see
+        knowledge_base.format_pdf_source_page_for_prompt) so it always has
+        complete context, plus an explicit marker naming exactly which
+        page to explain right now."""
+        continuation_re = re.compile(r"^\s*(next|continue|go on|proceed|keep going|carry on)\b", re.IGNORECASE)
+        is_continuation = bool(continuation_re.match((user_input or "").strip()))
+
+        source_blocks = []
+        for name in kb_sources or []:
+            record = midum.read_pdf_source(name)
+            page_count = (record or {}).get("page_count") or 0
+            if not record or "error" in record or page_count <= 0:
+                source_blocks.append(f"### Source: {name}\n(No page count available -- this source may have failed to load.)")
+                continue
+            page_no = self._explain_page_progress.get(name, 1)
+            if is_continuation and name in self._explain_page_progress:
+                page_no = min(page_no + 1, page_count)
+            page_no = max(1, min(page_no, page_count))
+            self._explain_page_progress[name] = page_no
+            source_blocks.append(midum.format_pdf_source_page_for_prompt(name, page_no))
+        rendered = "\n\n---\n\n".join(source_blocks) if source_blocks else "(None of the selected PDF sources could be loaded.)"
+
+        header = (
+            f"{self._KB_ONLY_MARKER}\n"
+            "KB Only mode is active for this message. Answer using ONLY the "
+            "source material below -- it is already the complete, real content "
+            "you need. Do not call search_internet, open_url, or any "
+            "browser/internet tool, and do not try to read_local_file, "
+            "read_file_smart, list_directory, find_file, or any other local "
+            "file-reading/discovery tool to go look at the source yourself -- "
+            "none of those are available right now, and everything relevant has "
+            "already been given to you above.\n\n"
+        )
+        explain_block = (
+            f"\n\n{self._EXPLAIN_MODE_MARKER}\n"
+            "EXPLAIN MODE (Page-by-Page) is active. Below is the FULL text of "
+            "each selected source, exact and complete with '[--- PAGE N ---]' "
+            "markers showing where each page starts, followed by a marker "
+            "telling you which PAGE of it the runtime wants you to explain "
+            "right now -- walk the user through ONLY that current page as a "
+            "detailed, guided explanation -- like a knowledgeable narrator "
+            "walking someone through a page out loud, the way NotebookLM's "
+            "'Deep Dive' narration does, not like someone citing a document. "
+            "The rest of the full text is there purely for your own context/ "
+            "continuity (e.g. references to earlier or later material) -- "
+            "don't narrate pages other than the current one unless the user "
+            "explicitly asks.\n"
+            "- Do NOT go line by line or explain what each individual line "
+            "'means' -- that produces a stilted, quote-by-quote commentary "
+            "instead of a real explanation. Instead, synthesize the page into a "
+            "flowing conceptual explanation: group related lines into the ideas "
+            "they form, explain those ideas in your own words, and move "
+            "naturally between them like a real lecture or narration would.\n"
+            "- 'No line skipped' means every DETAIL survives into your "
+            "explanation somewhere -- every name, number, term, example, "
+            "definition, cause/effect, and minor point on the page shown above "
+            "must show up in what you say, even the small or seemingly "
+            "throwaway ones. It does NOT mean restating or interpreting lines "
+            "one at a time in their original order and phrasing.\n"
+            "- Pages are a raw PDF boundary, not a content boundary -- a "
+            "sentence or paragraph can legitimately run across the edge of a "
+            "page. If the current page's content clearly continues into the "
+            "next page, it's fine to briefly finish that thought as a small "
+            "bit of forward explanation. Likewise, if the tail end of the "
+            "current page is really the start of the next idea, it's fine to "
+            "leave a small amount of it for the next page rather than forcing "
+            "an artificial cut. Don't use this as an excuse to drift multiple "
+            "pages ahead though -- stay anchored to the current page.\n"
+            "- Go deep: explain why these ideas matter, connect them to pages "
+            "already covered, and use concrete specifics that are actually "
+            "present in the text -- instead of vague, generic filler that could "
+            "apply to any topic.\n"
+            "- Never write like you are reporting on a document. Do NOT use "
+            "phrases like 'the source says', 'the text explains', 'according to "
+            "the document'. Speak the content directly and confidently, as if you "
+            "are the one explaining the subject to the user.\n"
+            "- Use proper explanation structure and formatting: markdown "
+            "headings/subheadings, bold/italic emphasis, and bullet or numbered "
+            "lists where they genuinely help readability. Render any mathematical "
+            "notation, formulas, or equations with LaTeX math syntax rather than "
+            "plain text. If (and ONLY if) the page contains a process, sequence, "
+            "decision tree, hierarchy, or system with clear steps/branches that "
+            "are genuinely easier to follow as a diagram than as prose, render a "
+            "flowchart for it -- don't force a flowchart into pages that are "
+            "purely conceptual/narrative and don't need one.\n"
+            "- End by briefly naming which page you just covered and inviting the "
+            "user to say 'next' or 'continue' when ready -- the runtime (not you) "
+            "decides and injects which page comes next once they do.\n"
+            "- If this is the very first message of the walkthrough, start with a "
+            "brief one-line orientation of what the whole source covers, then "
+            "explain the current page shown above.\n"
         )
         return f"{header}{rendered}{explain_block}"
 
@@ -1428,6 +1640,29 @@ class Api:
         except Exception as e:
             return {"ok": False, "name": "", "error": str(e)}
 
+    def get_explain_next_page_label(self, kb_sources: list):
+        """Page-by-Page counterpart to get_explain_next_part_name -- a
+        read-only lookup of the NEXT page number for each given source,
+        for the frontend's 'Next Page' button. Never mutates
+        self._explain_page_progress; the real advance only happens
+        through send_message -> _build_page_explain_message once the user
+        actually sends a message."""
+        try:
+            labels = []
+            for name in kb_sources or []:
+                record = midum.read_pdf_source(name)
+                page_count = (record or {}).get("page_count") or 0
+                if not record or "error" in record or page_count <= 0:
+                    continue
+                page_no = self._explain_page_progress.get(name, 1)
+                if name in self._explain_page_progress:
+                    page_no = min(page_no + 1, page_count)
+                page_no = max(1, min(page_no, page_count))
+                labels.append(f"page {page_no}")
+            return {"ok": True, "name": " / ".join(labels)}
+        except Exception as e:
+            return {"ok": False, "name": "", "error": str(e)}
+
     def get_pdf_source_parts(self, name: str):
         """Structured (not preformatted-text) parts list for the Knowledge
         tab's preview table: every line from the raw PDF extraction is
@@ -1484,15 +1719,31 @@ class Api:
                 line_no = 0
                 for block in page_dict.get("blocks", []):
                     for line in block.get("lines", []):
-                        text = "".join(s.get("text", "") for s in line.get("spans", [])).strip()
+                        spans = line.get("spans", [])
+                        text = "".join(s.get("text", "") for s in spans).strip()
                         if not text:
                             continue
                         x0, y0, x1, y1 = line.get("bbox")
+                        # Formatting signature (font family, size, bold) for
+                        # this line -- same computation knowledge_base.py's
+                        # extract_pdf_lines uses, kept in sync so line_ids
+                        # AND their reported style line up between the two.
+                        # Powers the Heading Tagger's "auto-detect matching
+                        # formatting" checkbox: the frontend reads this off
+                        # whichever line the user just tagged, then asks
+                        # auto_tag_pdf_headings_by_style to find every other
+                        # line in the WHOLE document that looks the same.
+                        first_span = spans[0] if spans else {}
+                        font_name = first_span.get("font", "") or ""
+                        size = round(float(first_span.get("size", 0) or 0), 1)
+                        flags = int(first_span.get("flags", 0) or 0)
+                        bold = bool(flags & (1 << 4)) or "bold" in font_name.lower()
                         lines.append({
                             "line_id": f"p{page_index + 1}_l{line_no}",
                             "page": page_index + 1,
                             "text": text,
                             "x0": x0 * zoom, "y0": y0 * zoom, "x1": x1 * zoom, "y1": y1 * zoom,
+                            "font": font_name, "size": size, "bold": bold,
                         })
                         line_no += 1
                 return {
@@ -1504,6 +1755,39 @@ class Api:
                 doc.close()
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    def auto_tag_pdf_headings_by_style(self, name: str, style: dict, exclude: list = None):
+        """Given a formatting signature ({font, size, bold}) captured off
+        one line the user just manually tagged, scan the ENTIRE source --
+        every page, not just the one currently open in the Heading Tagger
+        -- for every other line sharing that same font/size/bold. Backs
+        the Heading Tagger's "Auto-detect matching formatting" checkbox:
+        tag one line as H1 and every other line that LOOKS like an H1
+        (same formatting) is suggested automatically instead of having to
+        be clicked and tagged one by one.
+
+        Purely a lookup -- never writes to disk. The modal merges the
+        returned lines into its own in-memory tag list at the level the
+        user picked; only Save (save_pdf_headings) ever persists anything,
+        and the user can still untag any auto-suggested line individually
+        before saving. `exclude` is the list of {page, line_id} pairs
+        already tagged, so only genuinely new suggestions come back.
+        """
+        try:
+            record = midum.read_pdf_source(name)
+            if not record or "error" in record:
+                return {"ok": False, "error": f"PDF source '{name}' not found.", "lines": []}
+            path = record.get("source_path")
+            if not path or not os.path.exists(path):
+                return {"ok": False, "error": "Source PDF file not found on disk.", "lines": []}
+            exclude_keys = {
+                (int(e.get("page")), e.get("line_id"))
+                for e in (exclude or []) if e.get("line_id") is not None
+            }
+            matches = midum.find_pdf_lines_matching_style(path, style or {}, exclude_keys=exclude_keys)
+            return {"ok": True, "lines": matches}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "lines": []}
 
     def save_pdf_headings(self, name: str, headings: list):
         try:
@@ -2342,6 +2626,11 @@ html.blobs-off:not(.has-bg-image) #topbar{
   padding-bottom:8px;border-bottom:1px solid var(--border);margin-bottom:8px;}
 .kb-only-row label{cursor:pointer;}
 .kb-only-hint{font-size:10px;color:var(--subtext);margin-bottom:8px;}
+#kb-explain-mode-row{display:none;gap:6px;margin-bottom:8px;}
+#kb-explain-mode-row.show{display:flex;}
+.kb-mode-btn{flex:1;font-size:10px;font-weight:600;padding:6px 4px;border-radius:10px;border:1px solid var(--border);
+  background:transparent;color:var(--subtext);cursor:pointer;}
+.kb-mode-btn.active{background:var(--accent);color:#fff;border-color:var(--accent);}
 .kb-src-row{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--subtext);padding:4px 0;}
 .kb-src-row label{cursor:pointer;color:var(--text);}
 #kb-only-badge{
@@ -2464,9 +2753,14 @@ pre.code-block{background:var(--tool-bg);color:var(--tool-text);border-radius:12
   overflow-x:auto;font-family:Consolas,"Cascadia Code",monospace;font-size:12px;}
 code.inline-code{background:var(--surface2);color:var(--tool-text);border-radius:4px;padding:1px 5px;
   font-family:Consolas,"Cascadia Code",monospace;font-size:12.5px;}
-.bubble h1,.bubble h2,.bubble h3{margin:.4em 0;}
+.bubble h1,.bubble h2,.bubble h3,.bubble h4,.bubble h5,.bubble h6{margin:.4em 0;}
+.bubble h4{font-size:1em;}
+.bubble h5{font-size:.92em;}
+.bubble h6{font-size:.85em;color:var(--tool-text);}
 .bubble a{color:var(--accent);}
 .bubble hr{border:none;border-top:1px solid var(--border2);margin:10px 0;}
+.bubble .bullet-line{display:block;margin-top:10px;}
+.bubble .bullet-line:first-child{margin-top:0;}
 .md-table-wrap{overflow-x:auto;margin:10px 0;max-width:100%;}
 table.md-table{border-collapse:collapse;width:100%;font-size:13px;background:var(--surface);border-radius:8px;overflow:hidden;}
 table.md-table th,table.md-table td{border:1px solid var(--border2);padding:6px 12px;text-align:left;white-space:normal;}
@@ -2801,7 +3095,10 @@ textarea.code-area{
         <div id="input-row">
           <div style="width:100%;max-width:760px;position:relative;">
             <div id="kb-only-badge"><span>🔒</span><span id="kb-only-badge-text">KB Only — internet disabled, answering from selected PDF sources</span></div>
-            <button id="kb-next-part-btn" style="display:none;width:100%;margin-bottom:8px;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;">Next Part →</button>
+            <div id="kb-explain-actions-row" style="display:none;gap:6px;margin-bottom:8px;">
+              <button id="kb-next-part-btn" style="flex:1;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;">Next Part →</button>
+              <button id="kb-open-source-btn" style="flex:0 0 auto;padding:0 14px;height:30px;border-radius:14px;border:1px solid var(--border2);background:var(--surface2);color:var(--text);font-size:11px;font-weight:600;">📄 Open Source</button>
+            </div>
             <div id="kb-popover">
               <div class="kb-only-row">
                 <input type="checkbox" id="kb-only-checkbox"/>
@@ -2809,6 +3106,10 @@ textarea.code-area{
               </div>
               <div class="kb-only-hint">Restricts this session to the selected PDF sources below and disables internet search — resets when Midum restarts.</div>
               <div id="kb-sources-list"></div>
+              <div id="kb-explain-mode-row">
+                <button class="kb-mode-btn" id="kb-mode-part-btn" data-mode="part">Part-by-Part</button>
+                <button class="kb-mode-btn" id="kb-mode-page-btn" data-mode="page">Page-by-Page</button>
+              </div>
               <button id="kb-start-explanation-btn" style="display:none;width:100%;margin-top:8px;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;">▶ Start Explanation</button>
               <div class="kb-only-hint" id="kb-explain-hint" style="display:none;">Walks through the selected source(s) part by part (one sub-sub-heading per response) — say "next" to continue.</div>
             </div>
@@ -2844,6 +3145,7 @@ let state = {
   kbOnly: false,
   kbSources: [],
   explainMode: false,
+  explainModeType: "part",   // "part" (Part-by-Part) or "page" (Page-by-Page)
 };
 
 let voiceState = { running: false, connecting: false };
@@ -2939,6 +3241,9 @@ function renderInline(text){
   t = t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
   t = t.replace(/(^|[^*])\*([^*]+)\*/g, "$1<i>$2</i>");
   t = t.replace(/~~(.+?)~~/g, "<s>$1</s>");
+  t = t.replace(/^###### (.*)$/gm, "<h6>$1</h6>");
+  t = t.replace(/^##### (.*)$/gm, "<h5>$1</h5>");
+  t = t.replace(/^#### (.*)$/gm, "<h4>$1</h4>");
   t = t.replace(/^### (.*)$/gm, "<h3>$1</h3>");
   t = t.replace(/^## (.*)$/gm, "<h2>$1</h2>");
   t = t.replace(/^# (.*)$/gm, "<h1>$1</h1>");
@@ -2949,6 +3254,13 @@ function renderInline(text){
   t = t.replace(/^ {0,3}(?:-[ \t]*){3,}$/gm, "<hr>");
   t = t.replace(/^ {0,3}(?:\*[ \t]*){3,}$/gm, "<hr>");
   t = t.replace(/^ {0,3}(?:_[ \t]*){3,}$/gm, "<hr>");
+  // Bullet list items: a line starting with "- " (single hyphen, not the
+  // 3+ hyphen horizontal-rule pattern handled just above) becomes a round
+  // bullet marker instead of a raw hyphen. Wrapped in a block-level span
+  // so .bullet-line's CSS margin can space consecutive bullets out --
+  // the newline right after each one still becomes a <br> in the final
+  // \n -> <br> pass below, stacking with that margin for extra spacing.
+  t = t.replace(/^-[ \t]+(.+)$/gm, '<span class="bullet-line">\u2022 $1</span>');
   t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
   return t.replace(/\n/g, "<br>");
 }
@@ -3660,7 +3972,7 @@ async function sendMessage(){
   state.thinking = true;
   const kbOnlyActive = !!(state.kbOnly && state.kbSources.length);
   const explainActive = !!(kbOnlyActive && state.explainMode);
-  await api("send_message", text, kbOnlyActive, kbOnlyActive ? state.kbSources : [], explainActive);
+  await api("send_message", text, kbOnlyActive, kbOnlyActive ? state.kbSources : [], explainActive, state.explainModeType);
 }
 
 function setStatus(text, level){
@@ -3679,22 +3991,37 @@ function updateKbOnlyBadge(){
   const active = !!(state.kbOnly && state.kbSources.length);
   if (!active) state.explainMode = false;   // Explain Mode can't outlive KB Only being active
   const explainActive = !!(active && state.explainMode);
+  const isPageMode = state.explainModeType === "page";
   document.getElementById("kb-only-badge").classList.toggle("show", active);
   document.getElementById("kb-only-badge-text").textContent = explainActive
-    ? "Explaining — walking through the selected source(s), part by part"
+    ? (isPageMode ? "Explaining — walking through the selected source(s), page by page"
+                  : "Explaining — walking through the selected source(s), part by part")
     : "KB Only — internet disabled, answering from selected PDF sources";
   document.getElementById("input-box").classList.toggle("kb-only-active", active);
   document.getElementById("kb-toggle-btn").classList.toggle("active", active);
   const startBtn = document.getElementById("kb-start-explanation-btn");
   const explainHint = document.getElementById("kb-explain-hint");
+  const modeRow = document.getElementById("kb-explain-mode-row");
+  const modePartBtn = document.getElementById("kb-mode-part-btn");
+  const modePageBtn = document.getElementById("kb-mode-page-btn");
   if (startBtn){
     startBtn.style.display = active ? "block" : "none";
     startBtn.textContent = explainActive ? "▶ Restart Explanation" : "▶ Start Explanation";
   }
-  if (explainHint) explainHint.style.display = active ? "block" : "none";
+  if (modeRow) modeRow.classList.toggle("show", active);
+  if (modePartBtn) modePartBtn.classList.toggle("active", !isPageMode);
+  if (modePageBtn) modePageBtn.classList.toggle("active", isPageMode);
+  if (explainHint){
+    explainHint.style.display = active ? "block" : "none";
+    explainHint.textContent = isPageMode
+      ? "Walks through the selected source(s) page by page — say \"next\" to continue."
+      : "Walks through the selected source(s) part by part (one sub-sub-heading per response) — say \"next\" to continue.";
+  }
   const nextPartBtn = document.getElementById("kb-next-part-btn");
+  const explainActionsRow = document.getElementById("kb-explain-actions-row");
+  if (explainActionsRow) explainActionsRow.style.display = explainActive ? "flex" : "none";
   if (nextPartBtn){
-    nextPartBtn.style.display = explainActive ? "block" : "none";
+    nextPartBtn.textContent = isPageMode ? "Next Page \u2192" : "Next Part \u2192";
   }
 }
 
@@ -3707,7 +4034,8 @@ function updateKbOnlyBadge(){
 async function fillNextPartPrompt(){
   const explainActive = !!(state.kbOnly && state.kbSources.length && state.explainMode);
   if (!explainActive || state.thinking) return;
-  const res = await api("get_explain_next_part_name", state.kbSources);
+  const apiName = state.explainModeType === "page" ? "get_explain_next_page_label" : "get_explain_next_part_name";
+  const res = await api(apiName, state.kbSources);
   const name = (res && res.ok && res.name) ? res.name : "";
   const input = document.getElementById("msg-input");
   input.value = name ? `Next: ${name}` : "Next";
@@ -3723,10 +4051,9 @@ async function renderKbSourcesList(){
     updateKbOnlyBadge();
     return;
   }
-  // Default to every known source selected the first time the list is
-  // populated so checking "KB Only" alone is immediately useful; after
-  // that, respect whatever the user has (un)checked.
-  if (!state.kbSources.length) state.kbSources = files.slice();
+  // Nothing is selected by default the first time the list is populated --
+  // the user opts in to whichever source(s) they actually want, instead of
+  // starting from "everything selected" and having to uncheck the rest.
   list.innerHTML = files.map(f=>{
     const id = "kb-src-" + f.replace(/[^a-zA-Z0-9_]/g, "_");
     const checked = state.kbSources.includes(f) ? "checked" : "";
@@ -3741,6 +4068,25 @@ async function renderKbSourcesList(){
     };
   });
   updateKbOnlyBadge();
+}
+
+// Restores the KB Only / Explain Mode toggle state saved with a chat (see
+// Api.load_chat's "kb_state" field) -- called right after a chat is loaded
+// from the sidebar so an in-progress KB/Explain walkthrough picks back up
+// with the same source(s) selected and the same mode active, instead of
+// requiring the user to re-toggle everything (and re-explain their own
+// context) by hand. `kb_state` may be undefined for very old saved chats
+// (before this feature existed) or absent entirely -- both are treated as
+// "nothing was active", same as state's own defaults.
+function applyKbState(kbState){
+  kbState = kbState || {};
+  state.kbOnly = !!kbState.kb_only;
+  state.kbSources = Array.isArray(kbState.kb_sources) ? kbState.kb_sources.slice() : [];
+  state.explainMode = !!kbState.explain_mode;
+  state.explainModeType = kbState.explain_mode_type === "page" ? "page" : "part";
+  const onlyCheckbox = document.getElementById("kb-only-checkbox");
+  if (onlyCheckbox) onlyCheckbox.checked = state.kbOnly;
+  if (state.kbOnly) renderKbSourcesList(); else updateKbOnlyBadge();
 }
 
 function initKbOnlyControls(){
@@ -3763,6 +4109,23 @@ function initKbOnlyControls(){
     if (state.kbOnly) renderKbSourcesList(); else updateKbOnlyBadge();
   };
 
+  const modePartBtn = document.getElementById("kb-mode-part-btn");
+  const modePageBtn = document.getElementById("kb-mode-page-btn");
+  if (modePartBtn){
+    modePartBtn.onclick = (e)=>{
+      e.stopPropagation();
+      state.explainModeType = "part";
+      updateKbOnlyBadge();
+    };
+  }
+  if (modePageBtn){
+    modePageBtn.onclick = (e)=>{
+      e.stopPropagation();
+      state.explainModeType = "page";
+      updateKbOnlyBadge();
+    };
+  }
+
   const startExplainBtn = document.getElementById("kb-start-explanation-btn");
   if (startExplainBtn){
     startExplainBtn.onclick = (e)=>{
@@ -3776,7 +4139,7 @@ function initKbOnlyControls(){
       setActiveToolDot(null);
       setStatus("Executing turns... (Explaining)", "busy");
       state.thinking = true;
-      api("send_message", kickoff, true, state.kbSources, true);
+      api("send_message", kickoff, true, state.kbSources, true, state.explainModeType);
     };
   }
 
@@ -3785,6 +4148,17 @@ function initKbOnlyControls(){
     nextPartBtn.onclick = (e)=>{
       e.stopPropagation();
       fillNextPartPrompt();
+    };
+  }
+
+  const openSourceBtn = document.getElementById("kb-open-source-btn");
+  if (openSourceBtn){
+    openSourceBtn.onclick = (e)=>{
+      e.stopPropagation();
+      // Explain Mode can walk multiple selected sources at once, but the
+      // button just needs "the" source to view -- open the first selected
+      // one, same source the walkthrough is currently narrating.
+      if (state.kbSources && state.kbSources.length) openPdfSourceViewer(state.kbSources[0]);
     };
   }
 
@@ -4115,7 +4489,7 @@ function buildSidebar(){
   document.getElementById("new-session-btn").onclick = async ()=>{
     const ok = await showConfirm("Clear current session context and reset memories?", "New Session");
     if (!ok) return;
-    await api("new_session"); clearChat(); refreshHistory();
+    await api("new_session"); clearChat(); applyKbState(null); refreshHistory();
   };
   document.getElementById("project-select").onchange = async (e)=>{
     const info = await api("switch_project", e.target.value);
@@ -4507,6 +4881,7 @@ async function refreshHistory(){
       if (!r.ok){ showAlert(r.error, "Error"); return; }
       clearChat();
       (r.display||[]).forEach(([tag,text])=>appendRow(tag, text));
+      applyKbState(r.kb_state);
       switchTab("Chat");
       refreshHistory();
     };
@@ -4514,7 +4889,7 @@ async function refreshHistory(){
       const ok = await showConfirm(`Permanently delete "${title}"?`, "Delete Chat", {danger:true, okLabel:"Delete"});
       if (!ok) return;
       await api("delete_chat", chat.id);
-      if (chat.current) clearChat();
+      if (chat.current){ clearChat(); applyKbState(null); }
       refreshHistory();
     };
     box.appendChild(card);
@@ -4880,6 +5255,58 @@ function buildSysCorePane(box){
   load();
 }
 
+// ── PDF Source Viewer (read-only) ───────────────────────────────────────
+// Same Midum-themed modal chrome as the Heading Tagger below (same PNG
+// page rendering via get_pdf_page_image, same layout/colors), but with
+// none of the tagging machinery -- no clickable line overlays, no level
+// buttons, no side panel, no Save. Just Prev/Next page navigation and a
+// Close button, for the chat window's "Open Source" action during an
+// Explain Mode walkthrough so the person can glance at the real PDF
+// alongside the narration without being able to edit its tagging.
+function openPdfSourceViewer(name){
+  return new Promise((resolve)=>{
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center;";
+    const modal = document.createElement("div");
+    modal.style.cssText = "width:92vw;height:88vh;background:var(--panel);border:1px solid var(--border2);border-radius:20px;display:flex;flex-direction:column;overflow:hidden;";
+    modal.innerHTML = `
+      <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);">
+        <button class="ghost-btn" id="pv-prev" style="height:28px;">◀ Prev</button>
+        <div id="pv-page-label" style="font-size:12px;color:var(--subtext);">Page 1</div>
+        <button class="ghost-btn" id="pv-next" style="height:28px;">Next ▶</button>
+        <div style="flex:1;font-size:11px;color:var(--subtext);">${escapeHtml(name)}</div>
+        <button class="btn" id="pv-close" style="height:28px;background:var(--accent);color:#fff;">Close</button>
+      </div>
+      <div id="pv-canvas-wrap" style="flex:1;overflow:auto;background:#12161c;position:relative;text-align:center;padding:16px;">
+        <img id="pv-img" style="display:block;max-width:none;margin:0 auto;"/>
+      </div>`;
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    let pageIndex = 0;
+    let pageCount = 1;
+
+    async function renderPage(){
+      const r = await api("get_pdf_page_image", name, pageIndex);
+      if (!r.ok){ modal.querySelector("#pv-page-label").textContent = "Failed to render page: " + (r.error||""); return; }
+      pageCount = r.page_count;
+      pageIndex = r.page_index;
+      modal.querySelector("#pv-page-label").textContent = `Page ${pageIndex+1} / ${pageCount}`;
+      const img = modal.querySelector("#pv-img");
+      img.src = r.data_url;
+      img.style.width = r.width + "px";
+      img.style.height = r.height + "px";
+    }
+
+    modal.querySelector("#pv-prev").onclick = ()=>{ if (pageIndex>0){ pageIndex--; renderPage(); } };
+    modal.querySelector("#pv-next").onclick = ()=>{ if (pageIndex<pageCount-1){ pageIndex++; renderPage(); } };
+    modal.querySelector("#pv-close").onclick = ()=>{ overlay.remove(); resolve(); };
+    overlay.addEventListener("click", (e)=>{ if (e.target === overlay){ overlay.remove(); resolve(); } });
+
+    renderPage();
+  });
+}
+
 // ── PDF Heading Tagger modal ────────────────────────────────────────────
 // Renders the REAL PDF page (server-side via PyMuPDF, sent as a PNG data
 // URL) with an invisible clickable overlay div per text line (positioned
@@ -4900,6 +5327,9 @@ function openPdfHeadingTagger(name){
         <div id="pht-page-label" style="font-size:12px;color:var(--subtext);">Page 1</div>
         <button class="ghost-btn" id="pht-next" style="height:28px;">Next ▶</button>
         <div style="flex:1;font-size:11px;color:var(--subtext);">Click a line of text below, then tap a heading level to tag it.</div>
+        <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--subtext);cursor:pointer;white-space:nowrap;" title="When on, tagging a line also finds every other line in the whole document with the same font/size/bold and tags it the same level automatically. Turn off to tag every line by hand.">
+          <input type="checkbox" id="pht-auto-detect" checked style="cursor:pointer;"/> Auto-detect matching formatting
+        </label>
         <button class="ghost-btn" id="pht-close" style="height:28px;">Cancel</button>
         <button class="btn" id="pht-save" style="height:28px;background:var(--accent);color:#fff;">Save</button>
       </div>
@@ -4914,6 +5344,7 @@ function openPdfHeadingTagger(name){
           <div style="display:flex;gap:4px;flex-wrap:wrap;">
             ${[1,2,3,4,5,6].map(l=>`<button class="ghost-btn pht-level-btn" data-level="${l}" style="width:38px;height:28px;padding:0;">H${l}</button>`).join("")}
           </div>
+          <div id="pht-auto-status" style="font-size:10px;color:var(--accent);min-height:14px;"></div>
           <button class="ghost-btn" id="pht-untag" style="height:26px;font-size:10px;color:var(--red);">Untag selected line</button>
           <div style="font-size:9px;font-weight:700;color:var(--subtext);margin-top:8px;">TAGGED HEADINGS</div>
           <div id="pht-tagged-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;"></div>
@@ -4989,13 +5420,49 @@ function openPdfHeadingTagger(name){
     modal.querySelector("#pht-prev").onclick = ()=>{ if (pageIndex>0){ pageIndex--; renderPage(); } };
     modal.querySelector("#pht-next").onclick = ()=>{ if (pageIndex<pageCount-1){ pageIndex++; renderPage(); } };
     modal.querySelectorAll(".pht-level-btn").forEach(btn=>{
-      btn.onclick = ()=>{
+      btn.onclick = async ()=>{
         if (!selectedLineId) return;
         const line = currentLines.find(l=>l.line_id===selectedLineId);
         if (!line) return;
-        headings[selectedLineId] = { page: line.page, line_id: line.line_id, text: line.text, level: parseInt(btn.dataset.level,10) };
+        const level = parseInt(btn.dataset.level,10);
+        headings[selectedLineId] = { page: line.page, line_id: line.line_id, text: line.text, level };
         refreshTaggedList();
         renderOverlays();
+
+        // Auto-detect matching formatting: optional (checkbox in the
+        // toolbar, default on). Once this one line is tagged, ask the
+        // backend to scan the WHOLE document (every page, not just this
+        // one) for every other line sharing the same font/size/bold and
+        // tag those at the same level too -- so tagging a single H1
+        // picks up every other H1 in the document automatically. Turning
+        // the checkbox off falls back to the original fully-manual
+        // behaviour: only the clicked line gets tagged.
+        const autoEl = modal.querySelector("#pht-auto-detect");
+        const statusEl = modal.querySelector("#pht-auto-status");
+        if (autoEl && autoEl.checked && line.size){
+          statusEl.textContent = "Scanning document for matching formatting…";
+          const exclude = Object.values(headings).map(h=>({ page: h.page, line_id: h.line_id }));
+          const style = { font: line.font, size: line.size, bold: line.bold };
+          try {
+            const res = await api("auto_tag_pdf_headings_by_style", name, style, exclude);
+            if (res.ok && res.lines && res.lines.length){
+              res.lines.forEach(m=>{
+                if (!headings[m.line_id]){
+                  headings[m.line_id] = { page: m.page, line_id: m.line_id, text: m.text, level };
+                }
+              });
+              refreshTaggedList();
+              renderOverlays();
+              statusEl.textContent = `Auto-tagged ${res.lines.length} more line(s) as H${level} with matching formatting.`;
+            } else if (res.ok){
+              statusEl.textContent = "No other lines found with matching formatting.";
+            } else {
+              statusEl.textContent = res.error || "Auto-detect failed.";
+            }
+          } catch (e) {
+            statusEl.textContent = "Auto-detect failed.";
+          }
+        }
       };
     });
     modal.querySelector("#pht-untag").onclick = ()=>{

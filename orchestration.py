@@ -2,7 +2,7 @@
 import config
 import providers.openrouter_backend as providers_openrouter_backend
 from config import COMMANDS_FILE, MODEL_CANVAS_H, MODEL_CANVAS_W, OPENROUTER_CONSULT_MODE, SCALE_X, SCALE_Y, STARTUP_DIR, _is_legacy_toolcall_model
-from knowledge_base import add_instruction, add_path, add_pdf_source, create_domain_knowledge, create_domain_skill, format_pdf_source_part_for_prompt, list_domain_knowledge, list_domain_skills, list_pdf_source_parts, list_pdf_sources, read_domain_knowledge, read_instructions, read_paths, set_pdf_source_headings, set_pdf_source_part_levels
+from knowledge_base import add_instruction, add_path, add_pdf_source, create_domain_knowledge, create_domain_skill, format_pdf_source_page_for_prompt, format_pdf_source_part_for_prompt, list_domain_knowledge, list_domain_skills, list_pdf_source_parts, list_pdf_sources, read_domain_knowledge, read_instructions, read_paths, set_pdf_source_headings, set_pdf_source_part_levels
 from config import _IS_LINUX
 from flows import get_promoted_flows, list_flows, list_flows_formatted, run_flow
 from midum_mcp.manager import _mcp_resolve_name, connect_mcp_server, disconnect_mcp_server, list_mcp_servers
@@ -1505,6 +1505,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 tool_output = format_pdf_source_part_for_prompt(
                     arguments.get("name", ""),
                     int(arguments.get("part_index", 0))
+                )
+
+            elif func_name == "explain_pdf_source_page":
+                tool_output = format_pdf_source_page_for_prompt(
+                    arguments.get("name", ""),
+                    int(arguments.get("page_number", 1))
                 )
 
             elif func_name == "set_pdf_source_part_levels":

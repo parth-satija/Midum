@@ -95,7 +95,9 @@ class ChatStore:
             with open(self._path(chat_id), "r", encoding="utf-8") as f:
                 return json.load(f)
 
-    def save(self, chat_id: str, title: str, history: list, display_log: list) -> None:
+    def save(self, chat_id: str, title: str, history: list, display_log: list,
+             kb_state: dict = None, explain_progress: dict = None,
+             explain_page_progress: dict = None) -> None:
         now = datetime.datetime.now().isoformat(timespec="seconds")
         created_at = now
         path = self._path(chat_id)
@@ -113,6 +115,16 @@ class ChatStore:
                 "updated_at": now,
                 "history": history,
                 "display": display_log,
+                # KB Only / Explain Mode state -- lets a reopened chat resume
+                # exactly where it left off (toggle state + selected sources +
+                # walkthrough position) instead of starting over. See
+                # gui/app.py Api._persist_current_chat / Api.load_chat.
+                "kb_state": kb_state or {
+                    "kb_only": False, "kb_sources": [],
+                    "explain_mode": False, "explain_mode_type": "part",
+                },
+                "explain_progress": explain_progress or {},
+                "explain_page_progress": explain_page_progress or {},
             }
             tmp_path = path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:

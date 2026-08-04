@@ -47,6 +47,19 @@ _KB_ONLY_BLOCKED_TOOLS = {
     "search_internet", "open_search_result", "read_search_result", "open_url",
     "run_js_in_browser", "read_browser_page", "list_browser_tabs",
     "snapshot_browser_elements", "act_on_browser_element", "query_gemini_app",
+    # Local file-reading/discovery tools -- KB Only already injects the
+    # FULL relevant source content into the prompt every turn (see
+    # gui/app.py's _build_kb_only_context_message), so there's never a
+    # legitimate reason for the model to go open the underlying file
+    # itself instead of using what it was already given. Without this,
+    # the model would sometimes try read_local_file/read_file_smart/
+    # list_directory/etc. on the source PDF directly -- pointless (it
+    # can't actually reach the real file path from the KB source name
+    # anyway) and it undermines the whole point of KB Only being a
+    # closed, fully-provided context.
+    "read_local_file", "read_file_smart", "read_file_chunk",
+    "list_directory", "open_path", "open_path_by_index", "find_file",
+    "list_paths_indexed", "get_path",
 }
 
 

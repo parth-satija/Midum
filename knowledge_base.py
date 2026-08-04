@@ -251,11 +251,32 @@ def format_pdf_sources_for_prompt(names):
 _PDF_LINES_CACHE = {}   # pdf_path -> (mtime, lines) -- avoids re-parsing on every Explain Mode turn
 
 
+def _line_style_signature(spans):
+    """Derive a simple, comparable formatting signature (font family name,
+    size rounded to 1 decimal, bold flag) from a PyMuPDF line's spans --
+    just the first span, since headings are effectively always a single
+    consistent run of formatting. Used both to describe a line for the
+    Heading Tagger's overlay/learning UI and to match other lines against
+    a formatting the user has already tagged (see
+    find_pdf_lines_matching_style below)."""
+    if not spans:
+        return {"font": "", "size": 0.0, "bold": False}
+    span = spans[0]
+    font_name = span.get("font", "") or ""
+    size = round(float(span.get("size", 0) or 0), 1)
+    flags = int(span.get("flags", 0) or 0)
+    bold = bool(flags & (1 << 4)) or "bold" in font_name.lower()
+    return {"font": font_name, "size": size, "bold": bold}
+
+
 def extract_pdf_lines(pdf_path):
     """Open `pdf_path` with PyMuPDF and return a flat, ordered list of
     every non-empty text line in the document: [{page, line_id, text,
-    bbox}, ...], in reading order (page by page, top to bottom within
-    each page). Raises on missing file / open failure."""
+    bbox, font, size, bold}, ...], in reading order (page by page, top to
+    bottom within each page). `font`/`size`/`bold` are a lightweight
+    formatting signature (see _line_style_signature) used to power the
+    Heading Tagger's optional "auto-detect matching formatting" feature.
+    Raises on missing file / open failure."""
     import fitz
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
@@ -268,15 +289,20 @@ def extract_pdf_lines(pdf_path):
             line_no = 0
             for block in page_dict.get("blocks", []):
                 for line in block.get("lines", []):
-                    text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
+                    spans = line.get("spans", [])
+                    text = "".join(span.get("text", "") for span in spans).strip()
                     if not text:
                         continue
                     bbox = line.get("bbox")
+                    style = _line_style_signature(spans)
                     lines.append({
                         "page": page_index + 1,
                         "line_id": f"p{page_index + 1}_l{line_no}",
                         "text": text,
                         "bbox": list(bbox) if bbox else None,
+                        "font": style["font"],
+                        "size": style["size"],
+                        "bold": style["bold"],
                     })
                     line_no += 1
     finally:
@@ -298,6 +324,52 @@ def _cached_extract_pdf_lines(pdf_path):
     lines = extract_pdf_lines(pdf_path)
     _PDF_LINES_CACHE[pdf_path] = (mtime, lines)
     return lines
+
+
+def find_pdf_lines_matching_style(pdf_path, style, exclude_keys=None, size_tolerance=0.6):
+    """Scan the WHOLE document (every page, via the cached line
+    extraction above -- not just one page) for every line whose
+    formatting signature approximately matches `style`
+    ({"font": str, "size": float, "bold": bool}), as
+    [{"page": int, "line_id": str, "text": str}, ...].
+
+    Powers the Heading Tagger's optional "auto-detect matching
+    formatting": once the user tags one line with a heading level, its
+    formatting is captured as `style` and this call finds every other
+    line in the document that looks the same, so they can all be
+    pre-tagged at the same level automatically. `exclude_keys` is an
+    optional set of (page, line_id) tuples to skip -- typically lines
+    already tagged, so the caller only gets NEW suggestions back.
+
+    Matching is approximate on purpose (PDFs sometimes report the same
+    visual heading at very slightly different sizes across pages): bold
+    must match exactly, size must be within `size_tolerance` points, and
+    font family only has to match if `style` actually specifies one.
+    Never raises -- returns [] if the style has no usable size or the PDF
+    can't be read."""
+    target_size = (style or {}).get("size")
+    if target_size is None:
+        return []
+    target_font = (style or {}).get("font") or ""
+    target_bold = bool((style or {}).get("bold"))
+    exclude_keys = exclude_keys or set()
+    try:
+        lines = _cached_extract_pdf_lines(pdf_path)
+    except Exception:
+        return []
+    matches = []
+    for line in lines:
+        key = (line["page"], line["line_id"])
+        if key in exclude_keys:
+            continue
+        if bool(line.get("bold")) != target_bold:
+            continue
+        if abs(float(line.get("size") or 0) - float(target_size)) > size_tolerance:
+            continue
+        if target_font and line.get("font") != target_font:
+            continue
+        matches.append({"page": line["page"], "line_id": line["line_id"], "text": line["text"]})
+    return matches
 
 
 # =============================================================================
@@ -539,6 +611,86 @@ def format_pdf_source_part_for_prompt(name, part_index):
         + "\n\n"
     )
     return header + body_block
+
+
+def _build_full_text_with_page_markers(record):
+    """Like format_pdf_sources_full_text_for_prompt, but for a single
+    already-loaded source record, with an explicit '[--- PAGE N ---]'
+    marker inserted every time the page number changes. Used by
+    Page-by-Page Explain Mode so the model can see exactly where page
+    boundaries fall within the full text, instead of only being told a
+    bare page number with no way to locate it in the text itself."""
+    source_path = record.get("source_path")
+    if not source_path or not os.path.exists(source_path):
+        return ""
+    try:
+        lines = _cached_extract_pdf_lines(source_path)
+    except Exception:
+        return ""
+    if not lines:
+        return ""
+    out = []
+    current_page = None
+    for line in lines:
+        if line["page"] != current_page:
+            current_page = line["page"]
+            out.append(f"\n[--- PAGE {current_page} ---]\n")
+        out.append(line["text"])
+    return "\n".join(out)
+
+
+def format_pdf_source_page_for_prompt(name, page_number):
+    """
+    Page-by-Page counterpart to format_pdf_source_part_for_prompt(). Renders
+    ONE registered PDF source as a markdown block for Explain Mode: the FULL
+    text of the source (with '[--- PAGE N ---]' markers so page boundaries
+    are visible), plus an explicit header telling the model exactly which
+    page it must explain right now and how many remain.
+
+    Unlike Part-by-Part mode, this needs NO manually-tagged headings and NO
+    part-level selection at all -- pages are an inherent property of the PDF
+    itself (page_count is already known the moment add_pdf_source() runs),
+    so Page-by-Page mode works immediately on any registered source.
+
+    A little forward bleed into the next page (briefly finishing a
+    sentence/paragraph that spans the page boundary) or leaving a small
+    trailing bit of the current page for next time is expected and fine --
+    explaining content that clearly belongs to other pages is not. Returns
+    an error string if name/source can't be resolved.
+    """
+    record = read_pdf_source(name)
+    if not record or "error" in record:
+        return f"PDF source '{name}' not found. Call list_pdf_sources."
+    page_count = record.get("page_count") or 0
+    if page_count <= 0:
+        return f"PDF source '{name}' has no known page count."
+    try:
+        page_number = int(page_number)
+    except (TypeError, ValueError):
+        page_number = 1
+    page_number = max(1, min(page_number, page_count))
+
+    title = record.get("title") or name
+    full_text = _build_full_text_with_page_markers(record)
+    if not full_text:
+        full_text = "(No extractable text found in this PDF.)"
+
+    header = (
+        f"### EXPLAIN MODE (Page-by-Page) \u2014 Source: {title}\n"
+        f"You are now explaining PAGE {page_number} of {page_count}. "
+        f"The FULL text of this source is included below, with "
+        f"'[--- PAGE N ---]' markers showing exactly where each page starts, "
+        f"so you always have complete context -- but explain ONLY page "
+        f"{page_number} right now. Don't jump ahead to later pages or "
+        f"re-explain earlier ones unless the user asks. If a paragraph or "
+        f"idea clearly spans the boundary into the next page, it's fine to "
+        f"briefly finish that thought, or to leave a small amount of it for "
+        f"the next page -- don't force an artificial hard cut mid-sentence."
+        + (f" After this, {page_count - page_number} page(s) remain."
+           if page_number < page_count else " This is the LAST page of this source.")
+        + "\n\n"
+    )
+    return header + full_text
 
 
 def format_pdf_sources_full_text_for_prompt(names):
