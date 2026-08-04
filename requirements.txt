@@ -16,6 +16,7 @@ pyperclip
 pytesseract
 python-docx
 pywebview
+PyQt5
 pywin32
 qtpy
 requests

@@ -1663,6 +1663,22 @@ class Api:
         except Exception as e:
             return {"ok": False, "name": "", "error": str(e)}
 
+    def get_explain_current_page_index(self, kb_sources: list):
+        """Read-only lookup of the CURRENT (already-narrated) page for the
+        first of the given sources, used by the 'Open Source' button while
+        Page-by-Page Explain Mode is active so it opens the PDF viewer on
+        the exact page currently being explained instead of always page 1.
+        Unlike get_explain_next_page_label this does NOT peek ahead -- it
+        reads self._explain_page_progress as-is and never mutates it."""
+        try:
+            name = (kb_sources or [None])[0]
+            if not name:
+                return {"ok": False, "page_index": 0, "error": "no source"}
+            page_no = self._explain_page_progress.get(name, 1)
+            return {"ok": True, "page_index": max(0, page_no - 1)}
+        except Exception as e:
+            return {"ok": False, "page_index": 0, "error": str(e)}
+
     def get_pdf_source_parts(self, name: str):
         """Structured (not preformatted-text) parts list for the Knowledge
         tab's preview table: every line from the raw PDF extraction is
@@ -4153,12 +4169,21 @@ function initKbOnlyControls(){
 
   const openSourceBtn = document.getElementById("kb-open-source-btn");
   if (openSourceBtn){
-    openSourceBtn.onclick = (e)=>{
+    openSourceBtn.onclick = async (e)=>{
       e.stopPropagation();
       // Explain Mode can walk multiple selected sources at once, but the
       // button just needs "the" source to view -- open the first selected
       // one, same source the walkthrough is currently narrating.
-      if (state.kbSources && state.kbSources.length) openPdfSourceViewer(state.kbSources[0]);
+      if (!(state.kbSources && state.kbSources.length)) return;
+      const name = state.kbSources[0];
+      let startPageIndex = 0;
+      // In Page-by-Page mode, jump straight to the page currently being
+      // explained instead of always opening on page 1.
+      if (state.explainMode && state.explainModeType === "page"){
+        const r = await api("get_explain_current_page_index", state.kbSources);
+        if (r && r.ok) startPageIndex = r.page_index;
+      }
+      openPdfSourceViewer(name, startPageIndex);
     };
   }
 
@@ -5263,7 +5288,7 @@ function buildSysCorePane(box){
 // Close button, for the chat window's "Open Source" action during an
 // Explain Mode walkthrough so the person can glance at the real PDF
 // alongside the narration without being able to edit its tagging.
-function openPdfSourceViewer(name){
+function openPdfSourceViewer(name, startPageIndex){
   return new Promise((resolve)=>{
     const overlay = document.createElement("div");
     overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center;";
@@ -5283,7 +5308,7 @@ function openPdfSourceViewer(name){
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
 
-    let pageIndex = 0;
+    let pageIndex = startPageIndex > 0 ? startPageIndex : 0;
     let pageCount = 1;
 
     async function renderPage(){
