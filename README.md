@@ -1,6 +1,15 @@
 # Midum
 
+<img width="1408" height="768" alt="image" src="https://github.com/user-attachments/assets/cbba478e-cd41-4eac-97c8-2ea2790eeaf5" />
+
+
 Midum is an agentic framework built for local AI desktop assistance. It can help you with code, UI automation, repetitive tasks, browsing, research, file management, and more — all driven by a tool-calling AI agent that runs on **your** machine.
+
+<img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/4e26d709-33fc-42f8-b23b-b07d18286efa" />
+
+
+<img width="1276" height="779" alt="image" src="https://github.com/user-attachments/assets/e4c30848-f9e4-4265-a871-8dff452e5575" />
+
 
 
 ## What Midum Can Do
@@ -71,7 +80,6 @@ Talk to Midum out loud and have it talk back, with full tool-calling parity with
 - Real-time, bidirectional speech-to-speech control via Google's official **Gemini Live API** (`google-genai`'s `client.aio.live.connect`) — a persistent WebSocket session, separate from every other single-shot provider, that streams your microphone audio to Gemini continuously and plays back its spoken replies as they arrive.
 - Every tool call the model makes while in voice mode runs through the exact same dispatcher as text chat and the manual tool sandbox, so voice control has 100% tool parity — files, terminal, UI automation, browser, MCP servers, everything.
 - Two independently rebindable **global push-to-talk hotkeys** (keyboard key or mouse button, including side buttons) that work no matter which window has focus — hold to stream your mic, release to mute. The very first press opens the Gemini Live connection; the connection then stays open across presses so later ones resume instantly instead of reconnecting. Bindings persist to `storage/ptt_hotkeys.json` and default to **Right Alt** and **Mouse Button 4 (Side)**.
-- A small floating on-screen overlay indicator (`gui/voice_overlay.py`) that shows Midum's current voice state — listening 🎙️, running ⚙️, or responding 🔊.
 - Setup: `pip install google-genai sounddevice numpy pynput`, then add your `GEMINI_API_KEY` to the shared secrets file (the same key used by `MODEL_PROVIDER = "gemini_api"` — if that's already configured, voice control works with zero extra setup).
 
 ### 🔌 MCP (Model Context Protocol) Support
