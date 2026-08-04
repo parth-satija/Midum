@@ -8,6 +8,10 @@ Midum is an agentic framework built for local AI desktop assistance. It can help
 <img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/4e26d709-33fc-42f8-b23b-b07d18286efa" />
 
 
+<img width="1276" height="779" alt="image" src="https://github.com/user-attachments/assets/e4c30848-f9e4-4265-a871-8dff452e5575" />
+
+
+
 ## What Midum Can Do
 
 Midum is built around a large tool-calling loop, so it isn't limited to chatting — it can actually take action on your computer. Its capabilities include:
