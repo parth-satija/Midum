@@ -2,6 +2,26 @@
 import os
 import sys
 
+# Declare DPI awareness BEFORE any window/webview/Qt object is created.
+# Rationale: when run as `python gui/app.py`, python.exe ships a manifest
+# that already marks the process DPI-aware, so Windows lets it render at
+# native resolution on scaled displays. A PyInstaller-frozen .exe has no
+# such manifest, so Windows falls back to treating it as DPI-unaware and
+# bitmap-stretches the whole rendered window to fit the (smaller) virtual
+# resolution it assumes -- which is exactly what produces a GUI that's
+# shrunk/deformed and shoved into a corner on any monitor running above
+# 100% scaling. Setting this explicitly at startup opts the frozen exe
+# into the same per-monitor-DPI-aware behavior python.exe gets for free.
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE_V2
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()  # Windows 7/8 fallback
+        except Exception:
+            pass
+
 # gui/app.py -> parent: midum_pkg (package root)
 _GUI_DIR  = os.path.dirname(os.path.abspath(__file__))
 _PKG_ROOT = os.path.dirname(_GUI_DIR)
