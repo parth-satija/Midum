@@ -232,6 +232,18 @@ class Api:
         self._thinking     = False
         self._log_queue    = queue.Queue()
 
+        # Guards _display_log mutations + _persist_current_chat() itself.
+        # Without this, a close-triggered persist (from _on_closing, on the
+        # GUI/close thread) could interleave with the turn-execution
+        # thread's own append-then-persist sequence in _run_turn -- e.g.
+        # reading self._display_log via list(...) after the reply had been
+        # appended but before self._session.history was updated (or vice
+        # versa), producing a torn snapshot that's missing the just-finished
+        # reply. That torn, incomplete save could then be the LAST thing
+        # written to disk if the window finished closing right after --
+        # silently dropping the final reply from the saved chat even though
+        # it was fully rendered on screen.
+        self._persist_lock     = threading.Lock()
         self._chat_store       = ChatStore(CHATS_DIR)
         self._current_chat_id  = uuid.uuid4().hex
         self._chat_title       = None
@@ -453,17 +465,14 @@ class Api:
 
         self._scan_workspace_directory()
 
-        # Warm the PDF line-extraction cache for every registered source in
-        # the background, right after startup, so the Knowledge tab's
-        # FIRST open doesn't pay for a synchronous full-PDF text
-        # extraction there (see knowledge_base.extract_pdf_lines /
-        # _cached_extract_pdf_lines, which build_pdf_source_parts /
-        # get_pdf_source_parts depend on, and which the Knowledge pane
-        # calls on every load to render the Explain Mode parts preview).
-        # By the time the user actually switches to the tab, the cache is
-        # already populated (keyed on file mtime) and those calls return
-        # near-instantly instead of re-reading every page of every source.
-        threading.Thread(target=self._warm_pdf_source_cache, daemon=True).start()
+        # NOTE: warming the PDF line-extraction cache (build_pdf_source_parts
+        # for every registered source) used to run automatically here on a
+        # background thread. For accounts with many/large PDF sources that
+        # full-PDF text extraction pass was heavy enough to noticeably lag
+        # the whole machine on every single launch, even though nothing in
+        # the Knowledge tab was open yet. It's now opt-in: the user triggers
+        # it explicitly via the "Load Sources" button in the Knowledge tab
+        # (see warm_pdf_sources() below), so startup stays light.
 
     def _warm_pdf_source_cache(self):
         try:
@@ -474,6 +483,29 @@ class Api:
                     pass
         except Exception:
             pass
+
+    def warm_pdf_sources(self):
+        """User-triggered (Knowledge tab "Load Sources" button) equivalent
+        of the old automatic startup warm-up. Runs the full-PDF text
+        extraction for every registered PDF source on a background thread
+        -- this is the heavy pass that used to run unconditionally on every
+        launch and could noticeably lag the machine, so it's now opt-in and
+        only runs when the user explicitly asks for it. Pushes a
+        'pdf_cache_warmed' event when done so the button can reset itself.
+        """
+        if getattr(self, "_warming_pdf_cache", False):
+            return {"ok": True, "already_running": True}
+        self._warming_pdf_cache = True
+
+        def _run():
+            try:
+                self._warm_pdf_source_cache()
+            finally:
+                self._warming_pdf_cache = False
+                self._push_event("pdf_cache_warmed", {})
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {"ok": True}
 
     # ── Status / dashboard ───────────────────────────────────────────────
     def get_status(self):
@@ -1127,18 +1159,24 @@ class Api:
         }
 
     def _persist_current_chat(self):
-        if not self._display_log:
-            return
-        try:
-            title = self._chat_title or "Untitled chat"
-            self._chat_store.save(
-                self._current_chat_id, title, self._session.snapshot(), list(self._display_log),
-                kb_state=dict(self._kb_state),
-                explain_progress=dict(self._explain_progress),
-                explain_page_progress=dict(self._explain_page_progress),
-            )
-        except Exception as e:
-            self._push_event("log", {"text": f"⚠ Failed to save chat history: {e}\n"})
+        # Holds _persist_lock for the whole read-snapshot-and-save sequence
+        # so a concurrent _display_log.append() (from _run_turn on another
+        # thread) can't be interleaved between the emptiness check, the
+        # snapshot() call, and list(self._display_log) below -- see the
+        # comment on self._persist_lock in __init__ for why that mattered.
+        with self._persist_lock:
+            if not self._display_log:
+                return
+            try:
+                title = self._chat_title or "Untitled chat"
+                self._chat_store.save(
+                    self._current_chat_id, title, self._session.snapshot(), list(self._display_log),
+                    kb_state=dict(self._kb_state),
+                    explain_progress=dict(self._explain_progress),
+                    explain_page_progress=dict(self._explain_page_progress),
+                )
+            except Exception as e:
+                self._push_event("log", {"text": f"⚠ Failed to save chat history: {e}\n"})
 
     # ── Send / receive ──────────────────────────────────────────────────
     _KB_ONLY_MARKER = "[MIDUM KB-ONLY MODE]"
@@ -1514,12 +1552,22 @@ class Api:
                 self._session.turn_counter += 1
 
             cleaned_reply, visuals = self._extract_and_strip_visuals(reply, tool_outputs)
+            # Hold _persist_lock across the append(s) AND the persist call
+            # that follows, so a concurrent close-triggered persist (see
+            # _on_closing / _persist_lock comment in __init__) can never
+            # observe self._display_log after the reply was appended but
+            # save a snapshot from before it -- it either sees the state
+            # fully before this reply or fully after, never a torn mix.
+            with self._persist_lock:
+                if cleaned_reply:
+                    self._display_log.append(("midum", cleaned_reply))
+                for lang, body in visuals:
+                    block = f"```{lang}\n{body}\n```"
+                    self._display_log.append(("midum", block))
             if cleaned_reply:
-                self._display_log.append(("midum", cleaned_reply))
                 self._push_event("reply", {"text": cleaned_reply})
             for lang, body in visuals:
                 block = f"```{lang}\n{body}\n```"
-                self._display_log.append(("midum", block))
                 self._push_event("reply", {"text": block})
             self._persist_current_chat()
 
@@ -2709,9 +2757,14 @@ html.blobs-off:not(.has-bg-image) #topbar{
 #input-row{padding:8px 8px 12px 8px;display:flex;justify-content:center;}
 #input-box{
   width:100%;max-width:760px;background:var(--surface);border:1px solid var(--border2);
-  border-radius:26px;display:flex;align-items:center;padding:6px 6px 6px 16px;gap:8px;
+  border-radius:26px;display:flex;align-items:flex-end;padding:6px 6px 6px 16px;gap:8px;
 }
-#msg-input{flex:1;background:transparent;border:none;outline:none;color:var(--text);font-size:14px;height:34px;}
+#msg-input{
+  flex:1;background:transparent;border:none;outline:none;color:var(--text);font-size:14px;
+  line-height:20px;padding:7px 0;box-sizing:border-box;resize:none;font-family:inherit;
+  min-height:34px;max-height:216px;overflow-y:hidden;overflow-x:hidden;
+  white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word;
+}
 #msg-input::placeholder{color:var(--muted);}
 #send-btn{
   width:36px;height:36px;border-radius:50%;border:none;background:var(--accent);color:var(--text);
@@ -3234,7 +3287,7 @@ textarea.code-area{
             </div>
             <div id="input-box">
               <button class="icon-btn" id="kb-toggle-btn" title="Knowledge Base options">▾</button>
-              <input id="msg-input" placeholder="Message Midum..." />
+              <textarea id="msg-input" placeholder="Message Midum..." rows="1"></textarea>
               <button id="send-btn">↑</button>
             </div>
             <div id="send-hint">Enter to send</div>
@@ -4152,12 +4205,23 @@ function appendAsk(id, kind, payload){
 }
 
 // ── Sending ------------------------------------------------------------
+function autosizeMsgInput(){
+  const el = document.getElementById("msg-input");
+  if (!el) return;
+  el.style.height = "auto";
+  const maxHeight = 216; // ~10 lines
+  const newHeight = Math.min(el.scrollHeight, maxHeight);
+  el.style.height = newHeight + "px";
+  el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden";
+}
+
 async function sendMessage(){
   if (state.thinking) return;
   const input = document.getElementById("msg-input");
   const text = input.value.trim();
   if (!text) return;
   input.value = "";
+  autosizeMsgInput();
   appendRow("user", text);
   setActiveToolDot(null);
   setStatus("Executing turns...", "busy");
@@ -4231,6 +4295,7 @@ async function fillNextPartPrompt(){
   const name = (res && res.ok && res.name) ? res.name : "";
   const input = document.getElementById("msg-input");
   input.value = name ? `Next: ${name}` : "Next";
+  autosizeMsgInput();
   input.focus();
 }
 
@@ -4392,6 +4457,7 @@ window.__midumEvent = function(evt){
   else if (kind === "voice_error"){ appendVoiceSystemNote("⚠ " + payload.message); handleVoiceStatus({status:"stopped"}); }
   else if (kind === "ptt_captured"){ handlePttCaptured(payload); }
   else if (kind === "voice_ptt_state"){ handlePttState(payload); }
+  else if (kind === "pdf_cache_warmed"){ if (typeof onPdfCacheWarmed === "function") onPdfCacheWarmed(); }
 };
 
 function appendLog(text){
@@ -5696,6 +5762,9 @@ function buildKnowledgePane(box){
       <button class="ghost-btn" id="pdf-tag" style="margin-right:6px;">🏷️ Tag Headings</button>
       <button class="ghost-btn" id="pdf-add">+ Add PDF Source</button>
     </div>
+    <div class="hdr-row" style="margin-top:6px;">
+      <button class="ghost-btn" id="pdf-warm" style="flex:1;" title="Extracts and caches text for every PDF source so Explain Mode parts load instantly. This can be slow for large/many PDFs, so it only runs when you click it.">⚡ Load Sources</button>
+    </div>
     <div id="pdf-levels" style="margin-top:6px;background:var(--surface);border:1px solid var(--border);
          border-radius:14px;padding:8px 10px;font-size:11px;"></div>
     <div class="pdf-tree" id="pdf-tree" style="margin-top:6px;overflow-y:auto;max-height:180px;
@@ -5735,7 +5804,27 @@ function buildKnowledgePane(box){
   const pdfLevels = document.getElementById("pdf-levels");
   const pdfAddBtn = document.getElementById("pdf-add");
   const pdfTagBtn = document.getElementById("pdf-tag");
+  const pdfWarmBtn = document.getElementById("pdf-warm");
   enhanceSelect(pdfSel);
+
+  pdfWarmBtn.onclick = async ()=>{
+    pdfWarmBtn.disabled = true;
+    pdfWarmBtn.textContent = "⚡ Loading sources…";
+    const r = await api("warm_pdf_sources");
+    if (!r || !r.ok){
+      pdfWarmBtn.disabled = false;
+      pdfWarmBtn.textContent = "⚡ Load Sources";
+    }
+    // On success the button stays disabled/"Loading…" until the backend
+    // pushes a pdf_cache_warmed event (see onPdfCacheWarmed below), since
+    // the extraction runs on a background thread and may take a while.
+  };
+  window.onPdfCacheWarmed = ()=>{
+    if (!pdfWarmBtn.isConnected) return;
+    pdfWarmBtn.disabled = false;
+    pdfWarmBtn.textContent = "✓ Sources Loaded";
+    setTimeout(()=>{ if (pdfWarmBtn.isConnected) pdfWarmBtn.textContent = "⚡ Load Sources"; }, 2500);
+  };
 
   function renderHeadingsList(headings){
     if (!headings || !headings.length){
@@ -6956,7 +7045,8 @@ window.addEventListener("pywebviewready", async ()=>{
 
   document.getElementById("sidebar-toggle").onclick = toggleSidebar;
   document.getElementById("send-btn").onclick = sendMessage;
-  document.getElementById("msg-input").addEventListener("keydown", e=>{ if (e.key==="Enter") sendMessage(); });
+  document.getElementById("msg-input").addEventListener("keydown", e=>{ if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); sendMessage(); } });
+  document.getElementById("msg-input").addEventListener("input", autosizeMsgInput);
   document.getElementById("abort-btn").onclick = ()=>api("abort");
   document.getElementById("copy-chat-btn").onclick = copyFullConversation;
   initKbOnlyControls();
