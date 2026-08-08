@@ -1,5 +1,5 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
-from midum_mcp.manager import _MCPManager, _mcp_normalize_name, _mcp_resolve_name, get_promoted_tools
+from midum_mcp.manager import _mcp_manager, _mcp_normalize_name, _mcp_resolve_name, get_promoted_tools
 from midum_mcp.manager import _MCP_SERVERS as _MANAGER_MCP_SERVERS
 from midum_mcp.manager import _MCP_SERVER_ORDER as _MANAGER_MCP_SERVER_ORDER
 from tools_schema import tools
@@ -49,9 +49,6 @@ import json
 # reported the tool as nonexistent and suggested an unrelated native tool
 # (e.g. read_local_file) purely on string-similarity grounds. Do not
 # reintroduce local _MCP_SERVER_ORDER / _MCP_SERVERS globals here.
-
-_mcp_manager = _MCPManager()
-
 
 def _mcp_find_tool_matches(name: str) -> list:
     """
@@ -116,7 +113,7 @@ def show_server_tools(server) -> str:
     if name is None:
         return (f"Unknown server '{server}'. Call list_mcp_servers() first "
                 f"to see valid indices/names.")
-    handle = _MCP_SERVERS[name]
+    handle = _MANAGER_MCP_SERVERS[name]
     if not handle.connected:
         return f"Server '{name}' is not connected ({handle.error})."
     if not handle.tools:

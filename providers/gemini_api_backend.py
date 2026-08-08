@@ -73,9 +73,9 @@ def _sanitize_messages_for_gemini_api(messages: list) -> list:
     following "tool" messages (FIFO, since Midum only ever emits one tool
     call per step — see "tool_calls[:1]" in process_chat_turn).
     """
-    sanitized  = []
-    pending_ids = []
-    counter    = 0
+    sanitized    = []
+    pending_calls = []  # list of (call_id, function_name), FIFO
+    counter      = 0
     for m in messages:
         m = dict(m)
         role = m.get("role")
@@ -93,7 +93,7 @@ def _sanitize_messages_for_gemini_api(messages: list) -> list:
                         args = "{}"
                 call_id = tc.get("id") or f"call_{counter}"
                 counter += 1
-                pending_ids.append(call_id)
+                pending_calls.append((call_id, name))
                 new_calls.append({
                     "id": call_id,
                     "type": "function",
@@ -105,8 +105,31 @@ def _sanitize_messages_for_gemini_api(messages: list) -> list:
             sanitized.append(m)
 
         elif role == "tool":
-            if not m.get("tool_call_id"):
-                m["tool_call_id"] = pending_ids.pop(0) if pending_ids else f"call_{counter}"
+            # Google's endpoint maps "tool" messages to function_response and
+            # requires "name" to be non-empty ("Name cannot be empty" 400s
+            # otherwise) — Midum's internal format never sets it, so fill
+            # both tool_call_id and name in from the matching pending call.
+            call_id = m.get("tool_call_id")
+            name    = m.get("name")
+            if call_id and pending_calls:
+                # find matching call by id (usually the front of the queue)
+                for i, (cid, cname) in enumerate(pending_calls):
+                    if cid == call_id:
+                        name = name or cname
+                        del pending_calls[i]
+                        break
+                else:
+                    if not name and pending_calls:
+                        _, name = pending_calls.pop(0)
+            elif pending_calls:
+                call_id, pending_name = pending_calls.pop(0)
+                name = name or pending_name
+            if not call_id:
+                call_id = f"call_{counter}"
+            if not name:
+                name = "unknown_function"
+            m["tool_call_id"] = call_id
+            m["name"] = name
             sanitized.append(m)
 
         else:

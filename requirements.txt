@@ -26,3 +26,4 @@ sounddevice
 uiautomation
 websocket-client
 pdfstructx
+pygments

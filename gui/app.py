@@ -52,6 +52,20 @@ import webview  # pywebview — renders through the OS Chromium engine (WebView2
                  # Windows, WebKitGTK on Linux, WKWebView on macOS). Replaces the
                  # previous customtkinter/Tkinter shell entirely.
 
+# Pygments powers server-side syntax highlighting for ```-fenced code blocks
+# in the chat (see Api.highlight_code / Api.get_pygments_css below). Guarded
+# import so a missing/broken install degrades to the plain unhighlighted
+# code blocks the GUI already rendered before this feature existed, instead
+# of crashing the whole app on startup.
+try:
+    from pygments import highlight as _pygments_highlight
+    from pygments.lexers import get_lexer_by_name as _pygments_get_lexer_by_name, guess_lexer as _pygments_guess_lexer
+    from pygments.formatters import HtmlFormatter as _PygmentsHtmlFormatter
+    from pygments.util import ClassNotFound as _PygmentsClassNotFound
+    _PYGMENTS_OK = True
+except Exception:
+    _PYGMENTS_OK = False
+
 from gui.chat_store import ChatStore, MidumSession
 from gui.dispatch import _dispatch_midum_tool
 from flows import classify_tool_kind
@@ -483,6 +497,56 @@ class Api:
             "models": _known_models_for_provider(self._selected_provider),
             "current_model": self._selected_model,
         }
+
+    # Syntax highlighting (Pygments) --------------------------------------
+    # ```-fenced code blocks in chat are highlighted by running the block's
+    # text through Pygments here and handing back ready-to-inject HTML (see
+    # renderPendingCodeHighlight() in the frontend JS). Pure string
+    # transform, safe to call for every code block rendered, including ones
+    # re-rendered from a loaded chat history.
+    _PYGMENTS_STYLE = "one-dark"
+
+    def highlight_code(self, code: str, lang: str = ""):
+        """Returns Pygments-highlighted HTML (span soup, no wrapping
+        <pre>/<div> -- the frontend already supplies those) for one fenced
+        code block, or None if Pygments isn't available/no lexer could be
+        resolved, in which case the frontend keeps its plain-escaped-text
+        rendering."""
+        if not _PYGMENTS_OK or not code:
+            return None
+        try:
+            lang = (lang or "").strip()
+            try:
+                lexer = _pygments_get_lexer_by_name(lang) if lang else _pygments_guess_lexer(code)
+            except _PygmentsClassNotFound:
+                lexer = _pygments_guess_lexer(code)
+            formatter = _PygmentsHtmlFormatter(nowrap=True, style=self._PYGMENTS_STYLE)
+            return _pygments_highlight(code, lexer, formatter)
+        except Exception:
+            return None
+
+    def get_pygments_css(self):
+        """CSS for the Pygments token classes (.k, .s, .nf, etc), scoped
+        under .code-block so it can only ever affect highlighted code.
+        Fetched once on startup and injected as a <style> tag (see the
+        pywebviewready handler below)."""
+        if not _PYGMENTS_OK:
+            return ""
+        try:
+            css = _PygmentsHtmlFormatter(style=self._PYGMENTS_STYLE).get_style_defs(".code-block")
+            # get_style_defs() also emits a couple of rules that aren't
+            # scoped to our prefix (a bare "pre { line-height: ... }" and a
+            # base ".code-block { background/color }" that would fight our
+            # own pre.code-block background). Drop both -- the base look of
+            # the block already comes from our own CSS; only the per-token
+            # (.code-block .k, .code-block .s, ...) rules are wanted here.
+            kept = [
+                line for line in css.splitlines()
+                if line.strip().startswith(".code-block .")
+            ]
+            return "\n".join(kept)
+        except Exception:
+            return ""
 
     # ── Voice control (Gemini Live) ──────────────────────────────────────
     def _on_voice_event(self, kind: str, payload: dict):
@@ -2385,6 +2449,14 @@ _HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8" />
 <title>Midum Control Center</title>
+<!-- Modern monospace font for chat code blocks (pre.code-block / code.inline-code
+     below). Loaded as a plain <link> rather than through the lazy _loadKatexOnce-
+     style JS loader used for KaTeX/Mermaid: it's just CSS (no heavy JS payload),
+     and the font-family fallback stack (Cascadia Code/Fira Code/Consolas) already
+     covers the case where this fails to load, e.g. offline. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap">
 <style>
 :root{
   --bg:#05070c; --panel:#0b0f19; --surface:#0d1220; --surface2:#121a2c;
@@ -2786,9 +2858,20 @@ select, .btn, .ghost-btn{
   100%{transform:scale(0.7); box-shadow:0 0 0 0 rgba(16,185,129,0); }
 }
 pre.code-block{background:var(--tool-bg);color:var(--tool-text);border-radius:12px;padding:10px;
-  overflow-x:auto;font-family:Consolas,"Cascadia Code",monospace;font-size:12px;}
+  overflow-x:auto;font-family:"JetBrains Mono","Cascadia Code","Fira Code",Consolas,monospace;
+  font-size:12.5px;line-height:1.55;font-feature-settings:"liga" 1,"calt" 1;}
+.code-block-wrap{position:relative;}
+.code-copy-btn{
+  position:absolute;top:8px;right:8px;opacity:0;transition:opacity .15s,background .15s,color .15s;
+  width:22px;height:22px;border-radius:6px;border:1px solid var(--border2);background:var(--surface2);
+  color:var(--subtext);font-size:11px;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;padding:0;z-index:2;
+}
+.code-block-wrap:hover .code-copy-btn{opacity:1;}
+.code-copy-btn:hover{background:var(--border2);color:var(--text);}
+.code-copy-btn.copied{opacity:1;color:var(--green);}
 code.inline-code{background:var(--surface2);color:var(--tool-text);border-radius:4px;padding:1px 5px;
-  font-family:Consolas,"Cascadia Code",monospace;font-size:12.5px;}
+  font-family:"JetBrains Mono","Cascadia Code","Fira Code",Consolas,monospace;font-size:12.5px;}
 .bubble h1,.bubble h2,.bubble h3,.bubble h4,.bubble h5,.bubble h6{margin:.4em 0;}
 .bubble h4{font-size:1em;}
 .bubble h5{font-size:.92em;}
@@ -3266,7 +3349,22 @@ function escapeHtml(s){
 function renderInline(text){
   let t = escapeHtml(text);
   t = renderTablesInText(t);
-  t = t.replace(/```([\w_]*)\n([\s\S]*?)```/g, (m,lang,body)=>`<pre class="code-block">${body}</pre>`);
+  // Fenced code blocks are pulled out into placeholders *before* any of the
+  // markdown regexes below run -- same trick extractMath() uses for TeX
+  // spans, and for the same reason: a code block's own newlines have to
+  // stay real "\n" characters (rendered as line breaks purely via the
+  // block's white-space:pre CSS), not get swept up by the final
+  // "\n -> <br>" pass a few lines down. If they were converted to <br>,
+  // reading the block back out via .textContent (done both for the copy
+  // button and for the Pygments highlight call) would collapse the whole
+  // block onto a single line, since <br> contributes no characters to
+  // .textContent.
+  const _codeBlocks = [];
+  t = t.replace(/```([\w_]*)\n([\s\S]*?)```/g, (m,lang,body)=>{
+    const html = `<div class="code-block-wrap"><button class="code-copy-btn" title="Copy code">⧉</button><pre class="code-block" data-lang="${lang}">${body}</pre></div>`;
+    _codeBlocks.push(html);
+    return `\u0000CODEBLOCK${_codeBlocks.length - 1}\u0000`;
+  });
   t = t.replace(/`([^`]+)`/g, (m,c)=>`<code class="inline-code">${c}</code>`);
   // LaTeX math ($$...$$, \[...\], \(...\), $...$) is swapped for a
   // placeholder <span class="math-tex"> BEFORE the bold/italic/etc
@@ -3298,7 +3396,11 @@ function renderInline(text){
   // \n -> <br> pass below, stacking with that margin for extra spacing.
   t = t.replace(/^-[ \t]+(.+)$/gm, '<span class="bullet-line">\u2022 $1</span>');
   t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-  return t.replace(/\n/g, "<br>");
+  t = t.replace(/\n/g, "<br>");
+  // Swap the real code-block HTML back in now that the \n -> <br> pass is
+  // safely behind us.
+  t = t.replace(/\u0000CODEBLOCK(\d+)\u0000/g, (m, idx)=>_codeBlocks[Number(idx)]);
+  return t;
 }
 
 // ── Markdown table rendering (GFM-style pipe tables) ----------------------
@@ -3573,7 +3675,7 @@ async function renderPendingMermaid(){
   } catch (e) {
     pending.forEach(el=>{
       el.dataset.mermaidDone = "1";
-      el.outerHTML = `<pre class="code-block">${escapeHtml(el.textContent || "")}</pre>`;
+      el.outerHTML = `<div class="code-block-wrap"><button class="code-copy-btn" title="Copy code">⧉</button><pre class="code-block">${escapeHtml(el.textContent || "")}</pre></div>`;
     });
     return;
   }
@@ -3586,7 +3688,7 @@ async function renderPendingMermaid(){
       el.innerHTML = svg;
     } catch (e) {
       const wrap = el.closest(".flowchart-wrap") || el;
-      wrap.outerHTML = `<pre class="code-block">${escapeHtml(src)}</pre>`;
+      wrap.outerHTML = `<div class="code-block-wrap"><button class="code-copy-btn" title="Copy code">⧉</button><pre class="code-block">${escapeHtml(src)}</pre></div>`;
     }
   }
 }
@@ -3660,6 +3762,33 @@ async function renderPendingMath(){
   });
 }
 
+// Syntax-highlights fenced code blocks via the Pygments bridge on the
+// Python side (Api.highlight_code). Same lazy/idempotent pattern as
+// renderPendingMermaid/renderPendingMath above: called after every place
+// that injects new HTML into the chat, and marks each <pre> as done so a
+// later call (e.g. the next streamed chunk) doesn't re-highlight it.
+async function renderPendingCodeHighlight(){
+  const pending = Array.from(document.querySelectorAll("pre.code-block:not([data-hl-done])"));
+  if (!pending.length) return;
+  await Promise.all(pending.map(async (pre)=>{
+    pre.dataset.hlDone = "1";
+    // innerText (not textContent) -- besides matching what the copy button
+    // copies, it correctly turns any literal <br> that might end up inside
+    // the block into a real newline, whereas textContent would silently
+    // drop it and collapse the code onto one line.
+    const code = pre.innerText;
+    const lang = pre.dataset.lang || "";
+    try {
+      const html = await api("highlight_code", code, lang);
+      if (html) pre.innerHTML = html;
+    } catch (e) {
+      // Pygments unavailable or highlighting failed -- leave the plain
+      // escaped text already in the block, which is a perfectly fine
+      // (just uncolored) rendering on its own.
+    }
+  }));
+}
+
 function renderMidumContent(text){
   FLOWCHART_FENCE_RE.lastIndex = 0;
   if (!FLOWCHART_FENCE_RE.test(text)) return renderInline(text);
@@ -3708,7 +3837,7 @@ function renderMidumContent(text){
       // Fallback for malformed JSON
     }
 
-    out += renderedBlock || `<pre class="code-block">${escapeHtml(body)}</pre>`;
+    out += renderedBlock || `<div class="code-block-wrap"><button class="code-copy-btn" title="Copy code">⧉</button><pre class="code-block" data-lang="${lang === "mermaid" ? "" : "json"}">${escapeHtml(body)}</pre></div>`;
     lastIndex = FLOWCHART_FENCE_RE.lastIndex;
   }
   const rest = text.slice(lastIndex);
@@ -3797,6 +3926,7 @@ function appendRow(tag, text){
     animateWords(row.querySelector(".bubble"));
     renderPendingMermaid();
     renderPendingMath();
+    renderPendingCodeHighlight();
     scrollToBottom();
     return;
   } else if (tag === "system"){
@@ -3838,16 +3968,27 @@ function appendRow(tag, text){
 // instead of raw JSON schemas -- so both the per-row copy button and the
 // "copy full conversation" button produce something a person can paste
 // into an email/doc/ticket as-is.
+// Bubble text is read via innerText, but code blocks now carry an inline
+// .code-copy-btn (⧉) button for copying just that snippet -- strip those
+// out of a clone before reading innerText so row/full-conversation copies
+// don't pick up stray ⧉ glyphs that aren't part of the actual message.
+function bubblePlainText(b){
+  if (!b) return "";
+  const clone = b.cloneNode(true);
+  clone.querySelectorAll(".code-copy-btn").forEach(btn=>btn.remove());
+  return clone.innerText.trim();
+}
+
 function rowPlainText(row){
   if (!row) return "";
   if (row.classList.contains("user")){
     const b = row.querySelector(".bubble");
-    return "You: " + (b ? b.innerText.trim() : "");
+    return "You: " + bubblePlainText(b);
   }
   if (row.classList.contains("midum")){
     if (row.querySelector(".ask-card")) return "";   // inline ask cards aren't transcript text
     const b = row.querySelector(".bubble");
-    return "Midum: " + (b ? b.innerText.trim() : "");
+    return "Midum: " + bubblePlainText(b);
   }
   if (row.classList.contains("tool")){
     const name = row.dataset.toolName || "tool";
@@ -3910,6 +4051,21 @@ function wireRowCopyBtn(row){
     if (ok) flashCopyFeedback(btn);
   };
 }
+
+// Copy-to-clipboard for individual markdown code blocks. Code blocks are
+// injected into the DOM dynamically (streamed/rendered chat content), so a
+// single delegated listener on the chat column -- rather than wiring each
+// .code-copy-btn as it's created -- ensures every code block's copy button
+// works, including ones rendered after this listener is attached.
+document.addEventListener("click", async (e)=>{
+  const btn = e.target.closest(".code-copy-btn");
+  if (!btn) return;
+  e.stopPropagation();
+  const wrap = btn.closest(".code-block-wrap");
+  const pre = wrap ? wrap.querySelector("pre.code-block") : null;
+  const ok = await copyTextToClipboard(pre ? pre.innerText : "");
+  if (ok) flashCopyFeedback(btn);
+});
 
 async function copyFullConversation(){
   const rows = Array.from(chatCol().children);
@@ -5163,7 +5319,7 @@ function appendVoiceTranscript(role, text){
     col.appendChild(row);
     _voiceStreamRow = { role, bubbleEl, rawText: text };
   }
-  if (!isUser){ renderPendingMermaid(); renderPendingMath(); }
+  if (!isUser){ renderPendingMermaid(); renderPendingMath(); renderPendingCodeHighlight(); }
   scrollToBottom();
 }
 
@@ -6819,6 +6975,20 @@ window.addEventListener("pywebviewready", async ()=>{
     }
     applyBgImage(_bgState.cfg, _bgState.dataUrl);
   } catch (e) { /* pywebview bridge not ready yet on some platforms — fine */ }
+
+  // Pygments token-color CSS for syntax-highlighted code blocks -- fetched
+  // once and injected as a <style> tag. Injected here (rather than baked
+  // into the static CSS below) since the palette lives server-side next to
+  // the highlighter itself, so both always agree on the same theme.
+  try {
+    const css = await api("get_pygments_css");
+    if (css){
+      const styleEl = document.createElement("style");
+      styleEl.id = "pygments-css";
+      styleEl.textContent = css;
+      document.head.appendChild(styleEl);
+    }
+  } catch (e) { /* Pygments not installed server-side -- code blocks just stay unhighlighted */ }
 
   await api("startup");
 });
