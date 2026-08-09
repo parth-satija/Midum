@@ -67,7 +67,18 @@ MODEL_NAME     = "jarvishehe"
 #                _call_ollama, no JSON-translation layer needed. Requires an
 #                API key from https://ollama.com/settings/keys. See
 #                OLLAMA_CLOUD_MODEL below.
-MODEL_PROVIDER = "gemini_web"   # "ollama" | "openrouter" | "gemini_web" | "gemini_api" | "groq" | "ollama_cloud"
+# "omniroute"  — use OMNIROUTE_MODEL as the PRIMARY execution brain, routed
+#                through a self-hosted OmniRoute gateway
+#                (https://github.com/diegosouzapw/OmniRoute) instead of any
+#                single provider directly. OmniRoute exposes one
+#                OpenAI-compatible /v1/chat/completions endpoint in front of
+#                290+ providers/500+ models with its own quota-aware
+#                auto-fallback — same request shape as "openrouter" /
+#                "groq" / "gemini_api", so it's fully wired into tool
+#                calling / MCP servers exactly like every other provider.
+#                Requires the OmniRoute gateway running locally (or
+#                reachable) — see OMNIROUTE_API_BASE below.
+MODEL_PROVIDER = "gemini_web"   # "ollama" | "openrouter" | "gemini_web" | "gemini_api" | "groq" | "ollama_cloud" | "omniroute"
 
 # ── OpenRouter model selection ────────────────────────────────────────────────
 # Used when MODEL_PROVIDER == "openrouter" (primary), and always used for
@@ -177,6 +188,38 @@ GROQ_FALLBACK_MODELS = [
     "llama-3.1-8b-instant",
     "qwen/qwen3-32b",
     "moonshotai/kimi-k2-instruct",
+]
+
+# ── OmniRoute (self-hosted AI gateway) model selection ────────────────────────
+# Used when MODEL_PROVIDER == "omniroute" (primary), and always available
+# for on-demand consultation/delegation regardless of MODEL_PROVIDER, exactly
+# like OpenRouter/Groq/Gemini API/Ollama Cloud. OmniRoute is a free,
+# MIT-licensed, self-hosted AI gateway (https://github.com/diegosouzapw/OmniRoute)
+# that puts ONE OpenAI-compatible endpoint in front of 290+ providers
+# (90+ free) and ~500 models, doing its own format translation and
+# quota-aware auto-fallback across whatever providers you've connected in
+# its dashboard. Run it locally with:
+#   npm install -g omniroute && omniroute
+# or:
+#   docker run -p 20128:20128 diegosouzapw/omniroute
+# Dashboard + API both live on port 20128 by default.
+#
+# Model IDs are OmniRoute's own routing aliases (subject to what you've
+# connected in its dashboard), e.g.:
+#   "auto/best-free"        — auto-pick the best free-tier route
+#   "auto/best-coding"      — auto-pick the best route for coding tasks
+#   "gc/gemini-3-flash-preview" — Gemini CLI OAuth route
+#   "gh/claude-4.5-sonnet"  — GitHub Models route
+# See http://localhost:20128/dashboard (Providers tab) for what's connected.
+OMNIROUTE_MODEL      = "auto/best-free"   # primary (if selected) AND consult model
+OMNIROUTE_API_BASE   = "http://localhost:20128/v1"
+
+# OmniRoute already does its own cross-provider fallback server-side, but we
+# still keep a local fallback chain for the rare case the gateway itself
+# 429s/502s on a specific alias — mirrors every other provider's pattern.
+OMNIROUTE_FALLBACK_MODELS = [
+    OMNIROUTE_MODEL,
+    "auto/best-coding",
 ]
 
 # ── Ollama Cloud model selection ──────────────────────────────────────────────
@@ -299,6 +342,10 @@ SECRETS_TEMPLATE = {
     "GROQ_API_KEY": "",
     # https://ollama.com/settings/keys -- used by MODEL_PROVIDER="ollama_cloud".
     "OLLAMA_API_KEY": "",
+    # Gateway key from your OmniRoute dashboard (http://localhost:20128/dashboard)
+    # -- used by MODEL_PROVIDER="omniroute". Often optional for a purely local
+    # gateway with no auth configured -- leave blank if you haven't set one.
+    "OMNIROUTE_API_KEY": "",
     # Browser session cookies (NOT an API key) for consult_gemini's
     # web-chat path (gemini_webapi) -- both required together if used.
     # Copy from your browser's DevTools -> Application -> Cookies for

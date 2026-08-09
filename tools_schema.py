@@ -1090,6 +1090,137 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "consult_omniroute",
+            "description": (
+                "Send a reasoning, analysis, or research task to a model routed through "
+                "your self-hosted OmniRoute gateway (currently configured: see "
+                "OMNIROUTE_MODEL) — a single OpenAI-compatible endpoint in front of "
+                "290+ providers/500+ models with its own auto-fallback. "
+                "This is a FALLBACK/explicit-request tool, not a default choice — prefer "
+                "consult_gemini first. Only use consult_omniroute when: "
+                "(1) the user explicitly says 'ask OmniRoute' or names OmniRoute, or "
+                "(2) consult_gemini just failed/errored and you still need a second-brain "
+                "answer. Do not reach for this casually as an alternative to Gemini."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The full question or task for the model. Be specific and complete."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional: relevant context to include (file contents, memory, prior results)."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional: override the default OmniRoute model/route ID for this call."
+                    }
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_to_omniroute",
+            "description": (
+                "Hand off an entire task to OmniRoute as a real COWORKER, not just a "
+                "text consultant. Unlike consult_omniroute (which only returns text), "
+                "the model spun up here gets FULL access to every tool Midum has — it "
+                "can click UI elements, run terminal commands, read/write files, browse "
+                "the web, everything — and works through the task independently, then "
+                "reports back a final summary that you relay to the user. Good pick when "
+                "you want OmniRoute's own cross-provider fallback backing a delegated "
+                "sub-task. "
+                "\n\n"
+                "This runs in an ISOLATED conversation — the delegate does not see your "
+                "conversation history, only what you put in `task` and `context`. Be "
+                "complete and specific in both."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "The complete task to hand off, written as a self-contained "
+                            "instruction — the delegate has no other context except this "
+                            "and whatever you put in `context`."
+                        )
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional: relevant background the delegate needs (file contents, prior findings, constraints)."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional: override the default OmniRoute model/route ID for this delegated task."
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "description": "Optional: cap on tool-call steps the delegate can take before it must report back. Default 10."
+                    }
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_omniroute_models",
+            "description": (
+                "List models/routing aliases currently available from your OmniRoute "
+                "gateway as a numbered indexed table (IDX | model ID | owner). Follow up "
+                "with set_omniroute_model_by_index(index) to switch the active model — "
+                "this is the CHOOSE-pattern way to pick a model instead of typing an exact ID."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_omniroute_model_by_index",
+            "description": "Switch the active OmniRoute model to the entry at `index` from list_omniroute_models.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "Index from list_omniroute_models output."}
+                },
+                "required": ["index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_omniroute_model",
+            "description": (
+                "Switch the active OmniRoute model/route directly by its exact ID "
+                "(e.g. 'auto/best-free', 'gh/claude-4.5-sonnet', 'gc/gemini-3-flash-preview'). "
+                "Use list_omniroute_models + set_omniroute_model_by_index instead if you don't "
+                "know the exact ID. Takes effect immediately, no restart needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "model_id": {"type": "string", "description": "Exact OmniRoute model/route ID."}
+                },
+                "required": ["model_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "delegate_to_gemini_web",
             "description": (
                 "Hand off an entire task to Gemini (via the web-app account session, "

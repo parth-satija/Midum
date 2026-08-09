@@ -27,6 +27,8 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
         model_id = config.GEMINI_API_MODEL
     elif provider == "groq":
         model_id = config.GROQ_MODEL
+    elif provider == "omniroute":
+        model_id = config.OMNIROUTE_MODEL
     else:
         model_id = MODEL_NAME
     if _IS_LINUX:
@@ -84,6 +86,7 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
         if (provider == "openrouter" and model_id.endswith(":free"))
            or (provider == "ollama" and _is_legacy_toolcall_model(model_id))
            or provider == "gemini_web"
+           or provider == "omniroute"
         else ""
     )
 

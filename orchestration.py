@@ -13,6 +13,7 @@ from providers.gemini_reasoning import consult_gemini
 from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _call_gemini_web_primary, _gemini_webapi_load_msg, delegate_to_gemini_web, set_gemini_web_model
 from providers.groq_backend import _groq_chat_with_fallback, consult_groq, delegate_to_groq, list_groq_models, set_groq_model, set_groq_model_by_index
 from providers.ollama_cloud_backend import _ollama_cloud_chat_with_fallback, consult_ollama_cloud, delegate_to_ollama_cloud, list_ollama_cloud_models, set_ollama_cloud_model
+from providers.omniroute_backend import _omniroute_chat_with_fallback, consult_omniroute, delegate_to_omniroute, list_omniroute_models, set_omniroute_model, set_omniroute_model_by_index
 from screen_capture import capture_screen_to_ram, fallback_click_grid, fallback_click_text, fallback_find_text, type_text
 from skills import list_skills, load_skill
 from state import _abort_event
@@ -84,7 +85,7 @@ def get_gemini_reasoning(user_input: str, conversation_history: list) -> str | N
     execution brain), this consult step is skipped entirely — there's no
     benefit to a strong model consulting a plan from itself.
     """
-    if config.MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq", "ollama_cloud"):
+    if config.MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq", "ollama_cloud", "omniroute"):
         # Primary model IS OpenRouter or Gemini-web already — skip the
         # separate consult call, it would just be the same model (or the
         # same account's Gemini session) reasoning about itself twice.
@@ -558,6 +559,40 @@ def _call_ollama_cloud_primary(messages, result_q, model_override: str = None):
         result_q.put(("err", e))
 
 
+def _call_omniroute_primary(messages, result_q, model_override: str = None):
+    """
+    Run an OmniRoute (self-hosted gateway) chat completion on a background
+    thread — used when MODEL_PROVIDER == "omniroute" (OmniRoute driving
+    Midum directly), OR when a caller forces it for a single sub-turn via
+    _call_primary_model(provider_override="omniroute").
+
+    model_override lets delegate_to_omniroute() run the sub-agent on a
+    different model/route than config.OMNIROUTE_MODEL for that one
+    delegated task.
+
+    OmniRoute translates to whatever underlying provider is actually
+    serving the request, so native tool-calling reliability varies by
+    route — same situation as OpenRouter's free-tier models. We reuse the
+    same legacy-parser fallback here for that reason, applied
+    unconditionally, same as the OpenRouter backend.
+    """
+    try:
+        use_model = model_override or config.OMNIROUTE_MODEL
+        resp = _omniroute_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(tools))
+
+        if not resp["message"].get("tool_calls"):
+            raw_content = resp["message"].get("content") or ""
+            legacy_calls, cleaned_content = _extract_legacy_tool_calls(raw_content)
+            if legacy_calls:
+                legacy_calls = legacy_calls[:1]   # one tool at a time
+                resp["message"]["tool_calls"] = legacy_calls
+                resp["message"]["content"]    = cleaned_content
+
+        result_q.put(("ok", resp))
+    except Exception as e:
+        result_q.put(("err", e))
+
+
 def _call_primary_model(messages, result_q, provider_override: str = None, model_override: str = None):
     """
     Dispatches to the configured primary model provider (see MODEL_PROVIDER
@@ -582,6 +617,8 @@ def _call_primary_model(messages, result_q, provider_override: str = None, model
         _call_groq_primary(messages, result_q, model_override=model_override)
     elif provider == "ollama_cloud":
         _call_ollama_cloud_primary(messages, result_q, model_override=model_override)
+    elif provider == "omniroute":
+        _call_omniroute_primary(messages, result_q, model_override=model_override)
     else:
         _call_ollama(messages, result_q)
 
@@ -1052,6 +1089,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 "gemini_api": "Gemini-API",
                 "groq": "Groq",
                 "ollama_cloud": "Ollama Cloud",
+                "omniroute": "OmniRoute",
             }.get(effective_provider, "Ollama")
             return f"[{provider_name} error: {payload}]", turn_tool_outputs
         response   = payload
@@ -1586,6 +1624,25 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 tool_output = set_groq_model_by_index(int(arguments.get("index", 0)))
             elif func_name == "set_groq_model":
                 tool_output = set_groq_model(arguments.get("model_id", ""))
+            elif func_name == "consult_omniroute":
+                tool_output = consult_omniroute(
+                    arguments.get("prompt", ""),
+                    arguments.get("context", ""),
+                    arguments.get("model") or None
+                )
+            elif func_name == "delegate_to_omniroute":
+                tool_output = delegate_to_omniroute(
+                    arguments.get("task", ""),
+                    arguments.get("context", ""),
+                    arguments.get("model") or None,
+                    int(arguments.get("max_steps", 10))
+                )
+            elif func_name == "list_omniroute_models":
+                tool_output = list_omniroute_models()
+            elif func_name == "set_omniroute_model_by_index":
+                tool_output = set_omniroute_model_by_index(int(arguments.get("index", 0)))
+            elif func_name == "set_omniroute_model":
+                tool_output = set_omniroute_model(arguments.get("model_id", ""))
             elif func_name == "consult_ollama_cloud":
                 tool_output = consult_ollama_cloud(
                     arguments.get("prompt", ""),
@@ -1875,6 +1932,15 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     "list_groq_models":     "list_groq_models",
                     "switch_groq_model":    "set_groq_model_by_index",
                     "set_groq_model":       "set_groq_model",
+                    # OmniRoute (self-hosted gateway)
+                    "omniroute":            "consult_omniroute",
+                    "ask_omniroute":        "consult_omniroute",
+                    "consult_or_gateway":   "consult_omniroute",
+                    "delegate_omniroute":   "delegate_to_omniroute",
+                    "offload_to_omniroute": "delegate_to_omniroute",
+                    "list_omniroute_models": "list_omniroute_models",
+                    "switch_omniroute_model": "set_omniroute_model_by_index",
+                    "set_omniroute_model":  "set_omniroute_model",
                     # Gemini-web (primary-execution delegate, distinct from consult_gemini)
                     "delegate_gemini":      "delegate_to_gemini_web",
                     "delegate_to_gemini":   "delegate_to_gemini_web",

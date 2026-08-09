@@ -122,6 +122,7 @@ def _default_model_for_provider(provider_key: str) -> str:
         "gemini_api":    midum.config.GEMINI_API_MODEL,
         "groq":          midum.config.GROQ_MODEL,
         "ollama_cloud":  midum.config.OLLAMA_CLOUD_MODEL,
+        "omniroute":     midum.config.OMNIROUTE_MODEL,
     }.get(provider_key, "")
 
 
@@ -136,6 +137,8 @@ def _known_models_for_provider(provider_key: str) -> list:
         return _list_gemini_web_model_options()
     if provider_key == "ollama_cloud":
         return list(dict.fromkeys(midum.config.OLLAMA_CLOUD_FALLBACK_MODELS))
+    if provider_key == "omniroute":
+        return _list_omniroute_models()
     return [midum.config.MODEL_NAME]
 
 
@@ -176,6 +179,34 @@ def _list_ollama_cloud_models() -> list:
         return []
 
 
+def _list_omniroute_models() -> list:
+    """
+    Live model/route list from the OmniRoute gateway's /v1/models endpoint,
+    with the configured default + fallback chain always included so the
+    dropdown isn't empty if the gateway isn't reachable yet (not started,
+    wrong port, etc).
+    """
+    seed = list(dict.fromkeys([midum.config.OMNIROUTE_MODEL] + list(midum.config.OMNIROUTE_FALLBACK_MODELS)))
+    try:
+        import requests as _requests
+        headers = {}
+        try:
+            from providers.omniroute_backend import _OMNIROUTE_API_KEY
+            if _OMNIROUTE_API_KEY:
+                headers["Authorization"] = f"Bearer {_OMNIROUTE_API_KEY}"
+        except Exception:
+            pass
+        resp = _requests.get(f"{midum.config.OMNIROUTE_API_BASE}/models", headers=headers, timeout=5)
+        resp.raise_for_status()
+        items = resp.json().get("data", [])
+        live = [m.get("id") for m in items if isinstance(m, dict) and m.get("id")]
+        if live:
+            return list(dict.fromkeys(seed + sorted(live)))
+    except Exception:
+        pass
+    return seed
+
+
 def _list_ollama_models() -> list:
     try:
         resp = midum.ollama.list()
@@ -197,6 +228,7 @@ PROVIDER_OPTIONS = [
     ("Gemini (Web)",    "gemini_web"),
     ("Gemini (API)",    "gemini_api"),
     ("Groq",            "groq"),
+    ("OmniRoute",       "omniroute"),
 ]
 _PROVIDER_LABEL_TO_KEY = {label: key for label, key in PROVIDER_OPTIONS}
 _PROVIDER_KEY_TO_LABEL = {key: label for label, key in PROVIDER_OPTIONS}
@@ -751,6 +783,8 @@ class Api:
             midum.config.GROQ_MODEL = model_id
         elif provider_key == "ollama_cloud":
             midum.config.OLLAMA_CLOUD_MODEL = model_id
+        elif provider_key == "omniroute":
+            midum.config.OMNIROUTE_MODEL = model_id
 
         self._push_event("log", {"text": f"🔀 [Provider switched: {label} — {model_id or '(auto)'}]\n"})
         return self.get_status()
@@ -2753,7 +2787,7 @@ html.blobs-off:not(.has-bg-image) #topbar{
 /* Chat pane (always present) */
 #chat-pane-wrap{left:0;width:100%;}
 #chat-scroll{flex:1;overflow-y:auto;padding:8px 8px 0 8px;}
-#chat-col{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:2px;}
+#chat-col{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:6px;}
 #input-row{padding:8px 8px 12px 8px;display:flex;justify-content:center;}
 #input-box{
   width:100%;max-width:760px;background:var(--surface);border:1px solid var(--border2);
@@ -2856,7 +2890,7 @@ select, .btn, .ghost-btn{
 #sidebar-footer .ghost-btn{flex:1;font-size:10px;}
 
 /* Chat bubbles */
-.row{display:flex;flex-direction:column;padding:6px 0;position:relative;}
+.row{display:flex;flex-direction:column;padding:10px 0;position:relative;}
 .row.user{align-items:flex-end;}
 .row.midum{align-items:flex-start;}
 .row-label-row{display:flex;align-items:center;gap:6px;margin-bottom:4px;}
@@ -2872,7 +2906,7 @@ select, .btn, .ghost-btn{
 .row:hover .row-copy-btn{opacity:1;}
 .row-copy-btn:hover{background:var(--border2);color:var(--text);}
 .row-copy-btn.copied{opacity:1;color:var(--green);}
-.bubble{border-radius:18px;padding:10px 16px;font-size:14px;line-height:1.5;max-width:78%;white-space:pre-wrap;word-wrap:break-word;}
+.bubble{border-radius:18px;padding:12px 18px;font-size:15.5px;line-height:1.7;max-width:78%;white-space:pre-wrap;word-wrap:break-word;letter-spacing:.1px;}
 .bubble.user{background:var(--user-msg);}
 .bubble.midum{background:transparent;max-width:100%;}
 .row.system, .row.error{align-items:center;text-align:center;}
