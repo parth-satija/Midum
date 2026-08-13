@@ -1,6 +1,6 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
 from config import SCREEN_H, SCREEN_W
-from config import _IS_WINDOWS
+from config import _IS_WINDOWS, _IS_MAC
 import json
 import os
 import re
@@ -20,11 +20,28 @@ try:
     if _IS_WINDOWS:
         TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
-    # On Linux, tesseract is on PATH after apt/dnf install — no path needed
+    # On Linux, tesseract is on PATH after apt/dnf install — no path needed.
+    # On macOS (Homebrew: `brew install tesseract`), it's on PATH too
+    # (/opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel) as long
+    # as the shell that launched Midum has brew's shellenv sourced — if
+    # get_tesseract_version() below fails, check `which tesseract` and set
+    # pytesseract.pytesseract.tesseract_cmd to that path explicitly.
     pytesseract.get_tesseract_version()
     _TESSERACT_AVAILABLE = True
 except Exception:
-    pass
+    # macOS fallback: PATH may not include Homebrew's bin dir if Midum was
+    # launched from a GUI/launcher rather than a login shell. Try the two
+    # standard Homebrew prefixes directly before giving up.
+    if _IS_MAC:
+        for _cand in ("/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract"):
+            if os.path.exists(_cand):
+                try:
+                    pytesseract.pytesseract.tesseract_cmd = _cand
+                    pytesseract.get_tesseract_version()
+                    _TESSERACT_AVAILABLE = True
+                    break
+                except Exception:
+                    pass
 
 
 # ── UI Automation (UIA) SETUP — Windows only ─────────────────────────────────

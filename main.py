@@ -16,7 +16,6 @@ import providers.gemini_api_backend as providers_gemini_api_backend
 import providers.gemini_reasoning as providers_gemini_reasoning
 import providers.gemini_web_backend as providers_gemini_web_backend
 import providers.groq_backend as providers_groq_backend
-import providers.omniroute_backend as providers_omniroute_backend
 import providers.openrouter_backend as providers_openrouter_backend
 from browser_cdp import _CDP_AVAILABLE, _cdp_get_tabs, act_on_browser_element, list_browser_tabs, query_gemini_app, read_browser_page, run_js_in_browser, snapshot_browser_elements
 from config import GOAL_SECTION_END, GOAL_SECTION_HEADER, LOG_FILE, MCP_SERVERS_FILE, MODEL_NAME, MODEL_PROVIDER, OPENROUTER_CONSULT_MODE, SCREEN_H, SCREEN_W, SECRETS_FILE, SESSION_MEMORY, TARGET_DIR
@@ -26,14 +25,13 @@ from scheduler import create_schedule, delete_schedule, describe_schedule, get_s
 from midum_mcp.manager import _MCP_SERVERS, _MCP_SERVER_ORDER, init_mcp_servers_from_config
 from midum_mcp.manager import demote_mcp_tool, get_promoted_tools, is_tool_promoted, promote_mcp_tool
 from memory import init_memory_at_startup, python_trigger_memory_update, set_current_goal, update_memory
-from orchestration import _decompose_task, _is_trivial_input, get_gemini_reasoning, process_chat_turn, set_tool_call_hook, wait
+from orchestration import _decompose_task, _is_trivial_input, get_gemini_reasoning, is_action_loop_active, process_chat_turn, set_tool_call_hook, start_action_loop, stop_action_loop, wait
 from providers.gemini_api_backend import _gemini_api_load_msg, consult_gemini_api, delegate_to_gemini_api, set_gemini_api_model
 from providers.gemini_reasoning import consult_gemini
 from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _gemini_webapi_load_msg, _get_gemini_web_client, delegate_to_gemini_web, set_gemini_web_model
 from providers.gemini_live_backend import start_screen_share, stop_screen_share
 from providers.groq_backend import _groq_load_msg, consult_groq, delegate_to_groq, list_groq_models, set_groq_model, set_groq_model_by_index
 from providers.ollama_cloud_backend import consult_ollama_cloud, delegate_to_ollama_cloud, list_ollama_cloud_models, set_ollama_cloud_model
-from providers.omniroute_backend import _omniroute_load_msg, consult_omniroute, delegate_to_omniroute, list_omniroute_models, set_omniroute_model, set_omniroute_model_by_index
 from providers.openrouter_backend import _openrouter_load_msg, consult_openrouter, delegate_to_openrouter, list_openrouter_models, set_openrouter_model, set_openrouter_model_by_index
 from screen_capture import capture_screen_to_ram, fallback_click_grid, fallback_click_text, fallback_find_text, type_text
 from skills import list_skills, load_skill
@@ -241,13 +239,6 @@ if __name__ == "__main__":
         print( "    Add key: { \"GROQ_API_KEY\": \"gsk_...\" } (same file as everything else)")
         print( "    Get a free key: https://console.groq.com/keys")
 
-    # ── OmniRoute status ────────────────────────────────────────────────────────
-    print(f"🛰️  [OmniRoute: gateway={config.OMNIROUTE_API_BASE}, model={config.OMNIROUTE_MODEL} "
-          f"— {_omniroute_load_msg}]")
-    if MODEL_PROVIDER == "omniroute":
-        print( "    If the gateway isn't running yet: npm install -g omniroute && omniroute")
-        print( "    (or) docker run -p 20128:20128 diegosouzapw/omniroute")
-
     # ── Primary model provider summary ────────────────────────────────────────
     if MODEL_PROVIDER == "openrouter":
         if not providers_openrouter_backend._OPENROUTER_AVAILABLE:
@@ -280,9 +271,6 @@ if __name__ == "__main__":
         else:
             print(f"🧠 [PRIMARY MODEL: Groq/{config.GROQ_MODEL} — driving Midum directly "
                   f"via GroqCloud's free-tier API]")
-    elif MODEL_PROVIDER == "omniroute":
-        print(f"🧠 [PRIMARY MODEL: OmniRoute/{config.OMNIROUTE_MODEL} — driving Midum directly "
-              f"via the self-hosted gateway at {config.OMNIROUTE_API_BASE}]")
     else:
         print(f"🧠 [PRIMARY MODEL: Ollama/{MODEL_NAME} — local execution brain]")
         if OPENROUTER_CONSULT_MODE != "off" and providers_openrouter_backend._OPENROUTER_AVAILABLE:

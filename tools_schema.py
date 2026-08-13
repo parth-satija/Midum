@@ -1408,6 +1408,9 @@ tools = [
                 "Print a message to the user mid-turn, then continue acting. "
                 "Use this to narrate what you are doing WHILE doing it — e.g. say('Opening Chrome...') "
                 "then immediately call execute_terminal_command. "
+                "Works in both text and VOICE sessions — in voice mode it shows up as a chat message "
+                "alongside the spoken conversation, useful for narrating actions or showing details "
+                "(e.g. a list, a path, a long result) that are awkward to just say out loud. "
                 "Do NOT use this as a substitute for acting. Always follow a say() with a real tool call."
             ),
             "parameters": {
@@ -2149,6 +2152,61 @@ tools = [
                     }
                 },
                 "required": ["tool_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_action_loop",
+            "description": (
+                "Enter CONTINUOUS ACTION LOOP mode: from this call on, keep calling "
+                "tools -- and say() in between to narrate progress out loud -- back "
+                "to back, WITHOUT ending your turn with a plain-text reply, until "
+                "the goal is done. This works the same way in voice mode: you do not "
+                "need to wait for the user to speak again between tool calls; you can "
+                "keep acting and narrating with say() continuously. "
+                "Use this for open-ended or long-running tasks that need many tool "
+                "calls in a row without checking back in -- e.g. 'organize this whole "
+                "folder', 'keep researching until you have 10 good sources', 'work "
+                "through this checklist step by step'. "
+                "\n\n"
+                "Call stop_action_loop(reason) the MOMENT the goal is complete, you "
+                "hit a blocker only the user can resolve, or the user asks you to "
+                "stop -- never leave the loop running once there's nothing productive "
+                "left to do."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "Short description of what this loop is working toward, e.g. 'organize Downloads folder'."
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_action_loop",
+            "description": (
+                "Exit continuous action-loop mode started by start_action_loop. "
+                "Call this as soon as the loop's goal is finished, blocked on "
+                "something only the user can resolve, or the user asks you to stop. "
+                "After this, a normal plain-text reply ends your turn again."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the loop is stopping, e.g. 'goal complete' or 'need user input'."
+                    }
+                },
+                "required": [],
             },
         },
     },

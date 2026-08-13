@@ -29,23 +29,50 @@ import time
 _GEMINI_API_AVAILABLE = False
 _GEMINI_API_KEY        = None
 
+# Fallback key chain -- GEMINI_API_KEY, GEMINI_API_KEY_2, _3, _4, _5
+# (whichever are actually filled in), tried in order. _GEMINI_API_KEY_INDEX
+# tracks which one is currently active so repeated calls keep using the
+# last-good key instead of restarting from the front every time.
+_GEMINI_API_KEYS       = []
+_GEMINI_API_KEY_INDEX  = 0
+
 def _load_gemini_api():
-    """Load GEMINI_API_KEY from the shared secrets file (official API path)."""
-    global _GEMINI_API_AVAILABLE, _GEMINI_API_KEY
+    """Load GEMINI_API_KEY (+ up to 4 numbered fallbacks, 5 keys total) from
+    the shared secrets file (official API path)."""
+    global _GEMINI_API_AVAILABLE, _GEMINI_API_KEY, _GEMINI_API_KEYS, _GEMINI_API_KEY_INDEX
     try:
         secrets_path = os.path.abspath(SECRETS_FILE)
         if not os.path.exists(secrets_path):
             return False, f"Secrets file not found: {secrets_path}"
         with open(secrets_path, "r", encoding="utf-8") as f:
             secrets = json.load(f)
-        key = secrets.get("GEMINI_API_KEY", "").strip()
-        if not key:
+        keys = []
+        for field in ("GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GEMINI_API_KEY_4", "GEMINI_API_KEY_5"):
+            k = secrets.get(field, "").strip()
+            if k:
+                keys.append(k)
+        if not keys:
             return False, "GEMINI_API_KEY is empty in secrets file."
-        _GEMINI_API_KEY       = key
+        _GEMINI_API_KEYS      = keys
+        _GEMINI_API_KEY_INDEX = 0
+        _GEMINI_API_KEY       = keys[0]
         _GEMINI_API_AVAILABLE = True
         return True, "OK"
     except Exception as e:
         return False, str(e)
+
+
+def _advance_gemini_api_key() -> bool:
+    """Switch to the next fallback key in the chain when the current one
+    is exhausted (429 / RESOURCE_EXHAUSTED). Returns True if there was a
+    next key to switch to, False if we've run out of keys."""
+    global _GEMINI_API_KEY, _GEMINI_API_KEY_INDEX
+    if _GEMINI_API_KEY_INDEX + 1 >= len(_GEMINI_API_KEYS):
+        return False
+    _GEMINI_API_KEY_INDEX += 1
+    _GEMINI_API_KEY = _GEMINI_API_KEYS[_GEMINI_API_KEY_INDEX]
+    print(f"   [Gemini API] Key exhausted — switching to fallback key #{_GEMINI_API_KEY_INDEX + 1}/{len(_GEMINI_API_KEYS)}")
+    return True
 
 
 _gemini_api_load_ok, _gemini_api_load_msg = _load_gemini_api()
@@ -174,8 +201,10 @@ def _gemini_api_chat(messages: list, model: str = None, tools_schema: list = Non
     }
 
     last_err = None
-    for attempt in range(_retries + 1):
+    attempt = 0
+    while attempt <= _retries:
         try:
+            headers["Authorization"] = f"Bearer {_GEMINI_API_KEY}"
             resp = requests.post(
                 f"{GEMINI_API_BASE}/chat/completions",
                 headers=headers, json=payload, timeout=timeout
@@ -195,6 +224,14 @@ def _gemini_api_chat(messages: list, model: str = None, tools_schema: list = Non
                 err_obj = err_container.get("error", {}) if isinstance(err_container, dict) else {}
                 err_msg = err_obj.get("message") or resp.text[:300] or f"HTTP {resp.status_code}"
 
+                # 429 = this key's quota is exhausted. Prefer switching to the
+                # next fallback key in the chain (instant) over just sleeping
+                # and retrying the same dead key — only fall through to the
+                # sleep/retry if there's no fresh key left to try.
+                if resp.status_code == 429 and _advance_gemini_api_key():
+                    last_err = err_msg
+                    continue   # retry immediately on the new key, same attempt budget
+
                 retryable = resp.status_code in (429, 502, 503, 504)
                 if retryable and attempt < _retries:
                     wait_s = 1.5 * (attempt + 1)
@@ -202,6 +239,7 @@ def _gemini_api_chat(messages: list, model: str = None, tools_schema: list = Non
                           f"retrying in {wait_s:.1f}s...")
                     time.sleep(wait_s)
                     last_err = err_msg
+                    attempt += 1
                     continue
 
                 raise RuntimeError(f"Gemini API error ({resp.status_code}): {err_msg}")

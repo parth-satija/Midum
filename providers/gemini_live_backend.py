@@ -455,6 +455,30 @@ class VoiceSession:
                         responses = []
                         for fc in (tool_call.function_calls or []):
                             args = dict(fc.args or {})
+
+                            # say() is narration, not an action -- surface it
+                            # to the user immediately as a real chat message
+                            # (same as text mode's say() -> _print_reply)
+                            # instead of routing it through
+                            # _dispatch_midum_tool, whose "say" branch is
+                            # deliberately an inert sandbox stand-in (see
+                            # gui/dispatch.py) that never reaches the UI.
+                            # A dedicated "voice_say" event (rather than
+                            # reusing voice_tool_call/voice_tool_result) lets
+                            # the frontend render it as a proper message
+                            # bubble and break the current streamed voice
+                            # transcript, exactly like a real tool call does.
+                            if fc.name == "say":
+                                msg_text = str(args.get("message", ""))
+                                self.on_event("voice_say", {"text": msg_text})
+                                responses.append(
+                                    genai_types.FunctionResponse(
+                                        id=fc.id, name=fc.name,
+                                        response={"result": "Message displayed to user."}
+                                    )
+                                )
+                                continue
+
                             self.on_event("voice_tool_call", {"name": fc.name, "args": args})
                             try:
                                 from gui.dispatch import _dispatch_midum_tool

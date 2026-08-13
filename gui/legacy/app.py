@@ -1717,6 +1717,20 @@ class MidumGUI(ctk.CTk):
             except Exception as e:
                 self._activity_append(f"⚠️ Memory Write failure: {e}\n")
 
+        # Actually move the model INTO this workspace. Everything above this
+        # point only injects text about the project into the chat context --
+        # it never changed what directory list_directory/execute_terminal_command/
+        # find_file/resolve_file_path etc. actually operate on, so the model
+        # kept seeing whatever directory the process happened to launch in
+        # (STARTUP_DIR was a frozen os.getcwd() snapshot from import time) no
+        # matter what was picked here. config.set_startup_dir() updates the
+        # live value every native tool reads AND os.chdir()s the process
+        # itself, so relative paths resolve inside the new workspace too.
+        try:
+            midum.config.set_startup_dir(project_dir)
+        except Exception as e:
+            self._activity_append(f"⚠️ Could not switch working directory to {project_dir}: {e}\n")
+
         # Pull contents dynamically into the active conversational context
         try:
             content = open(project_file, encoding="utf-8").read().strip()
@@ -1742,8 +1756,13 @@ class MidumGUI(ctk.CTk):
         except Exception as e:
             self._activity_append(f"⚠️ Context injection failure: {e}\n")
 
-        # Log updates
-        midum.memory.update_memory("master", f"Active project context switched to: {selected_project} ({project_dir})")
+        # Log the switch to the chat ticker only -- NOT master_memory.md.
+        # Workspace switches happen constantly (every dropdown click, every
+        # new project) and master_memory.md is meant for durable, curated
+        # knowledge the model accumulates over time, not a session-mechanics
+        # log -- writing here on every switch just filled it with noise. The
+        # project's own project_memory.md and this chat ticker line already
+        # capture "what workspace am I in" without polluting master memory.
         self._chat_append("system", f"[Workspace context switched to: {selected_project}]\n")
         
         self._set_status("Ready", C["green"])

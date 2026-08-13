@@ -1,6 +1,12 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
-from config import DOMAIN_INDEX, DOMAIN_SKILLS_INDEX, PATHS_FILE, RESPONSE_MEMORY, SKILLS_DIR, STARTUP_DIR
-from config import _IS_LINUX, _IS_WINDOWS
+from config import DOMAIN_INDEX, DOMAIN_SKILLS_INDEX, PATHS_FILE, RESPONSE_MEMORY, SKILLS_DIR
+from config import _IS_LINUX, _IS_WINDOWS, _IS_MAC
+# STARTUP_DIR is intentionally NOT imported by name here -- see config.py's
+# get_startup_dir()/set_startup_dir() docstring. Importing the name directly
+# would freeze a copy at import time, so every call site below reads
+# config.get_startup_dir() live instead, picking up GUI workspace switches
+# immediately instead of staying pinned to wherever the process launched.
+import config
 from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _gemini_webapi_load_msg, _get_gemini_web_client, _run_gemini_coro
 from screen_capture import _do_click, _grab_full_screenshot, ocr_screen
 from tools_schema import tools
@@ -27,7 +33,11 @@ import subprocess
 import sys
 import tempfile
 import time
-import win32gui
+
+if _IS_WINDOWS:
+    import win32gui
+else:
+    win32gui = None
 
 # --- from main.py, section 1 ---
 # GROQ LAZY TOOL LOADING (Option A)
@@ -53,6 +63,7 @@ GROQ_CORE_TOOL_NAMES = [
     "read_local_file", "write_local_file", "append_local_file",
     "search_internet", "open_url",
     "type_text", "wait", "say",
+    "start_action_loop", "stop_action_loop",
     "ask_user_text", "ask_user_approval", "ask_user_choice", "ask_user_file_path",
 ]
 GROQ_CORE_TOOL_NAMES = [n for n in GROQ_CORE_TOOL_NAMES if n in _TOOLS_BY_NAME]
@@ -1253,7 +1264,7 @@ def find_file(filename: str, search_root: str = "") -> str:
     Follow up with open_path_by_index(index) to open the chosen file.
     Hard timeout: 15 seconds.
     """
-    root = search_root.strip() or (os.path.expanduser("~") if _IS_LINUX else STARTUP_DIR)
+    root = search_root.strip() or (os.path.expanduser("~") if _IS_LINUX else config.get_startup_dir())
     matches  = []
     name_lower = filename.strip().lower()
     MAX_MATCHES = 20
@@ -1323,7 +1334,7 @@ def explore_path(path):
 
 def execute_terminal_command(command, working_directory=None):
     try:
-        cwd = working_directory if working_directory else STARTUP_DIR
+        cwd = working_directory if working_directory else config.get_startup_dir()
         if _IS_WINDOWS:
             result = subprocess.run(
                 ["powershell", "-Command", command],
@@ -1366,7 +1377,7 @@ def execute_python_code(code: str, timeout: int = 15) -> str:
     try:
         result = subprocess.run(
             [python_exe, "-I", "-c", code],
-            capture_output=True, text=True, timeout=timeout, cwd=STARTUP_DIR,
+            capture_output=True, text=True, timeout=timeout, cwd=config.get_startup_dir(),
         )
         return (
             f"[exit code {result.returncode}]\n"
@@ -1392,14 +1403,17 @@ def _uia_unavailable_message() -> str:
 
 
 def manual_scan_app_layouts(window_title: str):
-    if not _UIA_AVAILABLE:
+    if ui_navigator is None:
         return _uia_unavailable_message()
     # Support shell aliases so the model can explore taskbar/tray etc.
-    hwnd = ui_navigator._find_shell_hwnd(window_title.strip().lower())
-    if hwnd:
-        # Temporarily resolve via the alias path
-        import ctypes
-        win32gui.SetForegroundWindow  # just to ensure win32gui is loaded
+    # (Windows-only path — shell surfaces like the taskbar don't exist as a
+    # concept on Linux/macOS, where ui_navigator resolves windows by app name.)
+    if _IS_WINDOWS:
+        hwnd = ui_navigator._find_shell_hwnd(window_title.strip().lower())
+        if hwnd:
+            # Temporarily resolve via the alias path
+            import ctypes
+            win32gui.SetForegroundWindow  # just to ensure win32gui is loaded
     containers = ui_navigator.discover_ui_subtrees(window_title)
     if not containers:
         return (
@@ -1416,7 +1430,7 @@ def manual_scan_app_layouts(window_title: str):
     return summary + json.dumps(containers, indent=2)
 
 def manual_inspect_app_subtree(window_title: str, subtree_key: str):
-    if not _UIA_AVAILABLE:
+    if ui_navigator is None:
         return _uia_unavailable_message()
     controls = ui_navigator.inspect_subtree_controls(window_title, subtree_key)
     if not controls:
@@ -1431,7 +1445,7 @@ def manual_inspect_app_subtree(window_title: str, subtree_key: str):
     return summary + json.dumps(controls, indent=2)
 
 def manual_interact_with_ui(window_title: str, control_type: str, search_property: str, property_value: str, action: str, text_to_type: str = ""):
-    if not _UIA_AVAILABLE: return "UIA library not installed."
+    if ui_navigator is None: return "UI automation not available for this OS."
     return ui_navigator.safely_trigger_ui_element(
         window_title, control_type, search_property, property_value, action, text_to_type
     )
@@ -1484,6 +1498,30 @@ def list_active_windows():
         if not unique:
             return "No visible named windows found."
         return "Currently open windows:\n" + "\n".join(f"- {w}" for w in unique)
+
+    # macOS path — use System Events (osascript) to enumerate foreground
+    # processes and their window titles, since there is no win32gui/xdotool
+    # equivalent on macOS.
+    if _IS_MAC:
+        from ui_automation.mac_navigator import _osascript
+        script = (
+            'tell application "System Events"\n'
+            '  set out to {}\n'
+            '  repeat with p in (every process whose background only is false)\n'
+            '    try\n'
+            '      repeat with w in (every window of p)\n'
+            '        set end of out to (name of p) & ": " & (name of w)\n'
+            '      end repeat\n'
+            '    end try\n'
+            '  end repeat\n'
+            '  return out\n'
+            'end tell'
+        )
+        out, err = _osascript(script)
+        if not out:
+            return f"No visible named windows found." + (f" ({err[:100]})" if err else "")
+        titles = [t.strip() for t in out.split(", ") if t.strip()]
+        return "Currently open windows:\n" + "\n".join(f"- {w}" for w in titles)
 
     # Windows path
     if not _UIA_AVAILABLE:

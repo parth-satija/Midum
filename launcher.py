@@ -6,6 +6,19 @@ import time
 from pathlib import Path
 import json
 
+# ANSI escape codes
+RED = "\033[91m"
+HEADER = "\033[95m"
+INFO = "\033[94m"
+SUCCESS = "\033[92m"
+WARNING = "\033[93m"
+RESET = "\033[0m"
+
+def log_error(message: str): print(f"{RED}[ERROR]{RESET} {message}")
+def log_info(message: str): print(f"{INFO}[INFO]{RESET} {message}")
+def log_success(message: str): print(f"{SUCCESS}[SUCCESS]{RESET} {message}")
+def log_warn(message: str): print(f"{WARNING}[WARN]{RESET} {message}")
+
 # Default launcher config location (home directory) – kept for backward compatibility
 DEFAULT_CONFIG_DIR = Path.home() / ".midum"
 DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "launcher_config.json"
@@ -47,7 +60,7 @@ def _load_full_config(repo_root: Path | None = None) -> dict:
         with open(config_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        print(f"Failed to read launcher config: {e}")
+        log_error(f"Failed to read launcher config: {e}")
         return {}
 
 
@@ -63,7 +76,7 @@ def _save_full_config(data: dict, repo_root: Path | None = None) -> bool:
             json.dump(data, f, indent=4)
         return True
     except OSError as e:
-        print(f"Failed to write launcher config: {e}")
+        log_error(f"Failed to write launcher config: {e}")
         return False
 
 
@@ -105,7 +118,7 @@ def install_git():
         cmd = ["winget", "install", "--id", "Git.Git", "-e", "--source", "winget", "--accept-source-agreements", "--accept-package-agreements"]
     elif os_type == "Darwin":
         if not shutil.which("brew"):
-            print("Installation failed: Homebrew required on macOS.")
+            log_error("Installation failed: Homebrew required on macOS.")
             return
         cmd = ["brew", "install", "git"]
     elif os_type == "Linux":
@@ -118,20 +131,20 @@ def install_git():
         elif shutil.which("zypper"):
             cmd = ["sudo", "zypper", "install", "-y", "git"]
         else:
-            print("Installation failed: No supported Linux package manager found.")
+            log_error("Installation failed: No supported Linux package manager found.")
             return
     else:
-        print(f"Installation failed: Unsupported OS '{os_type}'.")
+        log_error(f"Installation failed: Unsupported OS '{os_type}'.")
         return
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print("Git installation succeeded.")
+        log_success("Git installation succeeded.")
     except subprocess.CalledProcessError as e:
-        print(f"Installation failed: {e.stderr.strip() or str(e)}")
+        log_error(f"Installation failed: {e.stderr.strip() or str(e)}")
     except FileNotFoundError:
-        print(f"Installation failed: Command '{cmd[0]}' not found.")
+        log_error(f"Installation failed: Command '{cmd[0]}' not found.")
     except Exception as e:
-        print(f"Installation failed: {e}")
+        log_error(f"Installation failed: {e}")
 
 
 def is_python_installed() -> bool:
@@ -152,7 +165,7 @@ def install_python():
         cmd = ["winget", "install", "--id", "Python.Python.3", "-e", "--source", "winget", "--accept-source-agreements", "--accept-package-agreements"]
     elif os_type == "Darwin":
         if not shutil.which("brew"):
-            print("Installation failed: Homebrew required on macOS.")
+            log_error("Installation failed: Homebrew required on macOS.")
             return
         cmd = ["brew", "install", "python"]
     elif os_type == "Linux":
@@ -165,20 +178,20 @@ def install_python():
         elif shutil.which("zypper"):
             cmd = ["sudo", "zypper", "install", "-y", "python3", "python3-pip"]
         else:
-            print("Installation failed: No supported Linux package manager found.")
+            log_error("Installation failed: No supported Linux package manager found.")
             return
     else:
-        print(f"Installation failed: Unsupported OS '{os_type}'.")
+        log_error(f"Installation failed: Unsupported OS '{os_type}'.")
         return
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print("Python and pip installation succeeded.")
+        log_success("Python and pip installation succeeded.")
     except subprocess.CalledProcessError as e:
-        print(f"Installation failed: {e.stderr.strip() or str(e)}")
+        log_error(f"Installation failed: {e.stderr.strip() or str(e)}")
     except FileNotFoundError:
-        print(f"Installation failed: Command '{cmd[0]}' not found.")
+        log_error(f"Installation failed: Command '{cmd[0]}' not found.")
     except Exception as e:
-        print(f"Installation failed: {e}")
+        log_error(f"Installation failed: {e}")
 
 
 def should_clone(repo_path: Path) -> bool:
@@ -194,7 +207,7 @@ def check_for_updates(repo_path: Path) -> bool:
         status = subprocess.run(["git", "-C", str(repo_path), "status", "-uno"], capture_output=True, text=True, check=True)
         return "behind" in status.stdout.lower()
     except Exception as e:
-        print(f"Update check failed: {e}")
+        log_error(f"Update check failed: {e}")
         return False
 
 
@@ -204,7 +217,7 @@ def pull_updates(repo_path: Path) -> bool:
         subprocess.run(["git", "-C", str(repo_path), "pull"], check=True, capture_output=True, text=True)
         return True
     except Exception as e:
-        print(f"Git pull failed: {e}")
+        log_error(f"Git pull failed: {e}")
         return False
 
 
@@ -224,28 +237,28 @@ def clone_midum_repo(folder_path: str) -> int:
     """
     path = Path(folder_path)
     if not path.is_absolute():
-        print("Cloning failed: Provided path is not an absolute path.")
+        log_error("Cloning failed: Provided path is not an absolute path.")
         return 1
     if not path.exists():
-        print("Cloning failed: Target directory does not exist.")
+        log_error("Cloning failed: Target directory does not exist.")
         return 2
     if not path.is_dir():
-        print("Cloning failed: Provided path points to a file, not a directory.")
+        log_error("Cloning failed: Provided path points to a file, not a directory.")
         return 3
     if not should_clone(path):
-        print("Skipping clone: configuration already present.")
+        log_error("Skipping clone: configuration already present.")
         return 8
     try:
         if any(path.iterdir()):
-            print("Cloning failed: Target directory exists but is not empty.")
+            log_error("Cloning failed: Target directory exists but is not empty.")
             return 4
     except PermissionError as e:
-        print(f"Cloning failed: Permission denied reading directory: {e}")
+        log_error(f"Cloning failed: Permission denied reading directory: {e}")
         return 6
     repo_url = "https://github.com/parth-satija/Midum.git"
     try:
         subprocess.run(["git", "clone", repo_url, str(path)], check=True, capture_output=True, text=True)
-        print("Repository cloned successfully.")
+        log_success("Repository cloned successfully.")
         config_dir = path / ".midum"
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / "config.json"
@@ -256,22 +269,22 @@ def clone_midum_repo(folder_path: str) -> int:
         }
         with open(config_path, "w", encoding="utf-8") as cfg:
             json.dump(default_cfg, cfg, indent=4)
-        print(f"Config JSON created at {config_path}")
+        log_success(f"Config JSON created at {config_path}")
         return 0
     except FileNotFoundError:
-        print("Cloning failed: 'git' executable not found.")
+        log_error("Cloning failed: 'git' executable not found.")
         return 5
     except subprocess.CalledProcessError as e:
-        print(f"Cloning failed: {e.stderr.strip() if e.stderr else str(e)}")
+        log_error(f"Cloning failed: {e.stderr.strip() if e.stderr else str(e)}")
         return 6
     except Exception as e:
-        print(f"Cloning failed: {e}")
+        log_error(f"Cloning failed: {e}")
         return 7
 
 
 def main():
     if not is_git_installed():
-        print("Git is not installed or not working properly.")
+        log_info("Git is not installed or not working properly.")
         if input("Allow Git installation? [y/n]: ").strip().lower() == "y":
             install_git()
             main()
@@ -279,7 +292,7 @@ def main():
             sys.exit(1)
 
     if not is_python_installed():
-        print("Python is not installed or not working properly.")
+        log_info("Python is not installed or not working properly.")
         if input("Allow Python installation? [y/n]: ").strip().lower() == "y":
             install_python()
             main()
@@ -288,29 +301,29 @@ def main():
 
     clone_path = input("Enter the absolute path where you want to clone the Midum repository: ").strip()
     result = clone_midum_repo(clone_path)
-    print(f"Clone result code: {result}")
+    log_info(f"Clone result code: {result}")
 
     repo_root = Path(clone_path)
     if result == 0:
         # Fresh clone – write initial config entry
         write_launcher_config("last_clone", "success", repo_root)
         val = read_launcher_config("last_clone", repo_root=repo_root)
-        print(f"Config entry 'last_clone': {val}")
+        log_info(f"Config entry 'last_clone': {val}")
     elif result == 8:
-        print("Repository already cloned; using existing configuration.")
+        log_info("Repository already cloned; using existing configuration.")
         # Check for updates
         if check_for_updates(repo_root):
-            print("Updates are available. Pulling latest changes...")
+            log_info("Updates are available. Pulling latest changes...")
             if pull_updates(repo_root):
-                print("Repository updated successfully.")
+                log_success("Repository updated successfully.")
                 write_launcher_config("updated_at", time.strftime("%Y-%m-%d %H:%M:%S"), repo_root)
             else:
-                print("Failed to pull updates.")
+                log_error("Failed to pull updates.")
         else:
-            print("Repository is up‑to‑date.")
+            log_success("Repository is up‑to‑date.")
         # Example read of existing config
         val = read_launcher_config("repo_path", repo_root=repo_root)
-        print(f"Existing repo path from config: {val}")
+        log_info(f"Existing repo path from config: {val}")
 
 if __name__ == "__main__":
     main()

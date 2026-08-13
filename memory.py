@@ -359,7 +359,11 @@ def init_memory_at_startup():
                 f"Created: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
             )
             print(f"🧠 [New project memory: {project_file}]")
-        update_memory("master", f"Active project: {project_name} ({project_dir})")
+        # Deliberately NOT logged to master_memory.md -- see the matching
+        # comment in gui/legacy/app.py's _on_project_switched for why:
+        # workspace/project selection is session mechanics, not durable
+        # knowledge, and logging it here on every launch just accumulates
+        # noise in master_memory.md over time.
     else:
         print("🧠 [No active project.]")
 

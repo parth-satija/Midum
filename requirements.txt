@@ -1,4 +1,4 @@
-comtypes
+comtypes; sys_platform == "win32"
 customtkinter
 ddgs
 gemini_webapi
@@ -18,12 +18,14 @@ python-docx
 pywebview
 PyQt5
 PyQtWebEngine
-pywin32
+pywin32; sys_platform == "win32"
+uiautomation; sys_platform == "win32"
+pyobjc-framework-ApplicationServices; sys_platform == "darwin"
+pyobjc-framework-Quartz; sys_platform == "darwin"
 qtpy
 requests
 rich
 sounddevice
-uiautomation
 websocket-client
 pdfstructx
 pygments

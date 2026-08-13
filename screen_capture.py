@@ -1,6 +1,6 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
 from config import GRID_STEP, MODEL_CANVAS_H, MODEL_CANVAS_W, SCALE_X, SCALE_Y
-from config import _IS_LINUX
+from config import _IS_LINUX, _IS_MAC
 from ui_automation.windows_uia import _TESSERACT_AVAILABLE, _UIA_AVAILABLE
 from PIL import Image as _PILImage
 from PIL import ImageGrab as _ImageGrab
@@ -9,16 +9,21 @@ import io
 import pytesseract
 import subprocess
 import time
-import win32gui
 import os
 import sys
 import time
+
+if sys.platform == "win32":
+    import win32gui
+else:
+    win32gui = None
 # --- from main.py, section 1 ---
 # 3. SCREEN CAPTURE & OCR
 # =============================================================================
 
 _IS_LINUX = sys.platform.startswith("linux")
 _IS_WINDOWS = sys.platform == "win32"
+_IS_MAC = sys.platform == "darwin"
 
 if _IS_WINDOWS:
     import ctypes
@@ -89,6 +94,14 @@ def _grab_full_screenshot():
         )
     else:
         if _IMAGEGRAB_AVAILABLE:
+            # PIL's ImageGrab supports macOS natively (shells out to the
+            # built-in `screencapture` binary under the hood since Pillow
+            # 6.0), so this same branch covers both Windows and macOS. On
+            # macOS this requires the Screen Recording permission (System
+            # Settings → Privacy & Security → Screen Recording) — without
+            # it, ImageGrab.grab() silently returns a black image instead
+            # of raising, so a suspiciously blank screenshot on Mac usually
+            # means that permission hasn't been granted.
             return _ImageGrab.grab()
         raise RuntimeError("PIL ImageGrab not available.")
 
@@ -448,6 +461,35 @@ def _do_click(screen_x, screen_y, click_type="left_click", label=""):
         except Exception as e:
             return f"Error simulating click: {str(e)}"
 
+    # -------------------------------------------------------------------------
+    # MACOS PATH (Quartz CGEvent — same mechanism used by ui_automation/mac_navigator.py)
+    # -------------------------------------------------------------------------
+    if _IS_MAC:
+        try:
+            import Quartz
+            button = Quartz.kCGMouseButtonLeft if click_type != "right_click" else Quartz.kCGMouseButtonRight
+            down_t = Quartz.kCGEventLeftMouseDown if click_type != "right_click" else Quartz.kCGEventRightMouseDown
+            up_t   = Quartz.kCGEventLeftMouseUp   if click_type != "right_click" else Quartz.kCGEventRightMouseUp
+
+            def _once():
+                d = Quartz.CGEventCreateMouseEvent(None, down_t, (screen_x, screen_y), button)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, d)
+                u = Quartz.CGEventCreateMouseEvent(None, up_t, (screen_x, screen_y), button)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, u)
+
+            _once()
+            if click_type == "double_click":
+                time.sleep(0.05)
+                _once()
+            return f"Success: {click_type} at screen({screen_x},{screen_y}) [{label}]"
+        except ImportError:
+            return (
+                "Error: pyobjc (Quartz) not installed. "
+                "pip install pyobjc-framework-Quartz"
+            )
+        except Exception as e:
+            return f"Error simulating click: {str(e)}"
+
     return "Unsupported OS platform."
 
 
@@ -524,6 +566,39 @@ def type_text(text, special_key=None, expected_window: str = ""):
                 _run(["xdotool", "key", "--clearmodifiers", key])
             suffix = f" + {special_key}" if special_key else ""
             return f"Success: typed '{text[:40]}{'...' if len(text) > 40 else ''}'{suffix}"
+
+        # ── macOS: Quartz CGEvent Unicode keyboard events ────────────────────────────
+        if _IS_MAC:
+            try:
+                import Quartz
+                for ch in text:
+                    ev = Quartz.CGEventCreateKeyboardEvent(None, 0, True)
+                    Quartz.CGEventKeyboardSetUnicodeString(ev, len(ch), ch)
+                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                    ev_up = Quartz.CGEventCreateKeyboardEvent(None, 0, False)
+                    Quartz.CGEventKeyboardSetUnicodeString(ev_up, len(ch), ch)
+                    Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev_up)
+
+                _MAC_KEYCODES = {
+                    "enter": 36, "tab": 48, "escape": 53,
+                    "backspace": 51, "delete": 117,
+                    "home": 115, "end": 119,
+                    "pageup": 116, "pagedown": 121,
+                    "up": 126, "down": 125, "left": 123, "right": 124,
+                }
+                if special_key:
+                    code = _MAC_KEYCODES.get(special_key.lower())
+                    if code is not None:
+                        kd = Quartz.CGEventCreateKeyboardEvent(None, code, True)
+                        Quartz.CGEventPost(Quartz.kCGHIDEventTap, kd)
+                        ku = Quartz.CGEventCreateKeyboardEvent(None, code, False)
+                        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ku)
+                suffix = f" + {special_key}" if special_key else ""
+                return f"Success: typed '{text[:40]}{'...' if len(text) > 40 else ''}'{suffix}"
+            except ImportError:
+                return "Error: pyobjc (Quartz) not installed. pip install pyobjc-framework-Quartz"
+            except Exception as e:
+                return f"Error typing text on macOS: {str(e)}"
 
         # ── Windows: PowerShell SendKeys ──────────────────────────────────────
         special_chars = "~%^+{}[]()"

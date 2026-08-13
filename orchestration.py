@@ -13,10 +13,9 @@ from providers.gemini_reasoning import consult_gemini
 from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _call_gemini_web_primary, _gemini_webapi_load_msg, delegate_to_gemini_web, set_gemini_web_model
 from providers.groq_backend import _groq_chat_with_fallback, consult_groq, delegate_to_groq, list_groq_models, set_groq_model, set_groq_model_by_index
 from providers.ollama_cloud_backend import _ollama_cloud_chat_with_fallback, consult_ollama_cloud, delegate_to_ollama_cloud, list_ollama_cloud_models, set_ollama_cloud_model
-from providers.omniroute_backend import _omniroute_chat_with_fallback, consult_omniroute, delegate_to_omniroute, list_omniroute_models, set_omniroute_model, set_omniroute_model_by_index
 from screen_capture import capture_screen_to_ram, fallback_click_grid, fallback_click_text, fallback_find_text, type_text
 from skills import list_skills, load_skill
-from state import _abort_event
+from state import _abort_event, _action_loop_event, _action_loop_lock, _action_loop_state
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
 from permissions import enforce_tool_permission, filter_tools_schema, mcp_permission_key
 from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
@@ -85,7 +84,7 @@ def get_gemini_reasoning(user_input: str, conversation_history: list) -> str | N
     execution brain), this consult step is skipped entirely — there's no
     benefit to a strong model consulting a plan from itself.
     """
-    if config.MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq", "ollama_cloud", "omniroute"):
+    if config.MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq", "ollama_cloud"):
         # Primary model IS OpenRouter or Gemini-web already — skip the
         # separate consult call, it would just be the same model (or the
         # same account's Gemini session) reasoning about itself twice.
@@ -221,6 +220,74 @@ def wait(seconds: float) -> str:
         return f"Successfully paused for {seconds} seconds."
     except Exception as e:
         return f"Error during wait execution: {str(e)}"
+
+# =============================================================================
+
+# =============================================================================
+# CONTINUOUS ACTION LOOP
+# =============================================================================
+# start_action_loop / stop_action_loop are a simple tool pair that flips the
+# shared _action_loop_event (state.py). While the flag is set:
+#   - process_chat_turn (below) stops treating a plain-text, no-tool-call
+#     reply as the end of the turn -- instead it nudges the model to keep
+#     acting and loops again, so the model can chain many tool calls (with
+#     say() narration in between) without ever handing control back.
+#   - The hard step ceiling for a turn is raised to MAX_ACTION_LOOP_STEPS
+#     instead of the normal max_steps, since a real long-running loop needs
+#     more room than a single ordinary turn.
+# This also works for the voice model (Gemini Live, providers/
+# gemini_live_backend.py) with ZERO extra plumbing: start_action_loop/
+# stop_action_loop are ordinary entries in tools_schema.py, so they're
+# already offered to the live session and dispatched through the exact same
+# gui/dispatch.py:_dispatch_midum_tool() every other voice tool call goes
+# through. Gemini Live already supports calling multiple tools back-to-back
+# within one turn on its own; this flag just gives the model (and the rest
+# of Midum) an explicit, checkable signal for "I'm in an open-ended work
+# loop right now" that both transports understand identically.
+# =============================================================================
+
+MAX_ACTION_LOOP_STEPS = 200   # hard safety ceiling even while looping
+
+
+def start_action_loop(goal: str = "") -> str:
+    """
+    Enter continuous action-loop mode: the model can keep calling tools (and
+    say() to narrate in between) back-to-back, without ending its turn with
+    plain text, until stop_action_loop() is called or the safety ceiling is
+    hit. Works identically for the voice model.
+    """
+    with _action_loop_lock:
+        if _action_loop_event.is_set():
+            return f"Action loop is already running (goal: '{_action_loop_state.get('goal', '')}'). Call stop_action_loop first if you want to restart it with a new goal."
+        _action_loop_event.set()
+        _action_loop_state["goal"] = goal.strip() or "(unspecified)"
+        _action_loop_state["started_steps"] = 0
+    print(f"\n🔁 [Action loop STARTED — goal: '{_action_loop_state['goal']}']")
+    return (
+        f"Action loop STARTED (goal: '{_action_loop_state['goal']}'). "
+        "Keep calling tools -- and say() to narrate progress as you go -- "
+        "without stopping to give a plain-text reply. Call stop_action_loop(reason) "
+        "the moment the goal is complete, blocked on something only the user can "
+        "resolve, or the user asks you to stop."
+    )
+
+
+def stop_action_loop(reason: str = "") -> str:
+    """Exit continuous action-loop mode started by start_action_loop()."""
+    with _action_loop_lock:
+        was_running = _action_loop_event.is_set()
+        goal = _action_loop_state.get("goal", "")
+        _action_loop_event.clear()
+        _action_loop_state["goal"] = ""
+        _action_loop_state["started_steps"] = 0
+    if not was_running:
+        return "Action loop was not running."
+    print(f"\n🔁 [Action loop STOPPED — goal was: '{goal}'. Reason: {reason or '(none given)'}]")
+    return f"Action loop STOPPED (goal was: '{goal}'). Reason: {reason or '(none given)'}"
+
+
+def is_action_loop_active() -> bool:
+    return _action_loop_event.is_set()
 
 # =============================================================================
 
@@ -559,40 +626,6 @@ def _call_ollama_cloud_primary(messages, result_q, model_override: str = None):
         result_q.put(("err", e))
 
 
-def _call_omniroute_primary(messages, result_q, model_override: str = None):
-    """
-    Run an OmniRoute (self-hosted gateway) chat completion on a background
-    thread — used when MODEL_PROVIDER == "omniroute" (OmniRoute driving
-    Midum directly), OR when a caller forces it for a single sub-turn via
-    _call_primary_model(provider_override="omniroute").
-
-    model_override lets delegate_to_omniroute() run the sub-agent on a
-    different model/route than config.OMNIROUTE_MODEL for that one
-    delegated task.
-
-    OmniRoute translates to whatever underlying provider is actually
-    serving the request, so native tool-calling reliability varies by
-    route — same situation as OpenRouter's free-tier models. We reuse the
-    same legacy-parser fallback here for that reason, applied
-    unconditionally, same as the OpenRouter backend.
-    """
-    try:
-        use_model = model_override or config.OMNIROUTE_MODEL
-        resp = _omniroute_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(tools))
-
-        if not resp["message"].get("tool_calls"):
-            raw_content = resp["message"].get("content") or ""
-            legacy_calls, cleaned_content = _extract_legacy_tool_calls(raw_content)
-            if legacy_calls:
-                legacy_calls = legacy_calls[:1]   # one tool at a time
-                resp["message"]["tool_calls"] = legacy_calls
-                resp["message"]["content"]    = cleaned_content
-
-        result_q.put(("ok", resp))
-    except Exception as e:
-        result_q.put(("err", e))
-
-
 def _call_primary_model(messages, result_q, provider_override: str = None, model_override: str = None):
     """
     Dispatches to the configured primary model provider (see MODEL_PROVIDER
@@ -617,8 +650,6 @@ def _call_primary_model(messages, result_q, provider_override: str = None, model
         _call_groq_primary(messages, result_q, model_override=model_override)
     elif provider == "ollama_cloud":
         _call_ollama_cloud_primary(messages, result_q, model_override=model_override)
-    elif provider == "omniroute":
-        _call_omniroute_primary(messages, result_q, model_override=model_override)
     else:
         _call_ollama(messages, result_q)
 
@@ -1044,12 +1075,21 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
         # ── Ctrl+Q abort check ────────────────────────────────────────────────
         if _abort_event.is_set():
             print("\n🛑 [Response aborted by Ctrl+Q]")
+            if is_action_loop_active():
+                stop_action_loop("aborted by user (Ctrl+Q)")
             return "[Response terminated by user.]", turn_tool_outputs
 
-        # ── Step ceiling ──────────────────────────────────────────────────────
+        # ── Step ceiling ─────────────────────────────────────────────────────
+        # Raised while a continuous action loop (start_action_loop) is active,
+        # since an open-ended loop legitimately needs more steps than a single
+        # ordinary turn -- still hard-capped so a runaway loop can't run forever.
         step_count += 1
-        if step_count > MAX_STEPS:
+        effective_max_steps = MAX_ACTION_LOOP_STEPS if is_action_loop_active() else MAX_STEPS
+        if step_count > effective_max_steps:
             msg = "[MAX STEPS REACHED] Midum exceeded the step limit for this turn."
+            if is_action_loop_active():
+                stop_action_loop("step ceiling reached")
+                msg = "[MAX STEPS REACHED] Action loop exceeded its safety step ceiling and was stopped."
             print(f"\n🚫 {msg}")
             _accumulated_reply.append(msg)
             break
@@ -1077,6 +1117,8 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
         while t.is_alive():
             if _abort_event.is_set():
                 print("\n🛑 [Response aborted by Ctrl+Q]")
+                if is_action_loop_active():
+                    stop_action_loop("aborted by user (Ctrl+Q)")
                 return "[Response terminated by user.]", turn_tool_outputs
             t.join(timeout=0.1)   # check abort flag every 100 ms
 
@@ -1089,7 +1131,6 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 "gemini_api": "Gemini-API",
                 "groq": "Groq",
                 "ollama_cloud": "Ollama Cloud",
-                "omniroute": "OmniRoute",
             }.get(effective_provider, "Ollama")
             return f"[{provider_name} error: {payload}]", turn_tool_outputs
         response   = payload
@@ -1118,6 +1159,29 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                         "[SYSTEM]: You just described what you're about to do instead of "
                         "doing it. Do not narrate steps in plain text — call the actual "
                         "tool for the next step RIGHT NOW. No commentary, just the tool call."
+                    )
+                })
+                continue
+
+            if is_action_loop_active():
+                # Continuous action-loop mode: a plain-text reply does NOT end
+                # the turn. It's already captured in _accumulated_reply above,
+                # but only PRINTED there when it accompanied a tool call -- a
+                # bare plain-text turn like this one wouldn't otherwise reach
+                # the user until the loop eventually ends, so surface it now
+                # the same way say() does, then push straight back into acting
+                # instead of returning control to the caller/user.
+                if msg_content:
+                    _print_reply("Midum:", msg_content)
+                conversation_history.append({
+                    "role": "user",
+                    "content": (
+                        f"[SYSTEM — ACTION LOOP ACTIVE, goal: '{_action_loop_state.get('goal', '')}']: "
+                        "You're in continuous action-loop mode -- do NOT end your turn with "
+                        "plain text. Call the next tool now to keep making progress (use say() "
+                        "first if you want to narrate what you're about to do), or call "
+                        "stop_action_loop(reason) if the goal is complete, blocked on something "
+                        "only the user can resolve, or the user asked you to stop."
                     )
                 })
                 continue
@@ -1624,25 +1688,6 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 tool_output = set_groq_model_by_index(int(arguments.get("index", 0)))
             elif func_name == "set_groq_model":
                 tool_output = set_groq_model(arguments.get("model_id", ""))
-            elif func_name == "consult_omniroute":
-                tool_output = consult_omniroute(
-                    arguments.get("prompt", ""),
-                    arguments.get("context", ""),
-                    arguments.get("model") or None
-                )
-            elif func_name == "delegate_to_omniroute":
-                tool_output = delegate_to_omniroute(
-                    arguments.get("task", ""),
-                    arguments.get("context", ""),
-                    arguments.get("model") or None,
-                    int(arguments.get("max_steps", 10))
-                )
-            elif func_name == "list_omniroute_models":
-                tool_output = list_omniroute_models()
-            elif func_name == "set_omniroute_model_by_index":
-                tool_output = set_omniroute_model_by_index(int(arguments.get("index", 0)))
-            elif func_name == "set_omniroute_model":
-                tool_output = set_omniroute_model(arguments.get("model_id", ""))
             elif func_name == "consult_ollama_cloud":
                 tool_output = consult_ollama_cloud(
                     arguments.get("prompt", ""),
@@ -1755,6 +1800,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 seconds = float(arguments.get("seconds", 1))
                 print(f"   [Wait] {seconds}s")
                 tool_output = wait(seconds)
+
+            elif func_name == "start_action_loop":
+                tool_output = start_action_loop(arguments.get("goal", ""))
+
+            elif func_name == "stop_action_loop":
+                tool_output = stop_action_loop(arguments.get("reason", ""))
 
             elif func_name == "say":
                 # NOTE: msg_text is intentionally NOT appended to
@@ -1932,15 +1983,6 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     "list_groq_models":     "list_groq_models",
                     "switch_groq_model":    "set_groq_model_by_index",
                     "set_groq_model":       "set_groq_model",
-                    # OmniRoute (self-hosted gateway)
-                    "omniroute":            "consult_omniroute",
-                    "ask_omniroute":        "consult_omniroute",
-                    "consult_or_gateway":   "consult_omniroute",
-                    "delegate_omniroute":   "delegate_to_omniroute",
-                    "offload_to_omniroute": "delegate_to_omniroute",
-                    "list_omniroute_models": "list_omniroute_models",
-                    "switch_omniroute_model": "set_omniroute_model_by_index",
-                    "set_omniroute_model":  "set_omniroute_model",
                     # Gemini-web (primary-execution delegate, distinct from consult_gemini)
                     "delegate_gemini":      "delegate_to_gemini_web",
                     "delegate_to_gemini":   "delegate_to_gemini_web",

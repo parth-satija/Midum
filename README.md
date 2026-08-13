@@ -202,6 +202,43 @@ python main.py
 
 ---
 
+## macOS Setup Instructions
+Midum runs on macOS too, following the same Setup Instructions above with a few platform-specific swaps below. Steps not mentioned here (1, 3, 4, 6) are identical to Windows — just run the same commands in Terminal instead of PowerShell.
+
+### Step 2 (macOS) — Install Python libraries
+Install requirements the same way:
+```bash
+pip install -r requirements.txt
+```
+`requirements.txt` is already platform-conditional — Windows-only packages (`pywin32`, `uiautomation`, `comtypes`) are skipped automatically on macOS, and the macOS-only UI automation packages are installed instead:
+```bash
+pip install pyobjc-framework-ApplicationServices pyobjc-framework-Quartz
+```
+(These two are what let Midum read the accessibility tree and simulate clicks/keystrokes on macOS — they're the Mac equivalent of `uiautomation`/`pywin32` on Windows.)
+
+### Step 5 (macOS) — Secrets file location
+Same command as Step 5 above:
+```bash
+python -c "import config; created = config.ensure_secrets_file(); print('Created:' if created else 'Already exists:', config.SECRETS_FILE)"
+```
+On macOS this writes the template to `~/Library/Application Support/JarvisSecrets/jarvis_secrets.json` (the standard macOS location for per-app data, matching Linux's `~/.config` and Windows' `%LOCALAPPDATA%` equivalents). Fill in the same keys described in Step 5.
+
+### Required macOS permissions
+Grant these in **System Settings → Privacy & Security** *before* launching Midum, or UI automation and screenshots will silently fail or return blank/black results instead of raising a clear error:
+- **Accessibility** — enable your terminal app (Terminal/iTerm) or Python interpreter. Required for `click_ui_element`, `manual_scan_app_layouts`, `type_text`, and all other UI-automation tools — without it, the accessibility tree comes back empty.
+- **Screen Recording** — enable the same app. Required for `fallback_view_screen`, `ocr_snapshot`, and any other screenshot-based tool — without it, `ImageGrab.grab()` returns a black image with no error.
+
+If you package Midum into a standalone `.app` later, grant these permissions to the `.app` itself instead of the terminal.
+
+### Optional Step — OCR on macOS
+Install Tesseract via Homebrew instead of the Windows installer:
+```bash
+brew install tesseract
+```
+Midum checks `PATH` first, then falls back to checking `/opt/homebrew/bin/tesseract` (Apple Silicon) and `/usr/local/bin/tesseract` (Intel) directly — so it should be found automatically either way, even if Midum was launched from a GUI/launcher without a login shell's `PATH`.
+
+---
+
 ## Alternative Setup — Prebuilt Executable
 If you'd rather not install Python or any dependencies, Windows users can skip the full Setup Instructions above entirely and just:
 

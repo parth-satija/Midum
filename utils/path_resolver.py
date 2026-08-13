@@ -1,5 +1,9 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
-from config import COMMANDS_FILE, DOMAIN_INDEX, DOMAIN_SKILLS_INDEX, INSTRUCTIONS_FILE, MASTER_MEMORY, PATHS_FILE, RESPONSE_MEMORY, SESSION_MEMORY, SKILLS_INDEX, STARTUP_DIR
+from config import COMMANDS_FILE, DOMAIN_INDEX, DOMAIN_SKILLS_INDEX, INSTRUCTIONS_FILE, MASTER_MEMORY, PATHS_FILE, RESPONSE_MEMORY, SESSION_MEMORY, SKILLS_INDEX
+# STARTUP_DIR is intentionally NOT imported by name -- it would freeze a
+# copy at import time and never see a GUI workspace switch again. Use
+# config.get_startup_dir() live instead (see config.py).
+import config
 import os
 
 # --- from main.py, section 1 ---
@@ -40,7 +44,8 @@ def resolve_file_path(path):
         if os.path.basename(sp) == os.path.normcase(filename):
             return sp, ""
 
-    print(f"   [Resolver] '{path}' is relative — BFS exploring under {STARTUP_DIR}...")
+    startup_dir = config.get_startup_dir()
+    print(f"   [Resolver] '{path}' is relative — BFS exploring under {startup_dir}...")
 
     import platform
     from collections import deque
@@ -75,7 +80,7 @@ def resolve_file_path(path):
         except Exception:
             return []
 
-    queue   = deque([(STARTUP_DIR, 0)])
+    queue   = deque([(startup_dir, 0)])
     visited = set()
     while queue:
         current_dir, depth = queue.popleft()
@@ -90,7 +95,7 @@ def resolve_file_path(path):
             if is_dir and depth < MAX_EXPLORE_DEPTH:
                 queue.append((full_path, depth + 1))
 
-    msg = f"Could not find '{filename}' within {MAX_EXPLORE_DEPTH} levels of {STARTUP_DIR}. Path used as given."
+    msg = f"Could not find '{filename}' within {MAX_EXPLORE_DEPTH} levels of {startup_dir}. Path used as given."
     print(f"   [Resolver] {msg}")
     return path, msg
 

@@ -2,6 +2,7 @@ import platform as _platform
 
 _IS_LINUX   = _platform.system() == "Linux"
 _IS_WINDOWS = _platform.system() == "Windows"
+_IS_MAC     = _platform.system() == "Darwin"
 
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
 import json
@@ -19,8 +20,56 @@ except ImportError:
 # --- from main.py, section 1 ---
 # CONFIGURATION
 # =============================================================================
+# DEPRECATED: frozen snapshot, kept only so any stray `from config import
+# STARTUP_DIR` doesn't hard-crash. Do NOT read this for anything that needs
+# to reflect a workspace switch -- use get_startup_dir() instead.
 STARTUP_DIR    = os.getcwd()
 MODEL_NAME     = "jarvishehe"
+
+# ── Live "workspace" directory ────────────────────────────────────────────────
+# STARTUP_DIR used to be a plain module-level constant snapshotted once at
+# import time (os.getcwd()). Every consumer that did `from config import
+# STARTUP_DIR` got its own frozen COPY of whatever directory the process
+# happened to launch in (which can be almost anything depending on how the
+# app was started/shortcut'd -- e.g. the Recycle Bin) -- and that copy could
+# never change again for the life of the process, even after the GUI's
+# workspace/project dropdown was switched to a different folder.
+#
+# Now it's a private variable behind get_startup_dir()/set_startup_dir() so
+# there is exactly ONE live value, read fresh on every call, and switching
+# the workspace in the GUI can actually update what every filesystem/
+# terminal-execution tool sees. Every call site that used to do
+# `from config import STARTUP_DIR` must instead do `import config` and call
+# `config.get_startup_dir()` at the point of use -- importing the name
+# directly would silently re-introduce the same frozen-copy bug.
+_STARTUP_DIR = os.getcwd()
+
+
+def get_startup_dir() -> str:
+    """The directory native tools (list_directory, execute_terminal_command,
+    find_file, resolve_file_path, ...) treat as 'home base' for relative
+    paths and subprocess cwd. Always read this live -- never cache it."""
+    return _STARTUP_DIR
+
+
+def set_startup_dir(path: str) -> str:
+    """Point the live workspace directory at `path` and hop the actual
+    process cwd to match, so every native tool (and any relative path a
+    subprocess resolves) sees the newly selected workspace immediately.
+    Called by the GUI whenever the workspace/project dropdown is switched
+    or a new project is created. Returns the resolved absolute path."""
+    global _STARTUP_DIR
+    resolved = os.path.abspath(path)
+    if not os.path.isdir(resolved):
+        raise NotADirectoryError(f"Not a directory: {resolved}")
+    _STARTUP_DIR = resolved
+    try:
+        os.chdir(resolved)
+    except Exception as e:
+        print(f"⚠️ [Config] Workspace directory updated to {resolved}, "
+              f"but os.chdir() failed: {e}")
+    return resolved
+
 
 # ── PRIMARY MODEL PROVIDER ────────────────────────────────────────────────────
 # "ollama"     — use the local Ollama model (MODEL_NAME above) as the primary
@@ -315,6 +364,18 @@ if _IS_LINUX:
     TARGET_DIR      = os.path.join(_HOME, "Jarvis")
     SKILLS_INDEX    = os.path.join(TARGET_DIR, "jarvis_project", "skills.md")
     SECRETS_FILE    = os.path.join(_HOME, ".config", "JarvisSecrets", "jarvis_secrets.json")
+elif _IS_MAC:
+    # macOS follows the platform convention of ~/Library/Application Support
+    # for per-app config/data instead of Linux's XDG ~/.config or Windows'
+    # AppData\Local. Kept as its own branch (not lumped into the old
+    # Windows-flavored `else`) so a Mac install doesn't silently inherit a
+    # D:\ drive path or an AppData layout that doesn't exist on macOS.
+    _HOME           = os.path.expanduser("~")
+    TARGET_DIR      = os.path.join(_HOME, "Jarvis")
+    SKILLS_INDEX    = os.path.join(TARGET_DIR, "jarvis_project", "skills.md")
+    SECRETS_FILE    = os.path.join(
+        _HOME, "Library", "Application Support", "JarvisSecrets", "jarvis_secrets.json"
+    )
 else:
     TARGET_DIR      = r"D:\Jarvis"
     SKILLS_INDEX    = r"D:\Jarvis\jarvis_project\skills.md"
@@ -336,6 +397,14 @@ SECRETS_TEMPLATE = {
     # Used by MODEL_PROVIDER="gemini_api" and by consult_gemini's Gemini
     # API reasoning helper (providers/gemini_reasoning.py).
     "GEMINI_API_KEY": "",
+    # Optional fallback keys -- tried in order (KEY, then _2, _3, _4, _5) whenever
+    # the current key comes back quota-exhausted (HTTP 429 / RESOURCE_EXHAUSTED).
+    # Handy for stacking multiple free-tier AI Studio keys. All blank/absent
+    # ones are simply skipped -- only GEMINI_API_KEY is required.
+    "GEMINI_API_KEY_2": "",
+    "GEMINI_API_KEY_3": "",
+    "GEMINI_API_KEY_4": "",
+    "GEMINI_API_KEY_5": "",
     # https://openrouter.ai/keys -- used by MODEL_PROVIDER="openrouter".
     "OPENROUTER_API_KEY": "",
     # https://console.groq.com/keys (free tier) -- used by MODEL_PROVIDER="groq".
@@ -434,6 +503,18 @@ def _detect_screen_resolution() -> tuple[int, int]:
         except Exception:
             pass
         return 1920, 1080   # safe fallback
+    elif _IS_MAC:
+        try:
+            out = subprocess.run(
+                ["system_profiler", "SPDisplaysDataType"],
+                capture_output=True, text=True, timeout=5
+            ).stdout
+            m = re.search(r"Resolution:\s*(\d+)\s*x\s*(\d+)", out)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+        except Exception:
+            pass
+        return 2560, 1600   # Retina-ish fallback — update if your resolution differs
     else:
         return 2560, 1600   # Windows default — update if your resolution differs
 

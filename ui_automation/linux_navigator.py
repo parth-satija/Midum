@@ -1,5 +1,5 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
-from config import _IS_LINUX
+from config import _IS_LINUX, _IS_MAC
 from ui_automation.windows_uia import _UIA_AVAILABLE
 import json
 import os
@@ -574,6 +574,8 @@ if _IS_LINUX and _PYATSPI_AVAILABLE:
 elif _IS_LINUX and not _PYATSPI_AVAILABLE:
     ui_navigator = AppMapNavigatorLinux()   # still usable for xdotool fallbacks
     print("🐧 [Linux UI navigator: AppMapNavigatorLinux (xdotool only — install pyatspi for full tree access)]")
+elif _IS_MAC:
+    from ui_automation.mac_navigator import ui_navigator
 else:
     from ui_automation.windows_uia import ui_navigator
 
