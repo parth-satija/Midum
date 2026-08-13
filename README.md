@@ -166,22 +166,29 @@ Create your secrets file — a local JSON file that holds your API keys (Gemini,
 ```PowerShell
 python -c "import config; created = config.ensure_secrets_file(); print('Created:' if created else 'Already exists:', config.SECRETS_FILE)"
 ```
-This writes a ready-to-fill-in template (every value blank) to the platform-appropriate location — `%LOCALAPPDATA%\JarvisSecrets\jarvis_secrets.json` on Windows, `~/.config/JarvisSecrets/jarvis_secrets.json` on Linux — with the following keys:
+This writes a ready-to-fill-in template (every value blank) to the platform-appropriate location — `%LOCALAPPDATA%\JarvisSecrets\jarvis_secrets.json` on Windows, `~/.config/JarvisSecrets/jarvis_secrets.json` on Linux, `~/Library/Application Support/JarvisSecrets/jarvis_secrets.json` on macOS — with the following keys (this is the full, always-current template — it's generated straight from `config.SECRETS_TEMPLATE`, so it never drifts out of sync with what the code actually reads):
 ```json
 {
   "GEMINI_API_KEY": "",
+  "GEMINI_API_KEY_2": "",
+  "GEMINI_API_KEY_3": "",
+  "GEMINI_API_KEY_4": "",
+  "GEMINI_API_KEY_5": "",
   "OPENROUTER_API_KEY": "",
   "GROQ_API_KEY": "",
   "OLLAMA_API_KEY": "",
+  "OMNIROUTE_API_KEY": "",
   "GEMINI_SECURE_1PSID": "",
   "GEMINI_SECURE_1PSIDTS": ""
 }
 ```
 Open the file and fill in only the key(s) your chosen `MODEL_PROVIDER` (and any providers you plan to consult/delegate to) actually needs — every reader treats a blank value as "not configured", so it's safe to leave the rest empty:
 - `GEMINI_API_KEY` — from [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey). Used by `MODEL_PROVIDER = "gemini_api"` and Gemini API consultation.
+- `GEMINI_API_KEY_2` / `_3` / `_4` / `_5` — optional extra AI Studio keys, tried in order whenever the current one comes back quota-exhausted (HTTP 429 / RESOURCE_EXHAUSTED). Handy for stacking multiple free-tier keys; leave blank if you only have one.
 - `OPENROUTER_API_KEY` — from [openrouter.ai/keys](https://openrouter.ai/keys). Used by `MODEL_PROVIDER = "openrouter"`.
 - `GROQ_API_KEY` — from [console.groq.com/keys](https://console.groq.com/keys) (free tier). Used by `MODEL_PROVIDER = "groq"`.
 - `OLLAMA_API_KEY` — from [ollama.com/settings/keys](https://ollama.com/settings/keys). Used by `MODEL_PROVIDER = "ollama_cloud"`.
+- `OMNIROUTE_API_KEY` — gateway key from your OmniRoute dashboard (`http://localhost:20128/dashboard`). Used by `MODEL_PROVIDER = "omniroute"`; often optional for a purely local gateway with no auth configured, so leave blank if you haven't set one.
 - `GEMINI_SECURE_1PSID` / `GEMINI_SECURE_1PSIDTS` — browser session cookies (not an API key) for `gemini.google.com`, copied from your browser's DevTools → Application → Cookies. Both are required together, and only needed if you'd rather use your Gemini account's web session (`MODEL_PROVIDER = "gemini_web"`) than the official API.
 
 This same file is also created automatically the first time you run `main.py` or `gui.py` if it doesn't exist yet (see Step 6 below), so this step is optional — but running it explicitly here lets you fill in your keys *before* first launch instead of stopping mid-startup to go find the file.
@@ -221,7 +228,23 @@ Same command as Step 5 above:
 ```bash
 python -c "import config; created = config.ensure_secrets_file(); print('Created:' if created else 'Already exists:', config.SECRETS_FILE)"
 ```
-On macOS this writes the template to `~/Library/Application Support/JarvisSecrets/jarvis_secrets.json` (the standard macOS location for per-app data, matching Linux's `~/.config` and Windows' `%LOCALAPPDATA%` equivalents). Fill in the same keys described in Step 5.
+On macOS this writes the template to `~/Library/Application Support/JarvisSecrets/jarvis_secrets.json` (the standard macOS location for per-app data, matching Linux's `~/.config` and Windows' `%LOCALAPPDATA%` equivalents), with the same full set of keys as Step 5 above:
+```json
+{
+  "GEMINI_API_KEY": "",
+  "GEMINI_API_KEY_2": "",
+  "GEMINI_API_KEY_3": "",
+  "GEMINI_API_KEY_4": "",
+  "GEMINI_API_KEY_5": "",
+  "OPENROUTER_API_KEY": "",
+  "GROQ_API_KEY": "",
+  "OLLAMA_API_KEY": "",
+  "OMNIROUTE_API_KEY": "",
+  "GEMINI_SECURE_1PSID": "",
+  "GEMINI_SECURE_1PSIDTS": ""
+}
+```
+See the key-by-key breakdown in Step 5 above for what each one is and which `MODEL_PROVIDER` needs it.
 
 ### Required macOS permissions
 Grant these in **System Settings → Privacy & Security** *before* launching Midum, or UI automation and screenshots will silently fail or return blank/black results instead of raising a clear error:
@@ -246,7 +269,7 @@ If you'd rather not install Python or any dependencies, Windows users can skip t
 Download `midum.exe` from the releases page and place it in its own empty folder (it will create `storage/` and other supporting files alongside itself on first run, so give it a dedicated folder rather than dropping it in `Downloads`).
 
 ### Step 2
-Launch `midum.exe` once (double-click it, or run it from a terminal) and then close it again. On this first run it automatically creates your secrets file — the same blank-template JSON described in Step 5 above — at `%LOCALAPPDATA%\JarvisSecrets\jarvis_secrets.json`, with the `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `OLLAMA_API_KEY`, `GEMINI_SECURE_1PSID`, and `GEMINI_SECURE_1PSIDTS` placeholders ready for you to fill in. Open that file, fill in only the key(s) your chosen provider needs (see the key-by-key breakdown in Step 5 above), and save it.
+Launch `midum.exe` once (double-click it, or run it from a terminal) and then close it again. On this first run it automatically creates your secrets file — the same full blank-template JSON shown in Step 5 above (every key: `GEMINI_API_KEY`, `GEMINI_API_KEY_2`–`_5`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `OLLAMA_API_KEY`, `OMNIROUTE_API_KEY`, `GEMINI_SECURE_1PSID`, `GEMINI_SECURE_1PSIDTS`) — at `%LOCALAPPDATA%\JarvisSecrets\jarvis_secrets.json`. Open that file, fill in only the key(s) your chosen provider needs (see the key-by-key breakdown in Step 5 above), and save it.
 
 Relaunch `midum.exe` and you're straight into the Midum Control Centre — no `pip install`, no Ollama, no IDE required.
 
