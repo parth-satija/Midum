@@ -19,6 +19,7 @@ from state import _abort_event, _action_loop_event, _action_loop_lock, _action_l
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
 from permissions import enforce_tool_permission, filter_tools_schema, mcp_permission_key
 from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
+from multi_agent import start_agent, send_agent_task, get_agent_report, list_agents, stop_agent, resume_agent, forget_agent, delegate_agent_task_to_supervisor, tell_supervisor_to_inform_user, get_current_agent_name, attach_agent_knowledge, list_agent_knowledge, attach_agent_skills, list_agent_skills
 from tools_schema import tools
 from ui_automation import ui_navigator
 from ui_automation.windows_uia import _UIA_AVAILABLE
@@ -1042,7 +1043,7 @@ def _looks_like_stalled_plan(text: str) -> bool:
 
 def process_chat_turn(conversation_history, user_request: str = "", gemini_plan: str = "",
                        force_provider: str = None, force_model: str = None,
-                       max_steps: int = 20):
+                       max_steps: int = 20, say_hook=None):
     from main import _print_reply
     from browser_cdp import act_on_browser_element, list_browser_tabs, query_gemini_app, read_browser_page, run_js_in_browser, snapshot_browser_elements
     from providers.openrouter_backend import consult_openrouter, delegate_to_openrouter, list_openrouter_models, set_openrouter_model, set_openrouter_model_by_index
@@ -1052,6 +1053,15 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
     delegate_to_openrouter() to spin up a self-contained OpenRouter "coworker"
     sub-agent that has full tool access via the exact same engine as the
     primary loop, without permanently switching Midum's primary provider.
+
+    say_hook, if given, intercepts say() narration for THIS call instead of
+    streaming it into the main chat via _print_reply(). Callers running an
+    isolated sub-agent turn (see multi_agent.py's _run_agent_task) pass a
+    hook that appends the message to that agent's own transcript, so a
+    sub-agent's say() calls stay with the agent (Agents tab) and never leak
+    into the primary user-facing chat pane. When say_hook is None (the
+    default — the ordinary Supervisor/primary loop), say() behaves exactly
+    as before and prints straight to the main chat.
     """
     clear_response_memory()
     turn_tool_outputs     = []
@@ -1070,6 +1080,40 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
 
     # Keep system messages always; slide a window over the rest
     HISTORY_WINDOW = 20
+
+    def _trim_history_preserving_tool_pairs(msgs: list, window: int) -> list:
+        """
+        Slice the last `window` non-system messages, but never let the slice
+        start on an orphaned 'tool' role message (a function response whose
+        preceding assistant tool_calls message got cut off by the window).
+        Providers like Gemini's OpenAI-compatible endpoint require every
+        function_response to have a matching function_call earlier in the
+        SAME request; an orphaned one at position 0 has no assistant call to
+        recover its name from, which is what produces the
+        "function_response.name: Name cannot be empty" 400. Walk the start
+        index backward past any leading 'tool' messages until we land on
+        their owning assistant message (or run out of history).
+
+        Symmetrically, Gemini also requires every function-CALL turn (an
+        assistant message carrying tool_calls) to be immediately preceded
+        -- in the same request -- by either a user turn or a
+        function-response ('tool') turn. If the slice instead starts
+        exactly ON such an assistant message, that message becomes the
+        very first turn sent (system messages are pulled out separately
+        and don't count as a preceding turn), with nothing before it to
+        satisfy that requirement -- producing the "function call turn
+        must come immediately after a user turn or after a function
+        response turn" 400. So also walk the start index backward past
+        any leading assistant message (whether or not it carries
+        tool_calls, to keep the walk simple and always land on a 'user'
+        message, which is always a safe turn to start a request on).
+        """
+        if len(msgs) <= window:
+            return msgs
+        start = len(msgs) - window
+        while start > 0 and msgs[start].get("role") in ("tool", "assistant"):
+            start -= 1
+        return msgs[start:]
 
     while True:
         # ── Ctrl+Q abort check ────────────────────────────────────────────────
@@ -1104,7 +1148,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
 
         sys_msgs = [m for m in conversation_history if m.get("role") == "system"]
         non_sys  = [m for m in conversation_history if m.get("role") != "system"]
-        trimmed  = sys_msgs + non_sys[-HISTORY_WINDOW:]
+        trimmed  = sys_msgs + _trim_history_preserving_tool_pairs(non_sys, HISTORY_WINDOW)
 
         # ── Run the primary model on a thread so Ctrl+Q can interrupt the wait ─
         result_q = _queue.Queue()
@@ -1137,6 +1181,23 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
         tool_calls = response["message"].get("tool_calls")
         if tool_calls:
             tool_calls = tool_calls[:1]   # one step at a time — more reliable for all models
+            # CRITICAL: response["message"] is what gets appended to
+            # conversation_history below (and re-sent to the provider next
+            # turn). If the model returned MORE than one tool_call, leaving
+            # response["message"]["tool_calls"] untouched means the stored
+            # assistant turn still declares every one of them -- but only
+            # the first ever gets a matching "tool" role response appended,
+            # since only tool_calls[:1] actually gets executed below. Every
+            # extra tool_call is then a dangling function-call with no
+            # function-response turn following it, which is exactly what
+            # trips Gemini's "function call turn must come immediately after
+            # a user turn or after a function response turn" 400 on the
+            # very next request -- independent of history length, and
+            # reproducible with as few as one multi-call turn. Keep the
+            # stored message in lockstep with what's actually executed by
+            # truncating it here too, not just the local `tool_calls` var.
+            response["message"] = dict(response["message"])
+            response["message"]["tool_calls"] = tool_calls
         msg_content = (response["message"].get("content") or "").strip()
 
         # ── Capture any prose the model emitted alongside tool calls ──────────
@@ -1807,6 +1868,61 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             elif func_name == "stop_action_loop":
                 tool_output = stop_action_loop(arguments.get("reason", ""))
 
+            elif func_name == "start_agent":
+                tool_output = start_agent(
+                    arguments.get("role", ""),
+                    arguments.get("name", ""),
+                    arguments.get("description", ""),
+                    arguments.get("personality", ""),
+                    bool(arguments.get("persistence", False)),
+                    arguments.get("model") or None,
+                    arguments.get("provider") or None,
+                    arguments.get("knowledge_bases") or None,
+                    arguments.get("skills") or None,
+                )
+
+            elif func_name == "attach_agent_knowledge":
+                tool_output = attach_agent_knowledge(
+                    arguments.get("name", ""),
+                    arguments.get("knowledge_bases", []),
+                )
+
+            elif func_name == "list_agent_knowledge":
+                tool_output = list_agent_knowledge(arguments.get("name", ""))
+
+            elif func_name == "attach_agent_skills":
+                tool_output = attach_agent_skills(
+                    arguments.get("name", ""),
+                    arguments.get("skills", []),
+                )
+
+            elif func_name == "list_agent_skills":
+                tool_output = list_agent_skills(arguments.get("name", ""))
+
+            elif func_name == "send_agent_task":
+                tool_output = send_agent_task(arguments.get("name", ""), arguments.get("task", ""))
+
+            elif func_name == "get_agent_report":
+                tool_output = get_agent_report(arguments.get("name", ""))
+
+            elif func_name == "list_agents":
+                tool_output = list_agents()
+
+            elif func_name == "stop_agent":
+                tool_output = stop_agent(arguments.get("name", ""))
+
+            elif func_name == "resume_agent":
+                tool_output = resume_agent(arguments.get("name", ""))
+
+            elif func_name == "forget_agent":
+                tool_output = forget_agent(arguments.get("name", ""))
+
+            elif func_name == "delegate_agent_task_to_supervisor":
+                tool_output = delegate_agent_task_to_supervisor(arguments.get("instruction", ""))
+
+            elif func_name == "tell_supervisor_to_inform_user":
+                tool_output = tell_supervisor_to_inform_user(arguments.get("message", ""))
+
             elif func_name == "say":
                 # NOTE: msg_text is intentionally NOT appended to
                 # _accumulated_reply. _print_reply() already streams it to
@@ -1816,8 +1932,25 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 # to be shown a SECOND time at the end of the turn, each
                 # copy carrying its own 'Midum:' label/header — i.e. every
                 # say() call rendered twice.
+                #
+                # ROUTING: when this process_chat_turn is running as a
+                # sub-agent's own isolated turn (say_hook is set by
+                # multi_agent.py's _run_agent_task), say() must NOT reach
+                # _print_reply -- that streams straight into the primary
+                # user-facing chat pane, which would leak a sub-agent's
+                # narration into the main conversation. Route it to the
+                # hook instead, which records it against that agent's own
+                # transcript (Agents tab) where it belongs. Only the
+                # ordinary Supervisor/primary loop (say_hook is None)
+                # still prints straight to the main chat.
                 msg_text = arguments.get("message", "")
-                _print_reply("Midum:", msg_text)
+                if say_hook is not None:
+                    try:
+                        say_hook(msg_text)
+                    except Exception as _say_hook_err:
+                        print(f"\u26a0\ufe0f [say_hook failed: {_say_hook_err}]")
+                else:
+                    _print_reply("Midum:", msg_text)
                 _said_parts.append(msg_text)
                 turn_tool_outputs.append(f"[say]: {msg_text}")
                 tool_output = "Message displayed to user."
@@ -2128,7 +2261,14 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
 
             if _tool_call_hook:
                 try:
-                    _tool_call_hook(func_name, arguments, tool_output)
+                    # Tag the call with the sub-agent's name when this tool
+                    # executed on a sub-agent's own worker thread (see
+                    # multi_agent.get_current_agent_name), so the GUI can
+                    # render a sub-agent's own tool activity as dim/grey
+                    # background chatter instead of a normal Supervisor
+                    # tool-call card. None on the Supervisor's own thread --
+                    # existing hook behavior is unchanged.
+                    _tool_call_hook(func_name, arguments, tool_output, agent_name=get_current_agent_name())
                 except Exception as _hook_err:
                     print(f"⚠️ [tool_call_hook failed: {_hook_err}]")
 

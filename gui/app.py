@@ -147,6 +147,12 @@ def _list_gemini_web_model_options() -> list:
     hardcoded guess if the account/session can't be reached yet (not
     logged in, library missing, network hiccup, etc) instead of leaving
     the dropdown looking broken.
+
+    This hits the network (lazily initialises the gemini_webapi client/
+    session on first call, then calls list_models()) and can take a couple
+    of seconds — callers on the GUI thread should use
+    _gemini_web_model_options_fast() for an instant response and fetch
+    this in the background instead (see Api.select_provider).
     """
     try:
         from providers.gemini_web_backend import list_gemini_web_models
@@ -154,9 +160,37 @@ def _list_gemini_web_model_options() -> list:
     except Exception:
         models = []
     if not models:
-        fallback = [midum.config.GEMINI_WEB_MODEL, "gemini-3-flash"]
-        return list(dict.fromkeys(["(auto)"] + [m for m in fallback if m]))
-    return list(dict.fromkeys(["(auto)"] + models))
+        options = _gemini_web_fallback_options()
+    else:
+        options = list(dict.fromkeys(["(auto)"] + models))
+    global _gemini_web_model_options_cache
+    _gemini_web_model_options_cache = options
+    return options
+
+
+# Cache of the last real gemini_webapi model lineup fetched (see
+# _list_gemini_web_model_options), so a provider switch after the first
+# successful fetch can serve instantly from cache instead of paying the
+# network round trip again every time.
+_gemini_web_model_options_cache: list | None = None
+
+
+def _gemini_web_fallback_options() -> list:
+    """Small hardcoded guess, no network — used before the first real
+    fetch has ever completed."""
+    fallback = [midum.config.GEMINI_WEB_MODEL, "gemini-3-flash"]
+    return list(dict.fromkeys(["(auto)"] + [m for m in fallback if m]))
+
+
+def _gemini_web_model_options_fast() -> list:
+    """
+    Instant, non-network model list for Gemini-web: the cached real lineup
+    if we've already fetched it once this session, otherwise the small
+    hardcoded fallback. Used so switching TO the Gemini-web provider in
+    the GUI updates the model field immediately, same as every other
+    provider, instead of blocking on a gemini_webapi client init/RPC.
+    """
+    return _gemini_web_model_options_cache or _gemini_web_fallback_options()
 
 
 def _list_ollama_cloud_models() -> list:
@@ -232,6 +266,31 @@ class Api:
         self._thinking     = False
         self._log_queue    = queue.Queue()
 
+        # Guards self._thinking (read AND write) together with
+        # self._pending_agent_notes below. _on_agent_done fires on a
+        # sub-agent's OWN worker thread -- concurrently with the GUI/turn
+        # thread -- so "if not self._thinking: self._thinking = True" is a
+        # classic check-then-act race: two agents finishing back-to-back
+        # could both see _thinking==False and both spawn a _run_turn()
+        # thread, running two process_chat_turn() calls against the same
+        # session concurrently. This lock makes that check-and-set atomic.
+        self._agent_turn_lock   = threading.Lock()
+        # Agent-finished notes that arrive while a turn is ALREADY running
+        # (_thinking is True) can't be spliced into that turn's own
+        # in-flight history_snapshot -- process_chat_turn owns that list
+        # exclusively until the turn ends. Queuing them here and merging
+        # them into self._session.history in _run_turn's own finally block
+        # (see below) means a note is never lost (previously: appended
+        # straight to self._session.history, then silently discarded when
+        # the in-flight turn's `self._session.history = history_snapshot`
+        # overwrote it) and never spliced into the MIDDLE of a live turn's
+        # message list, which is what could leave an assistant tool_calls
+        # turn without its matching function-response turn immediately
+        # after it -- exactly the shape of request Gemini's API rejects
+        # with "function call turn comes immediately after a user turn or
+        # after a function response turn".
+        self._pending_agent_notes = []
+
         # Guards _display_log mutations + _persist_current_chat() itself.
         # Without this, a close-triggered persist (from _on_closing, on the
         # GUI/close thread) could interleave with the turn-execution
@@ -295,6 +354,16 @@ class Api:
             if not text or re.match(r'^[{}\[\]",:\s]*$', text.strip()):
                 return
             self._push_event("say", {"text": text})
+            # Persist say() the same way a normal assistant reply is persisted
+            # (see _run_turn's cleaned_reply append below) -- until now this
+            # intercept only pushed the LIVE event; nothing here ever wrote to
+            # self._display_log, so a say() call rendered fine during the live
+            # session but reopening the chat showed only the generic tool-call
+            # card for it (see _handle_tool_call's new "toolcall" persistence
+            # below), not the actual reply text. Mirrors _on_voice_event's
+            # "voice_say" handling, which already does this for voice turns.
+            with self._persist_lock:
+                self._display_log.append(("midum", text))
         midum._print_reply = _gui_say_intercept
         # IMPORTANT: this must be set on tools.user_prompt_tools itself, not
         # on `midum` (main.py). main.py does `from tools.user_prompt_tools
@@ -312,6 +381,19 @@ class Api:
         # the chat pane. Separate from the plain-text log line the console
         # already gets from _on_log_line's "-> Executing: ..." interception.
         midum.set_tool_call_hook(self._handle_tool_call)
+
+        # Notified the moment a sub-agent's Action Loop stops (task done,
+        # crashed, or cut off) -- see multi_agent.set_agent_done_hook and
+        # Api._on_agent_done below. This is what lets the Supervisor learn
+        # about a finished agent automatically instead of polling for it.
+        midum.set_agent_done_hook(self._on_agent_done)
+
+        # Fired the moment a sub-agent calls tell_supervisor_to_inform_user()
+        # mid-task -- see multi_agent.set_agent_inform_hook and
+        # Api._on_agent_inform below. Same delivery mechanism as
+        # _on_agent_done, just for an interim message instead of the final
+        # report.
+        midum.set_agent_inform_hook(self._on_agent_inform)
 
         self._pending_ask = {}  # ask_id -> threading.Event / result box
 
@@ -370,6 +452,17 @@ class Api:
             self._push_event("say", {"text": line[len(_SAY_TAG):]})
             return
         self._push_event("log", {"text": line})
+        # Suppress the normal "tool_line" chat-pane row for prints that
+        # originate on a sub-agent's own worker thread (this callback runs
+        # synchronously on WHICHEVER thread called print(), so this check
+        # is accurate even though sub-agents print concurrently on their
+        # own threads). Their tool activity still reaches the chat pane --
+        # see _handle_tool_call below, which pushes a single grey
+        # "agent_tool_call" row (call + result together) once the call
+        # actually finishes, instead of the two-stage placeholder-then-
+        # detail flow normal Supervisor tool calls use.
+        if midum.get_current_agent_name() is not None:
+            return
         if _is_tool_line(line):
             self._push_event("tool_line", {"text": line.strip()})
 
@@ -382,11 +475,17 @@ class Api:
         self._push_event("log", {"text": f"⏰ [Schedule '{sched.get('id')}'] ran flow '{flow_name}' -> {str(result)[:200]}\n"})
         self._push_event("schedule_ran", {"schedule_id": sched.get("id"), "flow_name": flow_name, "result": str(result)[:500]})
 
-    def _handle_tool_call(self, name: str, args: dict, result: str):
+    def _handle_tool_call(self, name: str, args: dict, result: str, agent_name: str = None):
         """Called by orchestration.py right after every tool call executes,
         with the exact arguments it ran and the raw (pre-HTML-escaped)
-        result. Pushed to the frontend as a 'tool_call' event so the chat
-        pane's tool-call row can be clicked open to show both."""
+        result. agent_name is set when the call ran on a sub-agent's own
+        worker thread (see multi_agent.get_current_agent_name) instead of
+        the Supervisor's -- in that case this pushes a single self-
+        contained 'agent_tool_call' event (call + result together) that
+        the chat pane renders as a dim/grey row, instead of the normal
+        'tool_call' event, which only attaches detail to a placeholder row
+        _on_log_line already pushed for the Supervisor's own tool calls --
+        a placeholder that was intentionally NOT pushed for agent calls."""
         try:
             safe_args = json.loads(json.dumps(args, default=str))
         except Exception:
@@ -397,11 +496,53 @@ class Api:
         for k, v in list(safe_args.items()):
             if isinstance(v, str) and len(v) > 4000:
                 safe_args[k] = v[:4000] + f"… [{len(v)} chars total]"
+
+        if agent_name:
+            self._push_event("agent_tool_call", {
+                "agent": agent_name,
+                "name": name,
+                "args": safe_args,
+                "result": str(result)[:8000],
+            })
+            return
+
         self._push_event("tool_call", {
             "name": name,
             "args": safe_args,
             "result": str(result)[:8000],
         })
+
+        # 'say' is intentionally excluded from the persisted toolcall record
+        # below -- its actual content is already persisted as a normal
+        # "midum" text bubble by _gui_say_intercept (midum._print_reply)
+        # above, the same instant it's called. Persisting it again here too
+        # would show every say() twice on reload: once as the real reply
+        # bubble, once as a redundant bare tool-call card next to it.
+        if name == "say":
+            return
+
+        # Persist a self-contained record (call + result together) into the
+        # replayable display log -- until now this hook only pushed a LIVE
+        # event for the current session's chat pane; nothing here ever
+        # reached self._display_log, so tool-call cards rendered fine during
+        # a live turn but silently vanished the moment the chat was closed
+        # and reopened (load_chat only replays what's in _display_log/the
+        # persisted "display" list -- see gui/chat_store.py). Stored as its
+        # own "toolcall" tag (JSON payload) rather than reusing the live
+        # "tool" tag, since "tool" renders a placeholder row that expects a
+        # separate attachToolCallDetail() event to fill in later -- on
+        # replay there is no such follow-up event, so the row needs to
+        # arrive fully formed. See appendRow()'s "toolcall" branch.
+        try:
+            toolcall_payload = json.dumps({
+                "name": name,
+                "args": safe_args,
+                "result": str(result)[:8000],
+            }, default=str)
+        except Exception:
+            toolcall_payload = json.dumps({"name": name, "args": {}, "result": str(result)[:8000]})
+        with self._persist_lock:
+            self._display_log.append(("toolcall", toolcall_payload))
 
     # ── Bootstrap ─────────────────────────────────────────────────────────
     def startup(self):
@@ -523,10 +664,15 @@ class Api:
         }
 
     def get_providers(self):
+        models = (
+            _gemini_web_model_options_fast()
+            if self._selected_provider == "gemini_web"
+            else _known_models_for_provider(self._selected_provider)
+        )
         return {
             "options": [label for label, _ in PROVIDER_OPTIONS],
             "current": _PROVIDER_KEY_TO_LABEL[self._selected_provider],
-            "models": _known_models_for_provider(self._selected_provider),
+            "models": models,
             "current_model": self._selected_model,
         }
 
@@ -736,6 +882,25 @@ class Api:
                 "models": _list_ollama_cloud_models(),
                 "default_model": _default_model_for_provider(provider_key),
             }
+        if provider_key == "gemini_web":
+            # list_gemini_web_models() lazily initialises the gemini_webapi
+            # client/session over the network and can take a couple of
+            # seconds — calling it here would block this synchronous
+            # pywebview API call, making the Model field visibly lag behind
+            # every other provider (which are all static config lookups).
+            # Return the cached/fallback list instantly instead, and kick
+            # the real fetch off on a background thread; once it lands,
+            # push an event so the frontend can refresh the dropdown if
+            # the user is still on this provider.
+            def _refresh():
+                fresh = _list_gemini_web_model_options()
+                if self._selected_provider == "gemini_web":
+                    self._push_event("gemini_web_models", {"models": fresh})
+            threading.Thread(target=_refresh, daemon=True).start()
+            return {
+                "models": _gemini_web_model_options_fast(),
+                "default_model": _default_model_for_provider(provider_key),
+            }
         return {
             "models": _known_models_for_provider(provider_key),
             "default_model": _default_model_for_provider(provider_key),
@@ -770,13 +935,25 @@ class Api:
 
     # ── Persisted GUI settings (default model + theme colors) ────────────
     _SETTINGS_FILENAME = "gui_settings.json"
-    _DEFAULT_COLORS = {
+    # Separate default palettes per theme, so Light and Dark each have their
+    # own preset that gets saved/restored independently -- switching themes
+    # applies whichever colors were last saved for that theme, not a single
+    # shared set re-tinted on top of it.
+    _DEFAULT_COLORS_DARK = {
         "accent": "#60a5fa", "accent2": "#1d4ed8",
         "bg": "#05070c", "panel": "#0b0f19", "text": "#f3f4f6",
+        "user_msg": "#0f1e33",
+        "blob_center": "#60a5fa", "blob_a": "#f472b6", "blob_b": "#34d399", "blob_cursor": "#a78bfa",
+    }
+    _DEFAULT_COLORS_LIGHT = {
+        "accent": "#1d4ed8", "accent2": "#3730a3",
+        "bg": "#f7f9fc", "panel": "#ffffff", "text": "#10182b",
+        "user_msg": "#dbeafe",
         "blob_center": "#60a5fa", "blob_a": "#f472b6", "blob_b": "#34d399", "blob_cursor": "#a78bfa",
     }
     _DEFAULT_THEME = "dark"
-    _DEFAULT_BLOBS_ENABLED = True
+    _DEFAULT_BLOBS_ENABLED_DARK = True
+    _DEFAULT_BLOBS_ENABLED_LIGHT = True
     _DEFAULT_BG_IMAGE = {
         "enabled": False, "path": "",
         "brightness": 100, "blur": 0, "opacity": 100,
@@ -794,9 +971,13 @@ class Api:
             "provider": _PROVIDER_KEY_TO_LABEL[DEFAULT_PROVIDER_KEY],
             "model": _default_model_for_provider(DEFAULT_PROVIDER_KEY),
             "theme": self._DEFAULT_THEME,
-            "colors": dict(self._DEFAULT_COLORS),
-            "blobs_enabled": self._DEFAULT_BLOBS_ENABLED,
+            "colors_dark": dict(self._DEFAULT_COLORS_DARK),
+            "colors_light": dict(self._DEFAULT_COLORS_LIGHT),
+            "blobs_enabled_dark": self._DEFAULT_BLOBS_ENABLED_DARK,
+            "blobs_enabled_light": self._DEFAULT_BLOBS_ENABLED_LIGHT,
             "bg_image": dict(self._DEFAULT_BG_IMAGE),
+            "workspaces": [],
+            "active_workspace": "",
         }
         path = self._settings_path()
         try:
@@ -809,12 +990,36 @@ class Api:
                     defaults["model"] = saved["model"]
                 if saved.get("theme") in ("dark", "light"):
                     defaults["theme"] = saved["theme"]
-                if isinstance(saved.get("colors"), dict):
-                    defaults["colors"].update(saved["colors"])
-                if isinstance(saved.get("blobs_enabled"), bool):
-                    defaults["blobs_enabled"] = saved["blobs_enabled"]
+                if isinstance(saved.get("colors_dark"), dict):
+                    defaults["colors_dark"].update(saved["colors_dark"])
+                if isinstance(saved.get("colors_light"), dict):
+                    defaults["colors_light"].update(saved["colors_light"])
+                if (not isinstance(saved.get("colors_dark"), dict)
+                        and not isinstance(saved.get("colors_light"), dict)
+                        and isinstance(saved.get("colors"), dict)):
+                    # Legacy single-shared-palette format from before per-theme
+                    # presets existed -- apply it to whichever theme was active
+                    # when it was saved, rather than losing it on upgrade.
+                    legacy_theme = saved["theme"] if saved.get("theme") in ("dark", "light") else self._DEFAULT_THEME
+                    defaults[f"colors_{legacy_theme}"].update(saved["colors"])
+                if isinstance(saved.get("blobs_enabled_dark"), bool):
+                    defaults["blobs_enabled_dark"] = saved["blobs_enabled_dark"]
+                if isinstance(saved.get("blobs_enabled_light"), bool):
+                    defaults["blobs_enabled_light"] = saved["blobs_enabled_light"]
+                if ("blobs_enabled_dark" not in saved
+                        and "blobs_enabled_light" not in saved
+                        and isinstance(saved.get("blobs_enabled"), bool)):
+                    # Legacy single shared toggle from before per-theme presets
+                    # existed -- apply it to whichever theme was active when
+                    # it was saved, rather than losing it on upgrade.
+                    legacy_theme = saved["theme"] if saved.get("theme") in ("dark", "light") else self._DEFAULT_THEME
+                    defaults[f"blobs_enabled_{legacy_theme}"] = saved["blobs_enabled"]
                 if isinstance(saved.get("bg_image"), dict):
                     defaults["bg_image"].update(saved["bg_image"])
+                if isinstance(saved.get("workspaces"), list):
+                    defaults["workspaces"] = [p for p in saved["workspaces"] if isinstance(p, str) and p]
+                if isinstance(saved.get("active_workspace"), str):
+                    defaults["active_workspace"] = saved["active_workspace"]
         except Exception as e:
             self._push_event("log", {"text": f"⚠️ Failed to read saved settings: {e}\n"})
         return defaults
@@ -828,10 +1033,16 @@ class Api:
                 current["model"] = settings["model"] or ""
             if settings.get("theme") in ("dark", "light"):
                 current["theme"] = settings["theme"]
-            if isinstance(settings.get("colors"), dict):
-                current["colors"].update({k: v for k, v in settings["colors"].items() if v})
-            if isinstance(settings.get("blobs_enabled"), bool):
-                current["blobs_enabled"] = settings["blobs_enabled"]
+            if isinstance(settings.get("colors_dark"), dict):
+                current["colors_dark"].update({k: v for k, v in settings["colors_dark"].items() if v})
+            if isinstance(settings.get("colors_light"), dict):
+                current["colors_light"].update({k: v for k, v in settings["colors_light"].items() if v})
+            current.pop("colors", None)  # drop legacy flat key once migrated
+            if isinstance(settings.get("blobs_enabled_dark"), bool):
+                current["blobs_enabled_dark"] = settings["blobs_enabled_dark"]
+            if isinstance(settings.get("blobs_enabled_light"), bool):
+                current["blobs_enabled_light"] = settings["blobs_enabled_light"]
+            current.pop("blobs_enabled", None)  # drop legacy flat key once migrated
             if isinstance(settings.get("bg_image"), dict):
                 # Path changes only ever come through pick_background_image /
                 # clear_background_image (which persist immediately), so
@@ -858,6 +1069,18 @@ class Api:
     def _persist_bg_image(self, updates: dict):
         current = self.get_settings()
         current["bg_image"].update(updates)
+        path = self._settings_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(current, f, indent=2)
+        return current
+
+    def _persist_workspaces(self, workspaces=None, active_workspace=None):
+        current = self.get_settings()
+        if workspaces is not None:
+            current["workspaces"] = workspaces
+        if active_workspace is not None:
+            current["active_workspace"] = active_workspace
         path = self._settings_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
@@ -958,35 +1181,75 @@ class Api:
         return {"ok": True, "settings": current}
 
     # ── Workspace / projects ─────────────────────────────────────────────
+    # Workspaces are user-chosen folders (picked via a native folder dialog
+    # from the "+ Project" button) whose absolute paths are persisted to
+    # the settings file. The dropdown only ever shows folders the user
+    # explicitly added -- nothing here is derived by scanning a directory.
     def _scan_workspace_directory(self):
-        if not os.path.exists(self._base_work_dir):
-            os.makedirs(self._base_work_dir, exist_ok=True)
-        try:
-            subdirs = sorted(
-                d for d in os.listdir(self._base_work_dir)
-                if os.path.isdir(os.path.join(self._base_work_dir, d))
-            )
-            if not subdirs:
-                subdirs = []
-            self._push_event("projects", {"projects": subdirs})
-            if subdirs:
-                self.switch_project(subdirs[0])
-        except Exception as e:
-            self._push_event("log", {"text": f"⚠️ Scan failed: {e}\n"})
+        """Called once at startup. Loads the saved workspace list and
+        restores whichever workspace was last active (falling back to the
+        first saved one) instead of scanning any directory."""
+        settings = self.get_settings()
+        workspaces = settings.get("workspaces") or []
+        if not workspaces:
+            self._push_event("projects", {"projects": workspaces, "active": ""})
+            return
+        active = settings.get("active_workspace") or ""
+        target = active if active in workspaces else workspaces[0]
+        self._push_event("projects", {"projects": workspaces, "active": target})
+        self.switch_project(target)
 
     def list_projects(self):
-        try:
-            return sorted(
-                d for d in os.listdir(self._base_work_dir)
-                if os.path.isdir(os.path.join(self._base_work_dir, d))
-            )
-        except Exception:
-            return []
+        return self.get_settings().get("workspaces") or []
 
-    def switch_project(self, name: str):
-        project_dir = os.path.join(self._base_work_dir, name)
+    def add_workspace_folder(self):
+        """Handler for the "+ Project" button: opens a native folder
+        picker, saves the chosen absolute path to the persisted workspace
+        list (if not already present), switches to it, and returns the
+        updated list so the dropdown can be repopulated."""
+        try:
+            result = self.window.create_file_dialog(webview.FOLDER_DIALOG)
+        except Exception:
+            result = None
+        if not result:
+            return {"ok": False, "error": "No folder selected."}
+
+        folder = os.path.abspath(result[0])
+        if not os.path.isdir(folder):
+            return {"ok": False, "error": "Selected path is not a folder."}
+
+        workspaces = self.list_projects()
+        if folder not in workspaces:
+            workspaces = workspaces + [folder]
+            self._persist_workspaces(workspaces=workspaces)
+
+        self._push_event("projects", {"projects": workspaces, "active": folder})
+        self.switch_project(folder)
+        return {"ok": True, "projects": workspaces}
+
+    def remove_workspace_folder(self, path: str):
+        """Removes a saved workspace from the list (does not touch the
+        folder on disk)."""
+        workspaces = [p for p in self.list_projects() if p != path]
+        active = self.get_settings().get("active_workspace") or ""
+        new_active = active if active in workspaces else (workspaces[0] if workspaces else "")
+        self._persist_workspaces(workspaces=workspaces, active_workspace=new_active)
+        self._push_event("projects", {"projects": workspaces, "active": new_active})
+        if new_active:
+            self.switch_project(new_active)
+        return {"ok": True, "projects": workspaces}
+
+    def switch_project(self, path: str):
+        """Actually switches the active workspace: points memory at the
+        chosen folder's project_memory.md, injects that memory into the
+        live session, and persists the choice so it's restored next
+        launch."""
+        project_dir = os.path.abspath(path)
         project_file = os.path.join(project_dir, "project_memory.md")
         midum.memory._active_project_memory_path = project_file
+        self._base_work_dir = os.path.dirname(project_dir) or project_dir
+        self._persist_workspaces(active_workspace=project_dir)
+        name = os.path.basename(project_dir) or project_dir
 
         if not os.path.exists(project_file):
             try:
@@ -1035,32 +1298,6 @@ class Api:
         except Exception:
             pass
         return {"root": os.path.basename(directory) if directory else "", "files": out}
-
-    def create_project(self, name: str):
-        name = (name or "").strip()
-        if not name:
-            return {"ok": False, "error": "Name required."}
-        project_dir = os.path.join(self._base_work_dir, name)
-        if os.path.exists(project_dir):
-            return {"ok": False, "error": "A project with this name already exists."}
-        os.makedirs(project_dir, exist_ok=True)
-        midum.write_local_file(
-            os.path.join(project_dir, "project_memory.md"),
-            f"# Project Memory: {name}\nCreated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n",
-        )
-        self.switch_project(name)
-        return {"ok": True, "projects": self.list_projects()}
-
-    def change_base_work_directory(self):
-        try:
-            result = self.window.create_file_dialog(webview.FOLDER_DIALOG)
-        except Exception:
-            result = None
-        if result:
-            self._base_work_dir = os.path.abspath(result[0])
-            self._push_event("system_line", {"text": f"[Base scan directory moved to: {self._base_work_dir}]"})
-            self._scan_workspace_directory()
-        return {"base_dir": self._base_work_dir}
 
     def open_project_in_vscode(self):
         proj = midum.memory._active_project_memory_path
@@ -1593,7 +1830,35 @@ class Api:
             self._persist_current_chat()
         finally:
             permissions.set_kb_only_mode(False)
-            self._thinking = False
+            # Atomically: clear _thinking AND drain any agent-done notes
+            # that arrived (from other threads, via _on_agent_done) while
+            # this turn was running. They couldn't be spliced into this
+            # turn's own history_snapshot mid-flight, so they were queued
+            # in self._pending_agent_notes instead -- append them onto
+            # self._session.history now that it reflects this turn's
+            # completed, well-formed state, and restart the Supervisor
+            # immediately so it reacts to them instead of them sitting
+            # unseen until the user's next message. This same lock is what
+            # makes _on_agent_done's own "is a turn already running" check
+            # race-free against this clearing of _thinking.
+            with self._agent_turn_lock:
+                pending = self._pending_agent_notes
+                self._pending_agent_notes = []
+                if pending:
+                    with self._session._lock:
+                        self._session.history.extend(pending)
+                else:
+                    self._thinking = False
+                start_followup = bool(pending)
+                if start_followup:
+                    self._thinking = True
+            if start_followup:
+                self._push_event("status", {"text": "Executing turns... (agent report)", "level": "busy"})
+                threading.Thread(
+                    target=self._run_turn,
+                    args=(list(self._session.snapshot()), False, None),
+                    daemon=True,
+                ).start()
             self._push_event("done", {})
             # The window was closed while this reply was still being
             # generated (see _on_closing) -- the close was held off
@@ -2338,6 +2603,166 @@ class Api:
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True}
 
+    # ── Agents (Supervisor / sub-agents tab) ─────────────────────────────────────
+    # Thin wrappers around multi_agent.py -- every mutation also pushes an
+    # "agents_changed" event so the Agents pane (if open) refreshes itself
+    # immediately instead of waiting for its own poll interval, exactly
+    # like "mcp_changed" does for the MCP tab.
+    def list_agents_ui(self):
+        return midum.list_agents_struct()
+
+    def create_agent_ui(self, role: str, name: str, description: str = "", personality: str = "",
+                         persistence: bool = False, model: str = "", provider: str = "",
+                         knowledge_bases: list = None, skills: list = None):
+        msg = midum.start_agent(
+            role, name, description, personality, bool(persistence),
+            (model or "").strip() or None, (provider or "").strip() or None,
+            list(knowledge_bases or []) or None, list(skills or []) or None,
+        )
+        ok = not msg.lower().startswith("error")
+        self._push_event("log", {"text": f"🤖 {msg}\n"})
+        self._push_event("agents_changed", {})
+        return {"ok": ok, "message": msg}
+
+    def attach_agent_knowledge_ui(self, name: str, knowledge_bases: list):
+        """Attach (replacing) the given MD Knowledge Base names to an agent
+        -- see multi_agent.attach_agent_knowledge. `knowledge_bases` items
+        are filenames as returned by list_knowledge_files() (e.g.
+        'blender_notes.md'); the .md suffix is stripped here since the
+        backend keys knowledge bases by name-without-extension."""
+        names = [os.path.splitext(n)[0] for n in (knowledge_bases or [])]
+        msg = midum.attach_agent_knowledge(name, names)
+        self._push_event("log", {"text": f"📚 {msg}\n"})
+        self._push_event("agents_changed", {})
+        return {"ok": True, "message": msg}
+
+    def attach_agent_skills_ui(self, name: str, skills: list):
+        """Attach (replacing) the given MD Skill filenames to an agent --
+        see multi_agent.attach_agent_skills. `skills` items are filenames
+        as returned by list_skill_files() (e.g. 'terrain_debugging.md');
+        the .md suffix is stripped here since the backend keys skills by
+        name-without-extension."""
+        names = [os.path.splitext(n)[0] for n in (skills or [])]
+        msg = midum.attach_agent_skills(name, names)
+        self._push_event("log", {"text": f"📋 {msg}\n"})
+        self._push_event("agents_changed", {})
+        return {"ok": True, "message": msg}
+
+    def send_agent_task_ui(self, name: str, task: str):
+        msg = midum.send_agent_task(name, task)
+        self._push_event("agents_changed", {})
+        return {"ok": "queued" in msg.lower(), "message": msg}
+
+    def stop_agent_ui(self, name: str):
+        msg = midum.stop_agent(name)
+        self._push_event("agents_changed", {})
+        return {"ok": True, "message": msg}
+
+    def resume_agent_ui(self, name: str):
+        msg = midum.resume_agent(name)
+        ok = "started" in msg.lower()
+        self._push_event("log", {"text": f"🤖 {msg}\n"})
+        self._push_event("agents_changed", {})
+        return {"ok": ok, "message": msg}
+
+    def forget_agent_ui(self, name: str):
+        msg = midum.forget_agent(name)
+        self._push_event("agents_changed", {})
+        return {"ok": True, "message": msg}
+
+    def get_agent_transcript_ui(self, name: str):
+        return {"transcript": midum.get_agent_transcript(name)}
+
+    def _on_agent_done(self, name: str, role: str, report: str):
+        """Fired by multi_agent.py (on the AGENT'S OWN worker thread) the
+        instant a sub-agent's Action Loop stops and its report is ready.
+        Pushes the report straight into the Supervisor's own conversation
+        so it's already there for the NEXT time the Supervisor thinks --
+        no get_agent_report polling needed -- and, if the Supervisor isn't
+        already mid-turn, immediately kicks off a fresh turn so it reacts
+        to the report right away instead of only at the user's next
+        message."""
+        note = (
+            f"[SYSTEM — AGENT REPORT]: Sub-agent '{name}' ({role}) just finished its "
+            f"task and stopped its Action Loop — you do not need to call "
+            f"get_agent_report for it, this is automatic.\n\nIts final report:\n\n{report}\n\n"
+            "Relay anything relevant to the user now, or continue with whatever "
+            "you were doing."
+        )
+
+        # Atomically decide: is a turn already running right now? If so,
+        # this note CANNOT be appended straight to self._session.history --
+        # a turn in flight owns its own independent history_snapshot copy
+        # and self._session.history gets wholesale OVERWRITTEN with that
+        # snapshot the moment the turn finishes (see _run_turn), which
+        # would silently discard the note. Queue it instead; _run_turn's
+        # own finally block (still holding this same lock) merges any
+        # queued notes back in right after it writes the finished
+        # snapshot, and restarts a follow-up turn if any arrived. When no
+        # turn is running, append immediately and start one now, exactly
+        # as before -- this is still the common case.
+        with self._agent_turn_lock:
+            turn_in_flight = self._thinking
+            if turn_in_flight:
+                self._pending_agent_notes.append({"role": "user", "content": note})
+            else:
+                self._session.append({"role": "user", "content": note})
+                self._thinking = True
+
+        with self._persist_lock:
+            self._display_log.append(("system", f"🤖 Agent '{name}' finished its task — see below."))
+        self._persist_current_chat()
+        self._push_event("system_line", {"text": f"🤖 [Agent '{name}' finished its task]"})
+        self._push_event("agents_changed", {})
+
+        # If the Supervisor was idle, we already claimed _thinking above
+        # (inside the lock, atomically with the check) -- safe to start the
+        # turn now. If one was already running, the note is queued and
+        # _run_turn will pick it up and restart itself when it finishes.
+        if not turn_in_flight:
+            self._push_event("status", {"text": "Executing turns... (agent report)", "level": "busy"})
+            threading.Thread(
+                target=self._run_turn,
+                args=(list(self._session.snapshot()), False, None),
+                daemon=True,
+            ).start()
+
+    def _on_agent_inform(self, name: str, role: str, message: str):
+        """Fired by multi_agent.py (on the AGENT'S OWN worker thread) the
+        instant a sub-agent calls tell_supervisor_to_inform_user() mid-task.
+        Mirrors _on_agent_done's delivery mechanism exactly, just for an
+        interim message instead of a final report -- so the Supervisor
+        finds out immediately instead of only once the whole task ends."""
+        note = (
+            f"[SYSTEM — AGENT MESSAGE]: Sub-agent '{name}' ({role}) sent you this "
+            f"message while still working on its task (it has NOT finished yet):\n\n"
+            f"{message}\n\n"
+            "Relay anything relevant to the user now if it's time-sensitive, or note "
+            "it and continue with whatever you were doing."
+        )
+
+        with self._agent_turn_lock:
+            turn_in_flight = self._thinking
+            if turn_in_flight:
+                self._pending_agent_notes.append({"role": "user", "content": note})
+            else:
+                self._session.append({"role": "user", "content": note})
+                self._thinking = True
+
+        with self._persist_lock:
+            self._display_log.append(("system", f"📢 Agent '{name}' sent a message — see below."))
+        self._persist_current_chat()
+        self._push_event("system_line", {"text": f"📢 [Agent '{name}' sent a message]"})
+        self._push_event("agents_changed", {})
+
+        if not turn_in_flight:
+            self._push_event("status", {"text": "Executing turns... (agent message)", "level": "busy"})
+            threading.Thread(
+                target=self._run_turn,
+                args=(list(self._session.snapshot()), False, None),
+                daemon=True,
+            ).start()
+
     def view_mcp_tools(self, name: str):
         return {"content": midum.show_server_tools(name)}
 
@@ -2885,9 +3310,13 @@ select, .btn, .ghost-btn{
 .row:hover .row-copy-btn{opacity:1;}
 .row-copy-btn:hover{background:var(--border2);color:var(--text);}
 .row-copy-btn.copied{opacity:1;color:var(--green);}
-.bubble{border-radius:18px;padding:10px 16px;font-size:14px;line-height:1.5;max-width:78%;white-space:pre-wrap;word-wrap:break-word;}
+.bubble{border-radius:18px;padding:10px 16px;font-size:14px;line-height:1.5;max-width:78%;white-space:pre-wrap;word-wrap:break-word;
+  user-select:text;-webkit-user-select:text;cursor:text;}
+.bubble *{user-select:text;-webkit-user-select:text;}
 .bubble.user{background:var(--user-msg);}
 .bubble.midum{background:transparent;max-width:100%;}
+.midum-chunk{margin-top:10px;}
+.midum-chunk:first-child{margin-top:0;}
 .row.system, .row.error{align-items:center;text-align:center;}
 .row.system .bubble{background:transparent;color:var(--subtext);font-size:12px;}
 .row.error .bubble{background:transparent;color:var(--red);font-size:12px;}
@@ -2918,6 +3347,13 @@ select, .btn, .ghost-btn{
   background:var(--green);
   animation:toolPulse 1.1s ease-in-out infinite;box-shadow:0 0 0 rgba(16,185,129,.6);
 }
+/* Sub-agent tool calls: same shape as a normal tool-call row, but dimmed
+   down so they read as quiet background chatter from a spawned agent,
+   never mistaken for something the Supervisor itself is doing. */
+.agent-tool-line{opacity:.5;font-style:italic;}
+.agent-tool-line:hover{opacity:.85;font-style:normal;}
+.agent-tool-dot{background:var(--muted);}
+.agent-tool-row .tool-detail{opacity:.9;}
 @keyframes toolPulse{
   0%{  transform:scale(0.7); box-shadow:0 0 0 0 rgba(16,185,129,.55); }
   50%{ transform:scale(1.25); box-shadow:0 0 0 4px rgba(16,185,129,0); }
@@ -3320,7 +3756,7 @@ textarea.code-area{
 <script>
 const TABS = [
   ["Chat","💬"], ["Voice","🎤"], ["Log","📜"], ["Model","🧬"], ["Parameters","⚙"],
-  ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["Flows","🔗"], ["MCP","🔌"], ["Permissions","🔐"]
+  ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["Flows","🔗"], ["Agents","🤖"], ["MCP","🔌"], ["Permissions","🔐"]
 ];
 
 let state = {
@@ -3334,6 +3770,14 @@ let state = {
 };
 
 let voiceState = { running: false, connecting: false };
+
+// Tracks the chat row currently receiving say()/reply text for the
+// in-progress turn, so multiple say() calls (and the final reply) within
+// ONE response fold into a single bubble with a single "Midum" label at
+// the top, instead of each call creating its own row+label. Reset to null
+// whenever a new turn starts, whenever a tool call interrupts the flow, and
+// once the turn is fully done -- each of those should start a fresh bubble.
+let _currentMidumRow = null;
 
 function api(name, ...args){ return window.pywebview.api[name](...args); }
 
@@ -3946,6 +4390,41 @@ function attachToolCallDetail(name, args, result){
     <pre>${escapeHtml(result || "(empty)")}</pre>`;
 }
 
+// A sub-agent's own tool calls arrive as ONE complete event (call + result
+// together, see Api._handle_tool_call's agent_name branch) rather than the
+// two-stage placeholder-then-attach flow normal Supervisor tool calls use
+// -- there's no matching "-> Executing:" console line pushed for these (see
+// Api._on_log_line), so there's no pending row to attach to. Rendered as a
+// single dim/grey row, visually distinct from the Supervisor's own
+// tool-call cards, so background agent activity doesn't read as if the
+// Supervisor itself were doing it.
+function appendAgentToolRow(agent, name, args, result){
+  const col = chatCol();
+  const row = document.createElement("div");
+  row.className = "row tool tool-row agent-tool-row";
+  const argsStr = (args && Object.keys(args).length) ? JSON.stringify(args, null, 2) : "(no arguments)";
+  row.dataset.toolName = `${agent} → ${name}`;
+  row.innerHTML = `
+    <div class="tool-line agent-tool-line expandable">
+      <span class="tool-dot agent-tool-dot"></span><span class="gear">🤖</span><span>${escapeHtml(agent)} → ${escapeHtml(name)}</span>
+      <span class="chevron">▶</span>
+      <button class="row-copy-btn" title="Copy tool call" style="margin-left:6px;">⧉</button>
+    </div>
+    <div class="tool-detail">
+      <div class="tool-detail-label">Call</div>
+      <pre>${escapeHtml(name)}(${escapeHtml(argsStr)})</pre>
+      <div class="tool-detail-label">Result</div>
+      <pre>${escapeHtml(result || "(empty)")}</pre>
+    </div>`;
+  row.querySelector(".tool-line").onclick = (e)=>{
+    if (e.target.closest(".row-copy-btn")) return;
+    row.classList.toggle("open");
+  };
+  wireRowCopyBtn(row);
+  col.appendChild(row);
+  scrollToBottom();
+}
+
 function animateWords(container){
   if (!container) return;
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, null);
@@ -3980,15 +4459,34 @@ function appendRow(tag, text){
   const col = chatCol();
   const row = document.createElement("div");
   if (tag === "user"){
+    _currentMidumRow = null;   // a new user turn always starts a fresh Midum bubble
     row.className = "row user";
     row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">⧉</button></div><div class="bubble user">${escapeHtml(text)}</div>`;
     wireRowCopyBtn(row);
   } else if (tag === "midum"){
-    row.className = "row midum";
-    row.innerHTML = `<div class="row-label-row"><div class="row-label">Midum</div><button class="row-copy-btn" title="Copy response">⧉</button></div><div class="bubble midum">${renderMidumContent(text)}</div>`;
-    wireRowCopyBtn(row);
     setActiveToolDot(null);
+    // If a bubble is already streaming for this response (an earlier
+    // say() call, or a reply following one), append into it instead of
+    // creating a new row -- keeps exactly one "Midum" label per response
+    // no matter how many say()/reply chunks make it up.
+    if (_currentMidumRow && _currentMidumRow.isConnected){
+      const bubble = _currentMidumRow.querySelector(".bubble");
+      const chunk = document.createElement("div");
+      chunk.className = "midum-chunk";
+      chunk.innerHTML = renderMidumContent(text);
+      bubble.appendChild(chunk);
+      animateWords(chunk);
+      renderPendingMermaid();
+      renderPendingMath();
+      renderPendingCodeHighlight();
+      scrollToBottom();
+      return;
+    }
+    row.className = "row midum";
+    row.innerHTML = `<div class="row-label-row"><button class="row-copy-btn" title="Copy response">⧉</button></div><div class="bubble midum">${renderMidumContent(text)}</div>`;
+    wireRowCopyBtn(row);
     col.appendChild(row);
+    _currentMidumRow = row;
     animateWords(row.querySelector(".bubble"));
     renderPendingMermaid();
     renderPendingMath();
@@ -4003,6 +4501,7 @@ function appendRow(tag, text){
     row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
     setActiveToolDot(null);
   } else if (tag === "tool"){
+    _currentMidumRow = null;   // a tool call breaks any in-progress Midum bubble
     row.className = "row tool tool-row";
     const nameMatch = /-> Executing: '([^']+)'/.exec(text);
     row.dataset.toolName = nameMatch ? nameMatch[1] : "";
@@ -4021,6 +4520,37 @@ function appendRow(tag, text){
     col.appendChild(row);
     setActiveToolDot(row.querySelector(".tool-dot"));
     _pendingToolRows.push(row);
+    scrollToBottom();
+    return;
+  } else if (tag === "toolcall"){
+    // Persisted, already-resolved tool-call record (see Api._handle_tool_call) --
+    // replayed from a saved chat's display log, so call+result are both known
+    // up front. No placeholder / _pendingToolRows entry needed since there's no
+    // live 'tool_call' event coming later to attach detail to (that's the
+    // difference from the "tool" branch above, which is for a LIVE turn).
+    let data;
+    try { data = JSON.parse(text); } catch(e){ data = {name: "", args: {}, result: text}; }
+    row.className = "row tool tool-row";
+    const argsStr = (data.args && Object.keys(data.args).length) ? JSON.stringify(data.args, null, 2) : "(no arguments)";
+    row.dataset.toolName = data.name || "";
+    row.innerHTML = `
+      <div class="tool-line expandable">
+        <span class="tool-dot"></span><span class="gear">⚙</span><span>-> Executing: '${escapeHtml(data.name || "")}'</span>
+        <span class="chevron">▶</span>
+        <button class="row-copy-btn" title="Copy tool call" style="margin-left:6px;">⧉</button>
+      </div>
+      <div class="tool-detail">
+        <div class="tool-detail-label">Call</div>
+        <pre>${escapeHtml(data.name || "")}(${escapeHtml(argsStr)})</pre>
+        <div class="tool-detail-label">Result</div>
+        <pre>${escapeHtml(data.result || "(empty)")}</pre>
+      </div>`;
+    row.querySelector(".tool-line").onclick = (e)=>{
+      if (e.target.closest(".row-copy-btn")) return;
+      row.classList.toggle("open");
+    };
+    wireRowCopyBtn(row);
+    col.appendChild(row);
     scrollToBottom();
     return;
   }
@@ -4054,7 +4584,7 @@ function rowPlainText(row){
   if (row.classList.contains("midum")){
     if (row.querySelector(".ask-card")) return "";   // inline ask cards aren't transcript text
     const b = row.querySelector(".bubble");
-    return "Midum: " + bubblePlainText(b);
+    return bubblePlainText(b);
   }
   if (row.classList.contains("tool")){
     const name = row.dataset.toolName || "tool";
@@ -4145,7 +4675,7 @@ function scrollToBottom(){
   requestAnimationFrame(()=>{ sc.scrollTop = sc.scrollHeight; });
 }
 
-function clearChat(){ chatCol().innerHTML = ""; _pendingToolRows = []; }
+function clearChat(){ chatCol().innerHTML = ""; _pendingToolRows = []; _currentMidumRow = null; }
 
 // ── Ask cards --------------------------------------------------------------
 function appendAsk(id, kind, payload){
@@ -4454,11 +4984,13 @@ window.__midumEvent = function(evt){
   else if (kind === "error_line"){ appendRow("error", payload.text); }
   else if (kind === "tool_line"){ appendRow("tool", payload.text); }
   else if (kind === "tool_call"){ attachToolCallDetail(payload.name, payload.args, payload.result); }
+  else if (kind === "agent_tool_call"){ appendAgentToolRow(payload.agent, payload.name, payload.args, payload.result); }
   else if (kind === "log"){ appendLog(payload.text); }
-  else if (kind === "done"){ state.thinking = false; setActiveToolDot(null); }
-  else if (kind === "projects"){ populateProjects(payload.projects); }
+  else if (kind === "done"){ state.thinking = false; setActiveToolDot(null); _currentMidumRow = null; }
+  else if (kind === "projects"){ populateProjects(payload.projects, payload.active); }
   else if (kind === "ask"){ appendAsk(payload.id, payload.kind, payload.payload); }
   else if (kind === "mcp_changed"){ if (state.activeTab === "MCP") refreshMcpList(); }
+  else if (kind === "agents_changed"){ if (state.activeTab === "Agents") refreshAgentsList(); }
   else if (kind === "schedule_ran"){ if (state.activeTab === "Schedule") showToolPane("Schedule"); }
   else if (kind === "tool_result"){ const box=document.getElementById("tool-output"); if(box) box.value = payload.output; }
   else if (kind === "voice_status"){ handleVoiceStatus(payload); }
@@ -4472,6 +5004,22 @@ window.__midumEvent = function(evt){
   else if (kind === "ptt_captured"){ handlePttCaptured(payload); }
   else if (kind === "voice_ptt_state"){ handlePttState(payload); }
   else if (kind === "pdf_cache_warmed"){ if (typeof onPdfCacheWarmed === "function") onPdfCacheWarmed(); }
+  else if (kind === "gemini_web_models"){
+    // select_provider() returns an instant cached/fallback list for
+    // Gemini-web and fetches the real gemini_webapi lineup in the
+    // background (see Api.select_provider) -- this event carries that
+    // real list once it lands. Only refresh dropdowns that are actually
+    // showing Gemini-web right now, so we don't clobber a list the user
+    // has since switched away from.
+    const providerSel = document.getElementById("provider-select");
+    if (providerSel && providerSel.value === "Gemini (Web)"){
+      fillModelList(payload.models);
+    }
+    const settingsProviderSel = document.getElementById("settings-provider");
+    if (settingsProviderSel && settingsProviderSel.value === "Gemini (Web)"){
+      fillDatalist("settings-model-list", payload.models);
+    }
+  }
 };
 
 function appendLog(text){
@@ -4686,7 +5234,7 @@ function buildSidebar(){
       <select id="project-select"></select>
       <div class="btn-row">
         <button class="ghost-btn" id="proj-new">+ Project</button>
-        <button class="ghost-btn" id="proj-scan">📂 Scan</button>
+        <button class="ghost-btn" id="proj-remove">🗑 Remove</button>
         <button class="ghost-btn" id="proj-code">💻 Code</button>
       </div>
       <div id="file-list"></div>
@@ -4749,6 +5297,7 @@ function buildSidebar(){
         <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Background<input type="color" id="settings-color-bg" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
         <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Panel<input type="color" id="settings-color-panel" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
         <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Text<input type="color" id="settings-color-text" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
+        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">User bubble<input type="color" id="settings-color-user_msg" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
       </div>
       <div class="field-label">BLOB COLORS</div>
       <div style="display:flex;flex-wrap:wrap;gap:8px;">
@@ -4777,12 +5326,19 @@ function buildSidebar(){
     renderFileList(info);
   };
   document.getElementById("proj-new").onclick = async ()=>{
-    const name = await showPrompt("Enter new Project/Workspace name:", "New Project");
-    if (!name) return;
-    const r = await api("create_project", name);
-    if (!r.ok) showAlert(r.error, "Error"); else populateProjects(r.projects);
+    const r = await api("add_workspace_folder");
+    if (!r.ok) { if (r.error) showAlert(r.error, "Error"); return; }
+    populateProjects(r.projects, r.projects[r.projects.length - 1]);
   };
-  document.getElementById("proj-scan").onclick = async ()=>{ await api("change_base_work_directory"); };
+  document.getElementById("proj-remove").onclick = async ()=>{
+    const sel = document.getElementById("project-select");
+    const current = sel && sel.value;
+    if (!current) return;
+    const ok = await showConfirm(`Remove "${current.split(/[\\/]/).pop()}" from the workspace list? (folder itself is untouched)`, "Remove Workspace", {danger:true, okLabel:"Remove"});
+    if (!ok) return;
+    const r = await api("remove_workspace_folder", current);
+    if (r.ok) populateProjects(r.projects);
+  };
   document.getElementById("proj-code").onclick = ()=>api("open_project_in_vscode");
   document.getElementById("proj-term").onclick = ()=>api("open_project_terminal");
   document.getElementById("shutdown-btn").onclick = async ()=>{
@@ -4806,7 +5362,8 @@ function buildSidebar(){
     // while in Light mode gives back Light's real colors. Blob colors
     // aren't theme-dependent (THEME_VARS doesn't touch them), so they
     // always come from DEFAULT_COLORS regardless of active theme.
-    const defaults = {...DEFAULT_COLORS, ...(THEME_VARS[_activeTheme] || {})};
+    const defaults = {...DEFAULT_COLORS, ...(THEME_VARS[_activeTheme] || {}), user_msg: (THEME_VARS[_activeTheme] || {})["user-msg"] || DEFAULT_COLORS.user_msg};
+    _themeColors[_activeTheme] = defaults;
     applyColors(defaults);
     Object.entries(defaults).forEach(([k,v])=>{
       const el = document.getElementById(`settings-color-${k}`);
@@ -4827,6 +5384,7 @@ function buildSidebar(){
   };
   document.getElementById("settings-blobs-enabled").onchange = (e)=>{
     applyBlobsEnabled(e.target.checked);
+    _themeBlobsEnabled[_activeTheme] = e.target.checked;
   };
   document.getElementById("bg-choose").onclick = async ()=>{
     const r = await api("pick_background_image");
@@ -4856,6 +5414,7 @@ function buildSidebar(){
 
 const DEFAULT_COLORS = {
   accent:"#60a5fa", accent2:"#1d4ed8", bg:"#05070c", panel:"#0b0f19", text:"#f3f4f6",
+  user_msg:"#0f1e33",
   blob_center:"#60a5fa", blob_a:"#f472b6", blob_b:"#34d399", blob_cursor:"#a78bfa",
 };
 
@@ -4885,11 +5444,25 @@ const THEME_VARS = {
 
 let _activeTheme = "dark";
 
+// Each theme (dark/light) remembers its own saved custom-color preset AND
+// its own ambient-blobs on/off preference. Populated from get_settings()
+// on load/boot, updated whenever the user saves the settings panel.
+// applyTheme() layers whichever bucket matches the active theme on top of
+// that theme's base palette, so toggling Dark/Light auto-restores each
+// theme's own saved colors and blobs setting instead of always showing
+// the stock/shared values.
+let _themeColors = { dark: {...DEFAULT_COLORS}, light: {...DEFAULT_COLORS} };
+let _themeBlobsEnabled = { dark: true, light: true };
+
 function applyTheme(name){
   const vars = THEME_VARS[name] || THEME_VARS.dark;
   const root = document.documentElement.style;
   Object.entries(vars).forEach(([k,v])=> root.setProperty(`--${k}`, v));
   _activeTheme = name;
+  // Apply this theme's saved custom-color preset on top of its base palette.
+  applyColors(_themeColors[name]);
+  // Likewise restore this theme's own ambient-blobs preference.
+  applyBlobsEnabled(_themeBlobsEnabled[name] !== false);
   document.querySelectorAll('#settings-theme-toggle [data-theme]').forEach(b=>{
     b.classList.toggle("active", b.dataset.theme === name);
     b.style.background = b.dataset.theme === name ? "var(--accent)" : "transparent";
@@ -4897,10 +5470,12 @@ function applyTheme(name){
   });
   // Keep the custom color-picker swatches in the settings panel in sync
   // with whichever theme is now active, so switching to Light mode shows
-  // that theme's real colors instead of stale values left over from Dark.
-  ["accent","accent2","bg","panel","text"].forEach(k=>{
+  // that theme's own saved preset instead of stale values left over from
+  // Dark (or the stock palette, if nothing was customized for it yet).
+  const merged = {...vars, user_msg: vars["user-msg"], ...(_themeColors[name] || {})};
+  ["accent","accent2","bg","panel","text","user_msg","blob_center","blob_a","blob_b","blob_cursor"].forEach(k=>{
     const el = document.getElementById(`settings-color-${k}`);
-    if (el && vars[k]) el.value = vars[k];
+    if (el && merged[k]) el.value = merged[k];
   });
 }
 
@@ -4912,6 +5487,7 @@ function applyColors(colors){
   if (colors.bg) root.setProperty("--bg", colors.bg);
   if (colors.panel) root.setProperty("--panel", colors.panel);
   if (colors.text) root.setProperty("--text", colors.text);
+  if (colors.user_msg) root.setProperty("--user-msg", colors.user_msg);
   if (colors.blob_center) root.setProperty("--blob-center", colors.blob_center);
   if (colors.blob_a) root.setProperty("--blob-a", colors.blob_a);
   if (colors.blob_b) root.setProperty("--blob-b", colors.blob_b);
@@ -5057,8 +5633,14 @@ function enhanceSelect(sel){
 
 async function loadSettingsPanel(){
   const s = await api("get_settings");
+  // Populate the per-theme color + blobs caches BEFORE applying the theme,
+  // so applyTheme() layers each theme's own saved preset immediately
+  // instead of the stock/shared values.
+  _themeColors.dark = s.colors_dark || {...DEFAULT_COLORS};
+  _themeColors.light = s.colors_light || {...DEFAULT_COLORS};
+  _themeBlobsEnabled.dark = s.blobs_enabled_dark !== false;
+  _themeBlobsEnabled.light = s.blobs_enabled_light !== false;
   applyTheme(s.theme || "dark");
-  applyBlobsEnabled(s.blobs_enabled !== false);
   _bgState.cfg = s.bg_image || _bgState.cfg;
   if (_bgState.cfg.enabled && _bgState.cfg.path){
     const r = await api("get_background_image_data");
@@ -5077,11 +5659,9 @@ async function loadSettingsPanel(){
   if (modelInput) modelInput.value = s.model;
   const modelsForProvider = await api("select_provider", s.provider);
   fillDatalist("settings-model-list", modelsForProvider.models);
-  Object.entries(s.colors || {}).forEach(([k,v])=>{
-    const el = document.getElementById(`settings-color-${k}`);
-    if (el) el.value = v;
-  });
-  applyColors(s.colors);
+  // Swatches + live colors for the active theme are already handled by
+  // applyTheme() above (it reads from _themeColors), so nothing further
+  // needed here.
 }
 
 async function saveSettingsPanel(){
@@ -5094,17 +5674,28 @@ async function saveSettingsPanel(){
     opacity: Number(document.getElementById("bg-opacity").value),
   };
   const colors = {};
-  ["accent","accent2","bg","panel","text","blob_center","blob_a","blob_b","blob_cursor"].forEach(k=>{
+  ["accent","accent2","bg","panel","text","user_msg","blob_center","blob_a","blob_b","blob_cursor"].forEach(k=>{
     const el = document.getElementById(`settings-color-${k}`);
     if (el) colors[k] = el.value;
   });
-  const blobs_enabled = document.getElementById("settings-blobs-enabled").checked;
-  const r = await api("save_settings", {provider, model, theme: _activeTheme, colors, bg_image, blobs_enabled});
+  // Only the ACTIVE theme's swatches/checkbox are on screen, so only its
+  // bucket gets updated here -- the other theme's saved preset is sent
+  // through untouched so it isn't clobbered by whatever's currently showing.
+  _themeColors[_activeTheme] = colors;
+  _themeBlobsEnabled[_activeTheme] = document.getElementById("settings-blobs-enabled").checked;
+  const r = await api("save_settings", {
+    provider, model, theme: _activeTheme,
+    colors_dark: _themeColors.dark, colors_light: _themeColors.light,
+    blobs_enabled_dark: _themeBlobsEnabled.dark, blobs_enabled_light: _themeBlobsEnabled.light,
+    bg_image,
+  });
   const status = document.getElementById("settings-status");
   if (r.ok){
+    _themeColors.dark = r.settings.colors_dark || _themeColors.dark;
+    _themeColors.light = r.settings.colors_light || _themeColors.light;
+    _themeBlobsEnabled.dark = r.settings.blobs_enabled_dark !== false;
+    _themeBlobsEnabled.light = r.settings.blobs_enabled_light !== false;
     applyTheme(r.settings.theme || "dark");
-    applyColors(r.settings.colors);
-    applyBlobsEnabled(r.settings.blobs_enabled !== false);
     _bgState.cfg = r.settings.bg_image;
     applyBgImage(_bgState.cfg, _bgState.dataUrl);
     if (status) status.textContent = "Saved — will be remembered next launch.";
@@ -5113,17 +5704,26 @@ async function saveSettingsPanel(){
   }
 }
 
-function populateProjects(list){
+function populateProjects(list, selectPath){
   const sel = document.getElementById("project-select");
   if (!sel) return;
+  const prevValue = selectPath || sel.value;
   sel.innerHTML = "";
   if (!list.length){
-    sel.innerHTML = `<option>Create first project...</option>`;
+    sel.innerHTML = `<option value="">+ Project to add a workspace...</option>`;
+    sel.value = "";
     return;
   }
   list.forEach(p=>{
-    const o = document.createElement("option"); o.value = p; o.textContent = p; sel.appendChild(o);
+    const o = document.createElement("option");
+    o.value = p;
+    o.textContent = p.split(/[\\/]/).filter(Boolean).pop() || p;
+    o.title = p;
+    sel.appendChild(o);
   });
+  // Keep the dropdown's visible selection in sync with whichever workspace
+  // is actually active, instead of silently defaulting to index 0.
+  if (prevValue && list.includes(prevValue)) sel.value = prevValue;
 }
 
 function renderFileList(info){
@@ -5184,6 +5784,7 @@ function showToolPane(name){
     "Voice": buildVoicePane, "Log": buildLogPane, "Model": buildModelPane, "Parameters": buildParamsPane,
     "System Core": buildSysCorePane, "Knowledge": buildKnowledgePane,
     "Skills": buildSkillsPane, "Tools": buildToolsPane, "Flows": buildFlowsPane, "Schedule": buildSchedulePane, "MCP": buildMcpPane,
+    "Agents": buildAgentsPane,
     "Permissions": buildPermissionsPane,
   };
   box.innerHTML = "";
@@ -5389,7 +5990,7 @@ function appendVoiceTranscript(role, text){
     row.className = isUser ? "row user" : "row midum";
     row.innerHTML = isUser
       ? `<div class="row-label">You (voice)</div><div class="bubble user"></div>`
-      : `<div class="row-label">Midum (voice)</div><div class="bubble midum"></div>`;
+      : `<div class="bubble midum"></div>`;
     const bubbleEl = row.querySelector(".bubble");
     if (isUser){
       bubbleEl.textContent = text;
@@ -6814,6 +7415,319 @@ async function refreshMcpList(){
   });
 }
 
+// ── Agents pane -------------------------------------------------------------
+// Manually spawn/monitor/task the Supervisor's sub-agents (see multi_agent.py).
+// Running agents get a live-ish card (polled) with Task/Stop controls; dormant
+// persisted agents (persistence=true, not currently running) get Resume/Forget.
+// Clicking a running agent opens a chat-style transcript -- same bubble
+// styling as the main chat pane -- showing every task it's been given and
+// its final report for each, with a box to send it another task inline.
+let _agentsPollTimer = null;
+let _agentTranscriptPollTimer = null;
+
+function buildAgentsPane(box){
+  box.innerHTML = `
+    <div class="hdr-row">
+      <div class="section-label">AGENTS — SUPERVISOR</div>
+      <div>
+        <button class="ghost-btn" id="agents-refresh" style="height:24px;">⟳</button>
+        <button class="btn" id="agents-add" style="background:var(--accent);color:#fff;">+ New Agent</button>
+      </div>
+    </div>
+    <div style="font-size:10px;color:var(--subtext);margin:4px 0 8px;">
+      Sub-agents run their own Action Loop under the current text model (the Supervisor — never the voice model).
+      Persisted agents survive a restart — reactivate them below with Resume.
+    </div>
+    <div id="agents-list" style="flex:1;overflow-y:auto;"></div>`;
+  document.getElementById("agents-refresh").onclick = refreshAgentsList;
+  document.getElementById("agents-add").onclick = async ()=>{
+    const result = await showAgentAddModal();
+    if (!result || !result.name || !result.role) return;
+    const r = await api("create_agent_ui", result.role, result.name, result.description,
+      result.personality, result.persistence, result.model, result.provider, result.knowledge_bases, result.skills);
+    if (!r.ok) await showAlert(r.message, "Couldn't start agent");
+    refreshAgentsList();
+  };
+  refreshAgentsList();
+  if (_agentsPollTimer) clearInterval(_agentsPollTimer);
+  _agentsPollTimer = setInterval(()=>{ if (state.activeTab === "Agents") refreshAgentsList(); }, 4000);
+}
+
+async function refreshAgentsList(){
+  const listEl = document.getElementById("agents-list");
+  if (!listEl) return;
+  const {running, dormant} = await api("list_agents_ui");
+  listEl.innerHTML = "";
+  if (!running.length && !dormant.length){
+    listEl.innerHTML = `<div style="text-align:center;font-size:11px;color:var(--subtext);padding:24px 10px;">No agents yet.<br>Use "+ New Agent" to spawn the Supervisor's first sub-agent.</div>`;
+    return;
+  }
+  running.forEach(a=>{
+    const row = document.createElement("div"); row.className = "mcp-row";
+    const dotColor = a.status === "running" ? "var(--green)" : (a.status === "idle" ? "var(--yellow)" : "var(--red)");
+    const sub = `${a.role} · ${a.provider}/${a.model} · ${a.status}` + (a.queued ? ` · ${a.queued} queued` : "") + (a.persistence ? " · persisted" : "") + (a.knowledge_bases && a.knowledge_bases.length ? ` · KB: ${a.knowledge_bases.join(", ")}` : "") + (a.skills && a.skills.length ? ` · Skills: ${a.skills.join(", ")}` : "");
+    row.innerHTML = `
+      <div class="mcp-dot" style="background:${dotColor};"></div>
+      <div style="flex:1;min-width:0;cursor:pointer;" data-act="open">
+        <div class="mcp-name">${escapeHtml(a.name)}</div>
+        <div class="mcp-sub">${escapeHtml(sub)}</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:4px;">
+        <button class="mini-btn open" data-act="task">Task</button>
+        <button class="mini-btn" data-act="knowledge">Knowledge</button>
+        <button class="mini-btn" data-act="skills">Skills</button>
+        <button class="mini-btn del" data-act="stop">Stop</button>
+      </div>`;
+    row.querySelector('[data-act="open"]').onclick = ()=>showAgentTranscript(a.name);
+    row.querySelector('[data-act="task"]').onclick = async ()=>{
+      const task = await showPrompt(`Task for '${a.name}':`, "Send Agent Task");
+      if (task){ await api("send_agent_task_ui", a.name, task); showAgentTranscript(a.name); }
+    };
+    row.querySelector('[data-act="knowledge"]').onclick = async ()=>{
+      const picked = await showAgentKnowledgeModal(a.name, a.knowledge_bases || []);
+      if (picked !== null){ await api("attach_agent_knowledge_ui", a.name, picked); refreshAgentsList(); }
+    };
+    row.querySelector('[data-act="skills"]').onclick = async ()=>{
+      const picked = await showAgentSkillsModal(a.name, a.skills || []);
+      if (picked !== null){ await api("attach_agent_skills_ui", a.name, picked); refreshAgentsList(); }
+    };
+    row.querySelector('[data-act="stop"]').onclick = async ()=>{
+      const ok = await showConfirm(`Stop agent '${a.name}'?`, "Stop Agent");
+      if (ok){ await api("stop_agent_ui", a.name); refreshAgentsList(); }
+    };
+    listEl.appendChild(row);
+  });
+  if (dormant.length){
+    const hdr = document.createElement("div");
+    hdr.style.cssText = "font-size:10px;color:var(--subtext);margin:10px 0 4px;text-transform:uppercase;letter-spacing:.04em;";
+    hdr.textContent = "Persisted — not running";
+    listEl.appendChild(hdr);
+    dormant.forEach(a=>{
+      const row = document.createElement("div"); row.className = "mcp-row";
+      row.innerHTML = `
+        <div class="mcp-dot" style="background:var(--muted);"></div>
+        <div style="flex:1;min-width:0;">
+          <div class="mcp-name">${escapeHtml(a.name)}</div>
+          <div class="mcp-sub">${escapeHtml(a.role)} · ${escapeHtml(a.provider)}/${escapeHtml(a.model)}</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:4px;">
+          <button class="mini-btn" data-act="resume">Resume</button>
+          <button class="mini-btn del" data-act="forget">Forget</button>
+        </div>`;
+      row.querySelector('[data-act="resume"]').onclick = async ()=>{ await api("resume_agent_ui", a.name); refreshAgentsList(); };
+      row.querySelector('[data-act="forget"]').onclick = async ()=>{
+        const ok = await showConfirm(`Permanently forget agent '${a.name}'?`, "Forget Agent", {danger:true, okLabel:"Forget"});
+        if (ok){ await api("forget_agent_ui", a.name); refreshAgentsList(); }
+      };
+      listEl.appendChild(row);
+    });
+  }
+}
+
+// Multi-field modal for spawning a new agent -- role/name/description/
+// personality/model/provider/persistence/knowledge_bases, mirroring
+// start_agent()'s params.
+async function showAgentAddModal(){
+  const kbFiles = await api("list_knowledge_files"); // e.g. ['blender_notes.md', ...]
+  const skillFiles = await api("list_skill_files");  // e.g. ['terrain_debugging.md', ...]
+  return new Promise(resolve=>{
+    const roleId    = "ag-role-"    + Math.random().toString(36).slice(2);
+    const nameId    = "ag-name-"    + Math.random().toString(36).slice(2);
+    const descId    = "ag-desc-"    + Math.random().toString(36).slice(2);
+    const persId    = "ag-pers-"    + Math.random().toString(36).slice(2);
+    const modelId   = "ag-model-"   + Math.random().toString(36).slice(2);
+    const provId    = "ag-prov-"    + Math.random().toString(36).slice(2);
+    const persistId = "ag-persist-" + Math.random().toString(36).slice(2);
+    const kbListId  = "ag-kb-"      + Math.random().toString(36).slice(2);
+    const skListId  = "ag-sk-"      + Math.random().toString(36).slice(2);
+    const kbHtml = kbFiles.length
+      ? kbFiles.map(f=>{
+          const cbId = "ag-kbcb-" + Math.random().toString(36).slice(2);
+          return `<label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text);padding:2px 0;">
+            <input type="checkbox" class="ag-kb-cb" data-file="${escapeHtml(f)}" id="${cbId}"/> ${escapeHtml(f)}
+          </label>`;
+        }).join("")
+      : `<div style="font-size:10px;color:var(--subtext);">No Knowledge Bases yet — save one from the Knowledge tab first.</div>`;
+    const skHtml = skillFiles.length
+      ? skillFiles.map(f=>{
+          const cbId = "ag-skcb-" + Math.random().toString(36).slice(2);
+          return `<label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text);padding:2px 0;">
+            <input type="checkbox" class="ag-sk-cb" data-file="${escapeHtml(f)}" id="${cbId}"/> ${escapeHtml(f)}
+          </label>`;
+        }).join("")
+      : `<div style="font-size:10px;color:var(--subtext);">No Skills yet — save one from the Skills tab first.</div>`;
+    const body = `
+      <div class="modal-label">ROLE</div>
+      <input type="text" class="modal-input" id="${roleId}" placeholder="e.g. Researcher (one word to one line)"/>
+      <div class="modal-label">NAME</div>
+      <input type="text" class="modal-input" id="${nameId}" placeholder="e.g. Scout"/>
+      <div class="modal-label">DESCRIPTION</div>
+      <textarea class="modal-input" id="${descId}" rows="2" placeholder="What this agent is for, in detail..."></textarea>
+      <div class="modal-label">PERSONALITY / HOW IT SHOULD ACT</div>
+      <textarea class="modal-input" id="${persId}" rows="2" placeholder="Tone, style, behaviour while it works..."></textarea>
+      <div class="modal-label">MODEL</div>
+      <input type="text" class="modal-input" id="${modelId}" placeholder="gemini-3.5-flash-lite" value="gemini-3.5-flash-lite"/>
+      <div class="modal-label">PROVIDER</div>
+      <input type="text" class="modal-input" id="${provId}" placeholder="gemini_api" value="gemini_api"/>
+      <div class="modal-label">KNOWLEDGE (optional — full content given fresh every task, never compounds)</div>
+      <div id="${kbListId}" style="max-height:110px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;margin-bottom:6px;">${kbHtml}</div>
+      <div class="modal-label">SKILLS (optional — same fresh-every-task treatment as Knowledge)</div>
+      <div id="${skListId}" style="max-height:110px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;margin-bottom:6px;">${skHtml}</div>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11px;color:var(--text);">
+        <input type="checkbox" id="${persistId}"/> Persist — save so it can be reactivated later, even after a restart
+      </label>
+    `;
+    _renderModal("New Agent", body, [
+      { label: "Cancel", onClick: ()=>{ _closeModal(); resolve(null); } },
+      { label: "Start Agent", primary: true, onClick: ()=>{
+          const role        = document.getElementById(roleId).value.trim();
+          const name        = document.getElementById(nameId).value.trim();
+          const description = document.getElementById(descId).value.trim();
+          const personality = document.getElementById(persId).value.trim();
+          const model       = document.getElementById(modelId).value.trim();
+          const provider    = document.getElementById(provId).value.trim();
+          const persistence = document.getElementById(persistId).checked;
+          const knowledge_bases = Array.from(document.querySelectorAll(`#${kbListId} .ag-kb-cb:checked`)).map(cb=>cb.dataset.file);
+          const skills = Array.from(document.querySelectorAll(`#${skListId} .ag-sk-cb:checked`)).map(cb=>cb.dataset.file);
+          _closeModal();
+          resolve({ role, name, description, personality, model, provider, persistence, knowledge_bases, skills });
+        } },
+    ], roleId);
+    _modalKeyHandler = e=>{ if (e.key === "Escape"){ _closeModal(); resolve(null); } };
+    document.addEventListener("keydown", _modalKeyHandler);
+  });
+}
+
+// Modal for changing which Knowledge Bases are attached to an already-
+// running (or dormant) agent -- calls attach_agent_knowledge_ui, which
+// REPLACES the agent's whole knowledge_bases list with the checked set.
+async function showAgentKnowledgeModal(name, currentFiles){
+  const kbFiles = await api("list_knowledge_files");
+  const current = new Set((currentFiles || []).map(n => n.endsWith(".md") ? n : `${n}.md`));
+  return new Promise(resolve=>{
+    const kbListId = "ag-kb2-" + Math.random().toString(36).slice(2);
+    const kbHtml = kbFiles.length
+      ? kbFiles.map(f=>{
+          const cbId = "ag-kbcb2-" + Math.random().toString(36).slice(2);
+          return `<label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text);padding:2px 0;">
+            <input type="checkbox" class="ag-kb-cb2" data-file="${escapeHtml(f)}" id="${cbId}" ${current.has(f) ? "checked" : ""}/> ${escapeHtml(f)}
+          </label>`;
+        }).join("")
+      : `<div style="font-size:10px;color:var(--subtext);">No Knowledge Bases yet — save one from the Knowledge tab first.</div>`;
+    const body = `
+      <div style="font-size:10px;color:var(--subtext);margin-bottom:6px;">
+        Full content of the checked Knowledge Base(s) is given to '${escapeHtml(name)}' fresh every task —
+        it never accumulates in its own history.
+      </div>
+      <div id="${kbListId}" style="max-height:160px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;">${kbHtml}</div>
+    `;
+    _renderModal(`Knowledge — ${name}`, body, [
+      { label: "Cancel", onClick: ()=>{ _closeModal(); resolve(null); } },
+      { label: "Save", primary: true, onClick: ()=>{
+          const picked = Array.from(document.querySelectorAll(`#${kbListId} .ag-kb-cb2:checked`)).map(cb=>cb.dataset.file);
+          _closeModal();
+          resolve(picked);
+        } },
+    ]);
+    _modalKeyHandler = e=>{ if (e.key === "Escape"){ _closeModal(); resolve(null); } };
+    document.addEventListener("keydown", _modalKeyHandler);
+  });
+}
+
+// Same as showAgentKnowledgeModal() above, but for this agent's attached
+// MD Skill files -- calls attach_agent_skills_ui, which REPLACES the
+// agent's whole skills list with the checked set.
+async function showAgentSkillsModal(name, currentFiles){
+  const skillFiles = await api("list_skill_files");
+  const current = new Set((currentFiles || []).map(n => n.endsWith(".md") ? n : `${n}.md`));
+  return new Promise(resolve=>{
+    const skListId = "ag-sk2-" + Math.random().toString(36).slice(2);
+    const skHtml = skillFiles.length
+      ? skillFiles.map(f=>{
+          const cbId = "ag-skcb2-" + Math.random().toString(36).slice(2);
+          return `<label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text);padding:2px 0;">
+            <input type="checkbox" class="ag-sk-cb2" data-file="${escapeHtml(f)}" id="${cbId}" ${current.has(f) ? "checked" : ""}/> ${escapeHtml(f)}
+          </label>`;
+        }).join("")
+      : `<div style="font-size:10px;color:var(--subtext);">No Skills yet — save one from the Skills tab first.</div>`;
+    const body = `
+      <div style="font-size:10px;color:var(--subtext);margin-bottom:6px;">
+        Full content of the checked Skill(s) is given to '${escapeHtml(name)}' fresh every task —
+        it never accumulates in its own history.
+      </div>
+      <div id="${skListId}" style="max-height:160px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;">${skHtml}</div>
+    `;
+    _renderModal(`Skills — ${name}`, body, [
+      { label: "Cancel", onClick: ()=>{ _closeModal(); resolve(null); } },
+      { label: "Save", primary: true, onClick: ()=>{
+          const picked = Array.from(document.querySelectorAll(`#${skListId} .ag-sk-cb2:checked`)).map(cb=>cb.dataset.file);
+          _closeModal();
+          resolve(picked);
+        } },
+    ]);
+    _modalKeyHandler = e=>{ if (e.key === "Escape"){ _closeModal(); resolve(null); } };
+    document.addEventListener("keydown", _modalKeyHandler);
+  });
+}
+
+// Chat-style monitor for one running agent -- reuses the same .bubble
+// user/midum classes the main chat pane uses so it looks and feels
+// identical, just scoped to this one agent's own task/report history.
+// Polls every 3s while open so progress shows up without manual refresh,
+// and lets you send the agent another task right from the same view.
+async function showAgentTranscript(name){
+  const overlay = document.getElementById("modal-overlay");
+  const box = document.getElementById("modal-box");
+  box.classList.add("wide");
+  box.innerHTML = `
+    <div class="modal-title">Agent — ${escapeHtml(name)}</div>
+    <div id="agent-transcript-body" style="max-height:50vh;overflow-y:auto;margin:8px 0;display:flex;flex-direction:column;gap:10px;padding:4px;"></div>
+    <div style="display:flex;gap:8px;">
+      <input type="text" class="modal-input" id="agent-transcript-input" placeholder="Send this agent a task..." style="flex:1;margin:0;"/>
+      <button class="modal-btn primary" id="agent-transcript-send">Send</button>
+    </div>
+    <div class="modal-actions"><button class="modal-btn" id="agent-transcript-close">Close</button></div>
+  `;
+  overlay.classList.add("open");
+
+  async function refresh(){
+    const {transcript} = await api("get_agent_transcript_ui", name);
+    const bodyEl = document.getElementById("agent-transcript-body");
+    if (!bodyEl) return;
+    bodyEl.innerHTML = (transcript && transcript.length)
+      ? transcript.map(m=>{
+          const isUser = m.role === "user";
+          return `<div class="row ${isUser ? "user" : "midum"}" style="margin:0;">
+            <div class="row-label-row"><div class="row-label">${isUser ? "Supervisor" : escapeHtml(name)}</div></div>
+            <div class="bubble ${isUser ? "user" : "midum"}">${escapeHtml(m.content || "")}</div>
+          </div>`;
+        }).join("")
+      : `<div style="font-size:11px;color:var(--subtext);text-align:center;padding:20px;">No tasks sent to this agent yet.</div>`;
+    bodyEl.scrollTop = bodyEl.scrollHeight;
+  }
+  await refresh();
+
+  if (_agentTranscriptPollTimer) clearInterval(_agentTranscriptPollTimer);
+  _agentTranscriptPollTimer = setInterval(refresh, 3000);
+
+  const stopPolling = ()=>{ if (_agentTranscriptPollTimer){ clearInterval(_agentTranscriptPollTimer); _agentTranscriptPollTimer = null; } };
+
+  document.getElementById("agent-transcript-send").onclick = async ()=>{
+    const input = document.getElementById("agent-transcript-input");
+    const task = (input.value || "").trim();
+    if (!task) return;
+    input.value = "";
+    await api("send_agent_task_ui", name, task);
+    refresh();
+  };
+  document.getElementById("agent-transcript-input").onkeydown = (e)=>{
+    if (e.key === "Enter") document.getElementById("agent-transcript-send").click();
+  };
+  document.getElementById("agent-transcript-close").onclick = ()=>{ stopPolling(); _closeModal(); };
+  _modalKeyHandler = e=>{ if (e.key === "Escape"){ stopPolling(); _closeModal(); } };
+  document.addEventListener("keydown", _modalKeyHandler);
+}
+
 // ── Permissions pane -------------------------------------------------------
 // Per-tool (native + MCP) permission control: Always Allow / Ask for
 // Approval / Don't Allow. Enforced server-side in orchestration.py right
@@ -7069,9 +7983,11 @@ window.addEventListener("pywebviewready", async ()=>{
   // startup() call resolves, so the UI doesn't flash default colors first.
   try {
     const s = await api("get_settings");
+    _themeColors.dark = s.colors_dark || {...DEFAULT_COLORS};
+    _themeColors.light = s.colors_light || {...DEFAULT_COLORS};
+    _themeBlobsEnabled.dark = s.blobs_enabled_dark !== false;
+    _themeBlobsEnabled.light = s.blobs_enabled_light !== false;
     applyTheme(s.theme || "dark");
-    applyColors(s.colors);
-    applyBlobsEnabled(s.blobs_enabled !== false);
     _bgState.cfg = s.bg_image || _bgState.cfg;
     if (_bgState.cfg.enabled && _bgState.cfg.path){
       const r = await api("get_background_image_data");

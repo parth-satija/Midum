@@ -2210,6 +2210,321 @@ tools = [
             },
         },
     },
+    # ── MULTI-AGENT (Supervisor / sub-agents) ──────────────────────────────────
+    # The Supervisor is always the currently selected PRIMARY TEXT model (never
+    # the voice model). Sub-agents are persistent worker threads, each running
+    # its own Action Loop through the same orchestration.process_chat_turn engine.
+    {
+        "type": "function",
+        "function": {
+            "name": "start_agent",
+            "description": (
+                "Spawn a new sub-agent as the Supervisor. The agent starts an idle "
+                "Action-Loop worker thread immediately (with its own tool access, "
+                "identical to yours) and waits for work — give it tasks afterward "
+                "with send_agent_task. If persistence=true, the agent's definition "
+                "(role/name/description/personality/model/provider) is saved to disk "
+                "so it can be brought back later with resume_agent even after a "
+                "restart — its conversation history is not preserved across restarts, "
+                "only its identity/config."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "description": "The agent's role, one word to one line, e.g. 'Researcher' or 'File organizer'."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "A short unique name to identify and address this agent by, e.g. 'Scout'."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What this agent is for, in detail — its purpose and scope."
+                    },
+                    "personality": {
+                        "type": "string",
+                        "description": "How the agent should act/behave/talk while working — its personality and tone."
+                    },
+                    "persistence": {
+                        "type": "boolean",
+                        "description": "If true, save this agent's definition to disk so resume_agent can bring it back later. Default false."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model ID for this agent's brain. Default 'gemini-3.5-flash-lite'."
+                    },
+                    "provider": {
+                        "type": "string",
+                        "description": "Provider for this agent's brain (e.g. 'gemini_api', 'openrouter', 'groq'). Default 'gemini_api'."
+                    },
+                    "knowledge_bases": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional: names of MD Knowledge Bases (saved from the Knowledge tab — "
+                            "see list_domain_knowledge) to attach to this agent. Their full current "
+                            "content is given to the agent fresh on every task it runs, never stored "
+                            "in its conversation history, so it does not compound over time. Use "
+                            "attach_agent_knowledge to change this later."
+                        )
+                    },
+                    "skills": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional: names of MD Skill files (saved from the Skills tab — see "
+                            "list_domain_skills) to attach to this agent. Their full current content "
+                            "is given to the agent fresh on every task it runs, never stored in its "
+                            "conversation history, so it does not compound over time. Use "
+                            "attach_agent_skills to change this later."
+                        )
+                    }
+                },
+                "required": ["role", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attach_agent_knowledge",
+            "description": (
+                "Attach one or more MD Knowledge Bases (saved from the Knowledge tab — see "
+                "list_domain_knowledge for available names) to a sub-agent, REPLACING any "
+                "previously attached ones. The full current content of each is given to the "
+                "agent fresh on every task it works from now on — it is re-read from disk each "
+                "time and never written into the agent's own conversation history, so it cannot "
+                "compound or grow stale across many tasks. Pass an empty list to detach all "
+                "knowledge bases. Works on a running agent or a dormant persisted one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The agent's name, from start_agent or list_agents."},
+                    "knowledge_bases": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Knowledge base names (without .md), from list_domain_knowledge. Empty list detaches all."
+                    }
+                },
+                "required": ["name", "knowledge_bases"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_agent_knowledge",
+            "description": "List the MD Knowledge Base(s) currently attached to a sub-agent (running or dormant).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The agent's name, from start_agent or list_agents."}
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "attach_agent_skills",
+            "description": (
+                "Attach one or more MD Skill files (saved from the Skills tab — see "
+                "list_domain_skills for available names) to a sub-agent, REPLACING any "
+                "previously attached ones. The full current content of each is given to the "
+                "agent fresh on every task it works from now on — it is re-read from disk each "
+                "time and never written into the agent's own conversation history, so it cannot "
+                "compound or grow stale across many tasks. Pass an empty list to detach all "
+                "skills. Works on a running agent or a dormant persisted one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The agent's name, from start_agent or list_agents."},
+                    "skills": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Skill names (without .md), from list_domain_skills. Empty list detaches all."
+                    }
+                },
+                "required": ["name", "skills"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_agent_skills",
+            "description": "List the MD Skill(s) currently attached to a sub-agent (running or dormant).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The agent's name, from start_agent or list_agents."}
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_agent_task",
+            "description": (
+                "Queue a task for a running sub-agent. The agent works it inside its "
+                "own Action Loop on its OWN thread, IN THE BACKGROUND — this call "
+                "returns immediately, BEFORE the agent has done any work. It is NOT "
+                "synchronous and the task is NOT done when this returns. "
+                "Real sub-agent tasks take real time — roughly 20 seconds to several "
+                "minutes depending on complexity, since the agent runs its own "
+                "multi-step tool-calling loop rather than replying instantly. "
+                "You will be told AUTOMATICALLY, in your own context, the moment this "
+                "agent's Action Loop stops and its report is ready — you do NOT need "
+                "to call get_agent_report or otherwise check in to find out when it's "
+                "done. Just continue with other work (or end your turn) after queuing this."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The agent's name, from start_agent or list_agents."},
+                    "task": {"type": "string", "description": "The complete, self-contained task to hand off to this agent."}
+                },
+                "required": ["name", "task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_agent_report",
+            "description": (
+                "Check a sub-agent's current status (idle/running/stopped), queued "
+                "task count, and its most recent final report. You normally do NOT "
+                "need to call this — the moment an agent finishes a task, its report "
+                "is pushed automatically into your own context, so you'll already know "
+                "without checking. Only use this to re-check an old report, inspect "
+                "status for some other reason, or if you suspect a notification was "
+                "missed. If status is 'running', the agent has NOT finished yet — this "
+                "is expected, not a failure."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The agent's name, from start_agent or list_agents."}
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_agents",
+            "description": "List every currently running sub-agent (role, status, brain, persistence) plus any persisted-but-dormant agents that can be brought back with resume_agent.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_agent",
+            "description": (
+                "Stop a running sub-agent's Action Loop worker. If it's mid-task, it "
+                "finishes that task first, then shuts its thread down. A persisted "
+                "(persistence=true) agent's saved definition is kept on disk — bring it "
+                "back later with resume_agent — unless you also call forget_agent."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The agent's name to stop."}
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resume_agent",
+            "description": "Reactivate a persisted (persistence=true) agent that isn't currently running, using its saved role/name/description/personality/model/provider. Starts fresh (no old conversation history).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The agent's name, from list_agents' dormant list."}
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_agent",
+            "description": "Stop (if running) and permanently delete a sub-agent's persisted definition from disk.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The agent's name to forget."}
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_agent_task_to_supervisor",
+            "description": (
+                "VOICE MODE tool. Call this when the user gives a spoken command about "
+                "sub-agents — spawning one, giving one a task, checking on one, stopping "
+                "one, listing them, etc. This hands the raw instruction to the SUPERVISOR "
+                "(Midum's current primary TEXT model, NEVER the voice model itself), which "
+                "has the actual agent-management tools (start_agent, send_agent_task, "
+                "stop_agent, resume_agent, list_agents, get_agent_report, forget_agent) and "
+                "carries the request out, then returns a short summary for you to speak "
+                "back to the user. Do not try to manage agents yourself — always route "
+                "through this tool in voice mode."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {"type": "string", "description": "The user's agent-related request, in plain language."}
+                },
+                "required": ["instruction"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tell_supervisor_to_inform_user",
+            "description": (
+                "SUB-AGENT TOOL. Send the Supervisor a message RIGHT NOW so it can "
+                "pass it on to the user mid-task -- a status update, an important "
+                "finding, a question only the user can answer, a heads-up something "
+                "looks wrong -- WITHOUT waiting until you finish and give your final "
+                "report. Your final report only reaches the Supervisor once, at the "
+                "very end of your task; this can be called as many times as needed "
+                "during a long-running task to keep the Supervisor (and, through it, "
+                "the user) in the loop. Only usable by a sub-agent from inside its own "
+                "task -- calling it as the Supervisor itself does nothing, since the "
+                "Supervisor has no supervisor above it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The message to relay to the Supervisor, for it to pass on to the user."
+                    }
+                },
+                "required": ["message"],
+            },
+        },
+    },
 ]
 
 # =============================================================================

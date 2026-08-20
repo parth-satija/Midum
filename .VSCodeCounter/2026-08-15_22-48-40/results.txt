@@ -1,0 +1,98 @@
+Date : 2026-08-15 22:48:40
+Directory : d:\Midum\jarvis_project\midum_pkg
+Total : 56 files,  23546 codes, 6171 comments, 2961 blanks, all 32678 lines
+
+Languages
++------------------+------------+------------+------------+------------+------------+
+| language         | files      | code       | comment    | blank      | total      |
++------------------+------------+------------+------------+------------+------------+
+| Python           |         47 |     21,982 |      6,110 |      2,783 |     30,875 |
+| HTML             |          2 |      1,008 |         46 |         99 |      1,153 |
+| Markdown         |          4 |        283 |          0 |         69 |        352 |
+| JSON             |          1 |        211 |          0 |          0 |        211 |
+| pip requirements |          1 |         31 |          0 |          1 |         32 |
+| YAML             |          1 |         31 |         15 |          9 |         55 |
++------------------+------------+------------+------------+------------+------------+
+
+Directories
++-----------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| path                                                                        | files      | code       | comment    | blank      | total      |
++-----------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| .                                                                           |         56 |     23,546 |      6,171 |      2,961 |     32,678 |
+| . (Files)                                                                   |         26 |     10,137 |      3,658 |      1,152 |     14,947 |
+| .github                                                                     |          3 |         69 |         15 |         23 |        107 |
+| .github\ISSUE_TEMPLATE                                                      |          2 |         38 |          0 |         14 |         52 |
+| .github\workflows                                                           |          1 |         31 |         15 |          9 |         55 |
+| gui                                                                         |          9 |      9,534 |      1,147 |      1,102 |     11,783 |
+| gui (Files)                                                                 |          5 |      6,609 |        736 |        562 |      7,907 |
+| gui\legacy                                                                  |          3 |      2,925 |        411 |        539 |      3,875 |
+| gui\v2                                                                      |          1 |          0 |          0 |          1 |          1 |
+| midum_mcp                                                                   |          3 |        432 |        213 |         83 |        728 |
+| providers                                                                   |          8 |      1,766 |        737 |        355 |      2,858 |
+| tools                                                                       |          2 |        135 |         49 |         34 |        218 |
+| ui_automation                                                               |          3 |      1,397 |        340 |        194 |      1,931 |
+| utils                                                                       |          2 |         76 |         12 |         18 |        106 |
++-----------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+
+Files
++-----------------------------------------------------------------------------+------------------+------------+------------+------------+------------+
+| filename                                                                    | language         | code       | comment    | blank      | total      |
++-----------------------------------------------------------------------------+------------------+------------+------------+------------+------------+
+| d:\Midum\jarvis_project\midum_pkg\.github\ISSUE_TEMPLATE\bug_report.md      | Markdown         |         23 |          0 |          8 |         31 |
+| d:\Midum\jarvis_project\midum_pkg\.github\ISSUE_TEMPLATE\feature_request.md | Markdown         |         15 |          0 |          6 |         21 |
+| d:\Midum\jarvis_project\midum_pkg\.github\workflows\build-release.yml       | YAML             |         31 |         15 |          9 |         55 |
+| d:\Midum\jarvis_project\midum_pkg\README.md                                 | Markdown         |        243 |          0 |         54 |        297 |
+| d:\Midum\jarvis_project\midum_pkg\browser_cdp.py                            | Python           |        467 |        233 |         37 |        737 |
+| d:\Midum\jarvis_project\midum_pkg\business.html                             | HTML             |        115 |         17 |         13 |        145 |
+| d:\Midum\jarvis_project\midum_pkg\config.py                                 | Python           |        200 |        293 |         43 |        536 |
+| d:\Midum\jarvis_project\midum_pkg\context_summarizer.py                     | Python           |        159 |         65 |         43 |        267 |
+| d:\Midum\jarvis_project\midum_pkg\flow_meta.json                            | JSON             |        211 |          0 |          0 |        211 |
+| d:\Midum\jarvis_project\midum_pkg\flow_tools.py                             | Python           |         88 |         52 |         22 |        162 |
+| d:\Midum\jarvis_project\midum_pkg\flows.py                                  | Python           |        626 |        259 |        120 |      1,005 |
+| d:\Midum\jarvis_project\midum_pkg\gui\__init__.py                           | Python           |          0 |          0 |          1 |          1 |
+| d:\Midum\jarvis_project\midum_pkg\gui\app.py                                | Python           |      6,331 |        657 |        502 |      7,490 |
+| d:\Midum\jarvis_project\midum_pkg\gui\chat_store.py                         | Python           |        112 |         27 |         19 |        158 |
+| d:\Midum\jarvis_project\midum_pkg\gui\dispatch.py                           | Python           |         76 |         31 |         15 |        122 |
+| d:\Midum\jarvis_project\midum_pkg\gui\legacy\__init__.py                    | Python           |          0 |          0 |          1 |          1 |
+| d:\Midum\jarvis_project\midum_pkg\gui\legacy\app.py                         | Python           |      2,380 |        367 |        420 |      3,167 |
+| d:\Midum\jarvis_project\midum_pkg\gui\legacy\dialogs.py                     | Python           |        545 |         44 |        118 |        707 |
+| d:\Midum\jarvis_project\midum_pkg\gui\v2\__init__.py                        | Python           |          0 |          0 |          1 |          1 |
+| d:\Midum\jarvis_project\midum_pkg\gui\voice_overlay.py                      | Python           |         90 |         21 |         25 |        136 |
+| d:\Midum\jarvis_project\midum_pkg\hotkeys.py                                | Python           |        224 |         94 |         36 |        354 |
+| d:\Midum\jarvis_project\midum_pkg\index.html                                | HTML             |        893 |         29 |         86 |      1,008 |
+| d:\Midum\jarvis_project\midum_pkg\knowledge_base.py                         | Python           |        468 |        177 |         79 |        724 |
+| d:\Midum\jarvis_project\midum_pkg\launcher.py                               | Python           |        243 |         47 |         40 |        330 |
+| d:\Midum\jarvis_project\midum_pkg\main.py                                   | Python           |        351 |         40 |         48 |        439 |
+| d:\Midum\jarvis_project\midum_pkg\memory.py                                 | Python           |        298 |         24 |         53 |        375 |
+| d:\Midum\jarvis_project\midum_pkg\midum_mcp\__init__.py                     | Python           |          0 |          0 |          1 |          1 |
+| d:\Midum\jarvis_project\midum_pkg\midum_mcp\manager.py                      | Python           |        311 |        101 |         65 |        477 |
+| d:\Midum\jarvis_project\midum_pkg\midum_mcp\tools.py                        | Python           |        121 |        112 |         17 |        250 |
+| d:\Midum\jarvis_project\midum_pkg\multi_agent.py                            | Python           |        287 |         96 |         53 |        436 |
+| d:\Midum\jarvis_project\midum_pkg\orchestration.py                          | Python           |        528 |      1,667 |         25 |      2,220 |
+| d:\Midum\jarvis_project\midum_pkg\permissions.py                            | Python           |        129 |         86 |         39 |        254 |
+| d:\Midum\jarvis_project\midum_pkg\project_memory.md                         | Markdown         |          2 |          0 |          1 |          3 |
+| d:\Midum\jarvis_project\midum_pkg\providers\__init__.py                     | Python           |          0 |          0 |          1 |          1 |
+| d:\Midum\jarvis_project\midum_pkg\providers\gemini_api_backend.py           | Python           |        274 |         94 |         52 |        420 |
+| d:\Midum\jarvis_project\midum_pkg\providers\gemini_live_backend.py          | Python           |        337 |        144 |         56 |        537 |
+| d:\Midum\jarvis_project\midum_pkg\providers\gemini_reasoning.py             | Python           |         44 |         48 |         15 |        107 |
+| d:\Midum\jarvis_project\midum_pkg\providers\gemini_web_backend.py           | Python           |        380 |        249 |         80 |        709 |
+| d:\Midum\jarvis_project\midum_pkg\providers\groq_backend.py                 | Python           |        279 |         73 |         59 |        411 |
+| d:\Midum\jarvis_project\midum_pkg\providers\ollama_cloud_backend.py         | Python           |        187 |         41 |         39 |        267 |
+| d:\Midum\jarvis_project\midum_pkg\providers\openrouter_backend.py           | Python           |        265 |         88 |         53 |        406 |
+| d:\Midum\jarvis_project\midum_pkg\requirements.txt                          | pip requirements |         31 |          0 |          1 |         32 |
+| d:\Midum\jarvis_project\midum_pkg\scheduler.py                              | Python           |        249 |         80 |         64 |        393 |
+| d:\Midum\jarvis_project\midum_pkg\screen_capture.py                         | Python           |        444 |        107 |         82 |        633 |
+| d:\Midum\jarvis_project\midum_pkg\skills.py                                 | Python           |         49 |          5 |          8 |         62 |
+| d:\Midum\jarvis_project\midum_pkg\state.py                                  | Python           |          5 |         21 |          6 |         32 |
+| d:\Midum\jarvis_project\midum_pkg\system_prompt.py                          | Python           |        314 |         13 |         10 |        337 |
+| d:\Midum\jarvis_project\midum_pkg\tools\__init__.py                         | Python           |          0 |          0 |          1 |          1 |
+| d:\Midum\jarvis_project\midum_pkg\tools\user_prompt_tools.py                | Python           |        135 |         49 |         33 |        217 |
+| d:\Midum\jarvis_project\midum_pkg\tools_registry.py                         | Python           |      1,145 |        241 |        185 |      1,571 |
+| d:\Midum\jarvis_project\midum_pkg\tools_schema.py                           | Python           |      2,368 |         12 |          4 |      2,384 |
+| d:\Midum\jarvis_project\midum_pkg\ui_automation\__init__.py                 | Python           |          7 |          0 |          1 |          8 |
+| d:\Midum\jarvis_project\midum_pkg\ui_automation\linux_navigator.py          | Python           |        411 |        103 |         70 |        584 |
+| d:\Midum\jarvis_project\midum_pkg\ui_automation\windows_uia.py              | Python           |        979 |        237 |        123 |      1,339 |
+| d:\Midum\jarvis_project\midum_pkg\utils\__init__.py                         | Python           |          0 |          0 |          1 |          1 |
+| d:\Midum\jarvis_project\midum_pkg\utils\path_resolver.py                    | Python           |         76 |         12 |         17 |        105 |
+| Total                                                                       |                  |     23,546 |      6,171 |      2,961 |     32,678 |
++-----------------------------------------------------------------------------+------------------+------------+------------+------------+------------+

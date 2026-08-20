@@ -136,6 +136,29 @@ def list_domain_skills():
     return read_local_file(DOMAIN_SKILLS_INDEX)
 
 
+def read_domain_skill(name):
+    """Read the raw markdown content of a skill file from SKILLS_DIR (the
+    same files listed in the GUI's Skills tab / list_skill_files, and
+    created via create_domain_skill). Unlike skills.load_skill(), this
+    returns the PLAIN text with no base64/decode-instruction wrapper --
+    it's meant for direct injection into a prompt (e.g. an agent's
+    attached-skills context), not as a model tool-call result."""
+    from tools_registry import read_local_file
+    _ensure_kb_files()
+    safe  = re.sub(r'[^a-zA-Z0-9_]', '_', name.strip().lower())
+    fpath = os.path.join(SKILLS_DIR, f"{safe}.md")
+    if not os.path.exists(fpath):
+        try:
+            match = next((e for e in os.listdir(SKILLS_DIR) if e.lower() == f"{safe}.md"), None)
+            if match:
+                fpath = os.path.join(SKILLS_DIR, match)
+            else:
+                return f"Skill '{safe}.md' not found. Call list_domain_skills."
+        except Exception:
+            return f"Skill '{safe}.md' not found."
+    return read_local_file(fpath)
+
+
 # =============================================================================
 # 5. PDF SOURCES — no automatic structure detection at all (no pdfstructx
 #    anywhere in this module). Registering a source just records its path

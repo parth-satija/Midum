@@ -26,6 +26,7 @@ from midum_mcp.manager import _MCP_SERVERS, _MCP_SERVER_ORDER, init_mcp_servers_
 from midum_mcp.manager import demote_mcp_tool, get_promoted_tools, is_tool_promoted, promote_mcp_tool
 from memory import init_memory_at_startup, python_trigger_memory_update, set_current_goal, update_memory
 from orchestration import _decompose_task, _is_trivial_input, get_gemini_reasoning, is_action_loop_active, process_chat_turn, set_tool_call_hook, start_action_loop, stop_action_loop, wait
+from multi_agent import start_agent, send_agent_task, get_agent_report, list_agents, stop_agent, resume_agent, forget_agent, delegate_agent_task_to_supervisor, get_agent_transcript, list_agents_struct, set_agent_done_hook, tell_supervisor_to_inform_user, set_agent_inform_hook, get_current_agent_name, attach_agent_knowledge, list_agent_knowledge, attach_agent_skills, list_agent_skills
 from providers.gemini_api_backend import _gemini_api_load_msg, consult_gemini_api, delegate_to_gemini_api, set_gemini_api_model
 from providers.gemini_reasoning import consult_gemini
 from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _gemini_webapi_load_msg, _get_gemini_web_client, delegate_to_gemini_web, set_gemini_web_model

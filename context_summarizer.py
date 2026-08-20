@@ -226,6 +226,15 @@ def summarize_context_if_needed(conversation_history: list) -> list:
     split_idx = int(len(non_sys) * SUMMARIZE_OLDEST_RATIO)
     split_idx = max(1, min(split_idx, len(non_sys) - 1))   # always keep >=1 recent turn
 
+    # Never let recent_chunk start on an orphaned 'tool' response message --
+    # its owning assistant tool_calls message would get summarized away in
+    # oldest_chunk, leaving a function_response with no call to recover its
+    # name from (Gemini's API 400s with "Name cannot be empty" on that).
+    # Walk the split point backward past any leading 'tool' messages so the
+    # whole call/response pair stays together in the same chunk.
+    while split_idx > 1 and non_sys[split_idx].get("role") == "tool":
+        split_idx -= 1
+
     oldest_chunk = non_sys[:split_idx]
     recent_chunk = non_sys[split_idx:]
 
