@@ -185,8 +185,8 @@ This writes a ready-to-fill-in template (every value blank) to the platform-appr
 Open the file and fill in only the key(s) your chosen `MODEL_PROVIDER` (and any providers you plan to consult/delegate to) actually needs — every reader treats a blank value as "not configured", so it's safe to leave the rest empty:
 - `GEMINI_API_KEY` — from [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey). Used by `MODEL_PROVIDER = "gemini_api"` and Gemini API consultation.
 - `GEMINI_API_KEY_2` / `_3` / `_4` / `_5` — optional extra AI Studio keys, tried in order whenever the current one comes back quota-exhausted (HTTP 429 / RESOURCE_EXHAUSTED). Handy for stacking multiple free-tier keys; leave blank if you only have one.
-- `OPENROUTER_API_KEY` — from [openrouter.ai/keys](https://openrouter.ai/keys). Used by `MODEL_PROVIDER = "openrouter"`.
-- `GROQ_API_KEY` — from [console.groq.com/keys](https://console.groq.com/keys) (free tier). Used by `MODEL_PROVIDER = "groq"`.
+- `OPENROUTER_API_KEY` — from [openrouter.ai/keys](https://openrouter.ai/keys). Used by `MODEL_PROVIDER = "openrouter"`. *(Provider not recommended)*
+- `GROQ_API_KEY` — from [console.groq.com/keys](https://console.groq.com/keys) (free tier). Used by `MODEL_PROVIDER = "groq"`. *(Provider not recommended)*
 - `OLLAMA_API_KEY` — from [ollama.com/settings/keys](https://ollama.com/settings/keys). Used by `MODEL_PROVIDER = "ollama_cloud"`.
 - `OMNIROUTE_API_KEY` — gateway key from your OmniRoute dashboard (`http://localhost:20128/dashboard`). Used by `MODEL_PROVIDER = "omniroute"`; often optional for a purely local gateway with no auth configured, so leave blank if you haven't set one.
 - `GEMINI_SECURE_1PSID` / `GEMINI_SECURE_1PSIDTS` — browser session cookies (not an API key) for `gemini.google.com`, copied from your browser's DevTools → Application → Cookies. Both are required together, and only needed if you'd rather use your Gemini account's web session (`MODEL_PROVIDER = "gemini_web"`) than the official API.
