@@ -655,7 +655,7 @@ def _call_primary_model(messages, result_q, provider_override: str = None, model
         _call_ollama(messages, result_q)
 
 
-MAX_ACTION_TRIES = 3
+MAX_ACTION_TRIES = 10
 
 
 # --- from main.py, section 3 ---
@@ -1313,9 +1313,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             tool_images = None
 
             # ── Hard retry cap ────────────────────────────────────────────────
+            # Suspended entirely while a continuous action loop is active --
+            # open-ended loop work (e.g. "keep trying until it works") should
+            # not be cut short by the same cap that protects a normal turn.
             _EXEMPT = {"update_memory","set_current_goal","add_instruction","add_path","explore_path","write_response_memory","append_response_memory","read_response_memory"}
             _cap_hit = False
-            if func_name not in _EXEMPT:
+            if func_name not in _EXEMPT and not is_action_loop_active():
                 _karg = next((str(arguments[k])[:80] for k in
                     ("command","path","text","query","prompt","skill_name","name","instruction")
                     if k in arguments), "")
