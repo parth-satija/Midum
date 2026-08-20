@@ -575,7 +575,7 @@ class Api:
                 self._push_event("log", {"text": f"⚠️ Scheduler failed to start: {e}\n"})
 
             # Every launch starts a genuinely new session -- the same reset
-            # the "New Session" button performs. Full continuity across
+            # the "New Chat" button performs. Full continuity across
             # restarts is already covered by the persisted chat history
             # (sidebar -> open any past chat), so there's no need to
             # silently carry the previous session's goal/notes forward
@@ -1368,9 +1368,21 @@ class Api:
             self._start_new_chat_record()
         return {"ok": True, "chats": self.list_chats()}
 
+    def rename_chat(self, chat_id: str, new_title: str):
+        new_title = (new_title or "").strip()
+        if not new_title:
+            return {"ok": False, "error": "Title can't be empty."}
+        try:
+            self._chat_store.rename(chat_id, new_title)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if chat_id == self._current_chat_id:
+            self._chat_title = new_title
+        return {"ok": True, "chats": self.list_chats()}
+
     def _reset_session_memory_file(self):
         """(Re)creates a blank session-memory file with no active goal.
-        Shared by the explicit "New Session" button and by every app
+        Shared by the explicit "New Chat" button and by every app
         launch (see _startup_worker) -- both cases mean the same thing:
         start clean, don't carry the previous goal/notes forward."""
         if os.path.exists(midum.SESSION_MEMORY):
@@ -5230,7 +5242,7 @@ function buildSidebar(){
         <div class="section-label">WORKSPACE</div>
         <button class="icon-btn" style="width:26px;height:26px;font-size:11px;" id="sidebar-close">✕</button>
       </div>
-      <button class="btn" id="new-session-btn">+ New Session</button>
+      <button class="btn" id="new-session-btn">New Chat</button>
       <select id="project-select"></select>
       <div class="btn-row">
         <button class="ghost-btn" id="proj-new">+ Project</button>
@@ -5317,8 +5329,6 @@ function buildSidebar(){
   enhanceSelect(document.getElementById("project-select"));
   enhanceSelect(document.getElementById("settings-provider"));
   document.getElementById("new-session-btn").onclick = async ()=>{
-    const ok = await showConfirm("Clear current session context and reset memories?", "New Session");
-    if (!ok) return;
     await api("new_session"); clearChat(); applyKbState(null); refreshHistory();
   };
   document.getElementById("project-select").onchange = async (e)=>{
@@ -5746,6 +5756,7 @@ async function refreshHistory(){
   list.forEach(chat=>{
     const card = document.createElement("div");
     card.className = "history-card" + (chat.current ? " current" : "");
+    card.style.cursor = "pointer";
     let title = chat.title || "Untitled chat";
     if (title.length > 30) title = title.slice(0,29) + "…";
     card.innerHTML = `
@@ -5754,10 +5765,10 @@ async function refreshHistory(){
         <div class="history-ts">${(chat.updated_at||"").replace("T","  ")}</div>
       </div>
       <div class="history-actions">
-        <button class="mini-btn open">Open</button>
+        <button class="mini-btn rename" title="Rename">✏️</button>
         <button class="mini-btn del">🗑</button>
       </div>`;
-    card.querySelector(".open").onclick = async ()=>{
+    card.onclick = async ()=>{
       const r = await api("load_chat", chat.id);
       if (!r.ok){ showAlert(r.error, "Error"); return; }
       clearChat();
@@ -5766,7 +5777,18 @@ async function refreshHistory(){
       switchTab("Chat");
       refreshHistory();
     };
-    card.querySelector(".del").onclick = async ()=>{
+    card.querySelector(".rename").onclick = async (e)=>{
+      e.stopPropagation();
+      const newTitle = await showPrompt("New chat title:", "Rename Chat", title);
+      if (newTitle === null || newTitle === undefined) return;
+      const trimmed = newTitle.trim();
+      if (!trimmed || trimmed === title) return;
+      const r = await api("rename_chat", chat.id, trimmed);
+      if (!r.ok){ showAlert(r.error, "Error"); return; }
+      refreshHistory();
+    };
+    card.querySelector(".del").onclick = async (e)=>{
+      e.stopPropagation();
       const ok = await showConfirm(`Permanently delete "${title}"?`, "Delete Chat", {danger:true, okLabel:"Delete"});
       if (!ok) return;
       await api("delete_chat", chat.id);
@@ -6180,10 +6202,30 @@ function openPdfSourceViewer(name, startPageIndex){
       img.style.height = r.height + "px";
     }
 
-    modal.querySelector("#pv-prev").onclick = ()=>{ if (pageIndex>0){ pageIndex--; renderPage(); } };
-    modal.querySelector("#pv-next").onclick = ()=>{ if (pageIndex<pageCount-1){ pageIndex++; renderPage(); } };
-    modal.querySelector("#pv-close").onclick = ()=>{ overlay.remove(); resolve(); };
-    overlay.addEventListener("click", (e)=>{ if (e.target === overlay){ overlay.remove(); resolve(); } });
+    function goPrev(){ if (pageIndex>0){ pageIndex--; renderPage(); } }
+    function goNext(){ if (pageIndex<pageCount-1){ pageIndex++; renderPage(); } }
+    modal.querySelector("#pv-prev").onclick = goPrev;
+    modal.querySelector("#pv-next").onclick = goNext;
+    function closeViewer(){
+      document.removeEventListener("keydown", onKeyDown);
+      overlay.remove();
+      resolve();
+    }
+    modal.querySelector("#pv-close").onclick = closeViewer;
+    overlay.addEventListener("click", (e)=>{ if (e.target === overlay) closeViewer(); });
+
+    // Arrow-key page navigation while this viewer is open -- Left/Right
+    // (and Up/Down as an alias) step through pages, Escape closes, same
+    // as clicking Prev/Next/Close. Ignored while a text input/textarea
+    // elsewhere has focus so typing isn't hijacked.
+    function onKeyDown(e){
+      const tag = (document.activeElement && document.activeElement.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.key === "ArrowLeft" || e.key === "ArrowUp"){ e.preventDefault(); goPrev(); }
+      else if (e.key === "ArrowRight" || e.key === "ArrowDown"){ e.preventDefault(); goNext(); }
+      else if (e.key === "Escape"){ e.preventDefault(); closeViewer(); }
+    }
+    document.addEventListener("keydown", onKeyDown);
 
     renderPage();
   });
@@ -6299,8 +6341,21 @@ function openPdfHeadingTagger(name){
       refreshTaggedList();
     }
 
-    modal.querySelector("#pht-prev").onclick = ()=>{ if (pageIndex>0){ pageIndex--; renderPage(); } };
-    modal.querySelector("#pht-next").onclick = ()=>{ if (pageIndex<pageCount-1){ pageIndex++; renderPage(); } };
+    function goPrev(){ if (pageIndex>0){ pageIndex--; renderPage(); } }
+    function goNext(){ if (pageIndex<pageCount-1){ pageIndex++; renderPage(); } }
+    modal.querySelector("#pht-prev").onclick = goPrev;
+    modal.querySelector("#pht-next").onclick = goNext;
+
+    // Arrow-key page navigation, same as the read-only PDF Source Viewer --
+    // Left/Right (Up/Down alias) step pages, ignored while a text
+    // input/textarea has focus so it doesn't hijack typing elsewhere.
+    function onKeyDown(e){
+      const tag = (document.activeElement && document.activeElement.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.key === "ArrowLeft" || e.key === "ArrowUp"){ e.preventDefault(); goPrev(); }
+      else if (e.key === "ArrowRight" || e.key === "ArrowDown"){ e.preventDefault(); goNext(); }
+    }
+    document.addEventListener("keydown", onKeyDown);
     modal.querySelectorAll(".pht-level-btn").forEach(btn=>{
       btn.onclick = async ()=>{
         if (!selectedLineId) return;
@@ -6353,11 +6408,12 @@ function openPdfHeadingTagger(name){
       refreshTaggedList();
       renderOverlays();
     };
-    modal.querySelector("#pht-close").onclick = ()=>{ overlay.remove(); resolve(false); };
+    modal.querySelector("#pht-close").onclick = ()=>{ document.removeEventListener("keydown", onKeyDown); overlay.remove(); resolve(false); };
     modal.querySelector("#pht-save").onclick = async ()=>{
       const list = Object.values(headings);
       const res = await api("save_pdf_headings", name, list);
       if (!res.ok){ await showAlert(res.message, "Error"); return; }
+      document.removeEventListener("keydown", onKeyDown);
       overlay.remove();
       resolve(true);
     };
