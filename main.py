@@ -6,6 +6,7 @@ from knowledge_base import add_instruction, add_path, add_pdf_source, build_pdf_
 from midum_mcp.manager import _load_mcp_config, _mcp_manager, connect_mcp_server, disconnect_mcp_server, list_mcp_servers
 from midum_mcp.tools import call_mcp_tool, list_native_tools, show_native_tool_schema, show_server_tools
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
+from tools.render_surface_tools import write_render_code, edit_render_code, close_render_surface, save_render_surface, list_saved_render_surfaces, load_render_surface, delete_saved_render_surface, webapi_fetch, stream_asset, search_assets, search_web_assets, stream_web_asset
 from tools_schema import tools
 from ui_automation import ui_navigator
 

@@ -97,7 +97,7 @@ class ChatStore:
 
     def save(self, chat_id: str, title: str, history: list, display_log: list,
              kb_state: dict = None, explain_progress: dict = None,
-             explain_page_progress: dict = None) -> None:
+             explain_page_progress: dict = None, render_surface: dict = None) -> None:
         now = datetime.datetime.now().isoformat(timespec="seconds")
         created_at = now
         path = self._path(chat_id)
@@ -125,6 +125,15 @@ class ChatStore:
                 },
                 "explain_progress": explain_progress or {},
                 "explain_page_progress": explain_page_progress or {},
+                # Last Render Surface shown in THIS chat (whether it's still
+                # open or was closed) -- {code, title} or None if this chat
+                # never opened one. Lets the "reopen last Render Surface"
+                # button work correctly per-chat: switching to an old chat
+                # from history and clicking it brings back THAT chat's own
+                # surface, not whatever happens to be in memory from
+                # whichever chat was active most recently. See
+                # gui/app.py Api._persist_current_chat / Api.load_chat.
+                "render_surface": render_surface,
             }
             tmp_path = path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:

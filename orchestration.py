@@ -17,6 +17,7 @@ from screen_capture import capture_screen_to_ram, fallback_click_grid, fallback_
 from skills import list_skills, load_skill
 from state import _abort_event, _action_loop_event, _action_loop_lock, _action_loop_state
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
+from tools.render_surface_tools import write_render_code, edit_render_code, close_render_surface, save_render_surface, list_saved_render_surfaces, load_render_surface, delete_saved_render_surface
 from permissions import enforce_tool_permission, filter_tools_schema, mcp_permission_key
 from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
 from multi_agent import start_agent, send_agent_task, get_agent_report, list_agents, stop_agent, resume_agent, forget_agent, delegate_agent_task_to_supervisor, tell_supervisor_to_inform_user, get_current_agent_name, attach_agent_knowledge, list_agent_knowledge, attach_agent_skills, list_agent_skills
@@ -2032,6 +2033,33 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     arguments.get("choice_4", ""),
                     allow_custom=arguments.get("allow_custom", True)
                 )
+
+            elif func_name == "write_render_code":
+                tool_output = write_render_code(
+                    arguments.get("code", ""),
+                    arguments.get("title", "")
+                )
+
+            elif func_name == "edit_render_code":
+                tool_output = edit_render_code(
+                    arguments.get("old_code", ""),
+                    arguments.get("new_code", "")
+                )
+
+            elif func_name == "close_render_surface":
+                tool_output = close_render_surface()
+
+            elif func_name == "save_render_surface":
+                tool_output = save_render_surface(arguments.get("name", ""))
+
+            elif func_name == "list_saved_render_surfaces":
+                tool_output = list_saved_render_surfaces()
+
+            elif func_name == "load_render_surface":
+                tool_output = load_render_surface(arguments.get("name", ""))
+
+            elif func_name == "delete_saved_render_surface":
+                tool_output = delete_saved_render_surface(arguments.get("name", ""))
 
             elif func_name in list_flows():
                 # Direct-by-name flow call -- mirrors _mcp_autoroute_tool_call for

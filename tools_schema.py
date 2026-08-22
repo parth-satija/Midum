@@ -2525,6 +2525,287 @@ tools = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_render_code",
+            "description": (
+                "Open (or completely replace the contents of) the Render Surface -- "
+                "a panel pinned to the RIGHT HALF of the screen -- with a full HTML "
+                "document you write. Use this to SHOW the user something visual "
+                "instead of describing it in chat: a dashboard built from data you "
+                "just gathered, a gallery of images, a chart, a small interactive "
+                "tool, a formatted report -- anything. Opening it disables every "
+                "other openable panel (top tabs, Log/Parameters) except the sidebar, "
+                "so it can't get knocked off-screen. The code renders inside a "
+                "sandboxed iframe and is held only in memory -- it is never written "
+                "to the user's disk. Calling this again while already open replaces "
+                "everything; for a small incremental change to what's already "
+                "showing, prefer edit_render_code instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "A complete, self-contained HTML document -- inline "
+                            "<style> and <script> tags are fine and expected, there "
+                            "is no separate CSS/JS upload."
+                        )
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional short label shown in the panel's header bar."
+                    }
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_render_code",
+            "description": (
+                "Make a targeted edit to the HTML/CSS/JS currently showing in the "
+                "Render Surface, without resending the whole document. Requires the "
+                "surface to already be open (write_render_code first). old_code must "
+                "be an EXACT, character-for-character, UNIQUE substring of what you "
+                "last wrote -- it gets replaced with new_code. Errors (with no "
+                "change made) if old_code isn't found, or matches more than once. "
+                "For a large-scale change, calling write_render_code again with the "
+                "full new document is often simpler and more reliable."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_code": {
+                        "type": "string",
+                        "description": "Exact, unique snippet to find in the currently rendered code."
+                    },
+                    "new_code": {
+                        "type": "string",
+                        "description": "Text to replace it with."
+                    }
+                },
+                "required": ["old_code", "new_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "close_render_surface",
+            "description": (
+                "Close the Render Surface panel and discard the HTML/CSS/JS it was "
+                "showing -- it only ever lived in memory, so there's nothing to "
+                "clean up on disk. Every other panel goes back to being usable "
+                "normally. The user can also close it themselves at any time with "
+                "the panel's own ✕ button."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_render_surface",
+            "description": (
+                "Save a snapshot of the CURRENTLY OPEN Render Surface -- its HTML/CSS/JS "
+                "and title, exactly as they are right now -- to disk under `name`, so it "
+                "can be brought back up later with load_render_surface(name), even in a "
+                "future session or after the app restarts. Unlike the live surface itself "
+                "(RAM-only, wiped on close), a saved one persists. Requires a Render "
+                "Surface to already be open (write_render_code first). Saving again under "
+                "a name that already exists OVERWRITES the previous save."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Short name to save this surface under, e.g. 'sales_dashboard'."
+                    }
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_saved_render_surfaces",
+            "description": (
+                "List every Render Surface previously saved with save_render_surface, by "
+                "name, with its title and when it was saved. Follow up with "
+                "load_render_surface(name) to bring one back up, or "
+                "delete_saved_render_surface(name) to remove one."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_render_surface",
+            "description": (
+                "Open the Render Surface using a previously SAVED snapshot (see "
+                "save_render_surface / list_saved_render_surfaces) -- same effect as "
+                "write_render_code, just pulling the HTML/title from disk instead of "
+                "writing it out fresh. Completely replaces whatever is currently showing "
+                "in the surface. Call list_saved_render_surfaces() first if unsure of the "
+                "exact saved name."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Exact saved name, from list_saved_render_surfaces()."
+                    }
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "webapi_fetch",
+            "description": (
+                "Make a direct HTTP request to an external web API and return the "
+                "response as text. Callable by the model directly, or from inside a "
+                "Render Surface via `await midum.call(\"webapi_fetch\", {url, method, "
+                "headers, body})` -- the sandboxed Render Surface iframe has no fetch() "
+                "access to arbitrary origins itself, so this is its path to calling "
+                "any REST/JSON API on the open internet."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Full URL to request. https:// added automatically if missing."},
+                    "method": {"type": "string", "description": "HTTP method, default 'GET'."},
+                    "headers": {"type": "object", "description": "Optional header name/value pairs."},
+                    "body": {"type": "string", "description": "Optional raw request body (JSON-encode yourself first). Ignored for GET/HEAD."},
+                    "timeout": {"type": "integer", "description": "Max seconds to wait. Default 20, hard cap 60."}
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stream_asset",
+            "description": (
+                "Read a local file and return it as a base64 data URI, ready to drop "
+                "into an <img src>, CSS background, or <audio>/<video> tag inside a "
+                "Render Surface. Callable from inside a surface via "
+                "`await midum.call(\"stream_asset\", {path})` -- the sandboxed iframe "
+                "cannot read the user's disk itself. Use search_assets first if you "
+                "don't already know the exact path. Capped at 15MB."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the local file to stream in."}
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_assets",
+            "description": (
+                "Search for asset files (images, audio, video, small text/JSON/PDF) by "
+                "filename substring across saved render surfaces, generated_images, and "
+                "app_maps under storage/. Callable from inside a Render Surface via "
+                "`await midum.call(\"search_assets\", {query})`, or by the model directly. "
+                "Follow up with stream_asset(path) to pull a match into the surface."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Filename substring to search for, case-insensitive."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web_assets",
+            "description": (
+                "Search the open web for images matching `query` (DuckDuckGo image "
+                "search, no API key needed) and return a numbered list of direct image "
+                "URLs, thumbnails, sources, and dimensions. Callable from inside a "
+                "Render Surface via `await midum.call(\"search_web_assets\", {query})`, "
+                "or by the model directly. Web counterpart to search_assets (which only "
+                "looks at files already on disk). Follow up with stream_web_asset(url) "
+                "to pull a chosen result's bytes in as a data URI."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Image search query."},
+                    "count": {"type": "integer", "description": "How many results to return. Default 8, max 20."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stream_web_asset",
+            "description": (
+                "Fetch an asset (image, audio, video, PDF) from a remote URL and return "
+                "it as a base64 data URI, ready to drop into an <img src>, CSS "
+                "background, or <audio>/<video> tag inside a Render Surface. Callable "
+                "from inside a surface via `await midum.call(\"stream_web_asset\", "
+                "{url})` -- the sandboxed iframe cannot fetch() cross-origin resources "
+                "itself. Pair with search_web_assets(query) when you don't already have "
+                "a URL. Capped at 15MB."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Full URL of the remote asset. https:// added automatically if missing."},
+                    "timeout": {"type": "integer", "description": "Max seconds to wait. Default 20, hard cap 60."}
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_saved_render_surface",
+            "description": (
+                "Permanently delete a saved Render Surface by name (see "
+                "list_saved_render_surfaces). Does not affect a surface currently open "
+                "on screen -- only the saved copy on disk."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Exact saved name, from list_saved_render_surfaces()."
+                    }
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 # =============================================================================

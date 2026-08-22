@@ -70,6 +70,7 @@ from gui.chat_store import ChatStore, MidumSession
 from gui.dispatch import _dispatch_midum_tool
 from flows import classify_tool_kind
 import tools.user_prompt_tools as _user_prompt_tools
+import tools.render_surface_tools as _render_surface_tools
 
 import config
 import main as midum
@@ -238,11 +239,12 @@ DEFAULT_PROVIDER_KEY = "ollama"
 
 # Tabs — "Chat" is the permanent, always-visible pane. Every other entry is
 # an auxiliary tool pane that slides in beside it when selected.
+# NOTE: "Log" and "Parameters" are intentionally absent here -- they're
+# surfaced as togglable buttons inside the Settings panel (frontend JS)
+# rather than as tabs, so they don't take up horizontal tab-bar space.
 TAB_DEFS = [
     ("Chat",         "💬"),
-    ("Log",          "📜"),
     ("Model",        "🧬"),
-    ("Parameters",   "⚙"),
     ("System Core",  "🧠"),
     ("Knowledge",    "📚"),
     ("Skills",       "🛠"),
@@ -343,6 +345,19 @@ class Api:
         self._selected_provider = DEFAULT_PROVIDER_KEY
         self._selected_model    = _default_model_for_provider(DEFAULT_PROVIDER_KEY)
 
+        # ── Render Surface ────────────────────────────────────────────────
+        # Model-controlled HTML/CSS/JS panel (see write_render_code /
+        # edit_render_code / close_render_surface in
+        # tools/render_surface_tools.py and _handle_render below). The
+        # current markup is kept ONLY in this Python attribute and, once
+        # pushed, the sandboxed iframe's srcdoc on the JS side -- it is
+        # never written to a temp file or anywhere else on disk. Reset to
+        # None/False whenever the surface is closed, whether that's the
+        # model calling close_render_surface or the user clicking the ✕.
+        self._render_surface_open = False
+        self._render_surface_code = None
+        self._render_surface_title = None
+
         self._base_work_dir = r"D:\\"
         if not os.path.exists(self._base_work_dir):
             self._base_work_dir = os.path.expanduser("~/Documents")
@@ -375,6 +390,11 @@ class Api:
         # question/input request through the raw Tkinter popup fallback
         # instead of this app's inline chat card, no matter what.
         _user_prompt_tools._gui_ask_hook = self._handle_gui_ask
+        # Same rebinding caveat as _gui_ask_hook just above applies here --
+        # this must be set on tools.render_surface_tools itself, not on
+        # `midum`, or write_render_code/edit_render_code/close_render_surface
+        # would silently keep calling a stale None hook forever.
+        _render_surface_tools._gui_render_hook = self._handle_render
 
         # Structured tool-call detail (name + args + result) for every tool
         # executed during a turn -- powers the expandable tool-call cards in
@@ -1360,6 +1380,19 @@ class Api:
         }
         self._explain_progress = dict(data.get("explain_progress") or {})
         self._explain_page_progress = dict(data.get("explain_page_progress") or {})
+        # Restore THIS chat's own last Render Surface (see
+        # _persist_current_chat) so the "reopen last Render Surface" button
+        # brings back the surface that actually belongs to this chat --
+        # never the previous chat's -- rather than whatever happened to
+        # still be sitting in memory. Deliberately left CLOSED (not
+        # auto-reopened) until the user/model asks for it; any panel left
+        # open from whichever chat was previously active is force-closed
+        # here too, since it belongs to a different conversation now.
+        saved_render = data.get("render_surface") or None
+        self._render_surface_code  = saved_render.get("code") if saved_render else None
+        self._render_surface_title = saved_render.get("title") if saved_render else None
+        self._render_surface_open  = False
+        self._push_event("render_surface_close", {})
         return {"ok": True, "display": self._display_log, "kb_state": self._kb_state}
 
     def delete_chat(self, chat_id: str):
@@ -1419,6 +1452,14 @@ class Api:
             "kb_only": False, "kb_sources": [],
             "explain_mode": False, "explain_mode_type": "part",
         }
+        # A brand-new chat starts with no Render Surface to reopen -- don't
+        # let a surface from whatever chat was active a moment ago leak
+        # into it. Also force-close any panel still showing on screen, same
+        # reasoning as load_chat.
+        self._render_surface_code  = None
+        self._render_surface_title = None
+        self._render_surface_open  = False
+        self._push_event("render_surface_close", {})
 
     def _persist_current_chat(self):
         # Holds _persist_lock for the whole read-snapshot-and-save sequence
@@ -1431,11 +1472,16 @@ class Api:
                 return
             try:
                 title = self._chat_title or "Untitled chat"
+                render_surface = (
+                    {"code": self._render_surface_code, "title": self._render_surface_title}
+                    if self._render_surface_code is not None else None
+                )
                 self._chat_store.save(
                     self._current_chat_id, title, self._session.snapshot(), list(self._display_log),
                     kb_state=dict(self._kb_state),
                     explain_progress=dict(self._explain_progress),
                     explain_page_progress=dict(self._explain_page_progress),
+                    render_surface=render_surface,
                 )
             except Exception as e:
                 self._push_event("log", {"text": f"⚠ Failed to save chat history: {e}\n"})
@@ -1940,6 +1986,277 @@ class Api:
         box["value"] = value if value else "[USER CANCELLED]"
         done.set()
         return {"ok": True}
+
+    # ── Render Surface ────────────────────────────────────────────────────
+    # Called by tools/render_surface_tools.py's write_render_code /
+    # edit_render_code / close_render_surface -- i.e. from the turn-
+    # execution thread, not the GUI thread, same as _handle_gui_ask above.
+    # All state lives in self._render_surface_code (RAM only); the string
+    # only ever leaves Python via _push_event, which hands it to the
+    # sandboxed iframe's srcdoc on the JS side -- at no point does this
+    # code touch the filesystem.
+    def _handle_render(self, kind: str, payload: dict) -> str:
+        if kind == "write":
+            code = payload.get("code", "") or ""
+            title = (payload.get("title") or "").strip() or "Render Surface"
+            self._render_surface_code = code
+            self._render_surface_title = title
+            self._render_surface_open = True
+            self._push_event("render_surface_open", {"code": code, "title": title})
+            return f"Render Surface opened ({len(code)} chars rendered)."
+
+        if kind == "edit":
+            if not self._render_surface_open or self._render_surface_code is None:
+                return ("[RENDER SURFACE ERROR] Nothing is currently open -- "
+                        "call write_render_code first.")
+            old = payload.get("old_code", "") or ""
+            new = payload.get("new_code", "") or ""
+            count = self._render_surface_code.count(old)
+            if count == 0:
+                return ("[RENDER SURFACE ERROR] old_code was not found in the "
+                        "current render surface -- copy it exactly, character "
+                        "for character, from what you last wrote.")
+            if count > 1:
+                return (f"[RENDER SURFACE ERROR] old_code matches {count} "
+                         "locations -- include a little more surrounding "
+                         "context so it's unique before editing.")
+            self._render_surface_code = self._render_surface_code.replace(old, new, 1)
+            self._push_event("render_surface_update", {"code": self._render_surface_code})
+            return "Render Surface updated."
+
+        if kind == "close":
+            self._render_surface_open = False
+            # NOTE: intentionally NOT clearing _render_surface_code/_title
+            # here (unlike a straight reset) -- keeping the last rendered
+            # markup around after close is what lets the "reopen last
+            # Render Surface" button (see render_surface_reopen_ui below,
+            # wired to the button under Copy Conversation in the chat pane)
+            # bring it back without the model having to regenerate anything.
+            # It's only ever replaced by a fresh write_render_code/
+            # load_render_surface call, never implicitly wiped.
+            self._push_event("render_surface_close", {})
+            return "Render Surface closed."
+
+        if kind == "reopen":
+            if self._render_surface_code is None:
+                return ("[RENDER SURFACE ERROR] No Render Surface has been opened "
+                        "yet this session -- nothing to reopen.")
+            self._render_surface_open = True
+            self._push_event("render_surface_open", {
+                "code": self._render_surface_code,
+                "title": self._render_surface_title or "Render Surface",
+            })
+            return "Render Surface reopened."
+
+        if kind == "save":
+            name = (payload.get("name") or "").strip()
+            if not name:
+                return "[RENDER SURFACE ERROR] 'name' is required to save."
+            if not self._render_surface_open or self._render_surface_code is None:
+                return ("[RENDER SURFACE ERROR] Nothing is currently open to save -- "
+                        "call write_render_code first.")
+            try:
+                os.makedirs(_render_surface_tools.RENDER_SURFACES_DIR, exist_ok=True)
+                path = _render_surface_tools._saved_surface_path(name)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "name": name,
+                        "title": self._render_surface_title or "Render Surface",
+                        "code": self._render_surface_code,
+                        "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    }, f, indent=2)
+            except Exception as e:
+                return f"[RENDER SURFACE ERROR] Could not save '{name}': {e}"
+            self._push_event("log", {"text": f"\U0001f4be Render Surface saved as '{name}'.\n"})
+            return f"Render Surface saved as '{name}'."
+
+        if kind == "load":
+            name = (payload.get("name") or "").strip()
+            if not name:
+                return "[RENDER SURFACE ERROR] 'name' is required to load."
+            path = _render_surface_tools._saved_surface_path(name)
+            if not os.path.exists(path):
+                return f"[RENDER SURFACE ERROR] No saved Render Surface named '{name}'."
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                return f"[RENDER SURFACE ERROR] Could not read saved surface '{name}': {e}"
+            code  = data.get("code") or ""
+            title = data.get("title") or name
+            self._render_surface_code  = code
+            self._render_surface_title = title
+            self._render_surface_open  = True
+            self._push_event("render_surface_open", {"code": code, "title": title})
+            return f"Render Surface '{name}' loaded and opened ({len(code)} chars)."
+
+        return f"[RENDER SURFACE ERROR] unknown action '{kind}'."
+
+    # ── Render Surface -> tool/MCP/Flow bridge ────────────────────────
+    # Backs window.midum.call(name, args) inside every Render Surface (see
+    # the MIDUM_BRIDGE_SCRIPT injected by openRenderSurface/
+    # updateRenderSurfaceCode in the frontend JS below, and the matching
+    # postMessage handler that turns a {__midum_call:true,...} message into
+    # a call to render_surface_call_tool). This is what lets the surface's
+    # own JS invoke Midum tools like ordinary functions -- awaiting a
+    # Promise that resolves to the tool's return value -- instead of only
+    # being able to push free-form input back into the chat via
+    # render_surface_submit. Works for automatic calls the surface's script
+    # fires on load/on a timer, AND for calls made in response to user
+    # interaction (a button's onclick, a form submit handler, etc) -- both
+    # just call window.midum.call the same way.
+    #
+    # `name` selects which of the three tool universes to call:
+    #   "some_native_tool"        -> a built-in Midum tool (tools_schema.py)
+    #   "mcp:server/tool_name"    -> one tool on one connected MCP server
+    #   "flow:flow_name"          -> a saved Flow (flow_tools.py), run start
+    #                                to finish, returning its last step's result
+    # A bare name that ISN'T a known native tool is still auto-routed to the
+    # right MCP server if exactly one connected server exposes a tool by
+    # that name (same autoroute call_mcp_tool already relies on for normal
+    # chat turns), so "mcp:" is a disambiguation prefix, not a requirement.
+    def _call_any_tool_from_surface(self, tool_name: str, args):
+        tool_name = (tool_name or "").strip()
+        if not tool_name:
+            return "Error: 'tool' must be a non-empty tool/MCP/flow name."
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except Exception:
+                return f"Error: 'args' was not valid JSON: {args!r}"
+        if not isinstance(args, dict):
+            args = {} if args in (None, "") else {"value": args}
+
+        if tool_name.startswith("flow:"):
+            flow_name = tool_name[len("flow:"):].strip()
+            if not flow_name:
+                return "Error: 'flow:' prefix given with no flow name."
+            return midum.run_flow(flow_name)
+
+        if tool_name.startswith("mcp:"):
+            rest = tool_name[len("mcp:"):]
+            server, _, real_tool = rest.partition("/")
+            server, real_tool = server.strip(), real_tool.strip()
+            if not server or not real_tool:
+                return "Error: 'mcp:' prefix must be 'mcp:server/tool_name'."
+            return midum.call_mcp_tool(server, real_tool, args)
+
+        if permissions.get_permission(tool_name) == "deny":
+            return (f"[PERMISSION DENIED] '{tool_name}' is set to \"Don't Allow\" "
+                    f"in the Permissions tab.")
+
+        from midum_mcp.tools import _mcp_autoroute_tool_call
+        routed_name, routed_args = _mcp_autoroute_tool_call(tool_name, args)
+        return _dispatch_midum_tool(routed_name, routed_args)
+
+    def render_surface_call_tool(self, tool_name: str, args=None):
+        """
+        JS-callable entry point for window.midum.call(name, args) inside a
+        Render Surface. Executes synchronously (the turn-execution thread
+        isn't involved -- this runs directly on whatever thread pywebview
+        dispatches the JS bridge call on) and returns a JSON-serialisable
+        result, which resolves the Promise on the JS side. Every call is
+        also recorded through the normal tool-call hook so it shows up in
+        the Log pane / tool-call cards exactly like a model-initiated call,
+        since it's real tool/MCP/Flow execution either way.
+        """
+        result = self._call_any_tool_from_surface(tool_name, args)
+        try:
+            self._handle_tool_call(f"[Render Surface] {tool_name}", args or {}, result)
+        except Exception:
+            pass
+        try:
+            json.dumps(result)
+            return result
+        except Exception:
+            return str(result)
+
+    def render_surface_manual_close(self):
+        """Called from JS when the user clicks the panel's own ✕ button, so
+        Python's notion of the surface's state stays in sync with what the
+        user is actually looking at (the JS side already hid it instantly,
+        without waiting on this round-trip). Deliberately keeps
+        _render_surface_code/_title around afterwards (same reasoning as
+        the "close" branch of _handle_render) so render_surface_reopen_ui
+        can bring it back."""
+        self._render_surface_open = False
+        return {"ok": True}
+
+    def render_surface_reopen_ui(self):
+        """Called from the 'reopen last Render Surface' button in the chat
+        pane (under Copy Conversation) -- brings back whatever was last
+        showing, however it was closed (model call, panel's own ✕, or this
+        same button previously). No-op error if nothing has ever been
+        rendered this session."""
+        result = self._handle_render("reopen", {})
+        return {"ok": not result.startswith("[RENDER SURFACE ERROR]"), "message": result}
+
+    def render_surface_save_ui(self, name):
+        """Called from JS's own 💾 header button -- saves the currently open
+        surface under `name` without going through the model at all."""
+        result = self._handle_render("save", {"name": name})
+        return {"ok": not result.startswith("[RENDER SURFACE ERROR]"), "message": result}
+
+    def render_surface_load_ui(self, name):
+        """Called from JS's Saved Render Surfaces picker -- opens a saved
+        snapshot without going through the model at all."""
+        result = self._handle_render("load", {"name": name})
+        return {"ok": not result.startswith("[RENDER SURFACE ERROR]"), "message": result}
+
+    def render_surface_delete_ui(self, name):
+        """Called from JS's Saved Render Surfaces picker -- deletes a saved
+        snapshot from disk. Pure filesystem op, works even if no surface is
+        currently open."""
+        result = _render_surface_tools.delete_saved_render_surface(name)
+        return {"ok": not result.startswith("[RENDER SURFACE ERROR]"), "message": result}
+
+    def render_surface_list_saved(self):
+        """Called from JS to populate the Saved Render Surfaces picker modal."""
+        os.makedirs(_render_surface_tools.RENDER_SURFACES_DIR, exist_ok=True)
+        items = []
+        try:
+            files = sorted(f for f in os.listdir(_render_surface_tools.RENDER_SURFACES_DIR) if f.endswith(".json"))
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        for fname in files:
+            path = os.path.join(_render_surface_tools.RENDER_SURFACES_DIR, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                items.append({
+                    "name": data.get("name") or fname[:-5],
+                    "title": data.get("title") or fname[:-5],
+                    "saved_at": data.get("saved_at", ""),
+                })
+            except Exception:
+                items.append({"name": fname[:-5], "title": fname[:-5], "saved_at": ""})
+        return {"ok": True, "items": items}
+
+    def render_surface_submit(self, data):
+        """Called from JS whenever the sandboxed Render Surface iframe posts
+        a message up to the parent window (see the 'message' listener on
+        window in the frontend JS, and the postMessage bridge documented on
+        write_render_code in tools/render_surface_tools.py). This is what
+        lets the model accept input of ANY kind from the surface -- a form
+        submit, a button click with a payload, a value picked from a custom
+        widget, freeform text typed into the surface's own input, etc --
+        instead of the surface being view-only.
+
+        The payload is folded into the conversation as an ordinary user
+        turn (same path as send_message) so the model sees it, can react to
+        it (including calling write_render_code/edit_render_code again),
+        and it's visible/persisted in the chat like anything else the user
+        did. Ignored while a turn is already in flight or the surface isn't
+        actually open, same busy/empty guards send_message already has.
+        """
+        if not self._render_surface_open:
+            return {"ok": False, "error": "not_open"}
+        try:
+            rendered = json.dumps(data, default=str)
+        except Exception:
+            rendered = str(data)
+        wrapped = f"[Render Surface input]\n{rendered}"
+        return self.send_message(wrapped)
 
     def pick_file(self, must_exist: bool = True):
         try:
@@ -3283,6 +3600,7 @@ select, .btn, .ghost-btn{
 .ghost-btn:disabled:hover{background:transparent;}
 .btn-row{display:flex;gap:6px;}
 .btn-row .ghost-btn{flex:1;font-size:10px;height:26px;}
+#settings-panel-toggle .ghost-btn.active{background:var(--accent);color:#fff;}
 #file-list{
   background:var(--surface);border:1px solid var(--border);border-radius:14px;
   font-size:10px;color:var(--subtext);padding:8px;height:90px;overflow-y:auto;white-space:pre;
@@ -3304,6 +3622,36 @@ select, .btn, .ghost-btn{
 .mini-btn:disabled{opacity:.35;cursor:default;pointer-events:none;}
 #sidebar-footer{display:flex;gap:6px;}
 #sidebar-footer .ghost-btn{flex:1;font-size:10px;}
+
+/* Render Surface -- a model-controlled HTML/CSS/JS panel that occupies
+   the right half of the window. It's a real .pane-wrap/.pane, exactly
+   like the tool/chat/sidebar panes (see targetGeo/applyLayout), so it
+   sits flush in the normal split-pane grid -- same inset gap, same
+   border-radius, same translucent/opaque surface treatment -- instead of
+   floating on top as a separate overlay window. Only the sandboxed
+   iframe's srcdoc ever holds the model's markup -- nothing here is ever
+   written to disk (see write_render_code / edit_render_code /
+   close_render_surface in tools/render_surface_tools.py and
+   Api._handle_render in this file). */
+#render-surface-pane-wrap .pane{padding:0;}
+#render-surface-header{
+  flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;
+  padding:10px 14px;border-bottom:1px solid var(--border2);background:var(--surface);
+}
+#render-surface-title{font-size:12px;font-weight:700;color:var(--text);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#render-surface-frame{flex:1;width:100%;height:100%;border:none;background:#fff;}
+
+/* While the Render Surface is open, every OTHER openable panel is disabled
+   -- the top tab bar (Chat/Model/Knowledge/etc) and the Log/Parameters
+   buttons tucked inside the sidebar's Settings overlay -- so the model's
+   surface can't be knocked off-screen or fought over with the user's own
+   navigation. The sidebar toggle itself (☰) is deliberately left OUT of
+   this rule so the sidebar stays reachable. */
+body.render-surface-active #tabbar .tab-btn,
+body.render-surface-active #settings-panel-toggle .ghost-btn{
+  opacity:.35;pointer-events:none;
+}
 
 /* Chat bubbles */
 .row{display:flex;flex-direction:column;padding:6px 0;position:relative;}
@@ -3724,6 +4072,8 @@ textarea.code-area{
       <div class="pane">
         <button class="icon-btn" id="copy-chat-btn" title="Copy full conversation"
           style="position:absolute;top:10px;right:10px;z-index:5;">⧉</button>
+        <button class="icon-btn" id="reopen-render-surface-btn" title="Reopen last Render Surface"
+          style="position:absolute;top:52px;right:10px;z-index:5;">🖼</button>
         <div id="chat-scroll"><div id="chat-col"></div></div>
         <div id="input-row">
           <div style="width:100%;max-width:760px;position:relative;">
@@ -3760,20 +4110,36 @@ textarea.code-area{
     <div class="pane-wrap pane-hidden" id="sidebar-pane-wrap">
       <div class="pane"><div id="sidebar-inner"></div></div>
     </div>
+
+    <div class="pane-wrap pane-hidden" id="render-surface-pane-wrap">
+      <div class="pane" id="render-surface-pane">
+        <div id="render-surface-header">
+          <span id="render-surface-title">Render Surface</span>
+          <button class="icon-btn" id="render-surface-save" title="Save this Render Surface">💾</button>
+          <button class="icon-btn" id="render-surface-close" title="Close">✕</button>
+        </div>
+        <iframe id="render-surface-frame" sandbox="allow-scripts allow-forms allow-popups allow-modals" referrerpolicy="no-referrer"></iframe>
+      </div>
+    </div>
   </div>
 </div>
 
 <div id="modal-overlay"><div class="modal-box" id="modal-box"></div></div>
 
 <script>
+// "Log" and "Parameters" used to live here as ordinary tabs, but they're
+// now reached as togglable buttons from the Settings panel instead (see
+// the "PANELS" section in buildSidebar's settings overlay) so they no
+// longer eat into the horizontal tab bar's space.
 const TABS = [
-  ["Chat","💬"], ["Voice","🎤"], ["Log","📜"], ["Model","🧬"], ["Parameters","⚙"],
+  ["Chat","💬"], ["Voice","🎤"], ["Model","🧬"],
   ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["Flows","🔗"], ["Agents","🤖"], ["MCP","🔌"], ["Permissions","🔐"]
 ];
 
 let state = {
   activeTab: "Chat",
   sidebarOpen: false,
+  renderSurfaceOpen: false,
   thinking: false,
   kbOnly: false,
   kbSources: [],
@@ -3797,14 +4163,22 @@ function api(name, ...args){ return window.pywebview.api[name](...args); }
 function targetGeo(){
   const showTool = state.activeTab !== "Chat";
   const showSide = state.sidebarOpen;
+  const showRender = state.renderSurfaceOpen;
   // The Flows tab is a node-graph editor that needs real canvas space to
   // be usable, so it's the one tab given a pane larger than the chat
   // panel -- every other tab keeps the normal (smaller-than-chat) split.
   const isFlows = state.activeTab === "Flows";
-  if (showTool && showSide)      return isFlows ? {tool:[0,55], chat:[55,25], side:[80,20]} : {tool:[0,30], chat:[30,50], side:[80,20]};
-  if (showTool && !showSide)     return isFlows ? {tool:[0,70], chat:[70,30], side:[100,0]} : {tool:[0,40], chat:[40,60], side:[100,0]};
-  if (!showTool && showSide)     return {tool:[0,0],  chat:[0,80],  side:[80,20]};
-  return {tool:[0,0], chat:[0,100], side:[100,0]};
+  // Render Surface takes the right half of the window as a real pane in
+  // this same split, same as any other pane -- chat keeps the left half
+  // so the conversation (and the ability to send the model input) stays
+  // visible and usable while it's open. Tool/sidebar panes collapse to 0
+  // width while it's active (they're also dimmed via body.render-
+  // surface-active, see CSS) so nothing fights the surface for space.
+  if (showRender)                return {tool:[0,0], chat:[0,50], side:[100,0], render:[50,50]};
+  if (showTool && showSide)      return isFlows ? {tool:[0,55], chat:[55,25], side:[80,20], render:[100,0]} : {tool:[0,30], chat:[30,50], side:[80,20], render:[100,0]};
+  if (showTool && !showSide)     return isFlows ? {tool:[0,70], chat:[70,30], side:[100,0], render:[100,0]} : {tool:[0,40], chat:[40,60], side:[100,0], render:[100,0]};
+  if (!showTool && showSide)     return {tool:[0,0],  chat:[0,80],  side:[80,20], render:[100,0]};
+  return {tool:[0,0], chat:[0,100], side:[100,0], render:[100,0]};
 }
 
 function applyLayout(){
@@ -3812,13 +4186,16 @@ function applyLayout(){
   const toolWrap = document.getElementById("tool-pane-wrap");
   const chatWrap = document.getElementById("chat-pane-wrap");
   const sideWrap = document.getElementById("sidebar-pane-wrap");
+  const renderWrap = document.getElementById("render-surface-pane-wrap");
 
   toolWrap.style.left = g.tool[0]+"%"; toolWrap.style.width = g.tool[1]+"%";
   chatWrap.style.left = g.chat[0]+"%"; chatWrap.style.width = g.chat[1]+"%";
   sideWrap.style.left = g.side[0]+"%"; sideWrap.style.width = g.side[1]+"%";
+  if (renderWrap){ renderWrap.style.left = g.render[0]+"%"; renderWrap.style.width = g.render[1]+"%"; }
 
   toolWrap.classList.toggle("pane-hidden", g.tool[1] === 0);
   sideWrap.classList.toggle("pane-hidden", g.side[1] === 0);
+  if (renderWrap) renderWrap.classList.toggle("pane-hidden", g.render[1] === 0);
 }
 
 function switchTab(name){
@@ -3826,6 +4203,9 @@ function switchTab(name){
   state.activeTab = name;
   document.querySelectorAll(".tab-btn").forEach(b=>{
     b.classList.toggle("active", b.dataset.name === name);
+  });
+  document.querySelectorAll('#settings-panel-toggle [data-panel]').forEach(b=>{
+    b.classList.toggle("active", b.dataset.panel === name);
   });
   if (name !== "Chat") showToolPane(name);
   applyLayout();
@@ -3835,8 +4215,15 @@ function switchTab(name){
 function positionTabHighlight(){
   const bar = document.getElementById("tabbar");
   const hl  = document.getElementById("tab-highlight");
-  const activeBtn = bar && bar.querySelector(".tab-btn.active");
-  if (!bar || !hl || !activeBtn) return;
+  if (!bar || !hl) return;
+  const activeBtn = bar.querySelector(".tab-btn.active");
+  if (!activeBtn){
+    // Active pane (e.g. Log/Parameters, opened from Settings) has no
+    // corresponding tab-btn anymore -- collapse the pill instead of
+    // leaving it stuck on whatever tab was previously active.
+    hl.style.width = "0px";
+    return;
+  }
   hl.style.left  = activeBtn.offsetLeft + "px";
   hl.style.width = activeBtn.offsetWidth + "px";
 }
@@ -3847,6 +4234,113 @@ function toggleSidebar(){
   if (state.sidebarOpen) refreshHistory();
   applyLayout();
 }
+
+// ── Render Surface ---------------------------------------------------------
+// A model-controlled HTML/CSS/JS panel occupying the right half of the
+// window as a real pane (see #render-surface-pane-wrap CSS / targetGeo /
+// applyLayout). The markup the model gives us via write_render_code/
+// edit_render_code is pushed straight into a sandboxed <iframe>'s srcdoc
+// -- it lives only in this tab's memory for as long as the panel is open,
+// and is never written to the user's disk.
+// Opening it also flips on body.render-surface-active, which the CSS above
+// uses to grey out every other openable panel (top tabs, sidebar's Log/
+// Parameters buttons) EXCEPT the sidebar toggle itself, which stays live.
+// Auto-injected into every Render Surface (write/edit/reopen/load all
+// funnel through openRenderSurface/updateRenderSurfaceCode below), giving
+// the surface's own JS a `window.midum.call(name, args)` function that
+// behaves like a normal async function -- awaiting it returns the tool's
+// result, so it can be assigned straight to a variable. Under the hood it
+// posts a {__midum_call:true, id, tool, args} message up to the parent
+// (this document), which invokes render_surface_call_tool in Python (see
+// gui/app.py's Api._call_any_tool_from_surface) and posts the result back
+// in as {__midum_call_result:true, id, result|error} -- matched back to
+// the right pending Promise by `id`. This is purely additive: the model's
+// own HTML/JS (from write_render_code/edit_render_code) is untouched --
+// this script is prepended only to what's actually fed into the iframe's
+// srcdoc, never to the stored code itself, so edit_render_code's exact-
+// substring matching keeps working against exactly what the model wrote.
+const MIDUM_BRIDGE_SCRIPT = `<scr` + `ipt>
+(function(){
+  var __midumCallId = 0;
+  var __midumPending = {};
+  window.addEventListener("message", function(e){
+    var d = e.data;
+    if (d && d.__midum_call_result === true){
+      var p = __midumPending[d.id];
+      if (p){
+        delete __midumPending[d.id];
+        if (d.error) p.reject(new Error(d.error)); else p.resolve(d.result);
+      }
+    }
+  });
+  window.midum = window.midum || {};
+  window.midum.call = function(tool, args){
+    return new Promise(function(resolve, reject){
+      var id = "c" + (++__midumCallId) + "_" + Date.now();
+      __midumPending[id] = {resolve: resolve, reject: reject};
+      parent.postMessage({__midum_call: true, id: id, tool: tool, args: args || {}}, "*");
+    });
+  };
+})();
+<\/scr` + `ipt>`;
+
+function openRenderSurface(code, title){
+  const frame   = document.getElementById("render-surface-frame");
+  const titleEl = document.getElementById("render-surface-title");
+  titleEl.textContent = title && title.trim() ? title : "Render Surface";
+  frame.srcdoc = MIDUM_BRIDGE_SCRIPT + (code || "");
+  state.renderSurfaceOpen = true;
+  document.body.classList.add("render-surface-active");
+  applyLayout();
+}
+
+function updateRenderSurfaceCode(code){
+  if (!state.renderSurfaceOpen) return; // nothing open to update
+  document.getElementById("render-surface-frame").srcdoc = MIDUM_BRIDGE_SCRIPT + (code || "");
+}
+
+function closeRenderSurfaceUI(){
+  state.renderSurfaceOpen = false;
+  document.body.classList.remove("render-surface-active");
+  applyLayout();
+  // Drop the iframe's document entirely (rather than just hiding it) so
+  // any timers/listeners the model's script set up stop running and its
+  // markup isn't just sitting there invisibly in memory.
+  document.getElementById("render-surface-frame").srcdoc = "";
+}
+
+// The sandboxed iframe can't call pywebview.api directly (it's an opaque
+// srcdoc origin, deliberately not allow-same-origin) -- the only channel
+// out of it is postMessage to its parent. This is what lets the model's
+// surface accept input of ANY kind (a form, a button with a payload, a
+// slider, freeform text, a custom widget's selection, etc): the surface's
+// own script calls `parent.postMessage(yourData, "*")`, this listener
+// catches it, confirms it actually came from the live render-surface
+// iframe (not some other frame/extension), and hands it to Python via
+// render_surface_submit -- which folds it into the conversation as a
+// normal user turn so the model sees it and can act on it. Ignored
+// whenever the surface isn't open, so stray messages from an iframe
+// that's mid-teardown (srcdoc just cleared) can't leak through.
+window.addEventListener("message", (e)=>{
+  if (!state.renderSurfaceOpen) return;
+  const frame = document.getElementById("render-surface-frame");
+  if (!frame || !frame.contentWindow || e.source !== frame.contentWindow) return;
+  const d = e.data;
+  // Tool/MCP/Flow calls from window.midum.call() (see MIDUM_BRIDGE_SCRIPT
+  // above) are tagged with __midum_call and handled separately from free-
+  // form input -- they're routed to render_surface_call_tool and answered
+  // back into the SAME iframe (not folded into the chat as a user turn),
+  // so the surface's script can await the result like a normal function
+  // call, whether it fired automatically or from a user interaction.
+  if (d && d.__midum_call === true){
+    api("render_surface_call_tool", d.tool, d.args || {})
+      .then((result)=>{ frame.contentWindow.postMessage({__midum_call_result: true, id: d.id, result: result}, "*"); })
+      .catch((err)=>{ frame.contentWindow.postMessage({__midum_call_result: true, id: d.id, error: String(err && err.message || err)}, "*"); });
+    return;
+  }
+  api("render_surface_submit", d);
+});
+
 
 // ── Top bar build --------------------------------------------------------
 function buildTabbar(){
@@ -3870,6 +4364,21 @@ function escapeHtml(s){
 
 function renderInline(text){
   let t = escapeHtml(text);
+  // LaTeX math ($$...$$, \[...\], \(...\), $...$) is pulled out into
+  // \u0000MATHSPAN-tagged placeholders BEFORE the table parser and the
+  // bold/italic/etc regexes below run. This has to happen before table
+  // parsing (not just before emphasis) because _splitTableRow() splits
+  // cells on raw, unescaped "|" -- and plenty of real TeX contains bare
+  // "|" (absolute value like $|x|$, \begin{vmatrix}...\end{vmatrix},
+  // set-builder notation, etc). Left in place, that math would get
+  // sliced apart as if it were extra table columns. Stashing the
+  // rendered <span class="math-tex"> HTML behind an opaque placeholder
+  // (no "|", "*", "_", or "$" left in the text the table/emphasis
+  // regexes actually see) keeps it intact through both passes; it's
+  // swapped back in at the very end, once table/code/emphasis handling
+  // is safely behind us.
+  const _mathSpans = [];
+  t = extractMath(t, _mathSpans);
   t = renderTablesInText(t);
   // Fenced code blocks are pulled out into placeholders *before* any of the
   // markdown regexes below run -- same trick extractMath() uses for TeX
@@ -3888,11 +4397,6 @@ function renderInline(text){
     return `\u0000CODEBLOCK${_codeBlocks.length - 1}\u0000`;
   });
   t = t.replace(/`([^`]+)`/g, (m,c)=>`<code class="inline-code">${c}</code>`);
-  // LaTeX math ($$...$$, \[...\], \(...\), $...$) is swapped for a
-  // placeholder <span class="math-tex"> BEFORE the bold/italic/etc
-  // regexes below run, so things like x_i or a*b inside a formula never
-  // get misread as markdown emphasis -- see extractMath()'s docstring.
-  t = extractMath(t);
   t = t.replace(/\*\*\*(.+?)\*\*\*/g, "<b><i>$1</i></b>");
   t = t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
   t = t.replace(/(^|[^*])\*([^*]+)\*/g, "$1<i>$2</i>");
@@ -3922,6 +4426,11 @@ function renderInline(text){
   // Swap the real code-block HTML back in now that the \n -> <br> pass is
   // safely behind us.
   t = t.replace(/\u0000CODEBLOCK(\d+)\u0000/g, (m, idx)=>_codeBlocks[Number(idx)]);
+  // Swap the real math-span HTML back in last of all -- restoring it any
+  // earlier would put raw "|"/"*"/"_"/"$" TeX source back in front of the
+  // table parser and emphasis regexes above, exactly what the placeholder
+  // swap at the top of this function exists to avoid.
+  t = t.replace(/\u0000MATHSPAN(\d+)\u0000/g, (m, idx)=>_mathSpans[Number(idx)]);
   return t;
 }
 
@@ -4251,15 +4760,23 @@ function _loadKatexOnce(){
 // math (\(...\) and $...$). Inline $...$ requires no whitespace right
 // after the opening $ or right before the closing $ (so "$5 and $10"
 // isn't misread as one giant math span) and stays on a single line.
-function extractMath(text){
+function extractMath(text, store){
+  // Every match is pushed into `store` and replaced with an opaque
+  // \u0000MATHSPANn\u0000 token rather than the <span> HTML directly, so
+  // that later passes (table splitting, bold/italic, the \n -> <br> pass)
+  // see no "|", "*", "_", or "$" left over from the original TeX -- see
+  // the comment at the top of renderInline() for why table splitting in
+  // particular needs this. Caller restores the real HTML afterwards via
+  // store[n].
+  const push = (html)=>{ store.push(html); return `\u0000MATHSPAN${store.length - 1}\u0000`; };
   text = text.replace(/\$\$([\s\S]+?)\$\$/g, (m, expr)=>
-    `<span class="math-tex" data-display="1">${expr}</span>`);
+    push(`<span class="math-tex" data-display="1">${expr}</span>`));
   text = text.replace(/\\\[([\s\S]+?)\\\]/g, (m, expr)=>
-    `<span class="math-tex" data-display="1">${expr}</span>`);
+    push(`<span class="math-tex" data-display="1">${expr}</span>`));
   text = text.replace(/\\\(([\s\S]+?)\\\)/g, (m, expr)=>
-    `<span class="math-tex" data-display="0">${expr}</span>`);
+    push(`<span class="math-tex" data-display="0">${expr}</span>`));
   text = text.replace(/\$(?!\s)([^$\n]+?)(?<!\s)\$/g, (m, expr)=>
-    `<span class="math-tex" data-display="0">${expr}</span>`);
+    push(`<span class="math-tex" data-display="0">${expr}</span>`));
   return text;
 }
 
@@ -5016,6 +5533,9 @@ window.__midumEvent = function(evt){
   else if (kind === "ptt_captured"){ handlePttCaptured(payload); }
   else if (kind === "voice_ptt_state"){ handlePttState(payload); }
   else if (kind === "pdf_cache_warmed"){ if (typeof onPdfCacheWarmed === "function") onPdfCacheWarmed(); }
+  else if (kind === "render_surface_open"){ openRenderSurface(payload.code, payload.title); }
+  else if (kind === "render_surface_update"){ updateRenderSurfaceCode(payload.code); }
+  else if (kind === "render_surface_close"){ closeRenderSurfaceUI(); }
   else if (kind === "gemini_web_models"){
     // select_provider() returns an instant cached/fallback list for
     // Gemini-web and fetches the real gemini_webapi lineup in the
@@ -5233,6 +5753,75 @@ async function showMcpToolsPane(serverName){
   document.addEventListener("keydown", _modalKeyHandler);
 }
 
+// Saved Render Surfaces picker -- lets the user bring back a previously
+// saved Render Surface (see save_render_surface/list_saved_render_surfaces/
+// load_render_surface/delete_saved_render_surface in
+// tools/render_surface_tools.py) without going through the model at all.
+// Built as its own function for the same reason as showMcpToolsPane: it
+// needs live re-fetch-and-redraw after every Load/Delete click.
+async function showSavedRenderSurfacesPicker(){
+  const overlay = document.getElementById("modal-overlay");
+  const box = document.getElementById("modal-box");
+  box.classList.add("wide");
+  box.innerHTML = `
+    <div class="modal-title">Saved Render Surfaces</div>
+    <div id="render-surfaces-body" style="max-height:50vh;overflow-y:auto;margin:8px 0;"></div>
+    <div class="modal-actions"><button class="modal-btn primary" id="render-surfaces-close">Close</button></div>
+  `;
+  overlay.classList.add("open");
+  const bodyEl = document.getElementById("render-surfaces-body");
+  bodyEl.innerHTML = `<div style="font-size:11px;color:var(--subtext);padding:10px;">Loading...</div>`;
+
+  async function refresh(){
+    const r = await api("render_surface_list_saved");
+    if (!r.ok){
+      bodyEl.innerHTML = `<div style="font-size:11px;color:var(--red);padding:10px;">${escapeHtml(r.error || "Failed to load saved surfaces.")}</div>`;
+      return;
+    }
+    if (!r.items.length){
+      bodyEl.innerHTML = `<div style="font-size:11px;color:var(--subtext);padding:10px;">No saved Render Surfaces yet. Open one and click 💾 in its header to save it.</div>`;
+      return;
+    }
+    bodyEl.innerHTML = r.items.map(it => `
+      <div class="mcp-tool-row" data-name="${escapeHtml(it.name)}">
+        <div class="mcp-tool-info">
+          <div class="mcp-tool-name">${escapeHtml(it.title || it.name)}</div>
+          <div class="mcp-tool-desc">${escapeHtml(it.name)}${it.saved_at ? " · saved " + escapeHtml(it.saved_at) : ""}</div>
+        </div>
+        <div class="mcp-tool-actions">
+          <button class="mini-btn open" data-act="load">Load</button>
+          <button class="mini-btn del" data-act="delete">Delete</button>
+        </div>
+      </div>`).join("");
+  }
+  await refresh();
+
+  bodyEl.onclick = async (e)=>{
+    const btn = e.target.closest("[data-act]");
+    if (!btn || btn.disabled) return;
+    const row = btn.closest("[data-name]");
+    const name = row.dataset.name;
+    btn.disabled = true;
+    if (btn.dataset.act === "load"){
+      const r = await api("render_surface_load_ui", name);
+      if (r.ok){ doClose(); }
+      else { await showConfirm(r.message || "Failed to load.", "Error"); showSavedRenderSurfacesPicker(); }
+      return;
+    }
+    const ok = await showConfirm(`Delete saved Render Surface "${name}"? This can't be undone.`, "Delete", {danger:true, okLabel:"Delete"});
+    if (ok){ await api("render_surface_delete_ui", name); }
+    showSavedRenderSurfacesPicker();
+  };
+
+  function doClose(){
+    box.classList.remove("wide");
+    _closeModal();
+  }
+  document.getElementById("render-surfaces-close").onclick = doClose;
+  _modalKeyHandler = e=>{ if (e.key === "Escape"){ doClose(); } };
+  document.addEventListener("keydown", _modalKeyHandler);
+}
+
 // ── Sidebar -------------------------------------------------------------
 function buildSidebar(){
   const el = document.getElementById("sidebar-inner");
@@ -5268,6 +5857,14 @@ function buildSidebar(){
         <button id="settings-back-btn">←</button>
         <div class="section-label">SETTINGS</div>
         <div style="width:26px;"></div>
+      </div>
+      <div class="field-label" style="margin:2px 0 0;">PANELS</div>
+      <div class="btn-row" id="settings-panel-toggle">
+        <button class="ghost-btn" data-panel="Log" style="flex:1;">📜 Logs</button>
+        <button class="ghost-btn" data-panel="Parameters" style="flex:1;">⚙ Parameters</button>
+      </div>
+      <div class="btn-row">
+        <button class="ghost-btn" id="render-surfaces-btn" style="flex:1;">🖼 Render Surfaces</button>
       </div>
       <div class="field-label" style="margin:2px 0 0;">THEME</div>
       <div class="btn-row" id="settings-theme-toggle">
@@ -5366,6 +5963,20 @@ function buildSidebar(){
   document.getElementById("settings-back-btn").onclick = ()=>{
     document.getElementById("sidebar-settings-overlay").classList.remove("open");
   };
+  // "Log" and "Parameters" are opened from here rather than from the tab
+  // bar. Clicking one switches to that pane (closing the settings overlay
+  // + sidebar so the pane is visible); clicking the already-active one
+  // toggles back to Chat instead, so the buttons behave like on/off
+  // toggles rather than one-way links.
+  document.querySelectorAll('#settings-panel-toggle [data-panel]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const panel = btn.dataset.panel;
+      const next = state.activeTab === panel ? "Chat" : panel;
+      switchTab(next);
+      document.getElementById("sidebar-settings-overlay").classList.remove("open");
+      if (state.sidebarOpen) toggleSidebar();
+    };
+  });
   document.getElementById("settings-save").onclick = saveSettingsPanel;
   document.getElementById("settings-reset").onclick = ()=>{
     // Reset to the ACTIVE theme's defaults (not always Dark), so resetting
@@ -8028,11 +8639,28 @@ window.addEventListener("pywebviewready", async ()=>{
   applyLayout();
 
   document.getElementById("sidebar-toggle").onclick = toggleSidebar;
+  document.getElementById("render-surface-close").onclick = ()=>{
+    closeRenderSurfaceUI();
+    api("render_surface_manual_close"); // tell Python so a later edit_render_code/close_render_surface call doesn't operate on state the user already dismissed
+  };
+  document.getElementById("render-surface-save").onclick = async ()=>{
+    const name = await showPrompt("Save this Render Surface as:", "Save Render Surface");
+    if (name === null || !name.trim()) return;
+    const r = await api("render_surface_save_ui", name.trim());
+    if (!r.ok) await showConfirm(r.message || "Failed to save.", "Error");
+  };
+  document.getElementById("render-surfaces-btn").onclick = ()=>{
+    showSavedRenderSurfacesPicker();
+  };
   document.getElementById("send-btn").onclick = sendMessage;
   document.getElementById("msg-input").addEventListener("keydown", e=>{ if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); sendMessage(); } });
   document.getElementById("msg-input").addEventListener("input", autosizeMsgInput);
   document.getElementById("abort-btn").onclick = ()=>api("abort");
   document.getElementById("copy-chat-btn").onclick = copyFullConversation;
+  document.getElementById("reopen-render-surface-btn").onclick = async ()=>{
+    const r = await api("render_surface_reopen_ui");
+    if (!r.ok) await showConfirm(r.message || "Nothing to reopen.", "Reopen Render Surface");
+  };
   initKbOnlyControls();
 
   // Apply the remembered theme colors immediately, before the heavier
