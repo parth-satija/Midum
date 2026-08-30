@@ -328,6 +328,33 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "execute_wsl_command",
+            "description": (
+                "Run a bash command in YOUR OWN persistent WSL2 Linux terminal -- "
+                "think of this as your computer, separate from the user's Windows "
+                "desktop that execute_terminal_command drives. The shell stays alive "
+                "between calls (same working directory, exported env vars, background "
+                "jobs, activated venvs, etc., exactly like a real interactive terminal "
+                "you keep typing into), and the user's entire Windows filesystem is "
+                "reachable at /mnt/<drive letter> (e.g. C:\\Users -> /mnt/c/Users), so "
+                "you can read/write/build their real files from here too. Every command "
+                "you run, and its output, streams live to the user's GUI in the Shell "
+                "tab, where they can also type commands into this exact same session "
+                "themselves -- treat it like a shared terminal the user is watching."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The exact bash command to run."},
+                    "timeout": {"type": "integer", "description": "Optional: max seconds to wait for output (default 60, max 300)."}
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "execute_python_code",
             "description": (
                 "Run a snippet of Python code in an isolated sandbox subprocess (a "
@@ -2804,6 +2831,150 @@ tools = [
                 },
                 "required": ["name"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "call_discord",
+            "description": (
+                "Join a Discord VOICE CHANNEL and hold a live, two-way SPOKEN conversation with "
+                "whoever is in it -- the free alternative to a real phone call. NOTE: this does "
+                "not ring anyone; it joins the configured voice channel immediately and starts "
+                "talking, so the other person needs to already be in (or join) that channel. "
+                "Returns immediately with a call_id once the bot has joined; the conversation "
+                "proceeds asynchronously. Follow up with get_discord_call_status(call_id) or "
+                "get_discord_call_transcript(call_id) to see how it's going, or "
+                "end_discord_call(call_id) to leave early. Requires a Discord bot token "
+                "configured in the secrets file (DISCORD_BOT_TOKEN)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "opening_message": {
+                        "type": "string",
+                        "description": "The first thing Midum says out loud once it joins the voice channel."
+                    },
+                    "objective": {
+                        "type": "string",
+                        "description": (
+                            "What Midum is trying to accomplish in this conversation, e.g. "
+                            "'Ask if tomorrow's 3pm appointment can move to Friday and confirm "
+                            "whichever time works, then say goodbye.' Midum keeps the conversation "
+                            "going naturally toward this goal until it's satisfied."
+                        )
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Optional Discord voice channel ID to join. Defaults to DISCORD_DEFAULT_VOICE_CHANNEL_ID from secrets if omitted."
+                    }
+                },
+                "required": ["opening_message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_discord_call_status",
+            "description": "Check the current status and the last few lines said in a Discord voice call started with call_discord().",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "call_id": {"type": "string", "description": "The call_id returned by call_discord()."}
+                },
+                "required": ["call_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_discord_call_transcript",
+            "description": "Return the FULL transcript so far of a Discord voice call started with call_discord(), including after it has ended.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "call_id": {"type": "string", "description": "The call_id returned by call_discord()."}
+                },
+                "required": ["call_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "end_discord_call",
+            "description": "Leave the voice channel and end a Discord voice call started with call_discord().",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "call_id": {"type": "string", "description": "The call_id returned by call_discord()."}
+                },
+                "required": ["call_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_discord_calls",
+            "description": "List every Discord voice call session from this run (active and finished), most recent first.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_discord_sessions",
+            "description": (
+                "List every Discord TEXT CHAT session (DM or channel conversation) known "
+                "this run, most recently active first -- id, which DM/channel it belongs "
+                "to, message count, and how long ago it was last active. Use this to "
+                "find the id of an old conversation to resume with 'session <id>' if it "
+                "wasn't written down at the time. Separate from list_discord_calls(), "
+                "which is for VOICE calls, not text sessions."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "discord_upload_file",
+            "description": (
+                "Upload a local file to the Discord conversation (DM or channel) this "
+                "tool call is currently running inside of -- i.e. wherever the user's "
+                "message that triggered this turn came from. Use whenever the user "
+                "asks you to send/upload/share/attach a file in Discord. Only works "
+                "while replying to a Discord TEXT message (not from the terminal/GUI, "
+                "and not inside a Discord VOICE call, which has no text channel to "
+                "upload into)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "ABSOLUTE path to the file to upload. The file must already exist on disk."
+                    }
+                },
+                "required": ["file_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_discord_bot",
+            "description": (
+                "Start the Discord bot so it starts listening for and replying to DMs and "
+                "server messages immediately, without needing to place a voice call first. "
+                "Once running it answers any DM sent to it, and any message in a text channel "
+                "of the same server as the configured voice channel, using Midum's full "
+                "reasoning and tool-use pipeline -- a real chat interface to Midum over Discord."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
     },
 ]

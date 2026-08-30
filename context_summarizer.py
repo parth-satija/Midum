@@ -133,20 +133,67 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def estimate_history_tokens(conversation_history: list) -> int:
+def _estimate_message_tokens(m: dict) -> int:
     total = 0
-    for m in conversation_history:
-        content = m.get("content", "")
-        if isinstance(content, str):
-            total += estimate_tokens(content)
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and "text" in part:
-                    total += estimate_tokens(part["text"])
-        tool_calls = m.get("tool_calls")
-        if tool_calls:
-            total += estimate_tokens(str(tool_calls))
+    content = m.get("content", "")
+    if isinstance(content, str):
+        total += estimate_tokens(content)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and "text" in part:
+                total += estimate_tokens(part["text"])
+    tool_calls = m.get("tool_calls")
+    if tool_calls:
+        total += estimate_tokens(str(tool_calls))
     return total
+
+
+# -- Incremental token-count cache ---------------------------------------
+# process_chat_turn() calls should_summarize()/estimate_history_tokens()
+# on EVERY step of its loop (potentially dozens to hundreds of times per
+# turn in an action loop), passing the same, ever-growing
+# conversation_history list. Rescanning every message from scratch on
+# every single call is O(len(history)) each time, so a long-running
+# session becomes progressively slower the more turns pile up -- this is
+# the main source of "long conversations causing lag". Since messages are
+# only ever appended (never mutated in place) between cache checks --
+# except when this module itself replaces the list contents wholesale
+# during compaction -- we can cache the running total keyed by the list's
+# identity and only sum the NEW messages since the last check, making
+# repeat calls O(new messages) instead of O(total messages).
+_token_cache: dict[int, tuple[int, int]] = {}   # id(list) -> (len_at_cache, cached_total)
+
+
+def estimate_history_tokens(conversation_history: list) -> int:
+    key = id(conversation_history)
+    cur_len = len(conversation_history)
+    cached = _token_cache.get(key)
+
+    if cached is not None:
+        cached_len, cached_total = cached
+        if cur_len >= cached_len:
+            # Fast path: history only grew (or is unchanged) since last
+            # check -- sum just the new tail instead of rescanning it all.
+            total = cached_total + sum(
+                _estimate_message_tokens(m) for m in conversation_history[cached_len:]
+            )
+            _token_cache[key] = (cur_len, total)
+            return total
+        # History got shorter (e.g. compacted, or a different list reused
+        # the same id after GC) -- cache is stale, fall through to a full
+        # recompute below and refresh it.
+
+    total = sum(_estimate_message_tokens(m) for m in conversation_history)
+    _token_cache[key] = (cur_len, total)
+    return total
+
+
+def invalidate_history_token_cache(conversation_history: list) -> None:
+    """Call after replacing conversation_history's contents in place
+    (e.g. via .clear()/.extend(), as summarize_context_if_needed does)
+    so the next estimate starts from a correct baseline instead of
+    reusing a stale cached total under the same list id."""
+    _token_cache.pop(id(conversation_history), None)
 
 
 def should_summarize(conversation_history: list) -> bool:
@@ -259,6 +306,7 @@ def summarize_context_if_needed(conversation_history: list) -> list:
 
     conversation_history.clear()
     conversation_history.extend(new_history)
+    invalidate_history_token_cache(conversation_history)   # stale cache would double-count post-compaction
 
     print(f"[context_summarizer] Compacted {len(oldest_chunk)} turns -> 1 summary "
           f"(~{used_before} -> ~{used_after} tokens)")

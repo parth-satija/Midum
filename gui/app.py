@@ -69,6 +69,8 @@ except Exception:
 from gui.chat_store import ChatStore, MidumSession
 from gui.dispatch import _dispatch_midum_tool
 from flows import classify_tool_kind
+import knowledge_base as _knowledge_base
+import concurrent.futures
 import tools.user_prompt_tools as _user_prompt_tools
 import tools.render_surface_tools as _render_surface_tools
 
@@ -402,6 +404,14 @@ class Api:
         # already gets from _on_log_line's "-> Executing: ..." interception.
         midum.set_tool_call_hook(self._handle_tool_call)
 
+        # Wires the persistent WSL2 shell (shell_session.py) to the Shell
+        # tab -- every command run there, whether issued by the model via
+        # execute_wsl_command or typed by the user directly into the tab,
+        # streams here as a "shell_line" event so both sides watch (and
+        # can drive) the exact same live terminal.
+        from shell_session import get_shell_session
+        get_shell_session().set_event_hook(self._push_event)
+
         # Notified the moment a sub-agent's Action Loop stops (task done,
         # crashed, or cut off) -- see multi_agent.set_agent_done_hook and
         # Api._on_agent_done below. This is what lets the Supervisor learn
@@ -564,6 +574,42 @@ class Api:
         with self._persist_lock:
             self._display_log.append(("toolcall", toolcall_payload))
 
+    # ── Shell tab (persistent WSL2 terminal, shared with the model) ────────
+    def shell_run_user_command(self, command: str):
+        """Runs a command the USER typed directly into the Shell tab, in the
+        exact same persistent WSL2 session the model's execute_wsl_command
+        tool drives -- so cwd/env/background jobs stay consistent no matter
+        which side is typing. Output streams back asynchronously as
+        "shell_line" events (see shell_session.ShellSession._emit / the
+        hook wired up in __init__ above); this call just kicks it off on a
+        worker thread so the GUI never blocks on a slow/long-running command.
+        """
+        command = (command or "").strip()
+        if not command:
+            return {"ok": False, "error": "empty command"}
+        from shell_session import get_shell_session
+        def _run():
+            get_shell_session().run(command, origin="user", timeout=120)
+        threading.Thread(target=_run, daemon=True).start()
+        return {"ok": True}
+
+    def shell_restart(self):
+        """Kills the current WSL2 shell process so the next command (from
+        either the model or the user) starts a fresh session -- exposed as
+        a "Restart" button in the Shell tab for when a command hangs or the
+        environment needs a clean slate."""
+        from shell_session import get_shell_session
+        get_shell_session().restart()
+        return {"ok": True}
+
+    def get_shell_cwd(self):
+        """Current working directory of the persistent shell, for the
+        Shell tab's terminal-style prompt label ("<cwd> $"). Cheap
+        in-process lookup -- shell_session.py keeps this in sync with the
+        shell's real $PWD after every command (see ShellSession.run)."""
+        from shell_session import get_shell_session
+        return get_shell_session().get_cwd()
+
     # ── Bootstrap ─────────────────────────────────────────────────────────
     def startup(self):
         threading.Thread(target=self._startup_worker, daemon=True).start()
@@ -593,6 +639,24 @@ class Api:
                 self._push_event("log", {"text": "⏰ [Scheduler started -- scheduled Flows will run while this app is open]\n"})
             except Exception as e:
                 self._push_event("log", {"text": f"⚠️ Scheduler failed to start: {e}\n"})
+
+            # Discord bot: auto-start on launch if DISCORD_BOT_TOKEN is
+            # configured, instead of requiring the user to explicitly ask
+            # Midum to start_discord_bot() every session. Mirrors the
+            # scheduler's pattern above -- best-effort, logged either way,
+            # never blocks the rest of startup. providers.discord_voice
+            # already no-ops safely if discord.py isn't installed or the
+            # token is missing/blank, so this is safe to always attempt.
+            try:
+                from providers.discord_voice import start_discord_bot as _start_discord_bot, _CREDS_AVAILABLE as _discord_creds_available
+                if _discord_creds_available:
+                    discord_result = _start_discord_bot()
+                    self._push_event("log", {"text": f"\U0001f4ac [Discord] {discord_result}\n"})
+                # If not configured, stay silent -- most users never set up
+                # Discord at all, and the setup docstring in discord_voice.py
+                # already covers what's needed for anyone who does.
+            except Exception as e:
+                self._push_event("log", {"text": f"⚠️ Discord bot failed to auto-start: {e}\n"})
 
             # Every launch starts a genuinely new session -- the same reset
             # the "New Chat" button performs. Full continuity across
@@ -636,14 +700,80 @@ class Api:
         # (see warm_pdf_sources() below), so startup stays light.
 
     def _warm_pdf_source_cache(self):
+        """Extracts every registered PDF source's full line-by-line text
+        (the heavy step -- PyMuPDF's page.get_text("dict") plus building
+        large nested Python dict/list structures for every line of every
+        page) in separate worker PROCESSES rather than looping through it
+        on this background thread.
+
+        Running it on a plain background thread (the old approach) still
+        made the whole GUI stutter/freeze on click: this is genuinely
+        CPU-bound pure-Python work, and CPython's GIL means a thread doing
+        that work and the GUI's own thread (handling webview/JS calls)
+        trade off the interpreter every ~5ms rather than truly running
+        alongside each other -- for a large/many-page PDF that adds up to
+        real, visible lag on every click, exactly the "extreme lag" this
+        fixes. A ProcessPoolExecutor runs each extraction in its own
+        interpreter/GIL, so this CPU work never competes with the GUI
+        thread at all; only the small, already-parsed result list is
+        pickled back across the process boundary.
+
+        Results are written into knowledge_base._PDF_LINES_CACHE here (the
+        same cache _cached_extract_pdf_lines reads from), so the
+        build_pdf_source_parts() calls that follow are cheap in-process
+        lookups instead of re-parsing anything.
+        """
         try:
-            for name in midum.list_pdf_sources():
-                try:
-                    midum.build_pdf_source_parts(name)
-                except Exception:
-                    pass
+            names = midum.list_pdf_sources()
         except Exception:
-            pass
+            return
+
+        # Resolve each source's PDF path up front, deduped (several
+        # sources could in principle point at the same file) and limited
+        # to files that still exist on disk.
+        paths = set()
+        for name in names:
+            try:
+                record = midum.read_pdf_source(name)
+            except Exception:
+                continue
+            path = (record or {}).get("source_path")
+            if path and os.path.exists(path):
+                paths.add(path)
+
+        if paths:
+            try:
+                max_workers = min(4, max(1, os.cpu_count() or 1))
+                with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as ex:
+                    futures = {ex.submit(_knowledge_base.extract_pdf_lines, p): p for p in paths}
+                    for fut in concurrent.futures.as_completed(futures):
+                        path = futures[fut]
+                        try:
+                            lines = fut.result()
+                        except Exception:
+                            continue
+                        try:
+                            mtime = os.path.getmtime(path)
+                        except OSError:
+                            mtime = None
+                        _knowledge_base._PDF_LINES_CACHE[path] = (mtime, lines)
+            except Exception:
+                # Process pool unavailable for some reason (sandboxed
+                # environment, frozen-exe spawn issue, etc) -- fall back
+                # to the old sequential in-thread extraction rather than
+                # warming nothing at all. Uses the cached helper so the
+                # result still lands in _PDF_LINES_CACHE for reuse.
+                for path in paths:
+                    try:
+                        _knowledge_base._cached_extract_pdf_lines(path)
+                    except Exception:
+                        pass
+
+        for name in names:
+            try:
+                midum.build_pdf_source_parts(name)
+            except Exception:
+                pass
 
     def warm_pdf_sources(self):
         """User-triggered (Knowledge tab "Load Sources" button) equivalent
@@ -4118,7 +4248,7 @@ textarea.code-area{
           <button class="icon-btn" id="render-surface-save" title="Save this Render Surface">💾</button>
           <button class="icon-btn" id="render-surface-close" title="Close">✕</button>
         </div>
-        <iframe id="render-surface-frame" sandbox="allow-scripts allow-forms allow-popups allow-modals" referrerpolicy="no-referrer"></iframe>
+        <iframe id="render-surface-frame" sandbox="allow-scripts allow-forms allow-popups allow-modals" referrerpolicy="strict-origin-when-cross-origin"></iframe>
       </div>
     </div>
   </div>
@@ -4133,7 +4263,7 @@ textarea.code-area{
 // longer eat into the horizontal tab bar's space.
 const TABS = [
   ["Chat","💬"], ["Voice","🎤"], ["Model","🧬"],
-  ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["Flows","🔗"], ["Agents","🤖"], ["MCP","🔌"], ["Permissions","🔐"]
+  ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["Shell","💻"], ["Flows","🔗"], ["Agents","🤖"], ["MCP","🔌"], ["Permissions","🔐"], ["Surfaces","🖼"]
 ];
 
 let state = {
@@ -4148,6 +4278,12 @@ let state = {
 };
 
 let voiceState = { running: false, connecting: false };
+
+// Scrollback for the Shell tab -- kept here (not just in the DOM) so
+// switching away to another tab and back doesn't lose history, since
+// showToolPane() tears down and rebuilds #tool-content on every switch.
+let shellHistory = [];
+const SHELL_HISTORY_CAP = 1000;
 
 // Tracks the chat row currently receiving say()/reply text for the
 // in-progress turn, so multiple say() calls (and the final reply) within
@@ -4886,6 +5022,159 @@ function renderMidumContent(text){
 
 function chatCol(){ return document.getElementById("chat-col"); }
 
+// ── Windowed rendering for long conversations ─────────────────────────────
+// Opening a saved chat used to dump its ENTIRE display log into the DOM in
+// one shot -- one element (often several, for tool-call cards) per stored
+// row, with zero regard for how many turns the conversation actually had.
+// For a long-running chat that's hundreds/thousands of DOM nodes built and
+// inserted in a single frame, which is exactly what made scrolling/opening
+// long conversations feel laggy.
+//
+// Instead we group the log into "turns" (one user message plus everything
+// that followed it, up to the next user message) and only render the most
+// recent HIST_WINDOW turns up front -- scrolled to the bottom, exactly like
+// today. Scrolling up near the top of the pane lazily builds and prepends
+// the next batch of older turns from the in-memory log; nothing beyond
+// what's actually been scrolled into view is ever built. Turns are never
+// removed once rendered (in particular the newest/bottom ones), so a live
+// reply always appends correctly after whatever's currently shown.
+const HIST_WINDOW = 10;    // turns rendered up front when a chat is opened
+const HIST_SHIFT   = 10;   // extra older turns pulled in per scroll-up batch
+
+let _histTurns    = [];    // [[ [tag,text], [tag,text], ... ], ...] -- full log, grouped by turn
+let _histWinStart = 0;     // index of the oldest turn currently rendered
+let _histActive   = false; // true once a loaded chat's history is being windowed
+
+function groupDisplayIntoTurns(display){
+  const turns = [];
+  let cur = null;
+  (display || []).forEach(([tag, text])=>{
+    if (tag === "user" || !cur){
+      cur = [];
+      turns.push(cur);
+    }
+    cur.push([tag, text]);
+  });
+  return turns;
+}
+
+// Builds one row element from a stored (tag, text) pair for the windowed
+// history view. Deliberately does NOT touch any of the live-turn globals
+// (_currentMidumRow / _pendingToolRows / setActiveToolDot) -- those only
+// make sense for an in-progress live turn. One consequence: a turn whose
+// reply was streamed as several say() chunks is shown here as several
+// stacked "Midum" bubbles instead of one merged bubble (a small cosmetic
+// difference from the live view -- no content is lost).
+function buildStaticRow(tag, text){
+  const row = document.createElement("div");
+  if (tag === "user"){
+    row.className = "row user";
+    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">⧉</button></div><div class="bubble user">${escapeHtml(text)}</div>`;
+    wireRowCopyBtn(row);
+  } else if (tag === "midum"){
+    row.className = "row midum";
+    row.innerHTML = `<div class="row-label-row"><button class="row-copy-btn" title="Copy response">⧉</button></div><div class="bubble midum">${renderMidumContent(text)}</div>`;
+    wireRowCopyBtn(row);
+  } else if (tag === "system"){
+    row.className = "row system";
+    row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+  } else if (tag === "error"){
+    row.className = "row error";
+    row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+  } else if (tag === "toolcall"){
+    let data;
+    try { data = JSON.parse(text); } catch(e){ data = {name: "", args: {}, result: text}; }
+    row.className = "row tool tool-row";
+    const argsStr = (data.args && Object.keys(data.args).length) ? JSON.stringify(data.args, null, 2) : "(no arguments)";
+    row.dataset.toolName = data.name || "";
+    row.innerHTML = `
+      <div class="tool-line expandable">
+        <span class="tool-dot"></span><span class="gear">⚙</span><span>-> Executing: '${escapeHtml(data.name || "")}'</span>
+        <span class="chevron">▶</span>
+        <button class="row-copy-btn" title="Copy tool call" style="margin-left:6px;">⧉</button>
+      </div>
+      <div class="tool-detail">
+        <div class="tool-detail-label">Call</div>
+        <pre>${escapeHtml(data.name || "")}(${escapeHtml(argsStr)})</pre>
+        <div class="tool-detail-label">Result</div>
+        <pre>${escapeHtml(data.result || "(empty)")}</pre>
+      </div>`;
+    row.querySelector(".tool-line").onclick = (e)=>{
+      if (e.target.closest(".row-copy-btn")) return;
+      row.classList.toggle("open");
+    };
+    wireRowCopyBtn(row);
+  } else {
+    row.className = "row";
+    row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+  }
+  return row;
+}
+
+function buildTurnBlock(turnIndex){
+  const wrap = document.createElement("div");
+  wrap.className = "turn-block";
+  wrap.dataset.turnIndex = String(turnIndex);
+  _histTurns[turnIndex].forEach(([tag, text])=>{
+    wrap.appendChild(buildStaticRow(tag, text));
+  });
+  return wrap;
+}
+
+// Replaces appendRow's "forEach((tag,text)) => appendRow(...)" replay path.
+// Renders only the newest HIST_WINDOW turns and scrolls to the bottom --
+// visually identical to today's "open a chat, land at the bottom" behavior,
+// just without paying to build every row that came before it.
+function renderHistoryWindow(display){
+  _histTurns    = groupDisplayIntoTurns(display);
+  _histActive   = _histTurns.length > 0;
+  const col     = chatCol();
+  col.innerHTML = "";
+  _histWinStart = Math.max(0, _histTurns.length - HIST_WINDOW);
+  for (let i = _histWinStart; i < _histTurns.length; i++){
+    col.appendChild(buildTurnBlock(i));
+  }
+  renderPendingMermaid();
+  renderPendingMath();
+  renderPendingCodeHighlight();
+  scrollToBottom();
+}
+
+// Called when the user scrolls near the top of a windowed history -- pulls
+// the next older batch of turns in from the in-memory log and prepends
+// them, preserving scroll position so the viewport doesn't jump.
+function prependOlderHistoryTurns(){
+  if (!_histActive || _histWinStart <= 0) return;
+  const col        = chatCol();
+  const sc         = document.getElementById("chat-scroll");
+  if (!col || !sc) return;
+  const prevHeight = sc.scrollHeight;
+  const prevTop    = sc.scrollTop;
+  const newStart   = Math.max(0, _histWinStart - HIST_SHIFT);
+  const frag       = document.createDocumentFragment();
+  for (let i = newStart; i < _histWinStart; i++){
+    frag.appendChild(buildTurnBlock(i));
+  }
+  col.insertBefore(frag, col.firstChild);
+  _histWinStart = newStart;
+  renderPendingMermaid();
+  renderPendingMath();
+  renderPendingCodeHighlight();
+  requestAnimationFrame(()=>{
+    sc.scrollTop = prevTop + (sc.scrollHeight - prevHeight);
+  });
+}
+
+// Delegated (not queried at parse time, mirrors the existing delegated
+// click listener for .code-copy-btn below) -- scroll doesn't bubble, so
+// this needs the capture phase.
+document.addEventListener("scroll", (e)=>{
+  if (!_histActive) return;
+  const sc = e.target;
+  if (!sc || sc.id !== "chat-scroll") return;
+  if (sc.scrollTop < 120) prependOlderHistoryTurns();
+}, true);
+
 // Tracks whichever tool-call row is currently "live" so only the most
 // recent one pulses — earlier tool calls settle to a plain dot once a
 // newer tool call, a reply, or turn completion supersedes them.
@@ -5204,7 +5493,18 @@ function scrollToBottom(){
   requestAnimationFrame(()=>{ sc.scrollTop = sc.scrollHeight; });
 }
 
-function clearChat(){ chatCol().innerHTML = ""; _pendingToolRows = []; _currentMidumRow = null; }
+function clearChat(){
+  chatCol().innerHTML = "";
+  _pendingToolRows = [];
+  _currentMidumRow = null;
+  // Reset windowed-history state too -- otherwise a brand-new chat (or one
+  // started fresh after "New session") would still think it's showing a
+  // partially-scrolled window of some previous chat's log, and the
+  // scroll-up handler would try to prepend turns that no longer apply.
+  _histTurns    = [];
+  _histWinStart = 0;
+  _histActive   = false;
+}
 
 // ── Ask cards --------------------------------------------------------------
 function appendAsk(id, kind, payload){
@@ -5512,6 +5812,7 @@ window.__midumEvent = function(evt){
   else if (kind === "system_line"){ appendRow("system", payload.text); }
   else if (kind === "error_line"){ appendRow("error", payload.text); }
   else if (kind === "tool_line"){ appendRow("tool", payload.text); }
+  else if (kind === "shell_line"){ appendShellLine(payload); }
   else if (kind === "tool_call"){ attachToolCallDetail(payload.name, payload.args, payload.result); }
   else if (kind === "agent_tool_call"){ appendAgentToolRow(payload.agent, payload.name, payload.args, payload.result); }
   else if (kind === "log"){ appendLog(payload.text); }
@@ -5753,22 +6054,20 @@ async function showMcpToolsPane(serverName){
   document.addEventListener("keydown", _modalKeyHandler);
 }
 
-// Saved Render Surfaces picker -- lets the user bring back a previously
+// Saved Render Surfaces pane -- lets the user bring back a previously
 // saved Render Surface (see save_render_surface/list_saved_render_surfaces/
 // load_render_surface/delete_saved_render_surface in
 // tools/render_surface_tools.py) without going through the model at all.
-// Built as its own function for the same reason as showMcpToolsPane: it
-// needs live re-fetch-and-redraw after every Load/Delete click.
-async function showSavedRenderSurfacesPicker(){
-  const overlay = document.getElementById("modal-overlay");
-  const box = document.getElementById("modal-box");
-  box.classList.add("wide");
+// Lives as its own top-level tab (see TABS/showToolPane) rather than a
+// Settings option, since browsing/loading/deleting saved surfaces is a
+// primary action, not a preference. Built as its own function for the
+// same reason as buildMcpPane: it needs live re-fetch-and-redraw after
+// every Load/Delete click.
+function buildSurfacesPane(box){
   box.innerHTML = `
-    <div class="modal-title">Saved Render Surfaces</div>
-    <div id="render-surfaces-body" style="max-height:50vh;overflow-y:auto;margin:8px 0;"></div>
-    <div class="modal-actions"><button class="modal-btn primary" id="render-surfaces-close">Close</button></div>
+    <div class="hdr-row"><div class="section-label">SAVED RENDER SURFACES</div></div>
+    <div id="render-surfaces-body" style="flex:1;overflow-y:auto;margin-top:6px;"></div>
   `;
-  overlay.classList.add("open");
   const bodyEl = document.getElementById("render-surfaces-body");
   bodyEl.innerHTML = `<div style="font-size:11px;color:var(--subtext);padding:10px;">Loading...</div>`;
 
@@ -5794,7 +6093,7 @@ async function showSavedRenderSurfacesPicker(){
         </div>
       </div>`).join("");
   }
-  await refresh();
+  refresh();
 
   bodyEl.onclick = async (e)=>{
     const btn = e.target.closest("[data-act]");
@@ -5804,22 +6103,14 @@ async function showSavedRenderSurfacesPicker(){
     btn.disabled = true;
     if (btn.dataset.act === "load"){
       const r = await api("render_surface_load_ui", name);
-      if (r.ok){ doClose(); }
-      else { await showConfirm(r.message || "Failed to load.", "Error"); showSavedRenderSurfacesPicker(); }
+      if (r.ok){ switchTab("Chat"); }
+      else { await showConfirm(r.message || "Failed to load.", "Error"); refresh(); }
       return;
     }
     const ok = await showConfirm(`Delete saved Render Surface "${name}"? This can't be undone.`, "Delete", {danger:true, okLabel:"Delete"});
     if (ok){ await api("render_surface_delete_ui", name); }
-    showSavedRenderSurfacesPicker();
+    refresh();
   };
-
-  function doClose(){
-    box.classList.remove("wide");
-    _closeModal();
-  }
-  document.getElementById("render-surfaces-close").onclick = doClose;
-  _modalKeyHandler = e=>{ if (e.key === "Escape"){ doClose(); } };
-  document.addEventListener("keydown", _modalKeyHandler);
 }
 
 // ── Sidebar -------------------------------------------------------------
@@ -5862,9 +6153,6 @@ function buildSidebar(){
       <div class="btn-row" id="settings-panel-toggle">
         <button class="ghost-btn" data-panel="Log" style="flex:1;">📜 Logs</button>
         <button class="ghost-btn" data-panel="Parameters" style="flex:1;">⚙ Parameters</button>
-      </div>
-      <div class="btn-row">
-        <button class="ghost-btn" id="render-surfaces-btn" style="flex:1;">🖼 Render Surfaces</button>
       </div>
       <div class="field-label" style="margin:2px 0 0;">THEME</div>
       <div class="btn-row" id="settings-theme-toggle">
@@ -6383,7 +6671,7 @@ async function refreshHistory(){
       const r = await api("load_chat", chat.id);
       if (!r.ok){ showAlert(r.error, "Error"); return; }
       clearChat();
-      (r.display||[]).forEach(([tag,text])=>appendRow(tag, text));
+      renderHistoryWindow(r.display||[]);
       applyKbState(r.kb_state);
       switchTab("Chat");
       refreshHistory();
@@ -6416,9 +6704,10 @@ function showToolPane(name){
   const builders = {
     "Voice": buildVoicePane, "Log": buildLogPane, "Model": buildModelPane, "Parameters": buildParamsPane,
     "System Core": buildSysCorePane, "Knowledge": buildKnowledgePane,
-    "Skills": buildSkillsPane, "Tools": buildToolsPane, "Flows": buildFlowsPane, "Schedule": buildSchedulePane, "MCP": buildMcpPane,
+    "Skills": buildSkillsPane, "Tools": buildToolsPane, "Shell": buildShellPane, "Flows": buildFlowsPane, "Schedule": buildSchedulePane, "MCP": buildMcpPane,
     "Agents": buildAgentsPane,
     "Permissions": buildPermissionsPane,
+    "Surfaces": buildSurfacesPane,
   };
   box.innerHTML = "";
   box.style.display = "flex"; box.style.flexDirection = "column"; box.style.height = "100%";
@@ -6432,6 +6721,133 @@ function buildLogPane(box){
       <button class="ghost-btn" id="log-clear" style="height:22px;font-size:10px;">Clear</button></div>
     <textarea class="code-area" id="log-box" readonly style="color:var(--tool-text);background:var(--tool-bg);margin-top:6px;"></textarea>`;
   document.getElementById("log-clear").onclick = ()=>{ document.getElementById("log-box").value=""; };
+}
+
+// ── Shell tab -- persistent WSL2 terminal shared with the model ──────────
+// Every command run through execute_wsl_command (model side) or typed
+// here (user side) hits the exact same shell_session.ShellSession process
+// on the backend, so this really is one continuous terminal both parties
+// are watching/driving -- not two separate logs glued together.
+function shellLineColor(line){
+  if (line.stream === "cmd")  return line.origin === "user" ? "var(--accent)" : "#8fd3ff";
+  if (line.stream === "meta") return "var(--muted)";
+  return "var(--tool-text)";
+}
+
+function shellLineHtml(line){
+  const color = shellLineColor(line);
+  if (line.stream === "cmd"){
+    // Real-terminal-style prompt: "<cwd> $ command", exactly like typing
+    // into an actual shell -- the origin (user vs model) is conveyed by a
+    // small leading marker instead of a "[who]" bracket, so the line reads
+    // like a genuine terminal transcript rather than a chat log.
+    const originMark = line.origin === "model" ? '<span style="color:var(--subtext);">🤖 </span>' : "";
+    const cwd = line.cwd || "";
+    return `<div style="font-weight:600;white-space:pre-wrap;word-break:break-word;">${originMark}<span style="color:var(--subtext);">${escapeHtml(cwd)}</span> <span style="color:${color};">$</span> <span style="color:${color};">${escapeHtml(line.text)}</span></div>`;
+  }
+  if (line.stream === "meta"){
+    return `<div style="color:${color};font-style:italic;white-space:pre-wrap;word-break:break-word;">${escapeHtml(line.text)}</div>`;
+  }
+  return `<div style="color:${color};white-space:pre-wrap;word-break:break-word;">${escapeHtml(line.text)}</div>`;
+}
+
+// Tracks the shell's current working directory client-side, purely for
+// the live prompt label ("<cwd> $") -- kept in sync with the backend's
+// real $PWD (see shell_session.py) by re-fetching it after every command
+// finishes (a "meta" shell_line event -- see appendShellLine below).
+let shellCwd = "~";
+
+function updateShellPromptLabel(){
+  const el = document.getElementById("shell-cwd-label");
+  if (el) el.textContent = shellCwd;
+}
+
+async function refreshShellCwd(){
+  try {
+    shellCwd = (await api("get_shell_cwd")) || shellCwd;
+  } catch (e) { /* leave shellCwd as-is */ }
+  updateShellPromptLabel();
+}
+
+function buildShellPane(box){
+  box.innerHTML = `
+    <div class="hdr-row">
+      <div class="section-label">SHELL — WSL2 (live, shared with model)</div>
+      <button class="ghost-btn" id="shell-restart" style="height:22px;font-size:10px;">Restart</button>
+    </div>
+    <div style="font-size:10px;color:var(--muted);margin:2px 0 6px;line-height:1.5;">
+      This is a real, persistent Linux terminal the model treats as its own
+      computer (cwd/env/background jobs persist between commands) -- the
+      user's Windows files are reachable at /mnt/&lt;drive&gt; (e.g. C:\\Users
+      → /mnt/c/Users). Type directly into the terminal below, exactly like
+      a normal shell -- what you run lands in this exact same session.
+    </div>
+    <div id="shell-terminal" tabindex="-1" style="flex:1;min-height:0;overflow-y:auto;background:var(--tool-bg);color:var(--tool-text);
+      border:1px solid var(--border2);border-radius:10px;padding:8px 10px;font-family:var(--mono-font,monospace);
+      font-size:12px;line-height:1.5;cursor:text;">
+      <div id="shell-output"></div>
+      <div id="shell-prompt-line" style="display:flex;align-items:center;font-weight:600;">
+        <span id="shell-cwd-label" style="color:var(--subtext);white-space:pre;">${escapeHtml(shellCwd)}</span>
+        <span style="color:var(--tool-text);margin:0 4px;">$</span>
+        <input id="shell-input" autocomplete="off" spellcheck="false"
+          style="flex:1;min-width:0;background:transparent;border:none;outline:none;color:var(--tool-text);
+          font-family:var(--mono-font,monospace);font-size:12px;padding:0;"/>
+      </div>
+    </div>`;
+
+  const term = document.getElementById("shell-terminal");
+  const out = document.getElementById("shell-output");
+  const input = document.getElementById("shell-input");
+  out.innerHTML = shellHistory.map(shellLineHtml).join("");
+
+  // Clicking anywhere in the terminal (scrollback or the empty area below
+  // the prompt line) focuses the live input, same as clicking into a real
+  // terminal window puts the cursor back at the prompt.
+  term.addEventListener("mousedown", (e)=>{
+    if (e.target === input) return;
+    // Let a text selection inside the scrollback happen normally instead
+    // of yanking focus away and collapsing it.
+    if (window.getSelection && String(window.getSelection())) return;
+    input.focus();
+  });
+
+  const sendCmd = async ()=>{
+    const cmd = input.value;
+    if (!cmd || !cmd.trim()) return;
+    input.value = "";
+    await api("shell_run_user_command", cmd);
+  };
+  input.addEventListener("keydown", (e)=>{ if (e.key === "Enter") sendCmd(); });
+
+  document.getElementById("shell-restart").onclick = async ()=>{
+    await api("shell_restart");
+  };
+
+  input.focus();
+  refreshShellCwd();
+  term.scrollTop = term.scrollHeight;
+}
+
+// Called from window.__midumEvent for every "shell_line" push -- appends
+// to the persistent history array always, and to the live DOM only when
+// the Shell tab is the one currently mounted (its elements won't exist
+// otherwise, since showToolPane rebuilds #tool-content per tab). New
+// lines are inserted right before the live prompt row, so the prompt
+// (and the input the user's actively typing into) always stays pinned to
+// the bottom, exactly like a real terminal scrolling up under a fixed
+// cursor line.
+function appendShellLine(payload){
+  shellHistory.push(payload);
+  if (shellHistory.length > SHELL_HISTORY_CAP) shellHistory.shift();
+  const out = document.getElementById("shell-output");
+  const term = document.getElementById("shell-terminal");
+  if (!out || !term) return;
+  out.insertAdjacentHTML("beforeend", shellLineHtml(payload));
+  term.scrollTop = term.scrollHeight;
+  // A command has fully finished (its exit-code/meta line just arrived) --
+  // the shell's $PWD may have changed (e.g. `cd`), so refresh the prompt
+  // label to match. Cheap no-op most of the time (cwd usually unchanged).
+  if (payload.stream === "meta") refreshShellCwd();
 }
 
 function buildVoicePane(box){
@@ -8649,9 +9065,6 @@ window.addEventListener("pywebviewready", async ()=>{
     const r = await api("render_surface_save_ui", name.trim());
     if (!r.ok) await showConfirm(r.message || "Failed to save.", "Error");
   };
-  document.getElementById("render-surfaces-btn").onclick = ()=>{
-    showSavedRenderSurfacesPicker();
-  };
   document.getElementById("send-btn").onclick = sendMessage;
   document.getElementById("msg-input").addEventListener("keydown", e=>{ if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); sendMessage(); } });
   document.getElementById("msg-input").addEventListener("input", autosizeMsgInput);
@@ -8762,4 +9175,11 @@ def main():
 
 
 if __name__ == "__main__":
+    # Required on Windows (and for the frozen .exe, which always uses the
+    # "spawn" start method) before ANY ProcessPoolExecutor/multiprocessing
+    # use -- see _warm_pdf_source_cache() above. Without this, a frozen
+    # build would re-launch the whole GUI in every worker process it
+    # spawns instead of just running the one target function.
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

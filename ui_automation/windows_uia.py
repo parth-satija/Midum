@@ -18,8 +18,16 @@ _TESSERACT_AVAILABLE = False
 try:
     import pytesseract
     if _IS_WINDOWS:
-        TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        # MIDUM_TESSERACT_PATH is set by launcher.py when the user supplies a
+        # custom install location; falls back to the standard install path.
+        TESSERACT_PATH = os.environ.get(
+            "MIDUM_TESSERACT_PATH", r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        )
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    elif os.environ.get("MIDUM_TESSERACT_PATH"):
+        # Linux/macOS: only override if the user explicitly gave us a path
+        # (normally tesseract is just on PATH after apt/dnf/brew install).
+        pytesseract.pytesseract.tesseract_cmd = os.environ["MIDUM_TESSERACT_PATH"]
     # On Linux, tesseract is on PATH after apt/dnf install — no path needed.
     # On macOS (Homebrew: `brew install tesseract`), it's on PATH too
     # (/opt/homebrew/bin on Apple Silicon, /usr/local/bin on Intel) as long
@@ -33,8 +41,12 @@ except Exception:
     # launched from a GUI/launcher rather than a login shell. Try the two
     # standard Homebrew prefixes directly before giving up.
     if _IS_MAC:
-        for _cand in ("/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract"):
-            if os.path.exists(_cand):
+        _env_cand = os.environ.get("MIDUM_TESSERACT_PATH")
+        _mac_candidates = ([_env_cand] if _env_cand else []) + [
+            "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract",
+        ]
+        for _cand in _mac_candidates:
+            if _cand and os.path.exists(_cand):
                 try:
                     pytesseract.pytesseract.tesseract_cmd = _cand
                     pytesseract.get_tesseract_version()

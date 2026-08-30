@@ -274,12 +274,15 @@ def search_web_assets(query: str, count: int = 8) -> str:
     Render Surface via `await midum.call("search_web_assets", {query})`, or
     by the model directly. This is the web counterpart to search_assets
     (which only looks at files already on disk) -- use this when you need
-    an asset that doesn't exist locally yet. Follow up with
-    stream_web_asset(url) to actually pull a chosen result's bytes in as a
-    data URI (the surface's sandboxed iframe cannot hotlink arbitrary
-    external images directly in all cases, and can't fetch() cross-origin
-    at all), or just use the URL directly in an <img src> if hotlinking is
-    acceptable for your use case.
+    an asset that doesn't exist locally yet. ALWAYS follow up with
+    stream_web_asset(url) for each image you actually want to show, and use
+    the data URI it returns as the <img src> -- do NOT put these raw URLs
+    directly into <img src>. The surface's iframe is sandboxed without
+    allow-same-origin and can't fetch() cross-origin at all, and most image
+    hosts additionally reject a direct, Referer-less request from it -- a
+    raw hotlinked <img src> to one of these URLs typically renders as a
+    broken image with no visible error. Converting through stream_web_asset
+    first is what makes images actually appear.
     """
     if not _DDGS_AVAILABLE:
         return "[WEB ASSET ERROR] 'ddgs' package not installed. pip install ddgs"
@@ -312,7 +315,12 @@ def search_web_assets(query: str, count: int = 8) -> str:
         lines.append(f"      image: {img}")
         if thumb and thumb != img:
             lines.append(f"      thumb: {thumb}")
-    lines.append("\nUse stream_web_asset(url) to pull a chosen image's bytes in as a data URI.")
+    lines.append(
+        "\nIMPORTANT: never put these URLs directly into <img src>. Call "
+        "stream_web_asset(url) for each image you want to use and put the "
+        "returned data: URI in <img src> instead -- otherwise the image "
+        "will typically fail to render."
+    )
     return "\n".join(lines)
 
 
@@ -323,11 +331,15 @@ def stream_web_asset(url: str, timeout: int = 20) -> str:
     CSS background, or an <audio>/<video> tag inside a Render Surface.
     Callable from inside a surface via `await midum.call("stream_web_asset",
     {url})` -- the sandboxed iframe cannot fetch() cross-origin resources
-    itself, so this is the surface's path to actually pulling remote bytes
-    in (as opposed to hotlinking a URL directly, which is fine when the
-    source allows it but silently fails for many sites). Pair with
+    itself, so this is the surface's REQUIRED path to actually pulling
+    remote bytes in. Do not hotlink a web image URL directly in <img src>
+    instead of calling this -- the iframe has no allow-same-origin and most
+    hosts reject a direct, Referer-less request from it, so a raw hotlink
+    typically renders as a broken image with no visible error. Pair with
     search_web_assets(query) when you don't already have a URL in hand, or
     with any URL you already know (a search result, an API response, etc).
+    This function itself sends a same-origin Referer (and retries without
+    one) specifically to get past hosts that block referrer-less requests.
 
     Caps at 15MB to avoid choking the iframe -- for anything larger, this
     returns an error instead of a huge string.
@@ -346,29 +358,60 @@ def stream_web_asset(url: str, timeout: int = 20) -> str:
         timeout = 20
 
     MAX_BYTES = 15 * 1024 * 1024
-    try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            )
-        }
+    # Many image hosts reject "hotlink"-shaped requests -- specifically
+    # ones with NO Referer header at all, since that's the signature of a
+    # bot/scraper rather than a real browser navigating from a page.
+    # requests sends no Referer by default, which is why images pulled this
+    # way often silently fail to render even though everything here stays
+    # in memory (no disk involved). The standard fix is to send a Referer
+    # matching the image's OWN origin -- i.e. pretend the request came from
+    # a page on the same site the image lives on. If that still gets
+    # rejected, retry once with no Referer, since a few hosts do the
+    # opposite check (reject a foreign Referer instead of a missing one).
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    same_origin_referer = f"{parsed.scheme}://{parsed.netloc}/"
+    base_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+
+    def _attempt(referer):
+        headers = dict(base_headers)
+        if referer:
+            headers["Referer"] = referer
         resp = _webapi_requests.get(url, headers=headers, timeout=timeout, stream=True)
         resp.raise_for_status()
         content_length = resp.headers.get("Content-Length")
         if content_length and int(content_length) > MAX_BYTES:
-            return (f"[WEB ASSET ERROR] '{url}' reports "
-                     f"{int(content_length) / 1024 / 1024:.1f}MB, over the 15MB streaming cap.")
+            raise ValueError(
+                f"'{url}' reports {int(content_length) / 1024 / 1024:.1f}MB, "
+                f"over the 15MB streaming cap."
+            )
         raw = b""
         for chunk in resp.iter_content(chunk_size=65536):
             raw += chunk
             if len(raw) > MAX_BYTES:
-                return f"[WEB ASSET ERROR] '{url}' exceeded the 15MB streaming cap while downloading."
-    except Exception as e:
-        return f"[WEB ASSET ERROR] Could not fetch '{url}': {e}"
+                raise ValueError(f"'{url}' exceeded the 15MB streaming cap while downloading.")
+        return resp, raw
+
+    try:
+        resp, raw = _attempt(same_origin_referer)
+    except ValueError as e:
+        return f"[WEB ASSET ERROR] {e}"
+    except Exception as first_err:
+        try:
+            resp, raw = _attempt(None)
+        except ValueError as e:
+            return f"[WEB ASSET ERROR] {e}"
+        except Exception:
+            return f"[WEB ASSET ERROR] Could not fetch '{url}': {first_err}"
 
     if not raw:
-        return f"[WEB ASSET ERROR] '{url}' returned no data."
+        return f"[WEB ASSET ERROR] '{url}' returned no data (host may block automated fetches entirely)."
 
     mime = (resp.headers.get("Content-Type", "").split(";")[0].strip()
             or mimetypes.guess_type(url)[0]

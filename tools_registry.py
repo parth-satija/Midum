@@ -1349,6 +1349,34 @@ def execute_terminal_command(command, working_directory=None):
     except Exception as e:
         return f"Execution failed: {str(e)}"
     
+def execute_wsl_command(command, timeout=60):
+    """
+    Run a bash command in YOUR OWN persistent WSL2 Linux terminal --
+    think of this as your computer, separate from the user's Windows
+    desktop that execute_terminal_command drives. The shell stays alive
+    between calls (same working directory, exported env vars, background
+    jobs, activated venvs, etc., exactly like a real interactive terminal
+    you keep typing into), and the user's entire Windows filesystem is
+    reachable at /mnt/<drive letter> (e.g. C:\\Users -> /mnt/c/Users), so
+    you can read/write/build their real files from here too.
+
+    Every command you run here, and its output, streams live to the
+    user's GUI in the Shell tab, where they can also type commands into
+    this exact same session themselves -- treat it like a shared
+    terminal the user is watching, not a hidden sandbox.
+    """
+    command = (command or "").strip()
+    if not command:
+        return "Error: 'command' must contain the bash command to run."
+    try:
+        timeout = max(1, min(int(timeout or 60), 300))
+    except (TypeError, ValueError):
+        timeout = 60
+    from shell_session import get_shell_session
+    print(f"   [WSL2 shell] > {command}")
+    return get_shell_session().run(command, origin="model", timeout=timeout)
+
+
 def execute_python_code(code: str, timeout: int = 15) -> str:
     """
     Run a snippet of Python code in an isolated subprocess — a brand-new

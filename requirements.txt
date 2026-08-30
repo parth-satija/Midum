@@ -29,3 +29,8 @@ sounddevice
 websocket-client
 pdfstructx
 pygments
+discord.py[voice]
+discord-ext-voice-recv
+edge-tts
+SpeechRecognition
+PyNaCl

@@ -363,7 +363,9 @@ if _IS_LINUX:
     _HOME           = os.path.expanduser("~")
     TARGET_DIR      = os.path.join(_HOME, "Jarvis")
     SKILLS_INDEX    = os.path.join(TARGET_DIR, "jarvis_project", "skills.md")
-    SECRETS_FILE    = os.path.join(_HOME, ".config", "JarvisSecrets", "jarvis_secrets.json")
+    SECRETS_FILE    = os.environ.get("MIDUM_SECRETS_FILE") or os.path.join(
+        _HOME, ".config", "JarvisSecrets", "jarvis_secrets.json"
+    )
 elif _IS_MAC:
     # macOS follows the platform convention of ~/Library/Application Support
     # for per-app config/data instead of Linux's XDG ~/.config or Windows'
@@ -373,13 +375,18 @@ elif _IS_MAC:
     _HOME           = os.path.expanduser("~")
     TARGET_DIR      = os.path.join(_HOME, "Jarvis")
     SKILLS_INDEX    = os.path.join(TARGET_DIR, "jarvis_project", "skills.md")
-    SECRETS_FILE    = os.path.join(
+    SECRETS_FILE    = os.environ.get("MIDUM_SECRETS_FILE") or os.path.join(
         _HOME, "Library", "Application Support", "JarvisSecrets", "jarvis_secrets.json"
     )
 else:
     TARGET_DIR      = r"D:\Jarvis"
     SKILLS_INDEX    = r"D:\Jarvis\jarvis_project\skills.md"
-    SECRETS_FILE    = os.path.join(
+    # Prefer the path the launcher already resolved/created (passed via env
+    # so launcher.py and config.py can never disagree on where secrets
+    # live), falling back to the same computed default the launcher itself
+    # falls back to if the app is started some other way (e.g. directly via
+    # `python app.py`, bypassing launcher.py entirely).
+    SECRETS_FILE    = os.environ.get("MIDUM_SECRETS_FILE") or os.path.join(
         os.path.expanduser("~"), "AppData", "Local", "JarvisSecrets", "jarvis_secrets.json"
     )
 
@@ -422,6 +429,17 @@ SECRETS_TEMPLATE = {
     # account's web session than the official API above.
     "GEMINI_SECURE_1PSID": "",
     "GEMINI_SECURE_1PSIDTS": "",
+    # https://discord.com/developers/applications -- used by
+    # providers/discord_voice.py (call_discord/end_discord_call tools) to
+    # join a Discord voice channel and hold a live two-way spoken
+    # conversation. Create an Application -> Bot there, copy its token, and
+    # invite the bot to your server with the "Connect"/"Speak" voice
+    # permissions (and "Use Voice Activity" if you want it to listen).
+    "DISCORD_BOT_TOKEN": "",
+    # Default voice channel ID to join when call_discord() is called without
+    # an explicit channel_id. Right-click a voice channel in Discord with
+    # Developer Mode enabled (User Settings -> Advanced) and "Copy Channel ID".
+    "DISCORD_DEFAULT_VOICE_CHANNEL_ID": "",
 }
 
 
