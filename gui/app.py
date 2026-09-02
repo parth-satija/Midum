@@ -1104,6 +1104,149 @@ class Api:
     _DEFAULT_THEME = "dark"
     _DEFAULT_BLOBS_ENABLED_DARK = True
     _DEFAULT_BLOBS_ENABLED_LIGHT = True
+
+    # Built-in named presets, beyond the base Dark/Light toggle. Each is a
+    # full editable-color bundle (same shape as colors_dark/colors_light)
+    # plus which base theme (dark/light) it should be layered on top of and
+    # whether ambient blobs should be on. These ship read-only, IN CODE --
+    # they're always available, can't be renamed or deleted from the GUI,
+    # and aren't written to gui_settings.json. User-created presets are the
+    # opposite: they live only in storage (settings["custom_presets"], see
+    # get_settings/save_preset/delete_preset below), never in this dict.
+    _BUILTIN_PRESETS = {
+        "professional_dark": {
+            "label": "Professional Dark",
+            "base": "dark",
+            "blobs_enabled": False,
+            "colors": {
+                "accent": "#9a9a9f", "accent2": "#6e6e73",
+                "bg": "#111113", "panel": "#18181b", "text": "#e8e8ea",
+                "user_msg": "#232326",
+                "blob_center": "#8a8f98", "blob_a": "#6e6e73", "blob_b": "#5c6068", "blob_cursor": "#4b4b50",
+            },
+        },
+        "professional_light": {
+            "label": "Professional Light",
+            "base": "light",
+            "blobs_enabled": False,
+            "colors": {
+                "accent": "#52525b", "accent2": "#3f3f46",
+                "bg": "#f7f7f6", "panel": "#ffffff", "text": "#1c1c1e",
+                "user_msg": "#ececec",
+                "blob_center": "#71717a", "blob_a": "#a1a1aa", "blob_b": "#8a8f98", "blob_cursor": "#52525b",
+            },
+        },
+        "midnight": {
+            "label": "Midnight (dark)",
+            "base": "dark",
+            "blobs_enabled": True,
+            "colors": {
+                "accent": "#3b82f6", "accent2": "#1e3a8a",
+                "bg": "#05070f", "panel": "#0a0e1a", "text": "#e6e9f5",
+                "user_msg": "#12203a",
+                "blob_center": "#3b82f6", "blob_a": "#6366f1", "blob_b": "#1e3a8a", "blob_cursor": "#818cf8",
+            },
+        },
+        "obsidian": {
+            "label": "Obsidian (dark)",
+            "base": "dark",
+            "blobs_enabled": True,
+            "colors": {
+                "accent": "#a78bfa", "accent2": "#6d28d9",
+                "bg": "#0a0a0d", "panel": "#131316", "text": "#eae8f0",
+                "user_msg": "#221c33",
+                "blob_center": "#a78bfa", "blob_a": "#8b5cf6", "blob_b": "#6d28d9", "blob_cursor": "#c4b5fd",
+            },
+        },
+        "forest": {
+            "label": "Forest (dark)",
+            "base": "dark",
+            "blobs_enabled": True,
+            "colors": {
+                "accent": "#34d399", "accent2": "#059669",
+                "bg": "#06120b", "panel": "#0d1f14", "text": "#e3f3e6",
+                "user_msg": "#123322",
+                "blob_center": "#34d399", "blob_a": "#10b981", "blob_b": "#059669", "blob_cursor": "#6ee7b7",
+            },
+        },
+        "crimson": {
+            "label": "Crimson (dark)",
+            "base": "dark",
+            "blobs_enabled": True,
+            "colors": {
+                "accent": "#f87171", "accent2": "#b91c1c",
+                "bg": "#120608", "panel": "#1f0d10", "text": "#f5e6e8",
+                "user_msg": "#3a1216",
+                "blob_center": "#f87171", "blob_a": "#fb7185", "blob_b": "#b91c1c", "blob_cursor": "#fca5a5",
+            },
+        },
+        "amber": {
+            "label": "Amber (dark)",
+            "base": "dark",
+            "blobs_enabled": True,
+            "colors": {
+                "accent": "#fbbf24", "accent2": "#b45309",
+                "bg": "#120d05", "panel": "#1f160a", "text": "#f5ecd9",
+                "user_msg": "#3a2a10",
+                "blob_center": "#fbbf24", "blob_a": "#f59e0b", "blob_b": "#b45309", "blob_cursor": "#fcd34d",
+            },
+        },
+        "arctic": {
+            "label": "Arctic (light)",
+            "base": "light",
+            "blobs_enabled": True,
+            "colors": {
+                "accent": "#38bdf8", "accent2": "#0284c7",
+                "bg": "#f0f7fb", "panel": "#ffffff", "text": "#0f2a3d",
+                "user_msg": "#dff3fc",
+                "blob_center": "#38bdf8", "blob_a": "#7dd3fc", "blob_b": "#0284c7", "blob_cursor": "#bae6fd",
+            },
+        },
+        "sand": {
+            "label": "Sand (light)",
+            "base": "light",
+            "blobs_enabled": True,
+            "colors": {
+                "accent": "#d9a066", "accent2": "#b5793a",
+                "bg": "#faf6ef", "panel": "#ffffff", "text": "#3b2f22",
+                "user_msg": "#f2e3cc",
+                "blob_center": "#d9a066", "blob_a": "#e8c496", "blob_b": "#b5793a", "blob_cursor": "#f0d9b5",
+            },
+        },
+        "meadow": {
+            "label": "Meadow (light)",
+            "base": "light",
+            "blobs_enabled": True,
+            "colors": {
+                "accent": "#4ade80", "accent2": "#16a34a",
+                "bg": "#f3faf3", "panel": "#ffffff", "text": "#16321f",
+                "user_msg": "#dcf5df",
+                "blob_center": "#4ade80", "blob_a": "#86efac", "blob_b": "#16a34a", "blob_cursor": "#bbf7d0",
+            },
+        },
+        "blossom": {
+            "label": "Blossom (light)",
+            "base": "light",
+            "blobs_enabled": True,
+            "colors": {
+                "accent": "#f472b6", "accent2": "#db2777",
+                "bg": "#fdf3f7", "panel": "#ffffff", "text": "#3a1c28",
+                "user_msg": "#fbe1ec",
+                "blob_center": "#f472b6", "blob_a": "#f9a8d4", "blob_b": "#db2777", "blob_cursor": "#fbcfe8",
+            },
+        },
+        "sunrise": {
+            "label": "Sunrise (light)",
+            "base": "light",
+            "blobs_enabled": True,
+            "colors": {
+                "accent": "#fb923c", "accent2": "#ea580c",
+                "bg": "#fff8ee", "panel": "#ffffff", "text": "#3a2a0f",
+                "user_msg": "#ffe9cf",
+                "blob_center": "#fb923c", "blob_a": "#fdba74", "blob_b": "#ea580c", "blob_cursor": "#fed7aa",
+            },
+        },
+    }
     _DEFAULT_BG_IMAGE = {
         "enabled": False, "path": "",
         "brightness": 100, "blur": 0, "opacity": 100,
@@ -1125,9 +1268,15 @@ class Api:
             "colors_light": dict(self._DEFAULT_COLORS_LIGHT),
             "blobs_enabled_dark": self._DEFAULT_BLOBS_ENABLED_DARK,
             "blobs_enabled_light": self._DEFAULT_BLOBS_ENABLED_LIGHT,
+            "liquid_glass_enabled": False,
+            "liquid_glass_opacity": 55,
             "bg_image": dict(self._DEFAULT_BG_IMAGE),
             "workspaces": [],
             "active_workspace": "",
+            # User-saved custom presets, keyed by name -> {base, colors, blobs_enabled}.
+            # Distinct from _BUILTIN_PRESETS (read-only, shipped with the app);
+            # these are created/deleted via save_preset()/delete_preset() below.
+            "custom_presets": {},
         }
         path = self._settings_path()
         try:
@@ -1164,15 +1313,82 @@ class Api:
                     # it was saved, rather than losing it on upgrade.
                     legacy_theme = saved["theme"] if saved.get("theme") in ("dark", "light") else self._DEFAULT_THEME
                     defaults[f"blobs_enabled_{legacy_theme}"] = saved["blobs_enabled"]
+                if isinstance(saved.get("liquid_glass_enabled"), bool):
+                    defaults["liquid_glass_enabled"] = saved["liquid_glass_enabled"]
+                if isinstance(saved.get("liquid_glass_opacity"), (int, float)):
+                    defaults["liquid_glass_opacity"] = max(35, min(75, int(saved["liquid_glass_opacity"])))
                 if isinstance(saved.get("bg_image"), dict):
                     defaults["bg_image"].update(saved["bg_image"])
                 if isinstance(saved.get("workspaces"), list):
                     defaults["workspaces"] = [p for p in saved["workspaces"] if isinstance(p, str) and p]
                 if isinstance(saved.get("active_workspace"), str):
                     defaults["active_workspace"] = saved["active_workspace"]
+                if isinstance(saved.get("custom_presets"), dict):
+                    clean_presets = {}
+                    for name, preset in saved["custom_presets"].items():
+                        if not isinstance(name, str) or not name or not isinstance(preset, dict):
+                            continue
+                        if not isinstance(preset.get("colors"), dict):
+                            continue
+                        clean_presets[name] = {
+                            "base": preset.get("base") if preset.get("base") in ("dark", "light") else "dark",
+                            "colors": dict(preset["colors"]),
+                            "blobs_enabled": bool(preset.get("blobs_enabled", True)),
+                        }
+                    defaults["custom_presets"] = clean_presets
         except Exception as e:
             self._push_event("log", {"text": f"⚠️ Failed to read saved settings: {e}\n"})
         return defaults
+
+    def get_presets(self):
+        """Returns every preset available to the GUI: the built-in, read-only
+        Professional presets plus whatever the user has saved themselves.
+        Keyed by id -> {label, base, colors, blobs_enabled, builtin}."""
+        out = {}
+        for pid, preset in self._BUILTIN_PRESETS.items():
+            out[pid] = {**preset, "builtin": True}
+        for name, preset in self.get_settings().get("custom_presets", {}).items():
+            out[f"custom:{name}"] = {
+                "label": name, "base": preset["base"], "colors": preset["colors"],
+                "blobs_enabled": preset["blobs_enabled"], "builtin": False,
+            }
+        return out
+
+    def save_preset(self, name: str, base: str, colors: dict, blobs_enabled: bool):
+        """Saves (or overwrites) a user-defined custom preset under `name`."""
+        name = (name or "").strip()
+        if not name:
+            return {"ok": False, "error": "Preset name can't be empty."}
+        try:
+            current = self.get_settings()
+            current["custom_presets"][name] = {
+                "base": base if base in ("dark", "light") else "dark",
+                "colors": {k: v for k, v in (colors or {}).items() if v},
+                "blobs_enabled": bool(blobs_enabled),
+            }
+            path = self._settings_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(current, f, indent=2)
+            self._push_event("log", {"text": f"💾 [Preset \"{name}\" saved]\n"})
+            return {"ok": True, "settings": current}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def delete_preset(self, name: str):
+        """Deletes a previously-saved custom preset. Built-in presets can't be
+        removed this way -- they simply aren't stored in custom_presets."""
+        try:
+            current = self.get_settings()
+            if name in current["custom_presets"]:
+                del current["custom_presets"][name]
+            path = self._settings_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(current, f, indent=2)
+            return {"ok": True, "settings": current}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def save_settings(self, settings: dict):
         try:
@@ -1193,6 +1409,10 @@ class Api:
             if isinstance(settings.get("blobs_enabled_light"), bool):
                 current["blobs_enabled_light"] = settings["blobs_enabled_light"]
             current.pop("blobs_enabled", None)  # drop legacy flat key once migrated
+            if isinstance(settings.get("liquid_glass_enabled"), bool):
+                current["liquid_glass_enabled"] = settings["liquid_glass_enabled"]
+            if isinstance(settings.get("liquid_glass_opacity"), (int, float)):
+                current["liquid_glass_opacity"] = max(35, min(75, int(settings["liquid_glass_opacity"])))
             if isinstance(settings.get("bg_image"), dict):
                 # Path changes only ever come through pick_background_image /
                 # clear_background_image (which persist immediately), so
@@ -3416,15 +3636,61 @@ _HTML = r"""<!DOCTYPE html>
      match the original hardcoded hex values each blob used to have baked
      into its gradient/hue-rotate. */
   --blob-center:#60a5fa; --blob-a:#f472b6; --blob-b:#34d399; --blob-cursor:#a78bfa;
+  /* Liquid-glass surface tint (SETTINGS → toggle, only meaningful once the
+     panes are already transparent -- see the html.liquid-glass-on block
+     below for the full explanation). Plain color-mix() against transparent,
+     resolved once like any other background-color -- deliberately NOT a
+     backdrop-filter recipe, so these are just colors, not anything that
+     needs to be computed per-frame. */
+  --glass-pct: 55%; /* live intensity, driven by the SETTINGS slider (applyGlassOpacity()) -- kept in the 35-75 range so the whole slider stays at "ideal glass" instead of fading toward opaque-looking at one end */
+  --glass-fill: color-mix(in srgb, var(--panel) var(--glass-pct), transparent);
+  --glass-fill-strong: color-mix(in srgb, var(--panel) calc(var(--glass-pct) + 10%), transparent);
+  /* Sheen/edge brightness scale WITH --glass-pct rather than sitting at a
+     fixed alpha -- a fixed-alpha white highlight over a very-low-alpha
+     base tint used to read as a flat opaque white haze instead of glass
+     (the highlight dominated when the base tint barely showed). Scaling
+     both together keeps the highlight proportional to the tint at every
+     point on the slider. */
+  --glass-sheen: color-mix(in srgb, white calc(var(--glass-pct) * 0.55), transparent);
+  --glass-sheen-soft: color-mix(in srgb, white calc(var(--glass-pct) * 0.2), transparent);
+  --glass-edge: color-mix(in srgb, white calc(var(--glass-pct) * 0.6), transparent);
+  --glass-edge-dim: color-mix(in srgb, white calc(var(--glass-pct) * 0.22), transparent);
 }
 *{box-sizing:border-box;}
 html,body{margin:0;padding:0;height:100%;background:var(--bg);color:var(--text);
   font-family:"Segoe UI",-apple-system,sans-serif;overflow:hidden;user-select:none;}
 button{font-family:inherit;cursor:pointer;}
 input,textarea{font-family:inherit;}
-::-webkit-scrollbar{width:8px;height:8px;}
-::-webkit-scrollbar-thumb{background:var(--border2);border-radius:8px;}
+/* Scrollbars: sized and weighted to read as a deliberate, professional
+   surface rather than the bare OS default -- wide enough to grab, a
+   visible track so the thumb has somewhere to sit, and a hover/active
+   state so the control gives feedback instead of just being decorative.
+   scrollbar-gutter keeps layout stable so content doesn't shift by the
+   scrollbar's width when a panel's content grows past the fold. */
+*{scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
+::-webkit-scrollbar{width:11px;height:11px;}
 ::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-corner{background:transparent;}
+::-webkit-scrollbar-thumb{
+  background-color:var(--border2);border-radius:999px;
+  border:3px solid var(--panel);background-clip:padding-box;
+  transition:background-color .15s;
+}
+::-webkit-scrollbar-thumb:hover{background-color:var(--subtext);}
+::-webkit-scrollbar-thumb:active{background-color:var(--accent);}
+/* Panels sit on --surface/--surface2 rather than --panel, so give the
+   scrollbar thumb's clip-border a matching color there -- otherwise the
+   3px "padding" ring shows the wrong background and looks like a seam. */
+#sidebar-main-view::-webkit-scrollbar-thumb,#sidebar-settings-overlay::-webkit-scrollbar-thumb,
+#tool-content::-webkit-scrollbar-thumb,.modal-box::-webkit-scrollbar-thumb{border-color:var(--panel);}
+/* Smooth, physically-eased scrolling for panes the user navigates by
+   clicking/keying through (settings, history, tool panes, modals). The
+   live chat transcript (#chat-scroll) and the shell terminal deliberately
+   opt out below -- they're driven by streaming token/output events that
+   call scrollTop directly every few ms, and smooth-scroll easing would
+   fight that instead of tracking it, producing a laggy, inaccurate follow. */
+html{scroll-behavior:smooth;}
+#chat-scroll,#shell-terminal{scroll-behavior:auto;}
 
 #root{position:relative;width:100vw;height:100vh;background:var(--bg);}
 
@@ -3616,22 +3882,20 @@ html.blob-hidden #blob-layer{opacity:0;}
   background:transparent !important;
   border:none !important;
 }
-html.has-bg-image .pane{
-  background:color-mix(in srgb, var(--panel) 62%, transparent);
-  border:1px solid color-mix(in srgb, var(--text) 12%, transparent);
-  box-shadow:inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent), 0 8px 30px rgba(0,0,0,.35);
-}
-html.has-bg-image #topbar{
-  background:color-mix(in srgb, var(--panel) 62%, transparent) !important;
-  border:1px solid color-mix(in srgb, var(--text) 12%, transparent);
-  box-shadow:inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent), 0 8px 30px rgba(0,0,0,.35);
-}
+/* A background image behaves exactly like the ambient blobs layer: panes
+   stay fully transparent (their base rule above) so the image shows
+   straight through the whole window, not tinted/dimmed by a translucent
+   panel surface on top of it. (Previously this gave has-bg-image its own
+   62%-opacity tinted-panel treatment, which made the panels visible as
+   solid-ish shapes over the image instead of disappearing like they do
+   for ambient blobs -- removed so both features hide the panes the same
+   way.) */
 /* Ambient blobs are an optional setting (SETTINGS → AMBIENT BLOBS). When
    turned off, hide the blob layer entirely and give the panes/topbar their
    normal opaque surface back -- otherwise, with #blob-layer gone, they'd
    just show flat var(--bg) through fully transparent panes. Skipped when a
-   background image is active (html.has-bg-image above already gives that
-   case its own tinted-panel treatment). */
+   background image is active, since a background image wants the exact
+   same fully-transparent pane treatment as ambient blobs do. */
 html.blobs-off #blob-layer{ display:none; }
 html.blobs-off:not(.has-bg-image) .pane{
   background:var(--panel);
@@ -3642,6 +3906,131 @@ html.blobs-off:not(.has-bg-image) #topbar{
   border:1px solid var(--border2) !important;
 }
 .pane-hidden{opacity:0;pointer-events:none;}
+
+/* ── Liquid-glass surfaces (SETTINGS → toggle) ──────────────────────────────────────
+   Only does anything once the panes themselves are already transparent --
+   i.e. ambient blobs and/or a background image are on, per the pane rules
+   above -- so every rule here is gated behind html.liquid-glass-on AND
+   :is(.has-bg-image, :not(.blobs-off)); the settings checkbox that drives
+   the class is also disabled in JS whenever both are off (see
+   applyLiquidGlass()), so this never shows a control the user can't
+   actually use. With the pane surface gone, every *child* element that
+   still paints its own opaque background -- the pill tab strip, the
+   prompt box, buttons, message bubbles, tool/settings rows, dropdowns,
+   modals -- is what's left reading as a solid, ordinary panel; this block
+   reskins exactly those elements.
+     Deliberately NOT backdrop-filter: a live blur sitting over the
+   wandering/pulsing blob layer (or a background image) would have to
+   resample that moving backdrop every frame, which is the exact class of
+   continuous-repaint bug #blob-layer and #bg-image-layer above go out of
+   their way to avoid. Everything below is a static, one-time paint
+   instead -- a translucent color-mix() fill (same technique the pane tint
+   itself used to use), a diagonal "sheen" baked into background-image, and
+   a bright top edge / soft outer glow via box-shadow -- so toggling the
+   class only ever swaps plain background/border/box-shadow values, never
+   anything that forces the compositor to keep recomputing a blur. That's
+   also why the transition below is short and limited to those same
+   properties: enough to not feel like a hard cut, never long/continuous
+   enough to look like it's still "working".
+     Code/log/terminal surfaces (.code-area, pre.code-block, #shell-terminal,
+   code.inline-code) are intentionally left out -- glassing those hurts
+   monospace legibility for no real benefit. Text-entry fields (input/
+   textarea/select, minus the checkbox/radio/range/color types which have
+   their own native chrome) are covered generically by tag rather than by
+   id/class, since there are dozens of ad-hoc ones scattered through the
+   modals/tool panels that would otherwise get missed one at a time.
+     #sidebar-settings-overlay is deliberately NOT in this list -- see the
+   hard override right after this block for why. */
+html.liquid-glass-on.has-bg-image #tabbar,
+html.liquid-glass-on:not(.blobs-off) #tabbar,
+html.liquid-glass-on.has-bg-image .icon-btn,
+html.liquid-glass-on:not(.blobs-off) .icon-btn,
+html.liquid-glass-on.has-bg-image #input-box,
+html.liquid-glass-on:not(.blobs-off) #input-box,
+html.liquid-glass-on.has-bg-image #abort-btn,
+html.liquid-glass-on:not(.blobs-off) #abort-btn,
+html.liquid-glass-on.has-bg-image select,
+html.liquid-glass-on:not(.blobs-off) select,
+html.liquid-glass-on.has-bg-image textarea:not(#msg-input):not(.code-area),
+html.liquid-glass-on:not(.blobs-off) textarea:not(#msg-input):not(.code-area),
+html.liquid-glass-on.has-bg-image input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not(#shell-input),
+html.liquid-glass-on:not(.blobs-off) input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not(#shell-input),
+html.liquid-glass-on.has-bg-image .modal-input,
+html.liquid-glass-on:not(.blobs-off) .modal-input,
+html.liquid-glass-on.has-bg-image .btn,
+html.liquid-glass-on:not(.blobs-off) .btn,
+html.liquid-glass-on.has-bg-image .ghost-btn,
+html.liquid-glass-on:not(.blobs-off) .ghost-btn,
+html.liquid-glass-on.has-bg-image #settings-back-btn,
+html.liquid-glass-on:not(.blobs-off) #settings-back-btn,
+html.liquid-glass-on.has-bg-image #file-list,
+html.liquid-glass-on:not(.blobs-off) #file-list,
+html.liquid-glass-on.has-bg-image #history-list,
+html.liquid-glass-on:not(.blobs-off) #history-list,
+html.liquid-glass-on.has-bg-image .history-card,
+html.liquid-glass-on:not(.blobs-off) .history-card,
+html.liquid-glass-on.has-bg-image .bubble.user,
+html.liquid-glass-on:not(.blobs-off) .bubble.user,
+html.liquid-glass-on.has-bg-image .ask-card,
+html.liquid-glass-on:not(.blobs-off) .ask-card,
+html.liquid-glass-on.has-bg-image .ask-opt-btn,
+html.liquid-glass-on:not(.blobs-off) .ask-opt-btn,
+html.liquid-glass-on.has-bg-image .mcp-tool-row,
+html.liquid-glass-on:not(.blobs-off) .mcp-tool-row,
+html.liquid-glass-on.has-bg-image .mcp-row,
+html.liquid-glass-on:not(.blobs-off) .mcp-row,
+html.liquid-glass-on.has-bg-image .tools-args,
+html.liquid-glass-on:not(.blobs-off) .tools-args,
+html.liquid-glass-on.has-bg-image .perm-opt,
+html.liquid-glass-on:not(.blobs-off) .perm-opt,
+html.liquid-glass-on.has-bg-image #flow-drawer,
+html.liquid-glass-on:not(.blobs-off) #flow-drawer,
+html.liquid-glass-on.has-bg-image .flow-drawer-item,
+html.liquid-glass-on:not(.blobs-off) .flow-drawer-item,
+html.liquid-glass-on.has-bg-image .dropdown-trigger,
+html.liquid-glass-on:not(.blobs-off) .dropdown-trigger,
+html.liquid-glass-on.has-bg-image .dropdown-option,
+html.liquid-glass-on:not(.blobs-off) .dropdown-option,
+html.liquid-glass-on.has-bg-image .modal-box,
+html.liquid-glass-on:not(.blobs-off) .modal-box,
+html.liquid-glass-on.has-bg-image .flowchart-wrap,
+html.liquid-glass-on:not(.blobs-off) .flowchart-wrap,
+html.liquid-glass-on.has-bg-image table.md-table{
+  background-color:var(--glass-fill) !important;
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
+  border-color:var(--glass-edge) !important;
+  box-shadow:inset 0 1px 0 var(--glass-edge), inset 0 -1px 0 var(--glass-edge-dim), 0 6px 18px -10px rgba(0,0,0,.45) !important;
+  transition:background-color .18s var(--ease), box-shadow .18s var(--ease), border-color .18s var(--ease);
+}
+/* Small/round controls read better a touch more opaque than big flat
+   surfaces (icon glyphs and short labels need more contrast to stay
+   legible over the moving blobs/image behind them). */
+html.liquid-glass-on.has-bg-image .icon-btn,
+html.liquid-glass-on:not(.blobs-off) .icon-btn,
+html.liquid-glass-on.has-bg-image #abort-btn,
+html.liquid-glass-on:not(.blobs-off) #abort-btn,
+html.liquid-glass-on.has-bg-image #settings-back-btn,
+html.liquid-glass-on:not(.blobs-off) #settings-back-btn,
+html.liquid-glass-on.has-bg-image .btn,
+html.liquid-glass-on:not(.blobs-off) .btn{
+  background-color:var(--glass-fill-strong) !important;
+}
+/* #sidebar-settings-overlay is a full-panel replacement -- it covers the
+   ENTIRE sidebar (see its own rule: position:absolute;inset:0) while
+   open, sitting directly on top of #sidebar-main-view underneath (the
+   workspace list + chat history it's replacing). Making a panel THAT
+   size translucent doesn't read as "glass", it reads as the history list
+   bleeding through and overlapping the settings controls' own text --
+   unreadable, not stylish. Every other glass surface here is a small
+   child control sitting on top of the ambient blobs/background image
+   (which is what should show through); this one would sit on top of
+   more opaque UI instead, so it stays a normal solid panel regardless of
+   the toggle. */
+html.liquid-glass-on #sidebar-settings-overlay{
+  background-color:var(--panel) !important;
+  background-image:none !important;
+  box-shadow:none !important;
+}
 
 /* Tool pane */
 #tool-pane-wrap{left:0;width:0;}
@@ -4263,7 +4652,12 @@ textarea.code-area{
 // longer eat into the horizontal tab bar's space.
 const TABS = [
   ["Chat","💬"], ["Voice","🎤"], ["Model","🧬"],
-  ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["Shell","💻"], ["Flows","🔗"], ["Agents","🤖"], ["MCP","🔌"], ["Permissions","🔐"], ["Surfaces","🖼"]
+  ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["Shell","💻"], ["Flows","🔗"], ["Agents","🤖"], ["MCP","🔌"], ["Permissions","🔐"]
+  // "Surfaces" used to live here as a top tab, but it's a sidebar quick-
+  // access button now (see #sidebar-surfaces-btn in buildSidebar) -- it's
+  // a "jump to my saved surfaces" shortcut, not a work area someone tabs
+  // between repeatedly, so it reads better pinned at the top of the
+  // sidebar than competing for space in the horizontal tab bar.
 ];
 
 let state = {
@@ -4294,6 +4688,76 @@ const SHELL_HISTORY_CAP = 1000;
 let _currentMidumRow = null;
 
 function api(name, ...args){ return window.pywebview.api[name](...args); }
+
+// ── Weighted scrolling ───────────────────────────────────────────────────────────
+// Native wheel scrolling in Chromium jumps by whatever raw delta the OS/
+// input device reports and stops dead the instant the wheel does -- there's
+// no give to it. This intercepts wheel events on scrollable panes and
+// replaces that jump with a momentum glide: each tick adds to a velocity
+// that decays a little every frame (friction) rather than being applied
+// and forgotten, so the pane keeps drifting for a few frames after the
+// wheel stops instead of snapping still. That gradual decay -- plus a
+// capped top speed so a hard flick doesn't rocket past the content -- is
+// what reads as "weight" rather than a toy/instant scroll.
+//
+// #chat-scroll and #shell-terminal opt out (see WEIGHTED_SCROLL_EXCLUDE):
+// both are driven by streaming output that sets scrollTop directly on a
+// tight loop to auto-follow new tokens, and layering momentum on top of
+// that would fight the auto-follow and make it lag behind incoming text
+// instead of tracking it accurately -- exactly the tradeoff called out for
+// scroll-behavior:smooth above. They keep plain, instant native scrolling.
+const WEIGHTED_SCROLL_FRICTION = 0.95;      // per-frame velocity decay -- higher = drifts longer after release
+const WEIGHTED_SCROLL_SENSITIVITY = 0.55;   // fraction of each wheel tick's delta fed into velocity
+const WEIGHTED_SCROLL_MAX_VELOCITY = 90;    // px/frame cap, so a hard flick still decelerates rather than teleporting
+const WEIGHTED_SCROLL_MIN_VELOCITY = 0.15;  // px/frame below which momentum is considered settled and stops
+const WEIGHTED_SCROLL_EXCLUDE = new Set(["chat-scroll","shell-terminal"]);
+const _weightedScrollState = new WeakMap();  // scrollable element -> {velocity, raf}
+
+function findWeightedScrollTarget(node){
+  let el = node;
+  while (el && el !== document.body){
+    if (el.nodeType === 1){
+      if (WEIGHTED_SCROLL_EXCLUDE.has(el.id)) return null;
+      const cs = getComputedStyle(el);
+      const canScrollY = (cs.overflowY === "auto" || cs.overflowY === "scroll") && el.scrollHeight > el.clientHeight + 1;
+      if (canScrollY) return el;
+    }
+    el = el.parentElement;
+  }
+  return null;
+}
+
+function stepWeightedScroll(el){
+  const st = _weightedScrollState.get(el);
+  if (!st) return;
+  el.scrollTop += st.velocity;
+  st.velocity *= WEIGHTED_SCROLL_FRICTION;
+  // Stop dead at either end instead of letting momentum keep "pushing"
+  // against a wall the pane has already reached.
+  if (el.scrollTop <= 0 || el.scrollTop >= el.scrollHeight - el.clientHeight){
+    st.velocity = 0;
+  }
+  if (Math.abs(st.velocity) < WEIGHTED_SCROLL_MIN_VELOCITY){
+    st.velocity = 0;
+    st.raf = null;
+    return;
+  }
+  st.raf = requestAnimationFrame(()=>stepWeightedScroll(el));
+}
+
+window.addEventListener("wheel", (e)=>{
+  const target = findWeightedScrollTarget(e.target);
+  if (!target) return;   // nothing weighted here (or an excluded pane) -- let native scrolling handle it
+  e.preventDefault();
+  let delta = e.deltaY;
+  if (e.deltaMode === 1) delta *= 16;                 // "line" units -> approx px
+  else if (e.deltaMode === 2) delta *= target.clientHeight;  // "page" units -> approx px
+  let st = _weightedScrollState.get(target);
+  if (!st){ st = {velocity:0, raf:null}; _weightedScrollState.set(target, st); }
+  st.velocity += delta * WEIGHTED_SCROLL_SENSITIVITY;
+  st.velocity = Math.max(-WEIGHTED_SCROLL_MAX_VELOCITY, Math.min(WEIGHTED_SCROLL_MAX_VELOCITY, st.velocity));
+  if (!st.raf) st.raf = requestAnimationFrame(()=>stepWeightedScroll(target));
+}, {passive:false});
 
 // ── Layout engine ------------------------------------------------------
 function targetGeo(){
@@ -6118,6 +6582,8 @@ function buildSidebar(){
   const el = document.getElementById("sidebar-inner");
   el.innerHTML = `
     <div id="sidebar-main-view">
+      <button class="ghost-btn" id="sidebar-surfaces-btn" style="width:100%;text-align:left;">🖼 Render Surfaces</button>
+      <div class="divider"></div>
       <div class="hdr-row">
         <div class="section-label">WORKSPACE</div>
         <button class="icon-btn" style="width:26px;height:26px;font-size:11px;" id="sidebar-close">✕</button>
@@ -6159,6 +6625,12 @@ function buildSidebar(){
         <button class="ghost-btn" data-theme="dark" style="flex:1;">🌙 Dark</button>
         <button class="ghost-btn" data-theme="light" style="flex:1;">☀️ Light</button>
       </div>
+      <div class="field-label" style="margin:4px 0 0;">PRESETS</div>
+      <div class="btn-row">
+        <select id="settings-preset-select" style="flex:1;"><option value="">Choose a preset…</option></select>
+        <button class="ghost-btn" id="settings-preset-delete" style="flex:0 0 auto;display:none;" title="Delete preset">✕</button>
+      </div>
+      <button class="ghost-btn" id="settings-preset-save" style="width:100%;">+ Save current as preset</button>
       <div class="hdr-row" style="margin-top:4px;">
         <div class="field-label" style="margin:0;">AMBIENT BLOBS</div>
         <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);">
@@ -6182,6 +6654,17 @@ function buildSidebar(){
       <input type="range" id="bg-blur" min="0" max="40" value="0" style="width:100%;"/>
       <div class="field-label">Opacity</div>
       <input type="range" id="bg-opacity" min="10" max="100" value="100" style="width:100%;"/>
+      <div class="hdr-row" style="margin-top:4px;">
+        <div class="field-label" style="margin:0;">GLASS SURFACES</div>
+        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);">
+          <input type="checkbox" id="settings-glass-enabled" style="width:14px;height:14px;"/> Enabled
+        </label>
+      </div>
+      <div id="glass-hint" style="font-size:9px;color:var(--subtext);margin:-4px 0 2px;">
+        Needs ambient blobs or a background image turned on.
+      </div>
+      <div class="field-label" style="margin-top:2px;">Glass Opacity</div>
+      <input type="range" id="settings-glass-opacity" min="35" max="75" value="55" style="width:100%;"/>
       <div class="field-label">DEFAULT PROVIDER</div>
       <select id="settings-provider"></select>
       <div class="field-label">DEFAULT MODEL</div>
@@ -6211,6 +6694,15 @@ function buildSidebar(){
     </div>
   `;
   document.getElementById("sidebar-close").onclick = toggleSidebar;
+  enhanceSelect(document.getElementById("settings-preset-select"));
+  document.getElementById("sidebar-surfaces-btn").onclick = ()=>{
+    // Jumps straight to the Surfaces tool pane (formerly a top tab, now a
+    // sidebar shortcut -- see the TABS comment above). switchTab doesn't
+    // require an entry in TABS; it just needs a matching case in
+    // showToolPane, so this works exactly like clicking a tab did.
+    toggleSidebar();
+    switchTab("Surfaces");
+  };
   enhanceSelect(document.getElementById("project-select"));
   enhanceSelect(document.getElementById("settings-provider"));
   document.getElementById("new-session-btn").onclick = async ()=>{
@@ -6287,6 +6779,20 @@ function buildSidebar(){
   document.querySelectorAll('#settings-theme-toggle [data-theme]').forEach(btn=>{
     btn.onclick = ()=>applyTheme(btn.dataset.theme);
   });
+  document.getElementById("settings-preset-save").onclick = saveCurrentAsPreset;
+  document.getElementById("settings-preset-select").onchange = (e)=>{
+    if (e.target.value) applyPreset(e.target.value);
+    updatePresetDeleteVisibility();
+  };
+  document.getElementById("settings-preset-delete").onclick = async ()=>{
+    const sel = document.getElementById("settings-preset-select");
+    const preset = _presets[sel.value];
+    if (!preset || preset.builtin) return;
+    const ok = await showConfirm(`Delete saved preset "${preset.label}"? This can't be undone.`, "Delete Preset", {danger:true, okLabel:"Delete"});
+    if (!ok) return;
+    await api("delete_preset", preset.label);
+    refreshPresets();
+  };
   document.getElementById("settings-bg-enabled").onchange = (e)=>{
     _bgState.cfg.enabled = e.target.checked;
     applyBgImage(_bgState.cfg, _bgState.dataUrl);
@@ -6294,6 +6800,12 @@ function buildSidebar(){
   document.getElementById("settings-blobs-enabled").onchange = (e)=>{
     applyBlobsEnabled(e.target.checked);
     _themeBlobsEnabled[_activeTheme] = e.target.checked;
+  };
+  document.getElementById("settings-glass-enabled").onchange = (e)=>{
+    applyLiquidGlass(e.target.checked);
+  };
+  document.getElementById("settings-glass-opacity").oninput = (e)=>{
+    applyGlassOpacity(e.target.value);
   };
   document.getElementById("bg-choose").onclick = async ()=>{
     const r = await api("pick_background_image");
@@ -6363,6 +6875,93 @@ let _activeTheme = "dark";
 let _themeColors = { dark: {...DEFAULT_COLORS}, light: {...DEFAULT_COLORS} };
 let _themeBlobsEnabled = { dark: true, light: true };
 
+// Custom savable presets, on top of the base Dark/Light toggle. Each preset
+// is a full editable-color bundle (see DEFAULT_COLORS keys) plus which base
+// theme it layers onto and its own ambient-blobs preference. "Professional
+// Dark/Light" ship built in (read-only, neutral graphite/slate palettes with
+// no blue accent, blobs off); anything else here was saved by the user via
+// "+ Save current as preset" and can be renamed/deleted freely.
+// Populated from get_presets() on load; re-fetched after any save/delete.
+let _presets = {};
+
+async function refreshPresets(){
+  _presets = await api("get_presets");
+  renderPresetList();
+}
+
+// PRESETS lives as a single dropdown (rather than a button per preset) so
+// it reads as one compact field alongside the Light/Dark toggle above it
+// instead of a growing list of buttons -- picking a preset is a one-shot
+// "apply this" action, which a <select> communicates more cleanly than a
+// bank of ghost-buttons. Built-ins are starred, user-saved ones get a
+// pin, and the delete button (only meaningful for user-saved presets)
+// appears next to the dropdown once one of those is selected.
+function renderPresetList(){
+  const sel = document.getElementById("settings-preset-select");
+  const delBtn = document.getElementById("settings-preset-delete");
+  if (!sel) return;
+  const prevValue = sel.value;
+  sel.innerHTML = `<option value="">Choose a preset\u2026</option>`;
+  Object.entries(_presets).forEach(([id, preset])=>{
+    const opt = document.createElement("option");
+    opt.value = id;
+    opt.textContent = (preset.builtin ? "\u2726 " : "\u2b50 ") + preset.label;
+    sel.appendChild(opt);
+  });
+  // Re-select whatever was chosen before the refresh (e.g. after a save),
+  // falling back to the placeholder if that preset no longer exists.
+  sel.value = _presets[prevValue] ? prevValue : "";
+  updatePresetDeleteVisibility();
+}
+
+function updatePresetDeleteVisibility(){
+  const sel = document.getElementById("settings-preset-select");
+  const delBtn = document.getElementById("settings-preset-delete");
+  if (!sel || !delBtn) return;
+  const preset = _presets[sel.value];
+  delBtn.style.display = (preset && !preset.builtin) ? "" : "none";
+}
+
+// Applying a preset switches to its base theme, layers its colors + blobs
+// preference on top (mirroring what "Reset defaults" already does for the
+// stock palette), and marks the active theme's in-memory bucket as this
+// preset's colors -- exactly like editing swatches by hand, so it previews
+// immediately and is persisted normally by hitting "Save" afterward.
+function applyPreset(id){
+  const preset = _presets[id];
+  if (!preset) return;
+  applyTheme(preset.base);
+  _themeColors[preset.base] = {...DEFAULT_COLORS, ...preset.colors};
+  _themeBlobsEnabled[preset.base] = preset.blobs_enabled !== false;
+  applyColors(_themeColors[preset.base]);
+  applyBlobsEnabled(_themeBlobsEnabled[preset.base]);
+  const blobsCb = document.getElementById("settings-blobs-enabled");
+  if (blobsCb) blobsCb.checked = _themeBlobsEnabled[preset.base];
+  Object.entries(_themeColors[preset.base]).forEach(([k,v])=>{
+    const colorEl = document.getElementById(`settings-color-${k}`);
+    if (colorEl) colorEl.value = v;
+  });
+}
+
+async function saveCurrentAsPreset(){
+  const name = await showPrompt("Name this preset:", "Save Preset");
+  if (!name) return;
+  const colors = {};
+  ["accent","accent2","bg","panel","text","user_msg","blob_center","blob_a","blob_b","blob_cursor"].forEach(k=>{
+    const el = document.getElementById(`settings-color-${k}`);
+    if (el) colors[k] = el.value;
+  });
+  const blobsEnabled = document.getElementById("settings-blobs-enabled").checked;
+  const r = await api("save_preset", name.trim(), _activeTheme, colors, blobsEnabled);
+  const status = document.getElementById("settings-status");
+  if (r.ok){
+    if (status) status.textContent = `Preset "${name.trim()}" saved.`;
+    refreshPresets();
+  } else if (status) {
+    status.textContent = `Error: ${r.error}`;
+  }
+}
+
 function applyTheme(name){
   const vars = THEME_VARS[name] || THEME_VARS.dark;
   const root = document.documentElement.style;
@@ -6422,6 +7021,10 @@ function applyBgImage(cfg, dataUrl){
     const fn = document.getElementById("bg-filename");
     if (fn) fn.textContent = cfg.path ? cfg.path.split(/[\\/]/).pop() : "No image selected";
   }
+  // A background image turning on/off changes whether the glass toggle is
+  // even available (see applyLiquidGlass below) -- recheck the gate every
+  // time, not just when the glass checkbox itself is touched.
+  applyLiquidGlass(_glassEnabled);
 }
 
 // Ambient blobs on/off. `_blobLayerCtl` is set once initBlobLayer() runs
@@ -6435,6 +7038,48 @@ function applyBlobsEnabled(enabled){
   if (_blobLayerCtl) (_blobsEnabled ? _blobLayerCtl.resume : _blobLayerCtl.pause)();
   const cb = document.getElementById("settings-blobs-enabled");
   if (cb) cb.checked = _blobsEnabled;
+  // Same reasoning as in applyBgImage above -- blobs are the other half
+  // of the glass toggle's availability gate.
+  applyLiquidGlass(_glassEnabled);
+}
+
+// The glass surfaces toggle. Purely cosmetic (see the html.liquid-glass-on
+// CSS block for what it actually does) and only ever meaningful while the
+// panes are already transparent, i.e. while ambient blobs and/or a
+// background image are on -- so this is gated on the very same two
+// signals those features already maintain (the "blobs-off" class and
+// "has-bg-image" class), and the checkbox itself is disabled whenever
+// neither is on, rather than left checkable with no visible effect.
+let _glassEnabled = false;
+function applyLiquidGlass(enabled){
+  _glassEnabled = !!enabled;
+  const available = _blobsEnabled || document.documentElement.classList.contains("has-bg-image");
+  // Toggling this class only ever changes background/border/box-shadow on
+  // a fixed set of already-painted elements (see the CSS) -- no layout
+  // change, no element being added/removed/hidden -- so there's nothing
+  // here that can produce a flash of unstyled/blank content.
+  document.documentElement.classList.toggle("liquid-glass-on", _glassEnabled && available);
+  const cb = document.getElementById("settings-glass-enabled");
+  if (cb){
+    cb.checked = _glassEnabled;
+    cb.disabled = !available;
+  }
+  const hint = document.getElementById("glass-hint");
+  if (hint) hint.style.display = available ? "none" : "block";
+}
+
+// How translucent the glass fill is (SETTINGS → Glass Opacity slider).
+// Just writes a percentage into --glass-pct, which the color-mix() calls
+// in the CSS read directly -- same "swap a plain custom property" update
+// as applyColors()/applyTheme() above, not a filter, so dragging the
+// slider repaints instantly with nothing left for the browser to keep
+// recomputing afterward.
+let _glassOpacity = 55;
+function applyGlassOpacity(pct){
+  _glassOpacity = Math.min(75, Math.max(35, Math.round(Number(pct) || 55)));
+  document.documentElement.style.setProperty("--glass-pct", _glassOpacity + "%");
+  const el = document.getElementById("settings-glass-opacity");
+  if (el) el.value = _glassOpacity;
 }
 
 // Cache of the current bg config + baked data url. Slider drags call a
@@ -6550,6 +7195,7 @@ async function loadSettingsPanel(){
   _themeBlobsEnabled.dark = s.blobs_enabled_dark !== false;
   _themeBlobsEnabled.light = s.blobs_enabled_light !== false;
   applyTheme(s.theme || "dark");
+  refreshPresets();
   _bgState.cfg = s.bg_image || _bgState.cfg;
   if (_bgState.cfg.enabled && _bgState.cfg.path){
     const r = await api("get_background_image_data");
@@ -6558,6 +7204,8 @@ async function loadSettingsPanel(){
     _bgState.dataUrl = null;
   }
   applyBgImage(_bgState.cfg, _bgState.dataUrl);
+  applyLiquidGlass(s.liquid_glass_enabled === true);
+  applyGlassOpacity(s.liquid_glass_opacity != null ? s.liquid_glass_opacity : 55);
   const provSel = document.getElementById("settings-provider");
   if (provSel && !provSel.options.length){
     const info = await api("get_providers");
@@ -6596,6 +7244,8 @@ async function saveSettingsPanel(){
     provider, model, theme: _activeTheme,
     colors_dark: _themeColors.dark, colors_light: _themeColors.light,
     blobs_enabled_dark: _themeBlobsEnabled.dark, blobs_enabled_light: _themeBlobsEnabled.light,
+    liquid_glass_enabled: _glassEnabled,
+    liquid_glass_opacity: _glassOpacity,
     bg_image,
   });
   const status = document.getElementById("settings-status");
@@ -6607,6 +7257,8 @@ async function saveSettingsPanel(){
     applyTheme(r.settings.theme || "dark");
     _bgState.cfg = r.settings.bg_image;
     applyBgImage(_bgState.cfg, _bgState.dataUrl);
+    applyLiquidGlass(r.settings.liquid_glass_enabled === true);
+    applyGlassOpacity(r.settings.liquid_glass_opacity != null ? r.settings.liquid_glass_opacity : 55);
     if (status) status.textContent = "Saved — will be remembered next launch.";
   } else if (status) {
     status.textContent = `Error: ${r.error}`;
@@ -9091,6 +9743,8 @@ window.addEventListener("pywebviewready", async ()=>{
       _bgState.dataUrl = r && r.ok ? r.data_url : null;
     }
     applyBgImage(_bgState.cfg, _bgState.dataUrl);
+    applyLiquidGlass(s.liquid_glass_enabled === true);
+    applyGlassOpacity(s.liquid_glass_opacity != null ? s.liquid_glass_opacity : 55);
   } catch (e) { /* pywebview bridge not ready yet on some platforms — fine */ }
 
   // Pygments token-color CSS for syntax-highlighted code blocks -- fetched
