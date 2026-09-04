@@ -21,7 +21,7 @@ from tools.render_surface_tools import write_render_code, edit_render_code, clos
 from permissions import enforce_tool_permission, filter_tools_schema, mcp_permission_key
 from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, execute_wsl_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
 from multi_agent import start_agent, send_agent_task, get_agent_report, list_agents, stop_agent, resume_agent, forget_agent, delegate_agent_task_to_supervisor, tell_supervisor_to_inform_user, get_current_agent_name, attach_agent_knowledge, list_agent_knowledge, attach_agent_skills, list_agent_skills
-from providers.discord_voice import call_discord, discord_upload_file, end_discord_call, get_discord_call_status, get_discord_call_transcript, list_discord_calls, list_discord_sessions, start_discord_bot
+from providers.discord_voice import call_discord, discord_upload_file, end_discord_call, get_discord_call_status, get_discord_call_transcript, list_discord_calls, list_discord_servers, list_discord_sessions, message_discord, start_discord_bot
 from tools_schema import tools
 from ui_automation import ui_navigator
 from ui_automation.windows_uia import _UIA_AVAILABLE
@@ -2099,6 +2099,17 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
 
             elif func_name == "start_discord_bot":
                 tool_output = start_discord_bot()
+
+            elif func_name == "list_discord_servers":
+                tool_output = list_discord_servers()
+
+            elif func_name == "message_discord":
+                tool_output = message_discord(
+                    arguments.get("message", ""),
+                    arguments.get("channel_id", ""),
+                    arguments.get("guild_id", ""),
+                    arguments.get("channel_name", "")
+                )
 
             elif func_name in list_flows():
                 # Direct-by-name flow call -- mirrors _mcp_autoroute_tool_call for

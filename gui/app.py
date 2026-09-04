@@ -1268,8 +1268,14 @@ class Api:
             "colors_light": dict(self._DEFAULT_COLORS_LIGHT),
             "blobs_enabled_dark": self._DEFAULT_BLOBS_ENABLED_DARK,
             "blobs_enabled_light": self._DEFAULT_BLOBS_ENABLED_LIGHT,
+            # Per-blob on/off, independent of the master dark/light toggles
+            # above -- lets each of the four blobs (center/a/b/cursor) be
+            # hidden individually. Not per-theme; applies regardless of
+            # which theme is active.
+            "blobs_individual": {"center": True, "a": True, "b": True, "cursor": True},
             "liquid_glass_enabled": False,
             "liquid_glass_opacity": 55,
+            "liquid_glass_sheen_enabled": True,
             "bg_image": dict(self._DEFAULT_BG_IMAGE),
             "workspaces": [],
             "active_workspace": "",
@@ -1313,10 +1319,16 @@ class Api:
                     # it was saved, rather than losing it on upgrade.
                     legacy_theme = saved["theme"] if saved.get("theme") in ("dark", "light") else self._DEFAULT_THEME
                     defaults[f"blobs_enabled_{legacy_theme}"] = saved["blobs_enabled"]
+                if isinstance(saved.get("blobs_individual"), dict):
+                    for key in ("center", "a", "b", "cursor"):
+                        if isinstance(saved["blobs_individual"].get(key), bool):
+                            defaults["blobs_individual"][key] = saved["blobs_individual"][key]
                 if isinstance(saved.get("liquid_glass_enabled"), bool):
                     defaults["liquid_glass_enabled"] = saved["liquid_glass_enabled"]
                 if isinstance(saved.get("liquid_glass_opacity"), (int, float)):
                     defaults["liquid_glass_opacity"] = max(35, min(75, int(saved["liquid_glass_opacity"])))
+                if isinstance(saved.get("liquid_glass_sheen_enabled"), bool):
+                    defaults["liquid_glass_sheen_enabled"] = saved["liquid_glass_sheen_enabled"]
                 if isinstance(saved.get("bg_image"), dict):
                     defaults["bg_image"].update(saved["bg_image"])
                 if isinstance(saved.get("workspaces"), list):
@@ -1409,10 +1421,16 @@ class Api:
             if isinstance(settings.get("blobs_enabled_light"), bool):
                 current["blobs_enabled_light"] = settings["blobs_enabled_light"]
             current.pop("blobs_enabled", None)  # drop legacy flat key once migrated
+            if isinstance(settings.get("blobs_individual"), dict):
+                for key in ("center", "a", "b", "cursor"):
+                    if isinstance(settings["blobs_individual"].get(key), bool):
+                        current["blobs_individual"][key] = settings["blobs_individual"][key]
             if isinstance(settings.get("liquid_glass_enabled"), bool):
                 current["liquid_glass_enabled"] = settings["liquid_glass_enabled"]
             if isinstance(settings.get("liquid_glass_opacity"), (int, float)):
                 current["liquid_glass_opacity"] = max(35, min(75, int(settings["liquid_glass_opacity"])))
+            if isinstance(settings.get("liquid_glass_sheen_enabled"), bool):
+                current["liquid_glass_sheen_enabled"] = settings["liquid_glass_sheen_enabled"]
             if isinstance(settings.get("bg_image"), dict):
                 # Path changes only ever come through pick_background_image /
                 # clear_background_image (which persist immediately), so
@@ -1651,7 +1669,7 @@ class Api:
         except Exception as e:
             self._push_event("log", {"text": f"⚠️ Context injection failure: {e}\n"})
 
-        midum.memory.update_memory("master", f"Active project context switched to: {name} ({project_dir})")
+        #midum.memory.update_memory("master", f"Active project context switched to: {name} ({project_dir})")
         self._push_event("system_line", {"text": f"[Workspace context switched to: {name}]"})
         return self.list_files(project_dir)
 
@@ -2684,6 +2702,227 @@ class Api:
         except Exception:
             return []
 
+    # ── "#" file-path picker (prompt-box live path browser) ─────────────
+    # Backs the "#" popup in the prompt box: typing "#" opens a small
+    # floating list above the input showing the machine's drives, and
+    # clicking/typing into it drills into folders so the user can grab a
+    # real file/folder path fast without leaving the keyboard. Kept as two
+    # tiny, fast calls (drives, then one dir listing per navigation step)
+    # rather than walking the whole tree up front, since a full recursive
+    # scan of a drive would be far too slow to feel "live".
+    def list_drives(self):
+        drives = []
+        if sys.platform == "win32":
+            import string
+            try:
+                import ctypes
+                bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+            except Exception:
+                bitmask = None
+            for i, letter in enumerate(string.ascii_uppercase):
+                letter_path = f"{letter}:\\"
+                present = (bitmask >> i) & 1 if bitmask is not None else os.path.exists(letter_path)
+                if present and os.path.exists(letter_path):
+                    label = letter_path
+                    try:
+                        if sys.platform == "win32":
+                            vol_buf = ctypes.create_unicode_buffer(261)
+                            ctypes.windll.kernel32.GetVolumeInformationW(
+                                ctypes.c_wchar_p(letter_path), vol_buf, ctypes.sizeof(vol_buf),
+                                None, None, None, None, 0,
+                            )
+                            if vol_buf.value:
+                                label = f"{letter_path} ({vol_buf.value})"
+                    except Exception:
+                        pass
+                    drives.append({"name": label, "path": letter_path})
+        else:
+            # Non-Windows: there's no drive-letter concept, so surface the
+            # filesystem root and the user's home dir as the top-level
+            # entry points instead.
+            drives.append({"name": "/ (root)", "path": "/"})
+            home = os.path.expanduser("~")
+            if home and os.path.isdir(home):
+                drives.append({"name": f"~ ({home})", "path": home})
+        return drives
+
+    def list_path_entries(self, path: str):
+        """List folders/files directly inside `path`, for the "#" picker.
+        Folders are returned before files, both alphabetically
+        (case-insensitive) -- errors (permission-denied, unplugged drive,
+        etc.) come back as {"ok": False, "error": ...} rather than raising,
+        since this is called live as the user types/navigates."""
+        try:
+            if not path or not os.path.isdir(path):
+                return {"ok": False, "error": "Not a folder."}
+            entries = []
+            with os.scandir(path) as it:
+                for entry in it:
+                    try:
+                        is_dir = entry.is_dir()
+                    except OSError:
+                        continue
+                    entries.append({"name": entry.name, "path": entry.path, "is_dir": is_dir})
+            entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+            return {"ok": True, "path": path, "entries": entries}
+        except PermissionError:
+            return {"ok": False, "error": "Permission denied."}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ── "/" capability picker (prompt-box live tools/skills/flows/KB browser) ──
+    # Backs the "/" popup in the prompt box, mirroring the "#" path picker's
+    # UX: typing "/" opens a small floating list showing five top-level
+    # capability sections (Native Tools, MCP Tools, Skills, Flows, KBs).
+    # Native Tools and MCP Tools drill one level deeper (by functional
+    # category / by MCP server) before reaching individual items; Skills,
+    # Flows and KBs go straight to their saved-item list. Selecting a leaf
+    # item splices its bare name into the message in place of the "/..."
+    # trigger text -- nothing here mutates state, it's all read-only listing
+    # exactly like list_drives/list_path_entries above.
+    def _native_tool_category(self, name: str, desc: str) -> str:
+        n = (name or "").lower()
+        def hit(*words):
+            return any(w in n for w in words)
+        if hit("terminal", "wsl", "python_code", "shell"):
+            return "Terminal & Code"
+        if hit("mcp"):
+            return "MCP Management"
+        if hit("file", "path", "directory", "docx", "find_file", "explore_path"):
+            return "Files & Paths"
+        if hit("search", "url", "browser", "web", "cdp"):
+            return "Web & Browser"
+        if hit("ui_", "uia", "click", "ocr", "window", "screen", "scan_app", "inspect_app", "interact_with_ui"):
+            return "UI Automation"
+        if hit("skill", "domain", "memory", "knowledge", "kb_", "pdf"):
+            return "Knowledge & Memory"
+        if hit("flow", "flowchart", "schedule"):
+            return "Flows & Scheduling"
+        if hit("agent"):
+            return "Agents"
+        if hit("image", "voice", "generate"):
+            return "Media & Voice"
+        if hit("ask_user", "say", "wait", "action_loop"):
+            return "Conversation Control"
+        return "General"
+
+    def list_capability_sections(self):
+        try:
+            native_count = len(midum.tools)
+        except Exception:
+            native_count = 0
+        try:
+            mcp_count = sum(len(h.tools) for h in midum._MCP_SERVERS.values() if h.connected)
+        except Exception:
+            mcp_count = 0
+        try:
+            skills_count = len(self.list_skill_files())
+        except Exception:
+            skills_count = 0
+        try:
+            flows_count = len(midum.list_flows())
+        except Exception:
+            flows_count = 0
+        try:
+            kbs_count = len(self.list_knowledge_files()) + len(self.list_pdf_sources())
+        except Exception:
+            kbs_count = 0
+        return [
+            {"key": "native", "label": "Native Tools", "icon": "🔧", "count": native_count},
+            {"key": "mcp",    "label": "MCP Tools",    "icon": "🔌", "count": mcp_count},
+            {"key": "skills", "label": "Skills",       "icon": "🧠", "count": skills_count},
+            {"key": "flows",  "label": "Flows",        "icon": "🔗", "count": flows_count},
+            {"key": "kbs",    "label": "KBs",          "icon": "📚", "count": kbs_count},
+        ]
+
+    def list_native_tool_categories(self):
+        buckets: dict = {}
+        for t in midum.tools:
+            fn = t.get("function", {})
+            name = fn.get("name", "")
+            desc = fn.get("description", "") or ""
+            cat = self._native_tool_category(name, desc)
+            buckets.setdefault(cat, []).append(name)
+        return sorted(
+            [{"name": cat, "count": len(v)} for cat, v in buckets.items()],
+            key=lambda c: c["name"].lower(),
+        )
+
+    def list_native_tools_by_category(self, category: str):
+        out = []
+        for t in sorted(midum.tools, key=lambda t: t["function"]["name"]):
+            fn = t["function"]
+            name = fn.get("name", "")
+            desc = fn.get("description", "") or ""
+            if self._native_tool_category(name, desc) != category:
+                continue
+            short = desc.strip().splitlines()[0][:90] if desc.strip() else ""
+            out.append({"name": name, "desc": short})
+        return out
+
+    def list_mcp_servers_for_picker(self):
+        out = []
+        for name in midum._MCP_SERVER_ORDER:
+            h = midum._MCP_SERVERS.get(name)
+            if not h:
+                continue
+            out.append({
+                "name": name,
+                "connected": bool(h.connected),
+                "count": len(h.tools) if h.connected else 0,
+            })
+        return out
+
+    def list_mcp_tools_by_server(self, server: str):
+        h = midum._MCP_SERVERS.get(server)
+        if not h or not h.connected:
+            return []
+        out = []
+        for td in sorted(h.tools or [], key=lambda t: t.get("name", "")):
+            desc = (td.get("description") or "").strip().splitlines()[0][:90] if td.get("description") else ""
+            out.append({"name": td.get("name", ""), "desc": desc})
+        return out
+
+    def list_skills_capability(self):
+        out = []
+        for fname in self.list_skill_files():
+            name = fname[:-3] if fname.endswith(".md") else fname
+            desc = ""
+            try:
+                path = os.path.join(midum.SKILLS_DIR, fname)
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            desc = line[:90]
+                            break
+            except Exception:
+                pass
+            out.append({"name": name, "desc": desc})
+        return out
+
+    def list_flows_capability(self):
+        out = []
+        for fname in midum.list_flows():
+            try:
+                desc = midum.flow_description(fname) or ""
+            except Exception:
+                desc = ""
+            out.append({"name": fname, "desc": desc[:90]})
+        return out
+
+    def list_kbs_capability(self):
+        out = []
+        for fname in self.list_knowledge_files():
+            name = fname[:-3] if fname.endswith(".md") else fname
+            out.append({"name": name, "desc": "Domain knowledge"})
+        try:
+            for nm in self.list_pdf_sources():
+                out.append({"name": nm, "desc": "PDF source"})
+        except Exception:
+            pass
+        return out
+
     def get_pdf_source(self, name: str):
         try:
             record = midum.read_pdf_source(name)
@@ -3655,6 +3894,18 @@ _HTML = r"""<!DOCTYPE html>
   --glass-sheen-soft: color-mix(in srgb, white calc(var(--glass-pct) * 0.2), transparent);
   --glass-edge: color-mix(in srgb, white calc(var(--glass-pct) * 0.6), transparent);
   --glass-edge-dim: color-mix(in srgb, white calc(var(--glass-pct) * 0.22), transparent);
+  --glass-glow: 0 6px 18px -10px rgba(0,0,0,.45);
+}
+/* Frosted-highlight toggle (SETTINGS → checkbox next to Glass Opacity).
+   This only kills the diagonal sheen gradient -- the thing that makes each
+   element look brighter on one side and fade out toward the other -- NOT
+   the edge/outline or the outer glow, which stay on regardless (they read
+   as a normal panel border, not a "left-to-right" shine). Same "swap a
+   custom property" mechanism as everything else glass-related: one
+   variable flip, no new rule needs to fire, nothing to flash. */
+html.glass-no-sheen{
+  --glass-sheen: transparent;
+  --glass-sheen-soft: transparent;
 }
 *{box-sizing:border-box;}
 html,body{margin:0;padding:0;height:100%;background:var(--bg);color:var(--text);
@@ -3897,6 +4148,13 @@ html.blob-hidden #blob-layer{opacity:0;}
    background image is active, since a background image wants the exact
    same fully-transparent pane treatment as ambient blobs do. */
 html.blobs-off #blob-layer{ display:none; }
+/* Individual blob toggles (SETTINGS → AMBIENT BLOBS). Independent of the
+   master blobs-off switch above -- each blob can be hidden on its own via
+   plain display:none, same cheap approach as blobs-off itself. */
+html.blob-center-off #blob-center{ display:none; }
+html.blob-a-off #blob-a{ display:none; }
+html.blob-b-off #blob-b{ display:none; }
+html.blob-cursor-off #blob-cursor{ display:none; }
 html.blobs-off:not(.has-bg-image) .pane{
   background:var(--panel);
   border:1px solid var(--border2);
@@ -3993,13 +4251,21 @@ html.liquid-glass-on.has-bg-image .dropdown-option,
 html.liquid-glass-on:not(.blobs-off) .dropdown-option,
 html.liquid-glass-on.has-bg-image .modal-box,
 html.liquid-glass-on:not(.blobs-off) .modal-box,
+html.liquid-glass-on.has-bg-image #path-picker,
+html.liquid-glass-on:not(.blobs-off) #path-picker,
+html.liquid-glass-on.has-bg-image .path-picker-row,
+html.liquid-glass-on:not(.blobs-off) .path-picker-row,
+html.liquid-glass-on.has-bg-image #capability-picker,
+html.liquid-glass-on:not(.blobs-off) #capability-picker,
+html.liquid-glass-on.has-bg-image .capability-picker-row,
+html.liquid-glass-on:not(.blobs-off) .capability-picker-row,
 html.liquid-glass-on.has-bg-image .flowchart-wrap,
 html.liquid-glass-on:not(.blobs-off) .flowchart-wrap,
 html.liquid-glass-on.has-bg-image table.md-table{
   background-color:var(--glass-fill) !important;
   background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
   border-color:var(--glass-edge) !important;
-  box-shadow:inset 0 1px 0 var(--glass-edge), inset 0 -1px 0 var(--glass-edge-dim), 0 6px 18px -10px rgba(0,0,0,.45) !important;
+  box-shadow:inset 0 1px 0 var(--glass-edge), inset 0 -1px 0 var(--glass-edge-dim), var(--glass-glow) !important;
   transition:background-color .18s var(--ease), box-shadow .18s var(--ease), border-color .18s var(--ease);
 }
 /* Small/round controls read better a touch more opaque than big flat
@@ -4014,6 +4280,27 @@ html.liquid-glass-on:not(.blobs-off) #settings-back-btn,
 html.liquid-glass-on.has-bg-image .btn,
 html.liquid-glass-on:not(.blobs-off) .btn{
   background-color:var(--glass-fill-strong) !important;
+}
+/* Hover/active/selected row states need to win over the flat glass fill
+   above (same rule, same specificity -- this just comes later in the
+   cascade). Without this, every row in these lists reads identically
+   once Liquid Glass is on and the keyboard/mouse highlight disappears --
+   .dropdown-option.selected had this same latent bug already; folding
+   the "#" path-picker's rows into the same fix here. */
+html.liquid-glass-on.has-bg-image .dropdown-option:hover,
+html.liquid-glass-on:not(.blobs-off) .dropdown-option:hover,
+html.liquid-glass-on.has-bg-image .dropdown-option.selected,
+html.liquid-glass-on:not(.blobs-off) .dropdown-option.selected,
+html.liquid-glass-on.has-bg-image .path-picker-row:hover,
+html.liquid-glass-on:not(.blobs-off) .path-picker-row:hover,
+html.liquid-glass-on.has-bg-image .path-picker-row.active,
+html.liquid-glass-on:not(.blobs-off) .path-picker-row.active,
+html.liquid-glass-on.has-bg-image .capability-picker-row:hover,
+html.liquid-glass-on:not(.blobs-off) .capability-picker-row:hover,
+html.liquid-glass-on.has-bg-image .capability-picker-row.active,
+html.liquid-glass-on:not(.blobs-off) .capability-picker-row.active{
+  background-color:var(--glass-fill-strong) !important;
+  box-shadow:inset 0 0 0 1px var(--glass-edge) !important;
 }
 /* #sidebar-settings-overlay is a full-panel replacement -- it covers the
    ENTIRE sidebar (see its own rule: position:absolute;inset:0) while
@@ -4087,6 +4374,49 @@ html.liquid-glass-on #sidebar-settings-overlay{
 }
 #kb-only-badge.show{display:flex;}
 #input-box.kb-only-active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent);}
+
+/* "#" file-path picker (prompt-box live drive/folder browser) */
+#path-picker{
+  position:absolute;bottom:calc(100% + 8px);left:0;width:100%;max-height:280px;overflow-y:auto;
+  background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:6px;
+  box-shadow:0 8px 24px rgba(0,0,0,.35);display:none;z-index:25;
+}
+#path-picker.open{display:block;}
+#path-picker-crumb{
+  font-size:10px;color:var(--subtext);padding:4px 8px 6px;border-bottom:1px solid var(--border);
+  margin-bottom:4px;white-space:nowrap;overflow-x:auto;font-family:Consolas,'Cascadia Code',monospace;
+}
+.path-picker-row{
+  display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;font-size:12px;
+  color:var(--text);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.path-picker-row:hover, .path-picker-row.active{background:var(--surface2);}
+.path-picker-icon{flex:0 0 auto;font-size:13px;}
+.path-picker-name{flex:1;overflow:hidden;text-overflow:ellipsis;}
+.path-picker-empty{font-size:11px;color:var(--subtext);text-align:center;padding:14px 10px;}
+
+/* "/" capability picker (prompt-box live Native Tools / MCP Tools / Skills / Flows / KBs browser) */
+#capability-picker{
+  position:absolute;bottom:calc(100% + 8px);left:0;width:100%;max-height:320px;overflow-y:auto;
+  background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:6px;
+  box-shadow:0 8px 24px rgba(0,0,0,.35);display:none;z-index:25;
+}
+#capability-picker.open{display:block;}
+#capability-picker-crumb{
+  font-size:10px;color:var(--subtext);padding:4px 8px 6px;border-bottom:1px solid var(--border);
+  margin-bottom:4px;white-space:nowrap;overflow-x:auto;
+}
+.capability-picker-row{
+  display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;font-size:12px;
+  color:var(--text);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.capability-picker-row:hover, .capability-picker-row.active{background:var(--surface2);}
+.capability-picker-icon{flex:0 0 auto;font-size:13px;}
+.capability-picker-main{flex:1;overflow:hidden;display:flex;flex-direction:column;min-width:0;}
+.capability-picker-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.capability-picker-desc{font-size:10px;color:var(--subtext);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.capability-picker-count{flex:0 0 auto;font-size:10px;color:var(--subtext);background:var(--surface2);border-radius:999px;padding:1px 7px;}
+.capability-picker-empty{font-size:11px;color:var(--subtext);text-align:center;padding:14px 10px;}
 
 /* Sidebar pane */
 #sidebar-pane-wrap{left:100%;width:0;}
@@ -4193,6 +4523,13 @@ body.render-surface-active #settings-panel-toggle .ghost-btn{
   user-select:text;-webkit-user-select:text;cursor:text;}
 .bubble *{user-select:text;-webkit-user-select:text;}
 .bubble.user{background:var(--user-msg);}
+/* "/capability" tokens inside a sent user message (see renderUserContent) --
+   distinguished from the surrounding text so an explicit capability request
+   reads at a glance, mirroring the "/" picker's own accent color. */
+.capability-tag{
+  color:var(--accent);background:var(--accent-faint);border-radius:6px;
+  padding:1px 5px;font-weight:600;font-family:"JetBrains Mono","Cascadia Code",Consolas,monospace;
+}
 .bubble.midum{background:transparent;max-width:100%;}
 .midum-chunk{margin-top:10px;}
 .midum-chunk:first-child{margin-top:0;}
@@ -4601,6 +4938,14 @@ textarea.code-area{
               <button id="kb-next-part-btn" style="flex:1;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;">Next Part →</button>
               <button id="kb-open-source-btn" style="flex:0 0 auto;padding:0 14px;height:30px;border-radius:14px;border:1px solid var(--border2);background:var(--surface2);color:var(--text);font-size:11px;font-weight:600;">📄 Open Source</button>
             </div>
+            <div id="path-picker">
+              <div id="path-picker-crumb"></div>
+              <div id="path-picker-list"></div>
+            </div>
+            <div id="capability-picker">
+              <div id="capability-picker-crumb"></div>
+              <div id="capability-picker-list"></div>
+            </div>
             <div id="kb-popover">
               <div class="kb-only-row">
                 <input type="checkbox" id="kb-only-checkbox"/>
@@ -4688,6 +5033,489 @@ const SHELL_HISTORY_CAP = 1000;
 let _currentMidumRow = null;
 
 function api(name, ...args){ return window.pywebview.api[name](...args); }
+
+// ── "#" file-path picker ---------------------------------------------------
+// Typing "#" in the prompt box (at the very start, or right after
+// whitespace) opens a small live folder browser positioned right above the
+// box: drives first, then whatever's inside wherever you navigate. Typing
+// more characters after the "#" filters the *currently loaded* listing
+// entirely client-side (no round trip), so it stays fast; only actually
+// drilling into a different folder does one fresh, cheap list_path_entries
+// call. Selecting a file/folder splices its full quoted path into the
+// message in place of the "#..." trigger text.
+const pathPicker = {
+  open: false,
+  triggerIndex: -1,   // index of the "#" character in msg-input's value
+  path: null,         // null while showing the top-level drive list
+  entries: [],        // raw entries for the currently loaded listing
+  filtered: [],
+  activeIndex: -1,
+};
+
+function _pathPickerEls(){
+  return {
+    input: document.getElementById("msg-input"),
+    box: document.getElementById("path-picker"),
+    crumb: document.getElementById("path-picker-crumb"),
+    list: document.getElementById("path-picker-list"),
+  };
+}
+
+function initPathPicker(){
+  const { input, box } = _pathPickerEls();
+  if (!input) return;
+  input.addEventListener("keydown", (e)=>{
+    if (!pathPicker.open) return;
+    if (e.key === "ArrowDown"){ e.preventDefault(); _movePathPicker(1); }
+    else if (e.key === "ArrowUp"){ e.preventDefault(); _movePathPicker(-1); }
+    else if (e.key === "Enter"){ e.preventDefault(); e.stopPropagation(); _activatePathPickerRow(e.shiftKey); }
+    else if (e.key === "Escape"){ e.preventDefault(); closePathPicker(); }
+    else if (e.key === "Backspace"){
+      if (input.selectionStart === pathPicker.triggerIndex + 1 && input.selectionStart === input.selectionEnd){
+        // Filter text is already empty right after the "#" -- treat
+        // Backspace as "go up a level" instead of deleting the "#" itself.
+        e.preventDefault();
+        _goUpPathPicker();
+      }
+    }
+  }, true); // capture, so this runs before the plain Enter-to-send listener
+  document.addEventListener("click", (e)=>{
+    if (pathPicker.open && !box.contains(e.target) && e.target !== input){
+      closePathPicker();
+    }
+  });
+}
+
+function _currentPathPickerFilter(){
+  const { input } = _pathPickerEls();
+  const cursor = input.selectionStart;
+  if (cursor < pathPicker.triggerIndex + 1) return null; // cursor moved before the trigger -- no longer applies
+  const text = input.value.slice(pathPicker.triggerIndex + 1, cursor);
+  if (/\s/.test(text)) return null; // whitespace cancels the trigger, like most "@mention" pickers
+  return text;
+}
+
+// Called from msg-input's "input" listener on every keystroke.
+function checkPathPickerTrigger(){
+  const { input } = _pathPickerEls();
+  if (!input || capabilityPicker.open) return; // the two pickers are mutually exclusive
+  const cursor = input.selectionStart;
+
+  if (pathPicker.open){
+    const filter = _currentPathPickerFilter();
+    if (filter === null){ closePathPicker(); return; }
+    _renderPathPickerList(filter);
+    return;
+  }
+
+  const charBefore = input.value.slice(cursor - 1, cursor);
+  const charBeforeThat = input.value.slice(cursor - 2, cursor - 1);
+  if (charBefore === "#" && (cursor === 1 || /\s/.test(charBeforeThat))){
+    pathPicker.triggerIndex = cursor - 1;
+    openPathPicker();
+  }
+}
+
+async function openPathPicker(){
+  closeCapabilityPicker();
+  pathPicker.open = true;
+  pathPicker.path = null;
+  const { box } = _pathPickerEls();
+  box.classList.add("open");
+  const drives = await api("list_drives");
+  if (!pathPicker.open) return; // closed again before this resolved
+  pathPicker.entries = drives.map(d=>({ name: d.name, path: d.path, is_dir: true }));
+  _renderPathPickerCrumb();
+  _renderPathPickerList("");
+}
+
+async function _navigatePathPicker(path){
+  const res = await api("list_path_entries", path);
+  if (!pathPicker.open) return; // closed again before this resolved
+  if (!res || !res.ok){
+    pathPicker.entries = [];
+    pathPicker.path = path;
+    _renderPathPickerCrumb();
+    _renderPathPickerList("", (res && res.error) || "Couldn't open that folder.");
+    return;
+  }
+  pathPicker.path = res.path;
+  pathPicker.entries = res.entries;
+  _renderPathPickerCrumb();
+  // Drilling into a folder consumes whatever filter text got the user
+  // there -- clear it out of the actual message text too, and reset the
+  // trigger to right after the "#" so a fresh filter starts clean.
+  const { input } = _pathPickerEls();
+  const cursor = input.selectionStart;
+  input.value = input.value.slice(0, pathPicker.triggerIndex + 1) + input.value.slice(cursor);
+  input.selectionStart = input.selectionEnd = pathPicker.triggerIndex + 1;
+  autosizeMsgInput();
+  _renderPathPickerList("");
+  input.focus();
+}
+
+function _goUpPathPicker(){
+  if (pathPicker.path === null) return; // already at the drive list
+  const parent = _pathPickerParent(pathPicker.path);
+  if (parent === null){ pathPicker.path = null; openPathPicker(); return; }
+  _navigatePathPicker(parent);
+}
+
+function _pathPickerParent(path){
+  if (/^[A-Za-z]:\\?$/.test(path)) return null; // Windows drive root -- back to drive list
+  if (path === "/") return null;
+  const trimmed = path.replace(/[\\/]+$/, "");
+  const idx = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
+  if (idx < 0) return null;
+  return trimmed.slice(0, idx + 1) || null;
+}
+
+function _renderPathPickerCrumb(){
+  const { crumb } = _pathPickerEls();
+  crumb.textContent = pathPicker.path === null ? "This PC" : pathPicker.path;
+}
+
+function _renderPathPickerList(filterText, errorText){
+  const { list } = _pathPickerEls();
+  const q = (filterText || "").toLowerCase();
+  pathPicker.filtered = pathPicker.entries.filter(e=>e.name.toLowerCase().includes(q));
+  pathPicker.activeIndex = pathPicker.filtered.length ? 0 : -1;
+  if (errorText){
+    list.innerHTML = `<div class="path-picker-empty">${escapeHtml(errorText)}</div>`;
+    return;
+  }
+  if (!pathPicker.filtered.length){
+    list.innerHTML = `<div class="path-picker-empty">No matches.</div>`;
+    return;
+  }
+  list.innerHTML = pathPicker.filtered.map((e, i)=>
+    `<div class="path-picker-row${i===0?' active':''}" data-i="${i}" title="${escapeHtml(e.is_dir ? 'Click: open   ·   Shift+Click: insert this folder\'s path (no quotes)' : 'Click: insert this file\'s path (no quotes)')}">`
+    + `<span class="path-picker-icon">${e.is_dir ? "📁" : "📄"}</span>`
+    + `<span class="path-picker-name">${escapeHtml(e.name)}</span>`
+    + `</div>`
+  ).join("");
+  list.querySelectorAll(".path-picker-row").forEach(row=>{
+    // mousedown (not click) + preventDefault: a plain click would first let
+    // the browser blur/refocus away from #msg-input, which can shift or
+    // clear its selectionStart/selectionEnd before insertPathPickerResult()
+    // reads them -- the classic "mention picker" bug where a selection
+    // silently inserts nothing (or inserts in the wrong place). Blocking
+    // the default mousedown behavior keeps the textarea focused and its
+    // cursor position exactly where it was the whole time.
+    row.addEventListener("mousedown", (ev)=>{
+      ev.preventDefault();
+      _activatePathPickerRow(ev.shiftKey, parseInt(row.dataset.i, 10));
+    });
+  });
+}
+
+function _movePathPicker(delta){
+  if (!pathPicker.filtered.length) return;
+  const n = pathPicker.filtered.length;
+  pathPicker.activeIndex = ((pathPicker.activeIndex + delta) % n + n) % n;
+  const { list } = _pathPickerEls();
+  list.querySelectorAll(".path-picker-row").forEach((row, i)=>{
+    row.classList.toggle("active", i === pathPicker.activeIndex);
+  });
+  const activeRow = list.children[pathPicker.activeIndex];
+  if (activeRow) activeRow.scrollIntoView({ block: "nearest" });
+}
+
+// insertOnly (Shift+Enter / Shift+Click): insert the highlighted folder's
+// own path instead of navigating into it -- lets you reference a folder
+// itself, not just files inside it.
+function _activatePathPickerRow(insertOnly, index){
+  const i = index !== undefined ? index : pathPicker.activeIndex;
+  const entry = pathPicker.filtered[i];
+  if (!entry) return;
+  if (entry.is_dir && !insertOnly){
+    _navigatePathPicker(entry.path);
+  } else {
+    insertPathPickerResult(entry.path);
+  }
+}
+
+function insertPathPickerResult(path){
+  const { input } = _pathPickerEls();
+  const cursor = input.selectionStart;
+  const before = input.value.slice(0, pathPicker.triggerIndex);
+  const after = input.value.slice(Math.max(cursor, pathPicker.triggerIndex + 1));
+  const insertText = `${path} `;
+  input.value = before + insertText + after;
+  const newCursor = before.length + insertText.length;
+  input.selectionStart = input.selectionEnd = newCursor;
+  autosizeMsgInput();
+  closePathPicker();
+  input.focus();
+}
+
+function closePathPicker(){
+  pathPicker.open = false;
+  pathPicker.path = null;
+  pathPicker.entries = [];
+  pathPicker.filtered = [];
+  pathPicker.activeIndex = -1;
+  pathPicker.triggerIndex = -1;
+  const { box } = _pathPickerEls();
+  box.classList.remove("open");
+}
+
+// ── "/" capability picker -----------------------------------------------------
+// Typing "/" in the prompt box (at the very start, or right after
+// whitespace) opens a small live browser -- positioned exactly like the
+// "#" path picker -- over the five capability sections: Native Tools, MCP
+// Tools, Skills, Flows and KBs. Native Tools and MCP Tools are two levels
+// deep (functional category, then MCP server, before reaching individual
+// tools); Skills/Flows/KBs go straight from the section to their saved-item
+// list. `stack` holds the navigation path taken so far (each entry is the
+// picked row at that depth); the currently displayed rows for whatever
+// depth we're at are (re)loaded into `entries` by _loadCapabilityLevel.
+const capabilityPicker = {
+  open: false,
+  triggerIndex: -1,
+  stack: [],      // [] at the section root; grows as the user drills in
+  entries: [],
+  filtered: [],
+  activeIndex: -1,
+};
+
+function _capabilityPickerEls(){
+  return {
+    input: document.getElementById("msg-input"),
+    box: document.getElementById("capability-picker"),
+    crumb: document.getElementById("capability-picker-crumb"),
+    list: document.getElementById("capability-picker-list"),
+  };
+}
+
+function initCapabilityPicker(){
+  const { input, box } = _capabilityPickerEls();
+  if (!input) return;
+  input.addEventListener("keydown", (e)=>{
+    if (!capabilityPicker.open) return;
+    if (e.key === "ArrowDown"){ e.preventDefault(); _moveCapabilityPicker(1); }
+    else if (e.key === "ArrowUp"){ e.preventDefault(); _moveCapabilityPicker(-1); }
+    else if (e.key === "Enter"){ e.preventDefault(); e.stopPropagation(); _activateCapabilityPickerRow(); }
+    else if (e.key === "ArrowRight"){ _activateCapabilityPickerRow(true); }
+    else if (e.key === "Escape"){ e.preventDefault(); closeCapabilityPicker(); }
+    else if (e.key === "Backspace"){
+      if (input.selectionStart === capabilityPicker.triggerIndex + 1 && input.selectionStart === input.selectionEnd){
+        e.preventDefault();
+        _goUpCapabilityPicker();
+      }
+    }
+  }, true); // capture, so this runs before the plain Enter-to-send listener
+  document.addEventListener("click", (e)=>{
+    if (capabilityPicker.open && !box.contains(e.target) && e.target !== input){
+      closeCapabilityPicker();
+    }
+  });
+}
+
+function _currentCapabilityPickerFilter(){
+  const { input } = _capabilityPickerEls();
+  const cursor = input.selectionStart;
+  if (cursor < capabilityPicker.triggerIndex + 1) return null;
+  const text = input.value.slice(capabilityPicker.triggerIndex + 1, cursor);
+  if (/\s/.test(text)) return null; // whitespace cancels the trigger, like the "#" picker
+  return text;
+}
+
+// Called from msg-input's "input" listener on every keystroke.
+function checkCapabilityPickerTrigger(){
+  const { input } = _capabilityPickerEls();
+  if (!input || pathPicker.open) return; // the two pickers are mutually exclusive
+  const cursor = input.selectionStart;
+
+  if (capabilityPicker.open){
+    const filter = _currentCapabilityPickerFilter();
+    if (filter === null){ closeCapabilityPicker(); return; }
+    _renderCapabilityPickerList(filter);
+    return;
+  }
+
+  const charBefore = input.value.slice(cursor - 1, cursor);
+  const charBeforeThat = input.value.slice(cursor - 2, cursor - 1);
+  if (charBefore === "/" && (cursor === 1 || /\s/.test(charBeforeThat))){
+    capabilityPicker.triggerIndex = cursor - 1;
+    openCapabilityPicker();
+  }
+}
+
+async function openCapabilityPicker(){
+  closePathPicker();
+  capabilityPicker.open = true;
+  capabilityPicker.stack = [];
+  const { box } = _capabilityPickerEls();
+  box.classList.add("open");
+  await _loadCapabilityLevel();
+  if (!capabilityPicker.open) return; // closed again before this resolved
+  _renderCapabilityPickerCrumb();
+  _renderCapabilityPickerList("");
+}
+
+// Fetches whatever level the current `stack` points at into `entries`.
+// Root (stack empty) -> the 5 sections. One level down from "native"/"mcp"
+// -> categories/servers. Two levels down from those -> the actual tools.
+// One level down from "skills"/"flows"/"kbs" -> their saved items directly.
+async function _loadCapabilityLevel(){
+  const depth = capabilityPicker.stack.length;
+  if (depth === 0){
+    const sections = await api("list_capability_sections");
+    capabilityPicker.entries = (sections || []).map(s=>({
+      section: s.key, label: s.label, icon: s.icon, count: s.count, is_leaf: false,
+    }));
+    return;
+  }
+  const root = capabilityPicker.stack[0].section;
+  if (root === "native"){
+    if (depth === 1){
+      const cats = await api("list_native_tool_categories");
+      capabilityPicker.entries = (cats || []).map(c=>({
+        label: c.name, icon: "📂", count: c.count, is_leaf: false,
+      }));
+    } else {
+      const tools = await api("list_native_tools_by_category", capabilityPicker.stack[1].label);
+      capabilityPicker.entries = (tools || []).map(t=>({
+        label: t.name, desc: t.desc, icon: "🔧", is_leaf: true,
+      }));
+    }
+  } else if (root === "mcp"){
+    if (depth === 1){
+      const servers = await api("list_mcp_servers_for_picker");
+      capabilityPicker.entries = (servers || []).map(s=>({
+        label: s.name, icon: s.connected ? "🔌" : "⚠️", count: s.count, is_leaf: false,
+      }));
+    } else {
+      const tools = await api("list_mcp_tools_by_server", capabilityPicker.stack[1].label);
+      capabilityPicker.entries = (tools || []).map(t=>({
+        label: t.name, desc: t.desc, icon: "🔌", is_leaf: true,
+      }));
+    }
+  } else if (root === "skills"){
+    const items = await api("list_skills_capability");
+    capabilityPicker.entries = (items || []).map(i=>({ label: i.name, desc: i.desc, icon: "🧠", is_leaf: true }));
+  } else if (root === "flows"){
+    const items = await api("list_flows_capability");
+    capabilityPicker.entries = (items || []).map(i=>({ label: i.name, desc: i.desc, icon: "🔗", is_leaf: true }));
+  } else if (root === "kbs"){
+    const items = await api("list_kbs_capability");
+    capabilityPicker.entries = (items || []).map(i=>({ label: i.name, desc: i.desc, icon: "📚", is_leaf: true }));
+  } else {
+    capabilityPicker.entries = [];
+  }
+}
+
+async function _drillIntoCapabilityPicker(entry){
+  capabilityPicker.stack.push(entry.section !== undefined ? entry : { label: entry.label });
+  await _loadCapabilityLevel();
+  if (!capabilityPicker.open) return;
+  // Drilling in consumes whatever filter text got the user here -- clear it
+  // out of the actual message text too, mirroring _navigatePathPicker.
+  const { input } = _capabilityPickerEls();
+  const cursor = input.selectionStart;
+  input.value = input.value.slice(0, capabilityPicker.triggerIndex + 1) + input.value.slice(cursor);
+  input.selectionStart = input.selectionEnd = capabilityPicker.triggerIndex + 1;
+  autosizeMsgInput();
+  _renderCapabilityPickerCrumb();
+  _renderCapabilityPickerList("");
+  input.focus();
+}
+
+function _goUpCapabilityPicker(){
+  if (!capabilityPicker.stack.length){ closeCapabilityPicker(); return; }
+  capabilityPicker.stack.pop();
+  _loadCapabilityLevel().then(()=>{
+    if (!capabilityPicker.open) return;
+    _renderCapabilityPickerCrumb();
+    _renderCapabilityPickerList("");
+  });
+}
+
+function _renderCapabilityPickerCrumb(){
+  const { crumb } = _capabilityPickerEls();
+  crumb.textContent = capabilityPicker.stack.length
+    ? capabilityPicker.stack.map(s=>s.label).join(" / ")
+    : "Capabilities";
+}
+
+function _renderCapabilityPickerList(filterText){
+  const { list } = _capabilityPickerEls();
+  const q = (filterText || "").toLowerCase();
+  capabilityPicker.filtered = capabilityPicker.entries.filter(e=>e.label.toLowerCase().includes(q));
+  capabilityPicker.activeIndex = capabilityPicker.filtered.length ? 0 : -1;
+  if (!capabilityPicker.filtered.length){
+    list.innerHTML = `<div class="capability-picker-empty">No matches.</div>`;
+    return;
+  }
+  list.innerHTML = capabilityPicker.filtered.map((e, i)=>
+    `<div class="capability-picker-row${i===0?' active':''}" data-i="${i}" `
+    + `title="${escapeHtml(e.is_leaf ? 'Click: insert this name' : 'Click: open')}">`
+    + `<span class="capability-picker-icon">${e.icon || (e.is_leaf ? "•" : "📁")}</span>`
+    + `<span class="capability-picker-main">`
+    + `<span class="capability-picker-name">${escapeHtml(e.label)}</span>`
+    + (e.desc ? `<span class="capability-picker-desc">${escapeHtml(e.desc)}</span>` : ``)
+    + `</span>`
+    + (typeof e.count === "number" ? `<span class="capability-picker-count">${e.count}</span>` : ``)
+    + `</div>`
+  ).join("");
+  list.querySelectorAll(".capability-picker-row").forEach(row=>{
+    // mousedown (not click) + preventDefault, same reasoning as the "#"
+    // picker: keeps #msg-input focused with its selection intact.
+    row.addEventListener("mousedown", (ev)=>{
+      ev.preventDefault();
+      _activateCapabilityPickerRow(false, parseInt(row.dataset.i, 10));
+    });
+  });
+}
+
+function _moveCapabilityPicker(delta){
+  if (!capabilityPicker.filtered.length) return;
+  const n = capabilityPicker.filtered.length;
+  capabilityPicker.activeIndex = ((capabilityPicker.activeIndex + delta) % n + n) % n;
+  const { list } = _capabilityPickerEls();
+  list.querySelectorAll(".capability-picker-row").forEach((row, i)=>{
+    row.classList.toggle("active", i === capabilityPicker.activeIndex);
+  });
+  const activeRow = list.children[capabilityPicker.activeIndex];
+  if (activeRow) activeRow.scrollIntoView({ block: "nearest" });
+}
+
+function _activateCapabilityPickerRow(drillOnly, index){
+  const i = index !== undefined ? index : capabilityPicker.activeIndex;
+  const entry = capabilityPicker.filtered[i];
+  if (!entry) return;
+  if (!entry.is_leaf){
+    _drillIntoCapabilityPicker(entry);
+  } else {
+    insertCapabilityPickerResult(entry.label);
+  }
+}
+
+function insertCapabilityPickerResult(name){
+  const { input } = _capabilityPickerEls();
+  const cursor = input.selectionStart;
+  const before = input.value.slice(0, capabilityPicker.triggerIndex);
+  const after = input.value.slice(Math.max(cursor, capabilityPicker.triggerIndex + 1));
+  const insertText = `/${name} `;
+  input.value = before + insertText + after;
+  const newCursor = before.length + insertText.length;
+  input.selectionStart = input.selectionEnd = newCursor;
+  autosizeMsgInput();
+  closeCapabilityPicker();
+  input.focus();
+}
+
+function closeCapabilityPicker(){
+  capabilityPicker.open = false;
+  capabilityPicker.stack = [];
+  capabilityPicker.entries = [];
+  capabilityPicker.filtered = [];
+  capabilityPicker.activeIndex = -1;
+  capabilityPicker.triggerIndex = -1;
+  const { box } = _capabilityPickerEls();
+  box.classList.remove("open");
+}
 
 // ── Weighted scrolling ───────────────────────────────────────────────────────────
 // Native wheel scrolling in Chromium jumps by whatever raw delta the OS/
@@ -4960,6 +5788,24 @@ function buildTabbar(){
 // ── Chat rendering --------------------------------------------------------
 function escapeHtml(s){
   return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+// Renders a USER message's bubble: escapes HTML, applies a small subset of
+// markdown (inline code, bold, italic -- deliberately not the full
+// renderInline() pipeline used for Midum's own replies, since a typed
+// prompt is plain input, not a document), and highlights any "/capability"
+// token -- a "/" at the very start of the message or right after
+// whitespace, immediately followed by a name with no spaces -- the same
+// trigger shape the "/" picker itself uses (see checkCapabilityPickerTrigger)
+// and the explicit capability-request convention described to the model in
+// the system prompt (see system_prompt.py's "/" CAPABILITY REQUESTS section).
+function renderUserContent(text){
+  let t = escapeHtml(text);
+  t = t.replace(/`([^`]+)`/g, (m,c)=>`<code class="inline-code">${c}</code>`);
+  t = t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+  t = t.replace(/(^|[^*])\*([^*]+)\*/g, "$1<i>$2</i>");
+  t = t.replace(/(^|\s)\/([A-Za-z0-9_\-.]+)/g, (m, pre, name)=>`${pre}<span class="capability-tag" title="Capability request">/${name}</span>`);
+  return t;
 }
 
 function renderInline(text){
@@ -5533,7 +6379,7 @@ function buildStaticRow(tag, text){
   const row = document.createElement("div");
   if (tag === "user"){
     row.className = "row user";
-    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">⧉</button></div><div class="bubble user">${escapeHtml(text)}</div>`;
+    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">⧉</button></div><div class="bubble user">${renderUserContent(text)}</div>`;
     wireRowCopyBtn(row);
   } else if (tag === "midum"){
     row.className = "row midum";
@@ -5743,7 +6589,7 @@ function appendRow(tag, text){
   if (tag === "user"){
     _currentMidumRow = null;   // a new user turn always starts a fresh Midum bubble
     row.className = "row user";
-    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">⧉</button></div><div class="bubble user">${escapeHtml(text)}</div>`;
+    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">⧉</button></div><div class="bubble user">${renderUserContent(text)}</div>`;
     wireRowCopyBtn(row);
   } else if (tag === "midum"){
     setActiveToolDot(null);
@@ -6637,6 +7483,20 @@ function buildSidebar(){
           <input type="checkbox" id="settings-blobs-enabled" style="width:14px;height:14px;"/> Enabled
         </label>
       </div>
+      <div id="blob-individual-toggles" style="display:flex;flex-wrap:wrap;gap:8px 14px;margin:-2px 0 2px;">
+        <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--subtext);">
+          <input type="checkbox" id="settings-blob-center-enabled" checked style="width:12px;height:12px;"/> Center
+        </label>
+        <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--subtext);">
+          <input type="checkbox" id="settings-blob-a-enabled" checked style="width:12px;height:12px;"/> Blob A
+        </label>
+        <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--subtext);">
+          <input type="checkbox" id="settings-blob-b-enabled" checked style="width:12px;height:12px;"/> Blob B
+        </label>
+        <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--subtext);">
+          <input type="checkbox" id="settings-blob-cursor-enabled" checked style="width:12px;height:12px;"/> Cursor
+        </label>
+      </div>
       <div class="hdr-row" style="margin-top:4px;">
         <div class="field-label" style="margin:0;">BACKGROUND IMAGE</div>
         <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);">
@@ -6665,6 +7525,9 @@ function buildSidebar(){
       </div>
       <div class="field-label" style="margin-top:2px;">Glass Opacity</div>
       <input type="range" id="settings-glass-opacity" min="35" max="75" value="55" style="width:100%;"/>
+      <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);margin-top:4px;">
+        <input type="checkbox" id="settings-glass-sheen-enabled" checked style="width:14px;height:14px;"/> Frosted highlight
+      </label>
       <div class="field-label">DEFAULT PROVIDER</div>
       <select id="settings-provider"></select>
       <div class="field-label">DEFAULT MODEL</div>
@@ -6801,11 +7664,18 @@ function buildSidebar(){
     applyBlobsEnabled(e.target.checked);
     _themeBlobsEnabled[_activeTheme] = e.target.checked;
   };
+  ["center","a","b","cursor"].forEach(key=>{
+    const cb = document.getElementById(`settings-blob-${key}-enabled`);
+    if (cb) cb.onchange = (e)=> applyBlobIndividual(key, e.target.checked);
+  });
   document.getElementById("settings-glass-enabled").onchange = (e)=>{
     applyLiquidGlass(e.target.checked);
   };
   document.getElementById("settings-glass-opacity").oninput = (e)=>{
     applyGlassOpacity(e.target.value);
+  };
+  document.getElementById("settings-glass-sheen-enabled").onchange = (e)=>{
+    applyGlassSheen(e.target.checked);
   };
   document.getElementById("bg-choose").onclick = async ()=>{
     const r = await api("pick_background_image");
@@ -7043,6 +7913,19 @@ function applyBlobsEnabled(enabled){
   applyLiquidGlass(_glassEnabled);
 }
 
+// Per-blob on/off (SETTINGS → AMBIENT BLOBS → Center/Blob A/Blob B/Cursor).
+// Independent of the master applyBlobsEnabled() above -- this just hides
+// one blob's own div via its own html.blob-<key>-off class (see CSS),
+// same plain display:none approach as the master toggle, no layout work.
+let _blobIndividualEnabled = {center:true, a:true, b:true, cursor:true};
+function applyBlobIndividual(key, enabled){
+  if (!(key in _blobIndividualEnabled)) return;
+  _blobIndividualEnabled[key] = !!enabled;
+  document.documentElement.classList.toggle(`blob-${key}-off`, !enabled);
+  const cb = document.getElementById(`settings-blob-${key}-enabled`);
+  if (cb) cb.checked = !!enabled;
+}
+
 // The glass surfaces toggle. Purely cosmetic (see the html.liquid-glass-on
 // CSS block for what it actually does) and only ever meaningful while the
 // panes are already transparent, i.e. while ambient blobs and/or a
@@ -7080,6 +7963,17 @@ function applyGlassOpacity(pct){
   document.documentElement.style.setProperty("--glass-pct", _glassOpacity + "%");
   const el = document.getElementById("settings-glass-opacity");
   if (el) el.value = _glassOpacity;
+}
+
+// The frosted-highlight toggle (SETTINGS → "Frosted highlight" checkbox).
+// Just flips the html.glass-no-sheen class -- see that CSS rule for what
+// it zeroes out. On by default, independent of the opacity slider.
+let _glassSheenEnabled = true;
+function applyGlassSheen(enabled){
+  _glassSheenEnabled = enabled !== false;
+  document.documentElement.classList.toggle("glass-no-sheen", !_glassSheenEnabled);
+  const cb = document.getElementById("settings-glass-sheen-enabled");
+  if (cb) cb.checked = _glassSheenEnabled;
 }
 
 // Cache of the current bg config + baked data url. Slider drags call a
@@ -7206,6 +8100,11 @@ async function loadSettingsPanel(){
   applyBgImage(_bgState.cfg, _bgState.dataUrl);
   applyLiquidGlass(s.liquid_glass_enabled === true);
   applyGlassOpacity(s.liquid_glass_opacity != null ? s.liquid_glass_opacity : 55);
+  applyGlassSheen(s.liquid_glass_sheen_enabled !== false);
+  const blobsIndiv = s.blobs_individual || {};
+  ["center","a","b","cursor"].forEach(key=>{
+    applyBlobIndividual(key, blobsIndiv[key] !== false);
+  });
   const provSel = document.getElementById("settings-provider");
   if (provSel && !provSel.options.length){
     const info = await api("get_providers");
@@ -7240,12 +8139,15 @@ async function saveSettingsPanel(){
   // through untouched so it isn't clobbered by whatever's currently showing.
   _themeColors[_activeTheme] = colors;
   _themeBlobsEnabled[_activeTheme] = document.getElementById("settings-blobs-enabled").checked;
+  const blobs_individual = {..._blobIndividualEnabled};
   const r = await api("save_settings", {
     provider, model, theme: _activeTheme,
     colors_dark: _themeColors.dark, colors_light: _themeColors.light,
     blobs_enabled_dark: _themeBlobsEnabled.dark, blobs_enabled_light: _themeBlobsEnabled.light,
+    blobs_individual,
     liquid_glass_enabled: _glassEnabled,
     liquid_glass_opacity: _glassOpacity,
+    liquid_glass_sheen_enabled: _glassSheenEnabled,
     bg_image,
   });
   const status = document.getElementById("settings-status");
@@ -7259,6 +8161,7 @@ async function saveSettingsPanel(){
     applyBgImage(_bgState.cfg, _bgState.dataUrl);
     applyLiquidGlass(r.settings.liquid_glass_enabled === true);
     applyGlassOpacity(r.settings.liquid_glass_opacity != null ? r.settings.liquid_glass_opacity : 55);
+    applyGlassSheen(r.settings.liquid_glass_sheen_enabled !== false);
     if (status) status.textContent = "Saved — will be remembered next launch.";
   } else if (status) {
     status.textContent = `Error: ${r.error}`;
@@ -9718,8 +10621,8 @@ window.addEventListener("pywebviewready", async ()=>{
     if (!r.ok) await showConfirm(r.message || "Failed to save.", "Error");
   };
   document.getElementById("send-btn").onclick = sendMessage;
-  document.getElementById("msg-input").addEventListener("keydown", e=>{ if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); sendMessage(); } });
-  document.getElementById("msg-input").addEventListener("input", autosizeMsgInput);
+  document.getElementById("msg-input").addEventListener("keydown", e=>{ if (pathPicker.open || capabilityPicker.open) return; if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); sendMessage(); } });
+  document.getElementById("msg-input").addEventListener("input", ()=>{ autosizeMsgInput(); checkPathPickerTrigger(); checkCapabilityPickerTrigger(); });
   document.getElementById("abort-btn").onclick = ()=>api("abort");
   document.getElementById("copy-chat-btn").onclick = copyFullConversation;
   document.getElementById("reopen-render-surface-btn").onclick = async ()=>{
@@ -9727,6 +10630,8 @@ window.addEventListener("pywebviewready", async ()=>{
     if (!r.ok) await showConfirm(r.message || "Nothing to reopen.", "Reopen Render Surface");
   };
   initKbOnlyControls();
+  initPathPicker();
+  initCapabilityPicker();
 
   // Apply the remembered theme colors immediately, before the heavier
   // startup() call resolves, so the UI doesn't flash default colors first.
@@ -9745,6 +10650,11 @@ window.addEventListener("pywebviewready", async ()=>{
     applyBgImage(_bgState.cfg, _bgState.dataUrl);
     applyLiquidGlass(s.liquid_glass_enabled === true);
     applyGlassOpacity(s.liquid_glass_opacity != null ? s.liquid_glass_opacity : 55);
+    applyGlassSheen(s.liquid_glass_sheen_enabled !== false);
+    const blobsIndiv = s.blobs_individual || {};
+    ["center","a","b","cursor"].forEach(key=>{
+      applyBlobIndividual(key, blobsIndiv[key] !== false);
+    });
   } catch (e) { /* pywebview bridge not ready yet on some platforms — fine */ }
 
   // Pygments token-color CSS for syntax-highlighted code blocks -- fetched

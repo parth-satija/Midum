@@ -2966,6 +2966,54 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "list_discord_servers",
+            "description": (
+                "List every Discord server (guild) Midum's bot is currently a member of, "
+                "with their guild IDs and text channel names/IDs -- use this to find the "
+                "channel_id/guild_id to pass to message_discord() when messaging a "
+                "SPECIFIC server, especially when the bot is connected to more than one."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "message_discord",
+            "description": (
+                "Send a text message to a specific channel in a specific Discord server "
+                "-- for proactively messaging out, not just replying to an incoming DM/"
+                "channel message. Works across every server Midum's bot is a member of "
+                "(use list_discord_servers() first if you don't already know the channel "
+                "ID). Starts the Discord bot automatically if it isn't already running."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The text to send."
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Numeric Discord text channel ID to send to. Either this or channel_name is required."
+                    },
+                    "channel_name": {
+                        "type": "string",
+                        "description": "Channel name (e.g. 'general') to look up if channel_id isn't known. Combine with guild_id to disambiguate across multiple servers."
+                    },
+                    "guild_id": {
+                        "type": "string",
+                        "description": "Optional numeric Discord server (guild) ID to scope a channel_name lookup to one particular server."
+                    }
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "start_discord_bot",
             "description": (
                 "Start the Discord bot so it starts listening for and replying to DMs and "

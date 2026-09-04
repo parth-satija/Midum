@@ -358,10 +358,41 @@ async def _run_live_conversation(call_id: str, channel_id: int):
         print(f"⚠️ [Discord voice] failed to connect to voice channel {channel_id}: {e}")
         return
     _voice_clients[call_id] = voice_client
-    sess["status"] = "in-progress"
 
-    playback = _LivePlaybackSource()
-    voice_client.play(playback)
+    # voice_client.play() constructs a discord.opus.Encoder() under the hood
+    # for any non-Opus AudioSource (ours is raw PCM), which raises
+    # discord.opus.OpusNotLoaded synchronously if libopus couldn't be found/
+    # loaded on this machine (common on Windows: wrong Python bitness, the
+    # bundled bin/libopus-0.x64.dll not reachable, AV quarantine, etc.).
+    # This used to be completely unguarded -- since it runs AFTER the bot has
+    # already joined the channel, an OpusNotLoaded (or any other playback
+    # start-up error) previously propagated straight out of this coroutine,
+    # skipping the disconnect/cleanup below entirely. The bot would just sit
+    # in the voice channel forever, connected but unable to ever emit audio,
+    # with the failure only ever noted (if at all) by the generic done-
+    # callback several frames up -- i.e. exactly "joins and goes completely
+    # silent". Guard it the same way channel.connect() above already is.
+    try:
+        playback = _LivePlaybackSource()
+        voice_client.play(playback)
+    except Exception as e:
+        sess["status"] = "failed"
+        sess["ended"] = True
+        _active_channel_calls.pop(str(channel_id), None)
+        print(f"⚠️ [Discord voice] failed to start audio playback in channel {channel_id}: {e}")
+        if not discord.opus.is_loaded():
+            print(
+                "⚠️ [Discord voice] libopus is not loaded -- voice playback/encoding "
+                "cannot work until it is. On Windows this is normally bundled and "
+                "auto-loaded; if it still fails, call discord.opus.load_opus(path) "
+                "with an explicit path to libopus, or install libopus system-wide."
+            )
+        if voice_client.is_connected():
+            await voice_client.disconnect()
+        _voice_clients.pop(call_id, None)
+        return
+
+    sess["status"] = "in-progress"
 
     gemini_key, _, _ = _get_gemini_live_creds()
     client = _genai.Client(api_key=gemini_key, http_options={"api_version": "v1alpha"})
@@ -572,7 +603,14 @@ _DISCORD_SESSIONS: dict = {}         # session_id (str) -> {history, key, create
 _DISCORD_SESSIONS_LOCK = threading.RLock()
 # key ("dm:<id>" / "channel:<id>") -> the session_id currently active there
 _ACTIVE_SESSION_PER_KEY: dict = {}
-_CHAT_ALLOWED_GUILD_ID = None
+# Every guild (server) Midum's bot is currently a member of -- populated in
+# on_ready() from _bot.guilds, so Midum works across MULTIPLE Discord
+# servers at once out of the box (invite the bot to as many servers as you
+# want; no extra config needed). Previously this was a single
+# _CHAT_ALLOWED_GUILD_ID limited to whichever server DISCORD_DEFAULT_VOICE_
+# CHANNEL_ID's server resolved to, so messages in any OTHER server the bot
+# had been invited to were silently ignored.
+_CHAT_ALLOWED_GUILD_IDS: set = set()
 _DISCORD_MSG_LIMIT = 2000
 _SESSION_IDLE_TIMEOUT = 3600   # seconds -- 1 hour of silence starts a new session
 
@@ -743,7 +781,7 @@ _MENTION_TOKEN_RE = re.compile(r"<@!?\d+>")
 async def _handle_chat_message(message):
     is_dm = message.guild is None
     if not is_dm:
-        if _CHAT_ALLOWED_GUILD_ID is not None and message.guild.id != _CHAT_ALLOWED_GUILD_ID:
+        if _CHAT_ALLOWED_GUILD_IDS and message.guild.id not in _CHAT_ALLOWED_GUILD_IDS:
             return
 
         # In a server (not a DM), only respond when explicitly @-mentioned
@@ -851,7 +889,7 @@ async def _maybe_auto_leave(channel):
 # BOT LIFECYCLE — one persistent bot, own thread + asyncio loop
 # =============================================================================
 def _ensure_bot_running() -> tuple:
-    global _bot, _bot_loop, _bot_thread, _CHAT_ALLOWED_GUILD_ID
+    global _bot, _bot_loop, _bot_thread
 
     with _bot_lock:
         if _bot_thread is not None and _bot_thread.is_alive():
@@ -868,12 +906,20 @@ def _ensure_bot_running() -> tuple:
 
         @_bot.event
         async def on_ready():
-            global _CHAT_ALLOWED_GUILD_ID
+            # Multi-server support: allow text chat in EVERY server the bot
+            # is currently a member of, not just the one that happens to
+            # host DISCORD_DEFAULT_VOICE_CHANNEL_ID. Re-computed here (not
+            # just once) so a fresh reconnect/on_ready always reflects the
+            # bot's current guild membership, e.g. after being invited to a
+            # new server without restarting Midum.
+            _CHAT_ALLOWED_GUILD_IDS.clear()
+            _CHAT_ALLOWED_GUILD_IDS.update(g.id for g in _bot.guilds)
+
             if _DEFAULT_CHANNEL_ID:
                 try:
                     ch = _bot.get_channel(int(_DEFAULT_CHANNEL_ID)) or await _bot.fetch_channel(int(_DEFAULT_CHANNEL_ID))
                     if ch is not None and getattr(ch, "guild", None) is not None:
-                        _CHAT_ALLOWED_GUILD_ID = ch.guild.id
+                        _CHAT_ALLOWED_GUILD_IDS.add(ch.guild.id)
                         # If humans are already sitting in the default channel
                         # when Midum starts up, join immediately rather than
                         # waiting for the NEXT join event.
@@ -887,6 +933,13 @@ def _ensure_bot_running() -> tuple:
                 except Exception:
                     pass
             _bot_ready_event.set()
+
+        @_bot.event
+        async def on_guild_join(guild):
+            # Bot got invited to a NEW server while already running -- add
+            # it immediately instead of requiring a restart to be usable
+            # there.
+            _CHAT_ALLOWED_GUILD_IDS.add(guild.id)
 
         @_bot.event
         async def on_message(message):
@@ -1175,6 +1228,119 @@ def discord_upload_file(file_path: str) -> str:
         return f"Error uploading '{os.path.basename(file_path)}' to Discord: {e}"
 
     return f"Success: uploaded '{os.path.basename(file_path)}' ({size} bytes) to Discord."
+
+
+def _find_text_channel_by_name(name: str, guild_id: str = ""):
+    """Best-effort lookup of a text channel by name (case-insensitive,
+    leading '#' stripped), optionally scoped to one guild_id. Searches only
+    guilds already in _CHAT_ALLOWED_GUILD_IDS (i.e. guilds the bot is
+    actually a member of)."""
+    name = (name or "").lstrip("#").strip().lower()
+    if not name:
+        return None
+    guilds = _bot.guilds
+    if guild_id:
+        try:
+            gid = int(guild_id)
+        except ValueError:
+            gid = None
+        guilds = [g for g in guilds if g.id == gid]
+    for guild in guilds:
+        for ch in guild.text_channels:
+            if ch.name.lower() == name:
+                return ch
+    return None
+
+
+def list_discord_servers() -> str:
+    """
+    List every Discord server (guild) Midum's bot is currently a member of,
+    with their IDs -- use this to find the guild_id/channel to pass to
+    message_discord() when you want to message a SPECIFIC server rather
+    than whichever one a conversation happens to already be in.
+    """
+    if _bot is None:
+        ok, msg = _ensure_bot_running()
+        if not ok:
+            return f"Error: could not start the Discord bot — {msg}"
+    if not _bot.guilds:
+        return "Midum's Discord bot isn't a member of any servers yet."
+    lines = ["Discord servers Midum is connected to:", ""]
+    for g in _bot.guilds:
+        text_channels = ", ".join(f"#{c.name} ({c.id})" for c in g.text_channels[:10])
+        lines.append(f"  '{g.name}' (guild_id={g.id})")
+        if text_channels:
+            lines.append(f"      channels: {text_channels}")
+    return "\n".join(lines)
+
+
+def message_discord(message: str, channel_id: str = "", guild_id: str = "", channel_name: str = "") -> str:
+    """
+    Send a text message to a specific channel in a specific Discord server
+    (guild) -- for proactively reaching out (e.g. "let the team know..."),
+    as opposed to discord_upload_file()/replying, which only work INSIDE an
+    already-in-progress conversation triggered by an incoming message. Works
+    across every server Midum's bot is a member of (see list_discord_servers()
+    to find IDs/names). Starts the bot automatically if it isn't already
+    running.
+
+    message      -- the text to send. Required.
+    channel_id   -- numeric Discord TEXT channel ID to send to. Either this
+                    or channel_name must be given.
+    channel_name -- channel name (e.g. 'general' or '#general') to look up,
+                    used only if channel_id is omitted. Combine with
+                    guild_id to disambiguate when multiple connected
+                    servers have a same-named channel -- otherwise the
+                    first match found is used.
+    guild_id     -- optional numeric Discord server (guild) ID to scope a
+                    channel_name lookup to a particular server. Not needed
+                    when channel_id is given directly.
+    """
+    message = (message or "").strip()
+    if not message:
+        return "Error: 'message' is required."
+    if not channel_id and not channel_name:
+        return "Error: either 'channel_id' or 'channel_name' is required."
+
+    if not _CREDS_AVAILABLE:
+        _load_discord_creds()   # see call_discord() -- picks up a key added after startup
+        if not _CREDS_AVAILABLE:
+            return f"Error: Discord is not configured — {_discord_load_msg}"
+
+    ok, msg = _ensure_bot_running()
+    if not ok:
+        return f"Error: could not start the Discord bot — {msg}"
+
+    async def _resolve_and_send():
+        channel = None
+        if channel_id:
+            try:
+                cid = int(channel_id)
+            except ValueError:
+                return None, f"Error: channel_id must be numeric, got '{channel_id}'."
+            channel = _bot.get_channel(cid)
+            if channel is None:
+                try:
+                    channel = await _bot.fetch_channel(cid)
+                except Exception as e:
+                    return None, f"Error: could not find channel '{channel_id}': {e}"
+        else:
+            channel = _find_text_channel_by_name(channel_name, guild_id)
+            if channel is None:
+                scope = f" in server {guild_id}" if guild_id else ""
+                return None, f"Error: no text channel named '{channel_name}' found{scope}. Try list_discord_servers()."
+
+        for chunk in _split_for_discord(message):
+            await channel.send(chunk)
+        guild_name = getattr(getattr(channel, "guild", None), "name", "unknown server")
+        return f"Success: message sent to #{getattr(channel, 'name', channel_id)} in '{guild_name}'.", None
+
+    future = asyncio.run_coroutine_threadsafe(_resolve_and_send(), _bot_loop)
+    try:
+        result, err = future.result(timeout=30)
+    except Exception as e:
+        return f"Error sending Discord message: {e}"
+    return err or result
 
 
 def start_discord_bot() -> str:
