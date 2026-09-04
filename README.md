@@ -10,7 +10,7 @@ Midum is an agentic framework built for local AI desktop assistance. It can help
 
 <img width="1276" height="779" alt="image" src="https://github.com/user-attachments/assets/e4c30848-f9e4-4265-a871-8dff452e5575" />
 
-
+Created by Parth Satija, maintained by Parth Satija in collaboration with Kairos Syndicate.
 
 ## What Midum Can Do
 
