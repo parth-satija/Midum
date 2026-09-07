@@ -80,6 +80,13 @@ import permissions
 
 CHATS_DIR = os.path.join(midum.STORAGE_DIR, "chats")
 
+# Snapshot of which conversation tabs were open (and which was active) the
+# last time Midum closed -- see Api._persist_open_tabs / _restore_tabs_or_start_fresh.
+# Stores each open tab's PERSISTED chat id (in tab order), not its in-RAM
+# conversation_tabs.py tab id, which is just a per-process counter and
+# means nothing after a restart.
+OPEN_TABS_FILE = os.path.join(midum.STORAGE_DIR, "open_tabs.json")
+
 _SAY_TAG = "\x02MIDUM_SAY\x02"
 
 # Only lines that represent an actual tool invocation should light up the
@@ -258,6 +265,295 @@ TAB_DEFS = [
 
 
 # =============================================================================
+# Custom titlebar — native Windows Snap support
+#
+# Frameless windows (see webview.create_window(frameless=True, ...) at the
+# bottom of this file) lose the OS titlebar and, with it, every OS-level
+# behavior that hangs off it: drag-to-move, drag-to-edge/Aero-Snap,
+# Win+Left/Right/Up/Down, double-click-to-maximize, and (Windows 11) the
+# Snap Layouts flyout you get from hovering the maximize button. None of
+# that can be recreated in pure JS/CSS or by any JS library -- dragging a
+# DOM element around does not move an OS window, and no browser API can
+# ask DWM to snap a window or draw the Snap Layouts flyout. The only way
+# to get genuine OS snapping back on a frameless window is to tell Windows
+# that parts of the client area ARE the caption/min/max/close buttons,
+# via a WM_NCHITTEST subclass -- the same technique Windows Terminal,
+# VS Code, and Chromium's own custom-titlebar mode use.
+# =============================================================================
+
+_TITLEBAR_H = 36     # px, must match #app-titlebar's height in the HTML/CSS below
+_CAPTION_BTN_W = 46  # px, must match .titlebar-btn's width in the CSS below
+_RESIZE_BORDER = 6   # px, invisible resize grab area outside a maximized window
+_snap_wndproc_refs = {}  # hwnd -> ctypes callback, kept alive to avoid GC
+
+
+def _find_own_hwnd(title_hint: str = "Midum Control Center"):
+    """Locates this process's own top-level window by walking all windows
+    owned by our PID, matched by title. More robust than trying to pull a
+    native handle out of pywebview's Qt wrapper directly, since that
+    internal shape can vary across pywebview/PySide/PyQt versions."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        pid = kernel32.GetCurrentProcessId()
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum_cb(hwnd, _lparam):
+            wpid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+            if wpid.value == pid and user32.IsWindowVisible(hwnd):
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buf, length + 1)
+                    if title_hint in buf.value:
+                        found.append(hwnd)
+            return True
+
+        user32.EnumWindows(_enum_cb, 0)
+        return found[0] if found else None
+    except Exception:
+        return None
+
+
+def _win_show_window(window, sw_cmd: int) -> bool:
+    """ShowWindow(hwnd, sw_cmd) on our own top-level window. Returns False
+    (never raises) if the hwnd can't be found, so callers can fall back to
+    pywebview's own minimize()/toggle_fullscreen()."""
+    try:
+        import ctypes
+        hwnd = _find_own_hwnd()
+        if not hwnd:
+            return False
+        ctypes.windll.user32.ShowWindow(hwnd, sw_cmd)
+        return True
+    except Exception:
+        return False
+
+
+def _install_win_snap_hook(window):
+    """Subclasses our window's WNDPROC to answer WM_NCHITTEST as if the
+    top _TITLEBAR_H px were a real caption bar and the rightmost three
+    _CAPTION_BTN_W-wide slots were real min/max/close buttons. Reporting
+    HTCAPTION/HTMINBUTTON/HTMAXBUTTON/HTCLOSE hands drag-to-move,
+    Aero-Snap, Win+arrow snapping, and (on Windows 11) the Snap Layouts
+    hover-flyout on the "maximize" zone straight back to the OS -- exactly
+    as if this were a normal titlebar. Every other message is passed
+    through untouched to the original WNDPROC. Best-effort: any failure
+    just leaves the window without native snap (drag still works via the
+    JS/-webkit-app-region fallback, just without OS snapping).
+
+    IMPORTANT ctypes note: GetWindowLongPtrW/SetWindowLongPtrW/
+    CallWindowProcW all move pointer-sized (LONG_PTR) values. ctypes
+    defaults every foreign function to restype=c_int (32-bit) unless told
+    otherwise -- left at that default, the 64-bit original-WNDPROC
+    pointer gets silently truncated/corrupted, and CallWindowProcW is then
+    called against a garbage address for every single message the window
+    receives (not just WM_NCHITTEST), which looks like "the whole GUI
+    stopped responding" rather than just the titlebar. All three are
+    given explicit c_void_p/argtypes below specifically to avoid that.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        hwnd = _find_own_hwnd()
+        if not hwnd:
+            return
+
+        user32 = ctypes.windll.user32
+        GWLP_WNDPROC = -4
+        WM_NCHITTEST = 0x0084
+        WM_NCCALCSIZE = 0x0083
+        HTCLIENT, HTCAPTION = 1, 2
+        HTLEFT, HTRIGHT, HTTOP, HTBOTTOM = 10, 11, 12, 15
+        HTTOPLEFT, HTTOPRIGHT, HTBOTTOMLEFT, HTBOTTOMRIGHT = 13, 14, 16, 17
+
+        is_64bit = ctypes.sizeof(ctypes.c_void_p) == 8
+        LRESULT = ctypes.c_longlong if is_64bit else ctypes.c_long
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM)
+
+        # -- Explicit signatures (see docstring above for why this matters) --
+        if is_64bit:
+            get_wndproc, set_wndproc = user32.GetWindowLongPtrW, user32.SetWindowLongPtrW
+        else:
+            get_wndproc, set_wndproc = user32.GetWindowLongW, user32.SetWindowLongW
+        get_wndproc.restype = ctypes.c_void_p
+        get_wndproc.argtypes = [wintypes.HWND, ctypes.c_int]
+        set_wndproc.restype = ctypes.c_void_p
+        set_wndproc.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        user32.CallWindowProcW.restype = LRESULT
+        user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        call_wndproc = user32.CallWindowProcW
+
+        # WM_NCHITTEST/GetWindowRect coordinates are PHYSICAL pixels, but
+        # _TITLEBAR_H/_CAPTION_BTN_W/_RESIZE_BORDER are logical/CSS pixels
+        # (they have to match the HTML's #app-titlebar/.titlebar-btn sizes,
+        # which Chromium lays out in logical pixels). The physical-per-
+        # logical ratio is read from `window._snap_dpi_scale` -- set by
+        # the JS side from its OWN window.devicePixelRatio (see
+        # initTitlebar()/set_dpi_scale below) -- rather than queried here
+        # via GetDpiForWindow. Chromium (inside QtWebEngine) can end up
+        # rendering at a different effective scale than the raw Windows
+        # monitor DPI depending on Qt's own HighDPI handling, so asking
+        # Windows for "the" DPI and asking Chromium what it actually used
+        # are not guaranteed to agree -- devicePixelRatio is the one value
+        # that's always exactly right for translating a physical WM_
+        # NCHITTEST coordinate back into the CSS pixels the titlebar was
+        # laid out in. Read fresh on every hit-test so a monitor change
+        # (different scaling) is picked up automatically once JS reports it.
+        def _current_scale():
+            try:
+                s = float(getattr(window, "_snap_dpi_scale", 1.0) or 1.0)
+                return s if s > 0 else 1.0
+            except Exception:
+                return 1.0
+
+        def _wnd_proc(h, msg, wparam, lparam):
+            try:
+                if msg == WM_NCCALCSIZE and wparam:
+                    # Returning 0 here (instead of forwarding to the
+                    # original WNDPROC/DefWindowProc) tells Windows the
+                    # client rect is the ENTIRE proposed window rect --
+                    # i.e. reserve no space for the caption/borders the
+                    # WS_CAPTION|WS_THICKFRAME style bits above would
+                    # otherwise cause it to paint. That's what makes the
+                    # window still look fully custom/frameless despite
+                    # now carrying "real window" styles for snap purposes.
+                    return 0
+                if msg == WM_NCHITTEST:
+                    x = ctypes.c_short(lparam & 0xFFFF).value
+                    y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+                    rc = wintypes.RECT()
+                    user32.GetWindowRect(h, ctypes.byref(rc))
+                    lx, ly = x - rc.left, y - rc.top
+                    w, hgt = rc.right - rc.left, rc.bottom - rc.top
+                    scale = _current_scale()
+
+                    b = _RESIZE_BORDER * scale
+                    on_left, on_right = lx < b, lx > w - b
+                    on_top, on_bottom = ly < b, ly > hgt - b
+                    if on_top and on_left: return HTTOPLEFT
+                    if on_top and on_right: return HTTOPRIGHT
+                    if on_bottom and on_left: return HTBOTTOMLEFT
+                    if on_bottom and on_right: return HTBOTTOMRIGHT
+                    if on_left: return HTLEFT
+                    if on_right: return HTRIGHT
+                    if on_top: return HTTOP
+                    if on_bottom: return HTBOTTOM
+
+                    titlebar_h_px = _TITLEBAR_H * scale
+                    btn_w_px = _CAPTION_BTN_W * scale
+                    if ly < titlebar_h_px:
+                        btn_start = w - btn_w_px * 3
+                        # The button strip must report plain HTCLIENT, not
+                        # HTMINBUTTON/HTMAXBUTTON/HTCLOSE: those hit-test
+                        # codes mean "this is a native, OS-drawn caption
+                        # button" and Windows then treats every mouse
+                        # message over them as non-client -- Chromium's
+                        # DOM never receives a hover or click there at
+                        # all. Our buttons are plain HTML, so they need
+                        # real client-area mouse messages; JS onclick
+                        # handlers already call titlebar_minimize/
+                        # titlebar_toggle_maximize/titlebar_close (see
+                        # initTitlebar() below) to do the actual native
+                        # action. Trade-off: this means hovering the
+                        # maximize button won't trigger Windows 11's Snap
+                        # Layouts flyout, since that specifically requires
+                        # a genuine OS-owned caption button -- edge-drag
+                        # and Win+arrow snapping (from HTCAPTION below)
+                        # still work fine.
+                        if lx >= btn_start:
+                            return HTCLIENT
+                        # Everything else in the titlebar row defaults to
+                        # HTCAPTION (real OS drag) -- but that's a BLANKET
+                        # rule that knows nothing about the titlebar's own
+                        # DOM layout, so any clickable HTML placed in
+                        # #titlebar-center (the conversation-tab strip,
+                        # "+" new-tab button, tab-group dropdown -- see
+                        # #conv-tab-controls in the HTML/JS below) would
+                        # never receive a real click on Windows no matter
+                        # what -webkit-app-region CSS says, since HTCAPTION
+                        # hit-test results are resolved entirely at the OS
+                        # level before Chromium ever sees the message.
+                        # reportTitlebarNodragZones() (JS) keeps
+                        # window._nodrag_zones (logical/CSS px, set via
+                        # Api.set_titlebar_nodrag_zones) up to date with
+                        # that DOM's actual bounding rect; anything inside
+                        # one of those rects gets real client-area mouse
+                        # messages instead of being swallowed as caption.
+                        for z in (getattr(window, "_nodrag_zones", None) or []):
+                            try:
+                                zl, zt = z["left"] * scale, z["top"] * scale
+                                zr, zb = z["right"] * scale, z["bottom"] * scale
+                            except Exception:
+                                continue
+                            if zl <= lx <= zr and zt <= ly <= zb:
+                                return HTCLIENT
+                        return HTCAPTION
+                    return HTCLIENT
+            except Exception:
+                # Never let a bug in this hook eat the message -- fall
+                # through to the original WNDPROC below just like any
+                # other message would.
+                pass
+            return call_wndproc(_snap_wndproc_refs[hwnd], h, msg, wparam, lparam)
+
+        cb = WNDPROC(_wnd_proc)
+        old_proc = get_wndproc(hwnd, GWLP_WNDPROC)
+        if not old_proc:
+            print("[titlebar] Windows Snap hook not installed: could not read the original WNDPROC.")
+            return
+        _snap_wndproc_refs[hwnd] = old_proc
+        set_wndproc(hwnd, GWLP_WNDPROC, cb)
+        # Keep the ctypes callback object referenced for the process's
+        # lifetime -- if it gets garbage-collected the window's WNDPROC
+        # would point at freed memory the moment Windows calls it.
+        _snap_wndproc_refs[f"{hwnd}_cb"] = cb
+
+        # Only NOW -- with our WM_NCCALCSIZE-suppressing WNDPROC already
+        # active -- put the real window styles back. pywebview's
+        # frameless=True gives the HWND a bare WS_POPUP style on Windows,
+        # missing WS_CAPTION/WS_THICKFRAME/WS_MAXIMIZEBOX/WS_MINIMIZEBOX/
+        # WS_SYSMENU. Those bits are what the window manager checks for
+        # snap-eligibility -- WM_NCHITTEST alone (already handled above)
+        # only controls hit-testing, not whether Windows considers the
+        # window snap/maximize-capable at all, which is exactly why
+        # clicks/hover worked but Aero Snap and the Snap Layouts flyout
+        # didn't. Restoring the bits AFTER the subclass is installed (not
+        # before) matters too: SWP_FRAMECHANGED forces an immediate
+        # WM_NCCALCSIZE recalculation, and if that fires against the
+        # original (Qt) WNDPROC instead of ours, DefWindowProc would
+        # briefly compute a real caption+border client-rect shrink --
+        # i.e. a one-frame flash of a native titlebar -- before our
+        # handler ever gets a chance to suppress it. This is the same
+        # "real styles + hidden non-client area" technique apps like
+        # Windows Terminal/VS Code use for a custom titlebar that still
+        # gets genuine OS snapping.
+        GWL_STYLE = -16
+        WS_CAPTION     = 0x00C00000
+        WS_THICKFRAME  = 0x00040000
+        WS_MINIMIZEBOX = 0x00020000
+        WS_MAXIMIZEBOX = 0x00010000
+        WS_SYSMENU     = 0x00080000
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_FRAMECHANGED = 0x2, 0x1, 0x4, 0x10, 0x20
+        style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+        style |= WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
+        user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+        user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+    except Exception as e:
+        print(f"[titlebar] Windows Snap hook not installed: {e}")
+
+
+# =============================================================================
 # JS <-> Python bridge — every method here is callable from the frontend as
 # `pywebview.api.<method>(...)` and returns JSON-serialisable data.
 # =============================================================================
@@ -308,6 +604,21 @@ class Api:
         # it was fully rendered on screen.
         self._persist_lock     = threading.Lock()
         self._chat_store       = ChatStore(CHATS_DIR)
+
+        # ── Conversation tabs (see conversation_tabs.py) ────────────────────
+        # Everything below this comment (_current_chat_id, _chat_title,
+        # _display_log, _kb_state, _explain_progress/_explain_page_progress,
+        # _render_surface_*) is GUI-visible state that belongs to whichever
+        # conversation tab is currently active -- conversation_tabs.py only
+        # tracks each tab's raw LLM history list, not this GUI-only stuff.
+        # tab_id -> a snapshot dict of all of it, for every tab that ISN'T
+        # the active one right now (see _snapshot_gui_state/_load_tab_gui_state
+        # below). The active tab's copy of this state simply lives in the
+        # plain self._current_chat_id/_chat_title/etc attributes below, same
+        # as before tabs existed -- switching tabs snapshots the outgoing
+        # tab's state in here, then loads the incoming tab's state (or
+        # blanks, for a brand-new tab) into those attributes.
+        self._tab_gui_state    = {}
         self._current_chat_id  = uuid.uuid4().hex
         self._chat_title       = None
         self._display_log      = []
@@ -622,13 +933,71 @@ class Api:
             saved = self.get_settings()
             self.apply_model(saved["provider"], saved["model"])
 
+            midum.memory._bootstrap_all_files()
+
+            # Every launch starts a genuinely new session GOAL/NOTES file --
+            # the same reset the "New Chat" button performs. This is
+            # separate from which chat TABS are open (see
+            # _restore_tabs_or_start_fresh below, which DOES restore those
+            # across a restart) -- there's just no need to silently carry
+            # the previous session's goal/notes forward into whatever tabs
+            # come back.
+            self._reset_session_memory_file()
+
+            try:
+                sys_prompt = midum.get_system_prompt()
+            except AttributeError:
+                sys_prompt = "You are Midum. Rules:\n- Proceed safely."
+
+            memories = []
+            master_ctx = midum.memory.load_memory_into_context(midum.MASTER_MEMORY, "master")
+            if master_ctx:
+                memories.append(master_ctx)
+            try:
+                with open(midum.INSTRUCTIONS_FILE, "r", encoding="utf-8") as f:
+                    _instr = f.read().strip()
+                if _instr:
+                    memories.append("[MIDUM INSTRUCTIONS — always active]\n" + _instr)
+            except Exception:
+                pass
+
+            self._session.initialise(sys_prompt, memories)
+
+            # Reopen every tab that was open the last time Midum closed
+            # (or start a single fresh tab if there's no saved state / it
+            # all failed to restore) -- see _restore_tabs_or_start_fresh's
+            # own docstring. Must happen AFTER initialise() above, not in
+            # __init__ -- initialise() reassigns self._session.history to
+            # a brand-new list object, and the fresh-tab fallback path
+            # needs to capture that final object by reference, not
+            # whatever empty list existed before initialise() ran.
+            import conversation_tabs
+            self._restore_tabs_or_start_fresh(sys_prompt, memories)
+
+            # Everything above this point is exactly what's needed to know
+            # which tabs were open last time and show them -- cheap, local,
+            # no network/subprocess involved. Push it to the frontend RIGHT
+            # NOW rather than waiting on the slower subsystems below (MCP
+            # server reconnects, the scheduler, the Discord bot), which used
+            # to run first and gate the tab strip's very first paint behind
+            # themselves for no real reason -- none of them affect which
+            # tabs exist or what's in them. JS listens for this event and
+            # calls buildConversationTabs() immediately; "status":"Ready"
+            # further down still marks the whole app as fully booted.
+            #
+            # Also hand over the ACTIVE tab's own display log + KB/Explain
+            # state right here, same shape switch_conversation_tab returns
+            # -- otherwise the chat pane sits empty (showing none of the
+            # restored conversation) until the user manually switches away
+            # from and back to this tab, since nothing else ever pushes
+            # this tab's content to the frontend on a plain launch.
+            self._push_event("tabs_restored", {"display": self._display_log, "kb_state": self._kb_state})
+
             configs = midum._load_mcp_config()
             if configs:
                 self._push_event("log", {"text": f"🔌 Reconnecting {len(configs)} saved MCP server(s)...\n"})
                 midum.init_mcp_servers_from_config()
                 self._push_event("mcp_changed", {})
-
-            midum.memory._bootstrap_all_files()
 
             # Scheduler: only fires while this app is open (see scheduler.py's
             # module docstring) -- start the background tick thread now, once
@@ -658,32 +1027,6 @@ class Api:
             except Exception as e:
                 self._push_event("log", {"text": f"⚠️ Discord bot failed to auto-start: {e}\n"})
 
-            # Every launch starts a genuinely new session -- the same reset
-            # the "New Chat" button performs. Full continuity across
-            # restarts is already covered by the persisted chat history
-            # (sidebar -> open any past chat), so there's no need to
-            # silently carry the previous session's goal/notes forward
-            # into what the UI is showing as a brand-new, empty chat.
-            self._reset_session_memory_file()
-
-            try:
-                sys_prompt = midum.get_system_prompt()
-            except AttributeError:
-                sys_prompt = "You are Midum. Rules:\n- Proceed safely."
-
-            memories = []
-            master_ctx = midum.memory.load_memory_into_context(midum.MASTER_MEMORY, "master")
-            if master_ctx:
-                memories.append(master_ctx)
-            try:
-                with open(midum.INSTRUCTIONS_FILE, "r", encoding="utf-8") as f:
-                    _instr = f.read().strip()
-                if _instr:
-                    memories.append("[MIDUM INSTRUCTIONS — always active]\n" + _instr)
-            except Exception:
-                pass
-
-            self._session.initialise(sys_prompt, memories)
             self._push_event("status", {"text": "Ready", "level": "ok"})
         except Exception as e:
             self._push_event("status", {"text": f"Startup error: {e}", "level": "err"})
@@ -944,7 +1287,7 @@ class Api:
             self._voice_stream_idx = len(self._display_log) - 1
             self._voice_stream_tag = tag
             if not self._chat_title and tag == "user":
-                self._chat_title = text[:60] or None
+                self._set_chat_title_from_first_message(text)
             with self._session._lock:
                 self._session.history.append({"role": session_role, "content": text})
 
@@ -1710,6 +2053,91 @@ class Api:
             return {"ok": False, "error": str(e)}
 
     # ── Chat history (sidebar) ────────────────────────────────────────────
+    def get_titlebar_info(self):
+        """Backs the custom titlebar's left-side label + model pill (see
+        #app-titlebar / refreshTitlebarInfo() in the HTML/JS below)."""
+        return {
+            "title": self._chat_title or "Untitled chat",
+            "model": self._selected_model or "(auto)",
+            "provider": self._selected_provider,
+        }
+
+    def set_dpi_scale(self, scale):
+        """Called from JS (initTitlebar / a resize listener) with the
+        browser's own window.devicePixelRatio -- the ground truth for how
+        many physical pixels correspond to one CSS pixel in THIS
+        Chromium view. Stashed on the window object so the native
+        WM_NCHITTEST hook (_install_win_snap_hook) can convert physical
+        hit-test coordinates back into the logical/CSS pixels the
+        titlebar's HTML was laid out in, without having to guess at (and
+        potentially disagree with) Windows' own GetDpiForWindow value."""
+        try:
+            self.window._snap_dpi_scale = float(scale) or 1.0
+        except Exception:
+            pass
+        return {"ok": True}
+
+    def set_titlebar_nodrag_zones(self, zones):
+        """Called from JS (reportTitlebarNodragZones) with the bounding
+        rects (logical/CSS px, {left,top,right,bottom}, viewport-relative --
+        which lines up with the titlebar since it's pinned to the top) of
+        whatever clickable HTML currently lives inside #titlebar-center
+        (the conversation-tab strip, its "+" button, the tab-group
+        dropdown). The native WM_NCHITTEST hook (_install_win_snap_hook)
+        otherwise treats that entire region as plain OS drag-caption --
+        a decision made at the OS level, before Chromium/CSS ever gets a
+        say -- so without this, nothing placed there could ever actually
+        be clicked on Windows. No-op (and harmless) on platforms without
+        that hook."""
+        try:
+            self.window._nodrag_zones = zones or []
+        except Exception:
+            pass
+        return {"ok": True}
+
+    def titlebar_minimize(self):
+        """Minimize button on the custom titlebar. Windows: a real native
+        ShowWindow(SW_MINIMIZE) so it behaves exactly like a normal
+        titlebar's minimize (taskbar animation, etc.) rather than
+        whatever pywebview's own minimize() does on this backend.
+        Falls back to pywebview's own method elsewhere / on failure."""
+        if sys.platform == "win32" and _win_show_window(self.window, 6):  # SW_MINIMIZE
+            return {"ok": True}
+        try:
+            self.window.minimize()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True}
+
+    def titlebar_toggle_maximize(self):
+        """Maximize/Restore button. On Windows this checks IsZoomed() and
+        flips it with a real ShowWindow call, so Snap Layouts / restoring
+        to a previously-snapped half/quarter all behave like a normal
+        window. Off Windows, toggle_fullscreen() is the closest pywebview
+        equivalent."""
+        if sys.platform == "win32":
+            hwnd = _find_own_hwnd()
+            if hwnd:
+                try:
+                    import ctypes
+                    is_zoomed = bool(ctypes.windll.user32.IsZoomed(hwnd))
+                    _win_show_window(self.window, 9 if is_zoomed else 3)  # SW_RESTORE / SW_MAXIMIZE
+                    return {"ok": True, "maximized": not is_zoomed}
+                except Exception as e:
+                    return {"ok": False, "error": str(e)}
+        try:
+            self.window.toggle_fullscreen()
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def titlebar_close(self):
+        try:
+            self.window.destroy()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True}
+
     def list_chats(self):
         chats = self._chat_store.list_chats()
         for c in chats:
@@ -1730,6 +2158,19 @@ class Api:
         with self._session._lock:
             self._session.history = history
             self._session.turn_counter = max(1, sum(1 for m in history if m.get("role") == "user"))
+        # Loading a saved chat replaces the CURRENT tab's conversation in
+        # place (note: new_session() used to work this way too, but now
+        # opens an additional tab instead -- see its own comment) rather
+        # than opening a new tab, so conversation_tabs.py's record for the
+        # active tab needs its history list mutated to match, not swapped
+        # for a different object it doesn't know about.
+        import conversation_tabs
+        active_id = conversation_tabs.get_active_tab_id()
+        if active_id:
+            live = conversation_tabs.get_tab_history(active_id)
+            if live is not None:
+                live[:] = self._session.history
+                self._session.history = live
         self._display_log = list(data.get("display", []))
         self._voice_stream_tag = None
         self._voice_stream_idx = None
@@ -1761,12 +2202,81 @@ class Api:
         self._render_surface_title = saved_render.get("title") if saved_render else None
         self._render_surface_open  = False
         self._push_event("render_surface_close", {})
+        if active_id:
+            self._tab_gui_state[active_id] = self._snapshot_gui_state()
+        self._persist_open_tabs()
         return {"ok": True, "display": self._display_log, "kb_state": self._kb_state}
+
+    def open_chat_in_new_tab(self, chat_id: str):
+        """Opening a chat from the sidebar's History list opens it as an
+        ADDITIONAL conversation tab (see conversation_tabs.py) -- whatever
+        tab is currently active is left completely untouched, unlike
+        load_chat() (still used e.g. by "delete_chat" bookkeeping), which
+        overwrites the CURRENT tab's conversation in place. The sidebar's
+        chat history is a library of saved conversations to reopen; the
+        titlebar's tab strip is what's actually open in RAM right now --
+        this is what turns a library entry into an open tab."""
+        if self._thinking:
+            return {"ok": False, "error": "Busy — wait for the current run to finish or abort first."}
+        import conversation_tabs
+        try:
+            data = self._chat_store.load(chat_id)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+        try:
+            # Resync the OUTGOING tab's stored history before touching any
+            # of self._session/_display_log/etc. -- same reasoning as
+            # switch_conversation_tab: those attributes are about to be
+            # overwritten with the reopened chat's content, but they still
+            # belong to whichever tab is active RIGHT NOW until this call
+            # finishes and hands the new tab a snapshot of its own.
+            self._save_active_tab_gui_state()
+
+            history = list(data.get("history") or [])
+            self._current_chat_id = data.get("id", chat_id)
+            self._chat_title = data.get("title")
+            with self._session._lock:
+                self._session.history = history
+                self._session.turn_counter = max(1, sum(1 for m in history if m.get("role") == "user"))
+            self._display_log = list(data.get("display", []))
+            self._voice_stream_tag = None
+            self._voice_stream_idx = None
+            saved_kb_state = data.get("kb_state") or {}
+            self._kb_state = {
+                "kb_only": bool(saved_kb_state.get("kb_only", False)),
+                "kb_sources": list(saved_kb_state.get("kb_sources") or []),
+                "explain_mode": bool(saved_kb_state.get("explain_mode", False)),
+                "explain_mode_type": saved_kb_state.get("explain_mode_type") or "part",
+            }
+            self._explain_progress = dict(data.get("explain_progress") or {})
+            self._explain_page_progress = dict(data.get("explain_page_progress") or {})
+            saved_render = data.get("render_surface") or None
+            self._render_surface_code  = saved_render.get("code") if saved_render else None
+            self._render_surface_title = saved_render.get("title") if saved_render else None
+            self._render_surface_open  = False
+            self._push_event("render_surface_close", {})
+
+            # NOW register the new tab, wrapping the reopened chat's own
+            # (freshly copied, not shared with any other tab) history list.
+            tab_id = conversation_tabs.open_tab(kind="user", history=self._session.history, activate=True)
+            self._tab_gui_state[tab_id] = self._snapshot_gui_state()
+            self._persist_open_tabs()
+
+            return {"ok": True, "tab_id": tab_id, "tabs": conversation_tabs.list_tabs(),
+                    "display": self._display_log, "kb_state": self._kb_state}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def delete_chat(self, chat_id: str):
         self._chat_store.delete(chat_id)
         if chat_id == self._current_chat_id:
             self._start_new_chat_record()
+            import conversation_tabs
+            active_id = conversation_tabs.get_active_tab_id()
+            if active_id:
+                self._tab_gui_state[active_id] = self._snapshot_gui_state()
+            self._persist_open_tabs()
         return {"ok": True, "chats": self.list_chats()}
 
     def rename_chat(self, chat_id: str, new_title: str):
@@ -1798,13 +2308,28 @@ class Api:
         )
 
     def new_session(self):
+        # The sidebar's "New Chat" button. Now behaves exactly like the
+        # titlebar's "+" (new_conversation_tab): opens an ADDITIONAL,
+        # blank tab rather than resetting the current tab's conversation
+        # in place -- so whatever's currently open (and its history) stays
+        # exactly as it was, and "new chat" always means "a new tab",
+        # never "erase what I was just looking at". Kept as its own
+        # method (rather than just aliasing new_conversation_tab) since
+        # the two buttons may want to diverge again later; for now the
+        # bodies are intentionally identical.
         if self._thinking:
             return {"ok": False, "error": "Busy — wait for the current run to finish or abort first."}
+        import conversation_tabs
         try:
+            self._save_active_tab_gui_state()
             self._reset_session_memory_file()
-            self._session.reset()
+            self._session.reset()  # reassigns self._session.history to a brand-new list
             self._start_new_chat_record()
-            return {"ok": True}
+            tab_id = conversation_tabs.open_tab(kind="user", history=self._session.history, activate=True)
+            self._tab_gui_state[tab_id] = self._snapshot_gui_state()
+            self._persist_open_tabs()
+            return {"ok": True, "tab_id": tab_id, "tabs": conversation_tabs.list_tabs(),
+                    "display": self._display_log, "kb_state": self._kb_state}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -1829,6 +2354,472 @@ class Api:
         self._render_surface_open  = False
         self._push_event("render_surface_close", {})
 
+    # =========================================================================
+    # CONVERSATION TABS -- GUI layer over conversation_tabs.py
+    # =========================================================================
+    # conversation_tabs.py only owns each tab's raw LLM history list (plus
+    # auto open/close around a sub-agent's task). Everything else the GUI
+    # shows per-conversation -- chat bubbles, KB Only / Explain Mode state,
+    # the persisted-chat id/title used by the sidebar's chat history, any
+    # open Render Surface -- lives in the plain self._current_chat_id /
+    # _chat_title / _display_log / etc attributes, same as before tabs
+    # existed. These helpers snapshot that bundle into
+    # self._tab_gui_state[tab_id] when leaving a tab and load it back out
+    # when entering one, so switching tabs is instant and each tab's chat
+    # pane comes back exactly as it was left -- no bleeding between tabs.
+
+    def _blank_gui_state(self) -> dict:
+        return {
+            'turn_counter': 1,
+            'chat_id': uuid.uuid4().hex,
+            'chat_title': None,
+            'display_log': [],
+            'kb_state': {
+                'kb_only': False, 'kb_sources': [],
+                'explain_mode': False, 'explain_mode_type': 'part',
+            },
+            'explain_progress': {},
+            'explain_page_progress': {},
+            'render_surface_code': None,
+            'render_surface_title': None,
+        }
+
+    def _snapshot_gui_state(self) -> dict:
+        return {
+            'turn_counter': self._session.turn_counter,
+            'chat_id': self._current_chat_id,
+            'chat_title': self._chat_title,
+            'display_log': list(self._display_log),
+            'kb_state': dict(self._kb_state),
+            'explain_progress': dict(self._explain_progress),
+            'explain_page_progress': dict(self._explain_page_progress),
+            'render_surface_code': self._render_surface_code,
+            'render_surface_title': self._render_surface_title,
+        }
+
+    def _save_active_tab_gui_state(self):
+        import conversation_tabs
+        active_id = conversation_tabs.get_active_tab_id()
+        if active_id:
+            # self._session.history gets reassigned to brand-new list
+            # objects in several places while this tab is active
+            # (_run_turn after every reply, switch_project, etc.) for
+            # reasons that have nothing to do with tabs -- so the object
+            # conversation_tabs was handed back at open_tab()/switch_tab()
+            # time is very likely NOT the one holding this tab's actual
+            # current content anymore. Explicitly resync content here,
+            # the one moment that matters: right before switching away.
+            conversation_tabs.set_tab_history(active_id, self._session.history)
+            self._tab_gui_state[active_id] = self._snapshot_gui_state()
+
+    def _load_tab_gui_state(self, tab_id: str):
+        # Makes `tab_id` the live conversation: restores its GUI bundle (or
+        # a blank one, for a tab that's never had a turn run in it yet)
+        # into the plain self._current_chat_id/_chat_title/etc attributes,
+        # and points self._session.history at that tab's OWN live history
+        # list (conversation_tabs.get_tab_history) -- the exact same object
+        # conversation_tabs holds for it, never a copy, so nothing written
+        # during this tab's turns can bleed into any other tab.
+        import conversation_tabs
+        state = self._tab_gui_state.get(tab_id) or self._blank_gui_state()
+        self._session.history = conversation_tabs.get_tab_history(tab_id)
+        if self._session.history is None:
+            self._session.history = []
+        self._session.turn_counter        = state['turn_counter']
+        self._current_chat_id             = state['chat_id']
+        self._chat_title                  = state['chat_title']
+        self._display_log                 = state['display_log']
+        self._kb_state                    = state['kb_state']
+        self._explain_progress            = state['explain_progress']
+        self._explain_page_progress       = state['explain_page_progress']
+        self._render_surface_code         = state['render_surface_code']
+        self._render_surface_title        = state['render_surface_title']
+        # Same reasoning as load_chat(): never auto-reopen a Render Surface
+        # belonging to the tab being switched TO -- force-close whatever
+        # panel is on screen (it belonged to the tab being left).
+        self._render_surface_open = False
+        self._push_event('render_surface_close', {})
+
+    def list_conversation_tabs(self):
+        # Every open conversation tab -- id, title, kind, message count, and
+        # which one is active. Backs the titlebar's tab strip.
+        #
+        # Title resolution: conversation_tabs._derive_title() only knows
+        # about a tab's raw history, so left alone it names "user" tabs via
+        # its OWN independent model-generated title -- a second, separate
+        # title from the one already shown for the same chat in the
+        # sidebar's History list (self._chat_title / _tab_gui_state[...]
+        # ['chat_title'], set by _set_chat_title_from_first_message and
+        # persisted via _persist_current_chat). That mismatch is confusing
+        # (the tab strip and the sidebar can end up disagreeing about what
+        # a chat is called) and wasteful (two silent model calls to title
+        # the same conversation). So here the GUI's own already-known chat
+        # title -- the exact name the sidebar's History panel shows for
+        # this chat -- wins whenever one exists; conversation_tabs' derived
+        # title is only used as a fallback (e.g. brand-new tabs with no
+        # messages yet, or agent tabs, which have no sidebar entry at all).
+        import conversation_tabs
+        rows = conversation_tabs.list_tabs()
+        for row in rows:
+            if row["kind"] != "user":
+                continue
+            if row["active"]:
+                chat_title = self._chat_title
+            else:
+                chat_title = (self._tab_gui_state.get(row["id"]) or {}).get("chat_title")
+            if chat_title:
+                row["title"] = chat_title
+        return rows
+
+    # ── Persisting/restoring the open tab strip across restarts ──────────
+    # Closing and reopening Midum should leave the tab strip exactly as it
+    # was -- the same "restore previous session" behavior a browser gives
+    # you -- rather than always coming back up with a single blank tab and
+    # making the user dig through the sidebar's chat history to reopen
+    # whatever they had open. What's persisted is deliberately lightweight:
+    # just each open tab's PERSISTED chat id (in tab order) plus which one
+    # was active -- not a duplicate copy of any conversation's content,
+    # which already lives in CHATS_DIR via self._chat_store. Agent tabs are
+    # excluded: they're auto-managed and belong to a specific in-progress
+    # task that won't exist anymore after a restart (register_agent_tab /
+    # unregister_agent_tab already handle their whole lifecycle).
+
+    def _load_open_tabs_state(self):
+        try:
+            if os.path.exists(OPEN_TABS_FILE):
+                with open(OPEN_TABS_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            self._push_event("log", {"text": f"\u26a0\ufe0f Could not read saved tab state: {e}\n"})
+        return None
+
+    def _persist_open_tabs(self):
+        """
+        Snapshot which (non-agent) tabs are currently open, in order, plus
+        which one is active, and write it to OPEN_TABS_FILE. Called after
+        every tab-topology change (new tab, close tab, switch tab, opening
+        a chat into a new tab, opening a tab group, deleting/loading a
+        chat that's currently the active tab's own chat_id) so the file
+        never goes stale, and read back by _restore_tabs_or_start_fresh()
+        on the next launch.
+
+        For the ACTIVE tab, self._current_chat_id is used directly (it's
+        always the freshest value -- self._tab_gui_state's copy for the
+        active tab is only refreshed on the way OUT of it, see
+        _save_active_tab_gui_state). For every other open tab, its chat id
+        is read out of self._tab_gui_state, which IS current for any tab
+        that isn't the active one. Every tab (blank "New Tab" included)
+        already has a real chat id assigned the moment it's created (see
+        _blank_gui_state/_start_new_chat_record) -- restoring later just
+        means checking whether a file actually exists on disk for that id
+        yet, not treating "no id" as a special case here.
+        """
+        import conversation_tabs
+        try:
+            active_id = conversation_tabs.get_active_tab_id()
+            chat_ids = []
+            active_chat_id = None
+            for row in conversation_tabs.list_tabs():
+                if row["kind"] == "agent":
+                    continue
+                tab_id = row["id"]
+                if tab_id == active_id:
+                    chat_id = self._current_chat_id
+                else:
+                    chat_id = (self._tab_gui_state.get(tab_id) or {}).get("chat_id")
+                if not chat_id:
+                    continue
+                chat_ids.append(chat_id)
+                if tab_id == active_id:
+                    active_chat_id = chat_id
+            payload = {"active_chat_id": active_chat_id, "chat_ids": chat_ids}
+            os.makedirs(os.path.dirname(OPEN_TABS_FILE), exist_ok=True)
+            tmp_path = OPEN_TABS_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp_path, OPEN_TABS_FILE)
+        except Exception as e:
+            self._push_event("log", {"text": f"\u26a0\ufe0f Could not save open-tab state: {e}\n"})
+
+    def _restore_tabs_or_start_fresh(self, sys_prompt: str, memories: list):
+        """
+        Called once from _startup_worker, immediately after
+        self._session.initialise(sys_prompt, memories) has built the base
+        system-prompt-seeded history. Reopens every tab that was open the
+        last time Midum closed (see _persist_open_tabs/OPEN_TABS_FILE)
+        instead of always starting with a single blank tab.
+
+        Falls back to the original single-fresh-tab behavior if there's no
+        saved state, or if every saved tab fails to restore (all of their
+        chat files were deleted, the save file is corrupted, etc) --
+        there must always be at least one open tab (see the invariant on
+        conversation_tabs.close_tab), so this can never leave zero tabs
+        open even in a total-failure case.
+        """
+        import conversation_tabs
+
+        def _start_single_fresh_tab():
+            self._main_tab_id = conversation_tabs.open_tab(kind="user", history=self._session.history, activate=True)
+            self._tab_gui_state[self._main_tab_id] = self._snapshot_gui_state()
+
+        saved = self._load_open_tabs_state() or {}
+        chat_ids = saved.get("chat_ids") or []
+        if not chat_ids:
+            _start_single_fresh_tab()
+            self._persist_open_tabs()
+            return
+
+        active_chat_id = saved.get("active_chat_id")
+        # One independent COPY of the blank seed history per restored blank
+        # tab -- never the same list object shared between two tabs, which
+        # would violate conversation_tabs.py's "no context bleeding"
+        # guarantee the moment either tab got its first message.
+        blank_seed = list(self._session.history)
+
+        first_tab_id  = None
+        active_tab_id = None
+
+        for chat_id in chat_ids:
+            try:
+                data = self._chat_store.load(chat_id)
+            except Exception:
+                data = None
+
+            if data is not None:
+                history = list(data.get("history") or [])
+                tab_id = conversation_tabs.open_tab(kind="user", history=history, activate=False)
+                saved_kb_state = data.get("kb_state") or {}
+                self._tab_gui_state[tab_id] = {
+                    "turn_counter": max(1, sum(1 for m in history if m.get("role") == "user")),
+                    "chat_id": data.get("id", chat_id),
+                    "chat_title": data.get("title"),
+                    "display_log": list(data.get("display", [])),
+                    "kb_state": {
+                        "kb_only": bool(saved_kb_state.get("kb_only", False)),
+                        "kb_sources": list(saved_kb_state.get("kb_sources") or []),
+                        "explain_mode": bool(saved_kb_state.get("explain_mode", False)),
+                        "explain_mode_type": saved_kb_state.get("explain_mode_type") or "part",
+                    },
+                    "explain_progress": dict(data.get("explain_progress") or {}),
+                    "explain_page_progress": dict(data.get("explain_page_progress") or {}),
+                    # Never auto-reopen a Render Surface on launch -- same
+                    # reasoning as load_chat()/_load_tab_gui_state, doubly
+                    # so here since nothing is even visible on screen yet
+                    # for the surface to belong to.
+                    "render_surface_code": None,
+                    "render_surface_title": None,
+                }
+            else:
+                # Either a blank "New Tab" that had no messages yet when
+                # Midum closed (nothing was ever saved to disk for it --
+                # see _persist_current_chat's early-return on an empty
+                # _display_log) or a chat that's since been deleted.
+                # Recreate an equivalent empty tab, keeping the SAME
+                # chat_id so _persist_open_tabs keeps writing a stable id
+                # for this tab going forward.
+                tab_id = conversation_tabs.open_tab(kind="user", history=list(blank_seed), activate=False)
+                blank_state = self._blank_gui_state()
+                blank_state["chat_id"] = chat_id
+                self._tab_gui_state[tab_id] = blank_state
+
+            if first_tab_id is None:
+                first_tab_id = tab_id
+            if chat_id == active_chat_id:
+                active_tab_id = tab_id
+
+        if first_tab_id is None:
+            # Every saved tab failed to restore -- fall back rather than
+            # leaving zero tabs open.
+            _start_single_fresh_tab()
+            self._persist_open_tabs()
+            return
+
+        chosen = active_tab_id or first_tab_id
+        conversation_tabs.switch_tab(chosen)
+        self._load_tab_gui_state(chosen)
+        self._persist_open_tabs()
+
+    def new_conversation_tab(self):
+        # The titlebar's "+" button. Identical behavior to the sidebar's
+        # "New Chat" button (new_session, above) -- both open an
+        # additional, blank tab and leave whatever's currently open
+        # untouched. Kept as a separate method for the same reason
+        # new_session is -- see its comment.
+        if self._thinking:
+            return {'ok': False, 'error': 'Busy \u2014 wait for the current run to finish or abort first.'}
+        import conversation_tabs
+        try:
+            self._save_active_tab_gui_state()
+            self._reset_session_memory_file()
+            self._session.reset()  # reassigns self._session.history to a brand-new list
+            self._start_new_chat_record()
+            tab_id = conversation_tabs.open_tab(kind='user', history=self._session.history, activate=True)
+            self._tab_gui_state[tab_id] = self._snapshot_gui_state()
+            self._persist_open_tabs()
+            return {'ok': True, 'tab_id': tab_id, 'tabs': conversation_tabs.list_tabs(),
+                    'display': self._display_log, 'kb_state': self._kb_state}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def switch_conversation_tab(self, tab_id: str):
+        # Clicking a tab in the titlebar's tab strip. Instant -- no disk
+        # I/O, unlike load_chat -- since every open tab's full state
+        # already lives in RAM (self._tab_gui_state + conversation_tabs'
+        # own history lists).
+        if self._thinking:
+            return {'ok': False, 'error': 'Busy \u2014 wait for the current run to finish or abort first.'}
+        import conversation_tabs
+        if conversation_tabs.get_tab(tab_id) is None:
+            return {'ok': False, 'error': f"No tab '{tab_id}' is open."}
+        if tab_id == conversation_tabs.get_active_tab_id():
+            return {'ok': True, 'tabs': conversation_tabs.list_tabs(),
+                    'display': self._display_log, 'kb_state': self._kb_state}
+        try:
+            self._save_active_tab_gui_state()
+            conversation_tabs.switch_tab(tab_id)
+            self._load_tab_gui_state(tab_id)
+            self._persist_open_tabs()
+            return {'ok': True, 'tabs': conversation_tabs.list_tabs(),
+                    'display': self._display_log, 'kb_state': self._kb_state}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def close_conversation_tab(self, tab_id: str):
+        # Closing a tab in the titlebar. An "agent" tab (a sub-agent
+        # actively working) can't be closed by hand -- it closes itself the
+        # moment that task finishes (see conversation_tabs.register_agent_tab
+        # / unregister_agent_tab). Closing the very last remaining tab isn't
+        # allowed to leave zero tabs open -- it's reset in place instead,
+        # same effect as clicking "New Chat" on it.
+        if self._thinking:
+            return {'ok': False, 'error': 'Busy \u2014 wait for the current run to finish or abort first.'}
+        import conversation_tabs
+        tab = conversation_tabs.get_tab(tab_id)
+        if tab is None:
+            return {'ok': False, 'error': f"No tab '{tab_id}' is open."}
+        if tab['kind'] == 'agent':
+            return {'ok': False, 'error': "That tab belongs to a sub-agent that's still working \u2014 it'll close on its own once the task finishes."}
+
+        try:
+            if conversation_tabs.tab_count() <= 1:
+                # Last tab open -- reset it in place rather than closing it.
+                self._reset_session_memory_file()
+                self._session.reset()
+                self._start_new_chat_record()
+                live = conversation_tabs.get_tab_history(tab_id)
+                live[:] = self._session.history
+                self._session.history = live
+                self._tab_gui_state[tab_id] = self._snapshot_gui_state()
+                self._persist_open_tabs()
+                return {'ok': True, 'tabs': conversation_tabs.list_tabs(),
+                        'display': self._display_log, 'kb_state': self._kb_state}
+
+            was_active = (tab_id == conversation_tabs.get_active_tab_id())
+            self._tab_gui_state.pop(tab_id, None)
+            conversation_tabs.close_tab(tab_id)
+            result = {'ok': True, 'tabs': conversation_tabs.list_tabs()}
+            if was_active:
+                new_active = conversation_tabs.get_active_tab_id()
+                self._load_tab_gui_state(new_active)
+                result['active_tab_id'] = new_active
+                result['display'] = self._display_log
+                result['kb_state'] = self._kb_state
+            self._persist_open_tabs()
+            return result
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    # ── Tab groups: named, saveable sets of tabs (see conversation_tabs.py) ──
+
+    def list_conversation_tab_groups(self):
+        import conversation_tabs
+        return conversation_tabs.get_tab_groups()
+
+    def save_conversation_tab_group(self, name: str):
+        # Saves every currently open (non-agent) tab as a named group.
+        # Saving again under a name that already exists OVERWRITES it --
+        # same behavior as conversation_tabs.save_tab_group.
+        import conversation_tabs
+        name = (name or '').strip()
+        if not name:
+            return {'ok': False, 'error': "Group name can't be empty."}
+        msg = conversation_tabs.save_tab_group(name)
+        if msg.startswith('Nothing to save'):
+            return {'ok': False, 'error': msg}
+        return {'ok': True, 'message': msg, 'groups': conversation_tabs.get_tab_groups()}
+
+    def open_conversation_tab_group(self, name: str):
+        # Reopens a saved tab group: one fresh tab per saved seed, added
+        # alongside whatever's already open, switching to the first of them.
+        if self._thinking:
+            return {'ok': False, 'error': 'Busy \u2014 wait for the current run to finish or abort first.'}
+        import conversation_tabs
+        try:
+            self._save_active_tab_gui_state()
+            msg = conversation_tabs.open_tab_group(name, activate_first=True)
+            if msg.startswith('No saved'):
+                return {'ok': False, 'error': msg}
+            # Newly created tabs have no GUI-state bundle yet -- give each
+            # one a blank bundle so _load_tab_gui_state below (and any
+            # later switch to one of the others) has something to load.
+            for row in conversation_tabs.list_tabs():
+                if row['id'] not in self._tab_gui_state:
+                    self._tab_gui_state[row['id']] = self._blank_gui_state()
+            active_id = conversation_tabs.get_active_tab_id()
+            self._load_tab_gui_state(active_id)
+            self._persist_open_tabs()
+            return {'ok': True, 'message': msg, 'tabs': conversation_tabs.list_tabs(),
+                    'active_tab_id': active_id, 'display': self._display_log, 'kb_state': self._kb_state}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def delete_conversation_tab_group(self, name: str):
+        import conversation_tabs
+        msg = conversation_tabs.delete_tab_group(name)
+        return {'ok': True, 'message': msg, 'groups': conversation_tabs.get_tab_groups()}
+
+    def _set_chat_title_from_first_message(self, first_message: str):
+        """
+        Shared by send_message() and _voice_record_transcript(): the first
+        time a chat gets a user message, this sets self._chat_title (used
+        by both the custom titlebar label -- get_titlebar_info -- and the
+        sidebar's persisted chat-history entry -- _persist_current_chat)
+        the SAME way conversation_tabs.py names a conversation tab: a
+        short, concise, model-generated title rather than a raw truncation
+        of the message.
+
+        conversation_tabs.generate_concise_title() returns the truncated
+        fallback immediately -- assign that synchronously so the titlebar
+        and next persisted save show SOMETHING right away -- and kicks off
+        a silent background model call that, on success, calls back into
+        _apply_generated_title below to swap the real title in once it's
+        ready. Failures are silent (see conversation_tabs.py) and simply
+        leave the fallback in place.
+        """
+        import conversation_tabs
+        chat_id_snapshot = self._current_chat_id
+        fallback = conversation_tabs.generate_concise_title(
+            chat_id_snapshot, first_message,
+            on_result=lambda title: self._apply_generated_title(chat_id_snapshot, fallback, title),
+        )
+        self._chat_title = fallback or None
+
+    def _apply_generated_title(self, chat_id: str, fallback_used: str, title: str):
+        """Called (from a background thread) once conversation_tabs has a
+        real model-generated title ready. Only applies it if the chat this
+        was generated for is STILL the active chat, and its title is STILL
+        exactly the fallback we set when generation started -- if either
+        has changed (the user switched/closed the chat, or manually
+        renamed it via rename_chat in the meantime) this is a no-op rather
+        than clobbering something that's no longer ours to update."""
+        if chat_id != self._current_chat_id:
+            return
+        if self._chat_title != fallback_used:
+            return
+        self._chat_title = title
+        self._persist_current_chat()
+        self._push_event("chat_title_updated", {"chat_id": chat_id, "title": title})
+
     def _persist_current_chat(self):
         # Holds _persist_lock for the whole read-snapshot-and-save sequence
         # so a concurrent _display_log.append() (from _run_turn on another
@@ -1851,6 +2842,13 @@ class Api:
                     explain_page_progress=dict(self._explain_page_progress),
                     render_surface=render_surface,
                 )
+                # Safety net: guarantees OPEN_TABS_FILE reflects this tab's
+                # (now-existing-on-disk) chat id even if some tab-topology
+                # call site above ever misses a _persist_open_tabs() call --
+                # cheap enough (small JSON, same directory) to just do on
+                # every save rather than rely solely on catching every call
+                # site by hand.
+                self._persist_open_tabs()
             except Exception as e:
                 self._push_event("log", {"text": f"⚠ Failed to save chat history: {e}\n"})
 
@@ -1867,7 +2865,7 @@ class Api:
 
         self._display_log.append(("user", user_input))
         if not self._chat_title:
-            self._chat_title = user_input[:60] or None
+            self._set_chat_title_from_first_message(user_input)
         self._persist_current_chat()
 
         approval_kw = ["yes", "grant", "approve", "run it", "go ahead", "y"]
@@ -3861,6 +4859,12 @@ _HTML = r"""<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap">
+<!-- Feather Icons -- tiny external icon library used purely for the custom
+     titlebar's minimize/maximize/close glyphs (see #app-titlebar below).
+     Loaded from a CDN like the Google Font above; if it fails to load
+     (offline first run) initTitlebar() falls back to plain glyph text so
+     the buttons still work, just without the vector icons. -->
+<script src="https://unpkg.com/feather-icons"></script>
 <style>
 :root{
   --bg:#05070c; --panel:#0b0f19; --surface:#0d1220; --surface2:#121a2c;
@@ -3910,6 +4914,10 @@ html.glass-no-sheen{
 *{box-sizing:border-box;}
 html,body{margin:0;padding:0;height:100%;background:var(--bg);color:var(--text);
   font-family:"Segoe UI",-apple-system,sans-serif;overflow:hidden;user-select:none;}
+/* body is a column: custom titlebar on top (fixed height), #root fills the
+   rest. This replaces the native OS titlebar removed via frameless=True
+   in webview.create_window (see app.py bottom). */
+body{display:flex;flex-direction:column;}
 button{font-family:inherit;cursor:pointer;}
 input,textarea{font-family:inherit;}
 /* Scrollbars: sized and weighted to read as a deliberate, professional
@@ -3918,32 +4926,174 @@ input,textarea{font-family:inherit;}
    state so the control gives feedback instead of just being decorative.
    scrollbar-gutter keeps layout stable so content doesn't shift by the
    scrollbar's width when a panel's content grows past the fold. */
-*{scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
-::-webkit-scrollbar{width:11px;height:11px;}
-::-webkit-scrollbar-track{background:transparent;}
-::-webkit-scrollbar-corner{background:transparent;}
-::-webkit-scrollbar-thumb{
+/* Chat transcript keeps its slightly more visible thumb (it's the pane
+   the user scrolls most), styled to match the rest of the app. */
+#chat-scroll{scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
+#chat-scroll::-webkit-scrollbar{width:11px;height:11px;}
+#chat-scroll::-webkit-scrollbar-track{background:transparent;}
+#chat-scroll::-webkit-scrollbar-corner{background:transparent;}
+#chat-scroll::-webkit-scrollbar-thumb{
   background-color:var(--border2);border-radius:999px;
   border:3px solid var(--panel);background-clip:padding-box;
   transition:background-color .15s;
 }
-::-webkit-scrollbar-thumb:hover{background-color:var(--subtext);}
-::-webkit-scrollbar-thumb:active{background-color:var(--accent);}
-/* Panels sit on --surface/--surface2 rather than --panel, so give the
-   scrollbar thumb's clip-border a matching color there -- otherwise the
-   3px "padding" ring shows the wrong background and looks like a seam. */
-#sidebar-main-view::-webkit-scrollbar-thumb,#sidebar-settings-overlay::-webkit-scrollbar-thumb,
-#tool-content::-webkit-scrollbar-thumb,.modal-box::-webkit-scrollbar-thumb{border-color:var(--panel);}
-/* Smooth, physically-eased scrolling for panes the user navigates by
-   clicking/keying through (settings, history, tool panes, modals). The
-   live chat transcript (#chat-scroll) and the shell terminal deliberately
-   opt out below -- they're driven by streaming token/output events that
-   call scrollTop directly every few ms, and smooth-scroll easing would
-   fight that instead of tracking it, producing a laggy, inaccurate follow. */
-html{scroll-behavior:smooth;}
-#chat-scroll,#shell-terminal{scroll-behavior:auto;}
+#chat-scroll::-webkit-scrollbar-thumb:hover{background-color:var(--subtext);}
+#chat-scroll::-webkit-scrollbar-thumb:active{background-color:var(--accent);}
+/* Everywhere else: an essentially invisible scrollbar -- no track, no
+   border/arrows, just a faint thin pill that only reads as "there's more
+   content" rather than a visible UI chrome element. Matches the app's
+   own palette (--border2) instead of falling back to the OS's native
+   (often stark white/grey) scrollbar now that the chat-only scoping
+   above stopped styling these. */
+*:not(#chat-scroll){scrollbar-width:thin;scrollbar-color:color-mix(in srgb, var(--border2) 55%, transparent) transparent;}
+*:not(#chat-scroll)::-webkit-scrollbar{width:8px;height:8px;}
+*:not(#chat-scroll)::-webkit-scrollbar-track{background:transparent;}
+*:not(#chat-scroll)::-webkit-scrollbar-corner{background:transparent;}
+*:not(#chat-scroll)::-webkit-scrollbar-thumb{
+  background-color:color-mix(in srgb, var(--border2) 55%, transparent);
+  border-radius:999px;border:none;background-clip:padding-box;
+  transition:background-color .15s;
+}
+*:not(#chat-scroll)::-webkit-scrollbar-thumb:hover{background-color:var(--border2);}
+*:not(#chat-scroll)::-webkit-scrollbar-thumb:active{background-color:var(--subtext);}
+/* scroll-behavior stays at the browser default (instant) everywhere
+   except the chat transcript is unaffected either way since it already
+   scrolls via direct scrollTop assignment during streaming. */
 
-#root{position:relative;width:100vw;height:100vh;background:var(--bg);}
+#root{position:relative;width:100%;height:100%;flex:1 1 auto;min-height:0;background:var(--bg);}
+
+/* ── Custom titlebar (replaces the native OS one -- frameless window) ──
+   Left: chat name + active-model pill. Middle: empty drag region. Right:
+   minimize/maximize/close. Real Windows Snap (drag-to-edge, Win+arrow,
+   hover-over-maximize flyout) is wired up natively in Python via a
+   WM_NCHITTEST subclass hook (see _install_win_snap_hook) that treats
+   #titlebar-center/#titlebar-left as the caption and the three buttons
+   as real HTMINBUTTON/HTMAXBUTTON/HTCLOSE hit zones -- no JS/CSS can
+   trigger genuine OS snapping on its own, only the OS can. The
+   -webkit-app-region hints below are a courtesy for non-Windows
+   (frameless+easy_drag) fallback and cost nothing on Windows. */
+:root{ --titlebar-h:36px; }
+#app-titlebar{
+  flex:0 0 var(--titlebar-h);height:var(--titlebar-h);width:100%;
+  display:flex;align-items:stretch;justify-content:space-between;
+  position:relative;z-index:1000;
+  -webkit-app-region:drag;
+  background:var(--bg); /* blends seamlessly with the app when glass is off */
+  border-bottom:1px solid transparent;
+  transition:background-color .2s var(--ease),border-color .2s var(--ease);
+}
+#titlebar-left{
+  display:flex;align-items:center;gap:8px;min-width:0;padding-left:12px;
+  -webkit-app-region:drag;
+}
+#titlebar-chat-title{
+  font-size:12px;font-weight:600;color:var(--text);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;max-width:38vw;
+}
+#titlebar-model-pill{
+  font-size:10px;font-weight:700;letter-spacing:.2px;color:var(--accent);
+  background:var(--accent-faint);border:1px solid var(--border2);
+  border-radius:999px;padding:2px 10px;white-space:nowrap;flex:0 0 auto;
+  -webkit-app-region:no-drag; /* a pill, not part of the draggable area */
+}
+#titlebar-center{
+  flex:1 1 auto;-webkit-app-region:drag;
+  display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden;padding:0 8px;
+}
+/* ── Conversation tabs (browser-tab-like AI conversations -- see
+   conversation_tabs.py) + new-tab button + saved-tab-group dropdown.
+   This strip is a SIBLING row directly under #app-titlebar (not inside
+   it). Styled to match #tabbar (the big subsystem pill tab bar) --
+   same rounded pill shell, same sliding accent #conv-tab-highlight
+   underlay -- just shrink-wrapped to its content instead of stretching
+   to a fixed width, and centered in the row via #conv-tabbar-row's
+   justify-content:center. Because the pill's width is content-driven
+   and it's centered rather than left-anchored, opening/closing tabs
+   grows or shrinks it symmetrically from the middle instead of pushing
+   everything rightward. Only the pill/buttons themselves opt OUT of
+   dragging; empty space in the row is still drag-to-move, same as the
+   titlebar above it. */
+#conv-tabbar-row{
+  flex:0 0 auto;width:100%;min-height:34px;
+  display:flex;align-items:flex-start;justify-content:center;padding:0 10px;
+  position:relative;z-index:900;
+  -webkit-app-region:drag;
+  background:transparent;
+}
+#conv-tab-controls{
+  display:inline-flex;align-items:center;gap:6px;
+  -webkit-app-region:no-drag;
+}
+#conv-tabbar{
+  height:34px;border-radius:17px;background:var(--surface);border:1px solid var(--border2);
+  display:flex;align-items:center;padding:4px;gap:2px;position:relative;
+  -webkit-app-region:no-drag;
+}
+#conv-tab-highlight{
+  position:absolute;top:4px;left:4px;height:26px;width:0;border-radius:13px;background:var(--accent);
+  transition:left .28s var(--ease), width .28s var(--ease);z-index:0;pointer-events:none;
+}
+.conv-tab{
+  position:relative;z-index:1;display:flex;align-items:center;gap:6px;
+  height:26px;max-width:150px;min-width:40px;padding:0 12px;
+  border-radius:13px;cursor:pointer;user-select:none;
+  background:transparent;color:var(--subtext);
+  transition:background-color .18s var(--ease),color .18s var(--ease);
+  white-space:nowrap;overflow:hidden;
+}
+.conv-tab:not(.active):hover{background:var(--surface2);}
+.conv-tab.active{background:transparent;color:var(--text);font-weight:600;}
+.conv-tab.agent{opacity:.85;}
+.conv-tab-title{
+  font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.conv-tab.active .conv-tab-title{color:var(--text);font-weight:600;}
+.conv-tab-close{
+  flex:0 0 auto;width:16px;height:16px;border:none;border-radius:5px;background:transparent;
+  color:var(--subtext);font-size:12px;line-height:1;display:flex;align-items:center;justify-content:center;
+}
+.conv-tab-close:hover{background:var(--border2);color:var(--text);}
+.conv-tab-icon-btn{
+  flex:0 0 auto;width:24px;height:24px;border:none;border-radius:12px;background:transparent;
+  color:var(--subtext);font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center;
+  -webkit-app-region:no-drag;
+}
+.conv-tab-icon-btn:hover{background:var(--surface2);color:var(--text);}
+#conv-tab-group-wrap{position:relative;-webkit-app-region:no-drag;}
+#conv-tab-group-menu{
+  display:none;position:absolute;top:38px;left:0;min-width:200px;max-width:260px;
+  background:var(--panel);border:1px solid var(--border2);border-radius:12px;
+  box-shadow:0 12px 32px rgba(0,0,0,.4);padding:6px;z-index:1001;
+  -webkit-app-region:no-drag;
+}
+#conv-tab-group-menu.open{display:block;}
+.conv-tab-group-item{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:7px 10px;border-radius:8px;font-size:12px;color:var(--text);cursor:pointer;
+}
+.conv-tab-group-item:hover{background:var(--surface2);}
+.conv-tab-group-item.new{color:var(--accent);font-weight:600;}
+.conv-tab-group-item .count{font-size:10px;color:var(--subtext);flex:0 0 auto;}
+.conv-tab-group-sep{height:1px;background:var(--border2);margin:5px 2px;}
+#titlebar-controls{display:flex;align-items:stretch;-webkit-app-region:no-drag;}
+.titlebar-btn{
+  width:46px;height:100%;border:none;background:transparent;color:var(--subtext);
+  display:flex;align-items:center;justify-content:center;position:relative;
+}
+/* Circular hit-highlight: the button ITSELF stays the full 46px-wide hit
+   slot (has to match _CAPTION_BTN_W in the native snap hook), but the
+   visible hover/active/glass surface is a smaller centered circle drawn
+   via ::before so it reads as a round button rather than a square one. */
+.titlebar-btn::before{
+  content:"";position:absolute;width:30px;height:30px;border-radius:50%;
+  background-color:transparent;transition:background-color .12s var(--ease),box-shadow .12s var(--ease);
+}
+.titlebar-btn:hover::before{background-color:var(--surface2);}
+.titlebar-btn:active::before{background-color:var(--border2);}
+#titlebar-close:hover::before{background-color:#e81123 !important;}
+.titlebar-btn:hover{color:var(--text);}
+#titlebar-close:hover{color:#fff;}
+.titlebar-btn svg,.titlebar-btn i{position:relative;z-index:1;width:14px;height:14px;pointer-events:none;}
 
 /* ── Top bar : 100% wide, 15% tall, rounded pill bar ── */
 #topbar-wrap{position:absolute;left:0;top:0;width:100%;height:15%;}
@@ -4199,8 +5349,45 @@ html.blobs-off:not(.has-bg-image) #topbar{
    modals/tool panels that would otherwise get missed one at a time.
      #sidebar-settings-overlay is deliberately NOT in this list -- see the
    hard override right after this block for why. */
+html.liquid-glass-on.has-bg-image #app-titlebar,
+html.liquid-glass-on:not(.blobs-off) #app-titlebar{
+  background-color:var(--glass-fill) !important;
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
+  border-bottom:1px solid var(--glass-edge-dim) !important;
+}
+/* Titlebar buttons: visible glass chips at rest (not just on hover) so
+   they read as part of the glass surface, same idea as .icon-btn's
+   always-on tint elsewhere -- hover/active just deepen it. */
+html.liquid-glass-on.has-bg-image .titlebar-btn::before,
+html.liquid-glass-on:not(.blobs-off) .titlebar-btn::before{
+  background-color:var(--glass-fill) !important;
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
+  border:1px solid var(--glass-edge-dim);
+  box-shadow:inset 0 1px 0 var(--glass-edge-dim);
+}
+html.liquid-glass-on.has-bg-image .titlebar-btn:hover::before,
+html.liquid-glass-on:not(.blobs-off) .titlebar-btn:hover::before{
+  background-color:var(--glass-fill-strong) !important;
+  border-color:var(--glass-edge);
+}
+html.liquid-glass-on.has-bg-image #titlebar-close:hover::before,
+html.liquid-glass-on:not(.blobs-off) #titlebar-close:hover::before{
+  background-color:#e81123 !important;
+  background-image:none !important;
+  border-color:#e81123 !important;
+}
+html.liquid-glass-on.has-bg-image .conv-tab:not(.active):hover,
+html.liquid-glass-on:not(.blobs-off) .conv-tab:not(.active):hover,
+html.liquid-glass-on.has-bg-image .conv-tab-icon-btn:hover,
+html.liquid-glass-on:not(.blobs-off) .conv-tab-icon-btn:hover{
+  background-color:var(--glass-fill-strong) !important;
+}
 html.liquid-glass-on.has-bg-image #tabbar,
 html.liquid-glass-on:not(.blobs-off) #tabbar,
+html.liquid-glass-on.has-bg-image #conv-tabbar,
+html.liquid-glass-on:not(.blobs-off) #conv-tabbar,
+html.liquid-glass-on.has-bg-image #conv-tab-group-menu,
+html.liquid-glass-on:not(.blobs-off) #conv-tab-group-menu,
 html.liquid-glass-on.has-bg-image .icon-btn,
 html.liquid-glass-on:not(.blobs-off) .icon-btn,
 html.liquid-glass-on.has-bg-image #input-box,
@@ -4891,6 +6078,35 @@ textarea.code-area{
 </style>
 </head>
 <body>
+<div id="app-titlebar">
+  <div id="titlebar-left">
+    <span id="titlebar-chat-title">Untitled chat</span>
+    <span id="titlebar-model-pill">(auto)</span>
+  </div>
+  <div id="titlebar-center"></div>
+  <div id="titlebar-controls">
+    <button class="titlebar-btn" id="titlebar-min" title="Minimize"><i data-feather="minus"></i></button>
+    <button class="titlebar-btn" id="titlebar-max" title="Maximize"><i data-feather="square"></i></button>
+    <button class="titlebar-btn" id="titlebar-close" title="Close"><i data-feather="x"></i></button>
+  </div>
+</div>
+<!-- Hanging tab strip: lives BELOW #app-titlebar (not inside it) so the
+     tabs can visually hang off the titlebar's bottom edge like an
+     upside-down Chrome tab strip. Because it's outside the titlebar's
+     36px caption band, WM_NCHITTEST never treats it as HTCAPTION on
+     Windows (see _wnd_proc's `if ly < titlebar_h_px` check) -- it's
+     ordinary client area, so every tab/button here is naturally
+     clickable with no nodrag-zone plumbing needed. -->
+<div id="conv-tabbar-row">
+  <div id="conv-tab-controls">
+    <div id="conv-tabbar"><div id="conv-tab-highlight"></div></div>
+    <button class="conv-tab-icon-btn" id="conv-tab-new-btn" title="New tab">+</button>
+    <div id="conv-tab-group-wrap">
+      <button class="conv-tab-icon-btn" id="conv-tab-group-btn" title="Tab groups">⌄</button>
+      <div id="conv-tab-group-menu"></div>
+    </div>
+  </div>
+</div>
 <div id="root">
 
   <div id="bg-image-layer"></div>
@@ -5784,6 +7000,165 @@ function buildTabbar(){
   requestAnimationFrame(positionTabHighlight);
   window.addEventListener("resize", positionTabHighlight);
 }
+
+// ── Conversation tabs (titlebar) -------------------------------------------
+// Each tab is an independent AI conversation living fully in RAM (see
+// conversation_tabs.py) -- switching is instant, no disk I/O. A tab's
+// title is ALWAYS derived from its own chat (first message), never
+// editable, so there's no rename affordance here at all.
+// Keeps the native Windows hit-test hook (_install_win_snap_hook, Python)
+// in sync with #conv-tab-controls' actual on-screen rect -- see
+// Api.set_titlebar_nodrag_zones for why this is necessary at all (the
+// hook resolves drag-vs-click at the OS level, entirely bypassing
+// -webkit-app-region CSS, for anything in the titlebar row). Called after
+// every tab-strip rebuild (width changes as tabs open/close/rename) and on
+// window resize; harmless no-op on platforms without the native hook.
+function reportTitlebarNodragZones(){
+  const el = document.getElementById("conv-tab-controls");
+  if (!el) return;
+  const r = el.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return;
+  api("set_titlebar_nodrag_zones", [{ left: r.left, top: r.top, right: r.right, bottom: r.bottom }]);
+}
+
+async function buildConversationTabs(){
+  const bar = document.getElementById("conv-tabbar");
+  if (!bar) return;
+  let tabs = [];
+  try{ tabs = await api("list_conversation_tabs"); }catch(e){ return; }
+  bar.querySelectorAll(".conv-tab").forEach(e=>e.remove());
+  tabs.forEach(t=>{
+    const el = document.createElement("div");
+    el.className = "conv-tab" + (t.active ? " active" : "") + (t.kind === "agent" ? " agent" : "");
+    el.title = t.title;
+    el.innerHTML = `<span class="conv-tab-title">${escapeHtml(t.kind === "agent" ? "🤖 " : "")}${escapeHtml(t.title)}</span>` +
+      (t.kind === "agent" ? "" : `<button class="conv-tab-close" title="Close tab">✕</button>`);
+    el.onclick = ()=>{ if (t.active) return; switchConvTab(t.id); };
+    const closeBtn = el.querySelector(".conv-tab-close");
+    if (closeBtn){
+      closeBtn.onclick = (e)=>{ e.stopPropagation(); closeConvTab(t.id); };
+    }
+    bar.appendChild(el);
+  });
+  positionConvTabHighlight();
+  requestAnimationFrame(reportTitlebarNodragZones);
+}
+
+// Sliding accent pill behind the active conv-tab -- same idea as
+// positionTabHighlight() for the big subsystem #tabbar, just measuring
+// #conv-tabbar's own children instead.
+function positionConvTabHighlight(){
+  const bar = document.getElementById("conv-tabbar");
+  const hl  = document.getElementById("conv-tab-highlight");
+  if (!bar || !hl) return;
+  const activeBtn = bar.querySelector(".conv-tab.active");
+  if (!activeBtn){
+    hl.style.width = "0px";
+    return;
+  }
+  hl.style.left  = activeBtn.offsetLeft + "px";
+  hl.style.width = activeBtn.offsetWidth + "px";
+}
+
+async function switchConvTab(tabId){
+  const r = await api("switch_conversation_tab", tabId);
+  if (!r.ok){ showAlert(r.error, "Error"); return; }
+  clearChat();
+  renderHistoryWindow(r.display || []);
+  applyKbState(r.kb_state);
+  await buildConversationTabs();
+  refreshTitlebarInfo();
+}
+
+async function newConvTab(){
+  const r = await api("new_conversation_tab");
+  if (!r.ok){ showAlert(r.error, "Error"); return; }
+  clearChat();
+  applyKbState(r.kb_state);
+  await buildConversationTabs();
+  refreshTitlebarInfo();
+}
+
+async function closeConvTab(tabId){
+  const r = await api("close_conversation_tab", tabId);
+  if (!r.ok){ showAlert(r.error, "Error"); return; }
+  if (r.display !== undefined){
+    // The closed tab was the active one -- a different tab (or a freshly
+    // reset version of the same tab, if it was the last one open) is now
+    // showing, so the chat pane needs to catch up.
+    clearChat();
+    renderHistoryWindow(r.display || []);
+    applyKbState(r.kb_state);
+  }
+  await buildConversationTabs();
+  refreshTitlebarInfo();
+}
+
+// ── Tab groups (titlebar dropdown) -----------------------------------------
+function closeConvTabGroupMenu(){
+  const menu = document.getElementById("conv-tab-group-menu");
+  if (menu) menu.classList.remove("open");
+  document.removeEventListener("click", _onConvTabGroupOutsideClick, true);
+}
+function _onConvTabGroupOutsideClick(e){
+  const wrap = document.getElementById("conv-tab-group-wrap");
+  if (wrap && !wrap.contains(e.target)) closeConvTabGroupMenu();
+}
+
+async function toggleConvTabGroupMenu(){
+  const menu = document.getElementById("conv-tab-group-menu");
+  if (!menu) return;
+  if (menu.classList.contains("open")){ closeConvTabGroupMenu(); return; }
+  await buildConvTabGroupMenu();
+  menu.classList.add("open");
+  setTimeout(()=>document.addEventListener("click", _onConvTabGroupOutsideClick, true), 0);
+}
+
+async function buildConvTabGroupMenu(){
+  const menu = document.getElementById("conv-tab-group-menu");
+  if (!menu) return;
+  let groups = [];
+  try{ groups = await api("list_conversation_tab_groups"); }catch(e){}
+  menu.innerHTML = "";
+
+  const newItem = document.createElement("div");
+  newItem.className = "conv-tab-group-item new";
+  newItem.innerHTML = `<span>+ New Group</span>`;
+  newItem.onclick = async ()=>{
+    closeConvTabGroupMenu();
+    const name = await showPrompt("Save all currently open tabs as a group named:", "New Tab Group");
+    if (name === null) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const r = await api("save_conversation_tab_group", trimmed);
+    if (!r.ok){ showAlert(r.error, "Error"); return; }
+  };
+  menu.appendChild(newItem);
+
+  if (groups.length){
+    const sep = document.createElement("div");
+    sep.className = "conv-tab-group-sep";
+    menu.appendChild(sep);
+  }
+
+  groups.forEach(g=>{
+    const item = document.createElement("div");
+    item.className = "conv-tab-group-item";
+    item.innerHTML = `<span>${escapeHtml(g.name)}</span><span class="count">${g.tab_count} tab${g.tab_count === 1 ? "" : "s"}</span>`;
+    item.onclick = async ()=>{
+      closeConvTabGroupMenu();
+      const r = await api("open_conversation_tab_group", g.name);
+      if (!r.ok){ showAlert(r.error, "Error"); return; }
+      clearChat();
+      renderHistoryWindow(r.display || []);
+      applyKbState(r.kb_state);
+      await buildConversationTabs();
+      refreshTitlebarInfo();
+    };
+    menu.appendChild(item);
+  });
+}
+
 
 // ── Chat rendering --------------------------------------------------------
 function escapeHtml(s){
@@ -7116,7 +8491,14 @@ function initKbOnlyControls(){
 // ── Event bridge from Python (async pushes) -----------------------------
 window.__midumEvent = function(evt){
   const {kind, payload} = evt;
-  if (kind === "status"){ setStatus(payload.text, payload.level); }
+  if (kind === "status"){ setStatus(payload.text, payload.level); if (payload.text === "Ready") buildConversationTabs(); }
+  else if (kind === "tabs_restored"){
+    clearChat();
+    renderHistoryWindow(payload.display || []);
+    applyKbState(payload.kb_state);
+    buildConversationTabs();
+    refreshTitlebarInfo();
+  }
   else if (kind === "reply"){ appendRow("midum", payload.text); }
   else if (kind === "say"){ appendRow("midum", payload.text); }
   else if (kind === "system_line"){ appendRow("system", payload.text); }
@@ -7126,11 +8508,11 @@ window.__midumEvent = function(evt){
   else if (kind === "tool_call"){ attachToolCallDetail(payload.name, payload.args, payload.result); }
   else if (kind === "agent_tool_call"){ appendAgentToolRow(payload.agent, payload.name, payload.args, payload.result); }
   else if (kind === "log"){ appendLog(payload.text); }
-  else if (kind === "done"){ state.thinking = false; setActiveToolDot(null); _currentMidumRow = null; }
+  else if (kind === "done"){ state.thinking = false; setActiveToolDot(null); _currentMidumRow = null; refreshTitlebarInfo(); buildConversationTabs(); }
   else if (kind === "projects"){ populateProjects(payload.projects, payload.active); }
   else if (kind === "ask"){ appendAsk(payload.id, payload.kind, payload.payload); }
   else if (kind === "mcp_changed"){ if (state.activeTab === "MCP") refreshMcpList(); }
-  else if (kind === "agents_changed"){ if (state.activeTab === "Agents") refreshAgentsList(); }
+  else if (kind === "agents_changed"){ if (state.activeTab === "Agents") refreshAgentsList(); buildConversationTabs(); }
   else if (kind === "schedule_ran"){ if (state.activeTab === "Schedule") showToolPane("Schedule"); }
   else if (kind === "tool_result"){ const box=document.getElementById("tool-output"); if(box) box.value = payload.output; }
   else if (kind === "voice_status"){ handleVoiceStatus(payload); }
@@ -7147,6 +8529,18 @@ window.__midumEvent = function(evt){
   else if (kind === "render_surface_open"){ openRenderSurface(payload.code, payload.title); }
   else if (kind === "render_surface_update"){ updateRenderSurfaceCode(payload.code); }
   else if (kind === "render_surface_close"){ closeRenderSurfaceUI(); }
+  else if (kind === "chat_title_updated"){
+    // A background model call (see Api._apply_generated_title in
+    // gui/app.py) finished naming this chat after the truncated fallback
+    // title was already shown. Refresh both places that display it: the
+    // custom titlebar label (if this chat is still the active one -- the
+    // backend already guards that before ever sending this event, but the
+    // payload's chat_id is included in case a future caller wants it) and
+    // the sidebar's chat-history list, which reads its titles from disk.
+    refreshTitlebarInfo();
+    if (typeof refreshHistory === "function") refreshHistory();
+    buildConversationTabs();
+  }
   else if (kind === "gemini_web_models"){
     // select_provider() returns an instant cached/fallback list for
     // Gemini-web and fetches the real gemini_webapi lineup in the
@@ -7569,7 +8963,7 @@ function buildSidebar(){
   enhanceSelect(document.getElementById("project-select"));
   enhanceSelect(document.getElementById("settings-provider"));
   document.getElementById("new-session-btn").onclick = async ()=>{
-    await api("new_session"); clearChat(); applyKbState(null); refreshHistory();
+    await api("new_session"); clearChat(); applyKbState(null); refreshHistory(); refreshTitlebarInfo(); buildConversationTabs();
   };
   document.getElementById("project-select").onchange = async (e)=>{
     const info = await api("switch_project", e.target.value);
@@ -8223,13 +9617,15 @@ async function refreshHistory(){
         <button class="mini-btn del">🗑</button>
       </div>`;
     card.onclick = async ()=>{
-      const r = await api("load_chat", chat.id);
+      const r = await api("open_chat_in_new_tab", chat.id);
       if (!r.ok){ showAlert(r.error, "Error"); return; }
       clearChat();
       renderHistoryWindow(r.display||[]);
       applyKbState(r.kb_state);
       switchTab("Chat");
       refreshHistory();
+      refreshTitlebarInfo();
+      buildConversationTabs();
     };
     card.querySelector(".rename").onclick = async (e)=>{
       e.stopPropagation();
@@ -8240,6 +9636,7 @@ async function refreshHistory(){
       const r = await api("rename_chat", chat.id, trimmed);
       if (!r.ok){ showAlert(r.error, "Error"); return; }
       refreshHistory();
+      refreshTitlebarInfo();
     };
     card.querySelector(".del").onclick = async (e)=>{
       e.stopPropagation();
@@ -8670,6 +10067,7 @@ function buildModelPane(box){
     const model = document.getElementById("model-input").value;
     const status = await api("apply_model", label, model);
     document.getElementById("model-active").textContent = `Active: ${status.provider} — ${status.model}`;
+    refreshTitlebarInfo();
   };
 
   const ctxInput  = document.getElementById("ctx-tokens-input");
@@ -10602,9 +12000,74 @@ function initBlobLayer(){
   };
 }
 
+// ── Custom titlebar --------------------------------------------------------
+// Real Windows Snap (edge-drag, Win+arrow, Snap Layouts flyout on hover)
+// comes from the native WM_NCHITTEST hook installed on the Python side
+// (_install_win_snap_hook) -- these handlers just cover: reflecting the
+// current chat name / active model, the click fallback on platforms
+// without that hook, and keeping the maximize icon in sync.
+function initTitlebar(){
+  _applyFeatherIcons();
+  refreshTitlebarInfo();
+  _reportDpiScale();
+  // devicePixelRatio changes if the window is dragged to a monitor with
+  // different scaling -- _reportDpiScale() re-arms its own matchMedia
+  // listener each time it runs, so this just needs the initial call plus
+  // a plain resize listener as a cheap, harmless extra signal.
+  window.addEventListener("resize", _reportDpiScale);
+  document.getElementById("titlebar-min").onclick = ()=>api("titlebar_minimize");
+  document.getElementById("titlebar-max").onclick = async ()=>{
+    const r = await api("titlebar_toggle_maximize");
+    if (r) setTitlebarMaxIcon(!!r.maximized);
+  };
+  document.getElementById("titlebar-close").onclick = ()=>api("titlebar_close");
+  // Fallback double-click-to-maximize for platforms where the native
+  // caption hit-test hook isn't installed (non-Windows) -- on Windows the
+  // real caption area swallows this at the OS level before it ever
+  // reaches the DOM, so this handler simply never fires there.
+  document.getElementById("app-titlebar").addEventListener("dblclick", (e)=>{
+    if (e.target.closest(".titlebar-btn")) return;
+    if (e.target.closest("#titlebar-center") && e.target !== document.getElementById("titlebar-center")) return;
+    document.getElementById("titlebar-max").click();
+  });
+
+  // Conversation tabs -- new-tab button, tab-group dropdown, initial strip.
+  document.getElementById("conv-tab-new-btn").onclick = newConvTab;
+  document.getElementById("conv-tab-group-btn").onclick = (e)=>{ e.stopPropagation(); toggleConvTabGroupMenu(); };
+  window.addEventListener("resize", reportTitlebarNodragZones);
+  window.addEventListener("resize", positionConvTabHighlight);
+  buildConversationTabs();
+}
+function _applyFeatherIcons(){
+  if (window.feather){ feather.replace({ "stroke-width": 2, width: 14, height: 14 }); }
+}
+function _reportDpiScale(){
+  api("set_dpi_scale", window.devicePixelRatio || 1);
+  // Re-arm the one-shot matchMedia listener at the new ratio so a further
+  // scale change (e.g. dragged to yet another monitor) is still caught.
+  try{
+    matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`).addEventListener("change", _reportDpiScale, { once: true });
+  }catch(e){}
+}
+function setTitlebarMaxIcon(isMaximized){
+  const btn = document.getElementById("titlebar-max");
+  btn.title = isMaximized ? "Restore Down" : "Maximize";
+  btn.innerHTML = isMaximized ? '<i data-feather="copy"></i>' : '<i data-feather="square"></i>';
+  _applyFeatherIcons();
+}
+async function refreshTitlebarInfo(){
+  try{
+    const info = await api("get_titlebar_info");
+    if (!info) return;
+    document.getElementById("titlebar-chat-title").textContent = info.title || "Untitled chat";
+    document.getElementById("titlebar-model-pill").textContent = info.model || "(auto)";
+  }catch(e){ /* best-effort -- never block the UI on this */ }
+}
+
 // ── Boot -----------------------------------------------------------------
 _blobLayerCtl = initBlobLayer(); // pure DOM/CSS, doesn't need the pywebview bridge -- start immediately
 window.addEventListener("pywebviewready", async ()=>{
+  initTitlebar();
   buildTabbar();
   buildSidebar();
   applyLayout();
@@ -10726,9 +12189,20 @@ def main():
         height=950,
         min_size=(1200, 750),
         background_color="#05070c",
+        frameless=True,
+        # Windows gets real OS drag/resize/Snap back via the WM_NCHITTEST
+        # subclass hook below, so pywebview's own crude "drag anywhere"
+        # mode would only fight it -- disabled there. Other platforms have
+        # no such hook (yet), so they fall back to pywebview's built-in
+        # whole-window drag; it moves the window but doesn't snap it.
+        easy_drag=(sys.platform != "win32"),
     )
     api.window = window
     window.events.closing += api._on_closing
+    if sys.platform == "win32":
+        # Installed once the page has actually loaded, so the hwnd/title
+        # this looks up (via _find_own_hwnd) is guaranteed to exist.
+        window.events.loaded += lambda: _install_win_snap_hook(window)
     # gui="qt" renders through QtWebEngine (PySide6 or PyQt5), which
     # bundles its own Chromium build. Unlike gui="edgechromium" this has no
     # dependency on the Microsoft Edge WebView2 Runtime being installed on

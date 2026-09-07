@@ -1343,6 +1343,90 @@ def message_discord(message: str, channel_id: str = "", guild_id: str = "", chan
     return err or result
 
 
+def get_discord_chat_history(server: str, length: int, channel_name: str = "") -> str:
+    """
+    Fetch the last N messages actually posted in a Discord server's text
+    channel (via Discord's own message history, not Midum's internal chat
+    sessions) -- use this when asked what's been said recently in a server.
+
+    server       -- which Discord server (guild) to read from. Accepts
+                    either a numeric guild_id or the server's name (see
+                    list_discord_servers() for both). Required.
+    length       -- how many of the most recent messages to return.
+                    Clamped to a max of 200 per call.
+    channel_name -- which text channel in that server to read (e.g.
+                    'general' or '#general'). If omitted, the server's
+                    default/first available text channel is used.
+
+    Returns the last `length` messages, oldest first, each tagged with the
+    author's display name.
+    """
+    server = (server or "").strip()
+    if not server:
+        return "Error: 'server' is required (a guild_id or server name -- see list_discord_servers())."
+
+    try:
+        length = int(length)
+    except (TypeError, ValueError):
+        return f"Error: 'length' must be a number, got '{length}'."
+    if length <= 0:
+        return "Error: 'length' must be a positive number."
+    length = min(length, 200)
+
+    if not _CREDS_AVAILABLE:
+        _load_discord_creds()   # see call_discord() -- picks up a key added after startup
+        if not _CREDS_AVAILABLE:
+            return f"Error: Discord is not configured — {_discord_load_msg}"
+
+    ok, msg = _ensure_bot_running()
+    if not ok:
+        return f"Error: could not start the Discord bot — {msg}"
+
+    async def _resolve_and_fetch():
+        guild = None
+        try:
+            gid = int(server)
+            guild = _bot.get_guild(gid)
+        except ValueError:
+            guild = next((g for g in _bot.guilds if g.name.lower() == server.lower()), None)
+        if guild is None:
+            return None, f"Error: no connected server matches '{server}'. Try list_discord_servers()."
+
+        channel = None
+        if channel_name:
+            name = channel_name.lstrip("#").strip().lower()
+            channel = next((c for c in guild.text_channels if c.name.lower() == name), None)
+            if channel is None:
+                return None, f"Error: no text channel named '{channel_name}' found in '{guild.name}'."
+        else:
+            channel = guild.system_channel or (guild.text_channels[0] if guild.text_channels else None)
+            if channel is None:
+                return None, f"Error: '{guild.name}' has no text channels Midum can read."
+
+        try:
+            messages = [m async for m in channel.history(limit=length)]
+        except discord.Forbidden:
+            return None, f"Error: missing permission to read message history in #{channel.name}."
+        except Exception as e:
+            return None, f"Error fetching message history from #{channel.name}: {e}"
+
+        messages.reverse()  # channel.history() comes back newest-first
+        lines = [
+            f"{m.author.display_name}: {m.content or '(no text content)'}"
+            for m in messages
+        ]
+        header = f"Last {len(lines)} message(s) in #{channel.name} ('{guild.name}'):\n\n"
+        body = "\n".join(lines) if lines else "(no messages found)"
+        return header + body, None
+
+    future = asyncio.run_coroutine_threadsafe(_resolve_and_fetch(), _bot_loop)
+    try:
+        result, err = future.result(timeout=30)
+    except Exception as e:
+        return f"Error fetching Discord chat history: {e}"
+    return err or result
+
+
 def start_discord_bot() -> str:
     """
     Start the Discord bot so it's listening for DMs, server messages, and

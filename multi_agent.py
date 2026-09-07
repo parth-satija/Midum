@@ -334,11 +334,19 @@ def _build_agent_skills_context_message(agent: dict) -> str | None:
 
 def _run_agent_task(agent: dict, task: str) -> None:
     from orchestration import process_chat_turn
+    from conversation_tabs import register_agent_tab, unregister_agent_tab
     with agent["lock"]:
         agent["status"] = "running"
         agent["task_started_at"] = time.time()
     if not agent["history"]:
         agent["history"] = [{"role": "system", "content": _agent_system_prompt(agent)}]
+
+    # Register this agent's conversation tab for the duration of this task
+    # only -- it wraps agent["history"] directly (zero-copy), stays closed
+    # to the user's own active tab (never switches them away from what
+    # they're looking at), and is torn down again in the `finally` block
+    # below the moment this task ends, no matter how it ends.
+    register_agent_tab(agent["name"], agent["role"], agent["history"])
     agent["history"].append({
         "role": "user",
         "content": (
@@ -386,6 +394,13 @@ def _run_agent_task(agent: dict, task: str) -> None:
         )
     except Exception as e:
         reply = f"[Agent '{agent['name']}' crashed while working the task: {e}]"
+    finally:
+        # This task's work is over (done, crashed, or cut off) -- close the
+        # agent's conversation tab now, regardless of outcome. If more tasks
+        # are queued, the next _run_agent_task() call will simply open a
+        # fresh tab for the next one -- a tab's lifetime is one task, not
+        # the agent's whole lifetime.
+        unregister_agent_tab(agent["name"])
 
     if kb_context_msg or skills_context_msg:
         # Strip both ephemeral messages back out -- they must never persist

@@ -341,6 +341,18 @@ if __name__ == "__main__":
     for inj in memory_injections:
         history.append({"role": "system", "content": inj})
 
+    # Register the primary CLI conversation as the "main" conversation tab
+    # (see conversation_tabs.py). This wraps `history` DIRECTLY -- same list
+    # object, not a copy -- so the tab and this loop's own `history`
+    # variable can never drift out of sync, and switching tabs later (once
+    # a front-end exists) is just a matter of pointing process_chat_turn at
+    # whichever tab's history list is active instead of always this one.
+    import conversation_tabs
+    if conversation_tabs.get_tab("main") is None:
+        conversation_tabs.open_tab(kind="user", tab_id="main", history=history)
+    else:
+        conversation_tabs.switch_tab("main")
+
     turn_counter = 1
 
     while True:

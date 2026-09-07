@@ -3014,6 +3014,36 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "get_discord_chat_history",
+            "description": (
+                "Fetch the last N messages actually posted in a Discord server's text "
+                "channel (via Discord's own message history) -- use this when asked "
+                "what's been said recently in a server, as opposed to Midum's own "
+                "internal chat sessions (see list_discord_sessions)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "description": "Guild ID or server name to read from (see list_discord_servers())."
+                    },
+                    "length": {
+                        "type": "integer",
+                        "description": "How many of the most recent messages to return. Capped at 200."
+                    },
+                    "channel_name": {
+                        "type": "string",
+                        "description": "Optional text channel name (e.g. 'general'). Defaults to the server's default/first text channel."
+                    }
+                },
+                "required": ["server", "length"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "start_discord_bot",
             "description": (
                 "Start the Discord bot so it starts listening for and replying to DMs and "
