@@ -7,6 +7,7 @@ from midum_mcp.manager import _load_mcp_config, _mcp_manager, connect_mcp_server
 from midum_mcp.tools import call_mcp_tool, list_native_tools, show_native_tool_schema, show_server_tools
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
 from tools.render_surface_tools import write_render_code, edit_render_code, close_render_surface, save_render_surface, list_saved_render_surfaces, load_render_surface, delete_saved_render_surface, webapi_fetch, stream_asset, search_assets, search_web_assets, stream_web_asset
+from tools.ambient_surface_tools import show_ambient_surface, edit_ambient_surface, move_ambient_surface, close_ambient_surface, list_ambient_surfaces
 from tools_schema import tools
 from ui_automation import ui_navigator
 
@@ -17,6 +18,7 @@ import providers.gemini_api_backend as providers_gemini_api_backend
 import providers.gemini_reasoning as providers_gemini_reasoning
 import providers.gemini_web_backend as providers_gemini_web_backend
 import providers.groq_backend as providers_groq_backend
+import providers.litellm_backend as providers_litellm_backend
 import providers.openrouter_backend as providers_openrouter_backend
 from browser_cdp import _CDP_AVAILABLE, _cdp_get_tabs, act_on_browser_element, list_browser_tabs, query_gemini_app, read_browser_page, run_js_in_browser, snapshot_browser_elements
 from config import GOAL_SECTION_END, GOAL_SECTION_HEADER, LOG_FILE, MCP_SERVERS_FILE, MODEL_NAME, MODEL_PROVIDER, OPENROUTER_CONSULT_MODE, SCREEN_H, SCREEN_W, SECRETS_FILE, SESSION_MEMORY, TARGET_DIR
@@ -26,7 +28,7 @@ from scheduler import create_schedule, delete_schedule, describe_schedule, get_s
 from midum_mcp.manager import _MCP_SERVERS, _MCP_SERVER_ORDER, init_mcp_servers_from_config
 from midum_mcp.manager import demote_mcp_tool, get_promoted_tools, is_tool_promoted, promote_mcp_tool
 from memory import init_memory_at_startup, python_trigger_memory_update, set_current_goal, update_memory
-from orchestration import _decompose_task, _is_trivial_input, get_gemini_reasoning, is_action_loop_active, process_chat_turn, set_tool_call_hook, start_action_loop, stop_action_loop, wait
+from orchestration import _decompose_task, _is_trivial_input, get_gemini_reasoning, is_action_loop_active, process_chat_turn, set_tool_call_hook, set_tool_start_hook, start_action_loop, stop_action_loop, wait
 from multi_agent import start_agent, send_agent_task, get_agent_report, list_agents, stop_agent, resume_agent, forget_agent, delegate_agent_task_to_supervisor, get_agent_transcript, list_agents_struct, set_agent_done_hook, tell_supervisor_to_inform_user, set_agent_inform_hook, get_current_agent_name, attach_agent_knowledge, list_agent_knowledge, attach_agent_skills, list_agent_skills
 from providers.gemini_api_backend import _gemini_api_load_msg, consult_gemini_api, delegate_to_gemini_api, set_gemini_api_model
 from providers.gemini_reasoning import consult_gemini
@@ -242,6 +244,12 @@ if __name__ == "__main__":
         print( "    Add key: { \"GROQ_API_KEY\": \"gsk_...\" } (same file as everything else)")
         print( "    Get a free key: https://console.groq.com/keys")
 
+    # ── LiteLLM status ──────────────────────────────────────────────────────────
+    if providers_litellm_backend._LITELLM_AVAILABLE:
+        print(f"🔀 [LiteLLM: installed — model={config.LITELLM_MODEL} (any provider; set keys in the Model tab)]")
+    else:
+        print(f"⚠️  [LiteLLM not available: {providers_litellm_backend._litellm_load_msg}]")
+
     # ── Primary model provider summary ────────────────────────────────────────
     if MODEL_PROVIDER == "openrouter":
         if not providers_openrouter_backend._OPENROUTER_AVAILABLE:
@@ -274,6 +282,13 @@ if __name__ == "__main__":
         else:
             print(f"🧠 [PRIMARY MODEL: Groq/{config.GROQ_MODEL} — driving Midum directly "
                   f"via GroqCloud's free-tier API]")
+    elif MODEL_PROVIDER == "litellm":
+        if not providers_litellm_backend._LITELLM_AVAILABLE:
+            print("🛑 [MODEL_PROVIDER='litellm' but the litellm package is NOT installed — "
+                  "run: pip install litellm]")
+        else:
+            print(f"🧠 [PRIMARY MODEL: LiteLLM/{config.LITELLM_MODEL} — driving Midum directly "
+                  f"via the LiteLLM package]")
     else:
         print(f"🧠 [PRIMARY MODEL: Ollama/{MODEL_NAME} — local execution brain]")
         if OPENROUTER_CONSULT_MODE != "off" and providers_openrouter_backend._OPENROUTER_AVAILABLE:

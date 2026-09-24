@@ -127,7 +127,15 @@ def set_startup_dir(path: str) -> str:
 #                calling / MCP servers exactly like every other provider.
 #                Requires the OmniRoute gateway running locally (or
 #                reachable) — see OMNIROUTE_API_BASE below.
-MODEL_PROVIDER = "gemini_web"   # "ollama" | "openrouter" | "gemini_web" | "gemini_api" | "groq" | "ollama_cloud" | "omniroute"
+# "litellm"    — use LITELLM_MODEL as the PRIMARY execution brain, routed through
+#                the LiteLLM Python package (`pip install litellm`), which speaks to
+#                100+ providers (OpenAI, Anthropic, Gemini, Mistral, xAI, DeepSeek,
+#                Together, Azure, Bedrock, Vertex, Ollama, any OpenAI-compatible
+#                server, ...) through one call with native tool calling. Model IDs
+#                are "<provider>/<model>" (e.g. "anthropic/claude-sonnet-4-5").
+#                Provider + model + API key are all picked in the GUI's Model tab.
+#                See providers/litellm_backend.py.
+MODEL_PROVIDER = "gemini_web"   # "ollama" | "openrouter" | "gemini_web" | "gemini_api" | "groq" | "ollama_cloud" | "omniroute" | "litellm"
 
 # ── OpenRouter model selection ────────────────────────────────────────────────
 # Used when MODEL_PROVIDER == "openrouter" (primary), and always used for
@@ -270,6 +278,18 @@ OMNIROUTE_FALLBACK_MODELS = [
     OMNIROUTE_MODEL,
     "auto/best-coding",
 ]
+
+# ── LiteLLM (any provider) model selection ────────────────────────────────────
+# Used when MODEL_PROVIDER == "litellm". The value is a LiteLLM model string:
+#   "<litellm-provider>/<model>"   e.g. "openai/gpt-4o-mini",
+#   "anthropic/claude-sonnet-4-5", "gemini/gemini-2.5-flash",
+#   "groq/llama-3.3-70b-versatile", "openrouter/qwen/qwen3-coder",
+#   "ollama/llama3.1", "azure/<deployment>" ...
+# Full list of providers/models: https://docs.litellm.ai/docs/providers
+# API keys + optional base URLs are stored per provider in the secrets file
+# under "LITELLM_PROVIDERS" (managed from the GUI's Model tab), or picked up
+# from the standard environment variables (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...).
+LITELLM_MODEL = "openai/gpt-4o-mini"   # primary (if selected) model, "<provider>/<model>"
 
 # ── Ollama Cloud model selection ──────────────────────────────────────────────
 # Used when MODEL_PROVIDER == "ollama_cloud" (primary), and always available
@@ -422,6 +442,11 @@ SECRETS_TEMPLATE = {
     # -- used by MODEL_PROVIDER="omniroute". Often optional for a purely local
     # gateway with no auth configured -- leave blank if you haven't set one.
     "OMNIROUTE_API_KEY": "",
+    # Per-provider keys/base URLs for MODEL_PROVIDER="litellm" (any provider
+    # LiteLLM supports). Managed from the GUI's Model tab; shape:
+    #   { "openai": {"api_key": "sk-...", "api_base": ""}, "anthropic": {...} }
+    # Providers not listed here fall back to LiteLLM's standard env vars.
+    "LITELLM_PROVIDERS": {},
     # Browser session cookies (NOT an API key) for consult_gemini's
     # web-chat path (gemini_webapi) -- both required together if used.
     # Copy from your browser's DevTools -> Application -> Cookies for

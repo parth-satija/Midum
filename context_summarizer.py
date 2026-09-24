@@ -116,14 +116,32 @@ def _active_model_name() -> str:
         "gemini_api":   config.GEMINI_API_MODEL,
         "groq":         config.GROQ_MODEL,
         "ollama_cloud": config.OLLAMA_CLOUD_MODEL,
+        "litellm":      config.LITELLM_MODEL,
     }.get(provider, config.MODEL_NAME)
+
+
+_LITELLM_CTX_CACHE: dict = {}
 
 
 def get_context_window(model_name: str = None) -> int:
     if _USER_CONTEXT_TOKENS is not None:
         return _USER_CONTEXT_TOKENS
     model_name = model_name or _active_model_name()
-    return _MODEL_CONTEXT_WINDOWS.get(model_name, _DEFAULT_CONTEXT_TOKENS)
+    if model_name in _MODEL_CONTEXT_WINDOWS:
+        return _MODEL_CONTEXT_WINDOWS[model_name]
+    # LiteLLM ships a table of context sizes for the models it supports, so
+    # any provider/model picked via the LiteLLM provider gets the right
+    # window automatically instead of the 32k default. Cached per model.
+    if config.MODEL_PROVIDER == "litellm":
+        if model_name not in _LITELLM_CTX_CACHE:
+            try:
+                from providers.litellm_backend import context_window_for
+                _LITELLM_CTX_CACHE[model_name] = context_window_for(model_name)
+            except Exception:
+                _LITELLM_CTX_CACHE[model_name] = None
+        if _LITELLM_CTX_CACHE[model_name]:
+            return _LITELLM_CTX_CACHE[model_name]
+    return _DEFAULT_CONTEXT_TOKENS
 
 
 def estimate_tokens(text: str) -> int:

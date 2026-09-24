@@ -207,5 +207,104 @@
         }
       }
     }
+  },
+  "hello": {
+    "description": "prints hello world",
+    "graph": {
+      "drawflow": {
+        "Home": {
+          "data": {
+            "1": {
+              "id": 1,
+              "name": "start",
+              "data": {},
+              "class": "flow-node-start",
+              "html": "<div class=\"flow-node flow-node-start\"><div class=\"flow-node-icon\">\u25b6</div><div class=\"flow-node-label\">Start</div></div>",
+              "typenode": false,
+              "inputs": {},
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "3",
+                      "output": "input_1"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 100,
+              "pos_y": 160
+            },
+            "2": {
+              "id": 2,
+              "name": "end",
+              "data": {},
+              "class": "flow-node-end",
+              "html": "<div class=\"flow-node flow-node-end\"><div class=\"flow-node-icon\">\u23f9</div><div class=\"flow-node-label\">End</div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "3",
+                      "input": "output_1"
+                    }
+                  ]
+                }
+              },
+              "outputs": {},
+              "pos_x": 632,
+              "pos_y": 189
+            },
+            "3": {
+              "id": 3,
+              "name": "tool::execute_python_code",
+              "data": {
+                "code": "print(\"hello world\")",
+                "timeout": "",
+                "_flow_param_order": [
+                  "code",
+                  "timeout"
+                ]
+              },
+              "class": "flow-node-tool--execute_python_code",
+              "html": "<div class=\"flow-node-tool\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\">\ud83d\udd27</span><span class=\"flow-node-label\">execute_python_code</span><span class=\"flow-node-kind-badge flow-node-kind-hybrid\">hybrid</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row required\" title=\"The Python code to run. Use print() to produce output you want to see.\"><span class=\"flow-param-label\">code</span><input class=\"flow-param-input\" type=\"text\" df-code placeholder=\"The Python code to run. Use print() to produce output you want to see.\"/></div><div class=\"flow-param-row\" title=\"Max seconds to allow before killing the process. Default 15, hard cap 60.\"><span class=\"flow-param-label\">timeout</span><input class=\"flow-param-input\" type=\"number\" df-timeout placeholder=\"Max seconds to allow before killing the process. Default 15, hard cap 60.\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: seq, params</span><span class=\"flow-object-out\">out: seq, \u2b24 object</span></div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "1",
+                      "input": "output_1"
+                    }
+                  ]
+                },
+                "input_2": {
+                  "connections": []
+                },
+                "input_3": {
+                  "connections": []
+                }
+              },
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "2",
+                      "output": "input_1"
+                    }
+                  ]
+                },
+                "output_2": {
+                  "connections": []
+                }
+              },
+              "pos_x": 258,
+              "pos_y": 51
+            }
+          }
+        }
+      }
+    }
   }
 }

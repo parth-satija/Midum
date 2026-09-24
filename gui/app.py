@@ -132,6 +132,7 @@ def _default_model_for_provider(provider_key: str) -> str:
         "gemini_api":    midum.config.GEMINI_API_MODEL,
         "groq":          midum.config.GROQ_MODEL,
         "ollama_cloud":  midum.config.OLLAMA_CLOUD_MODEL,
+        "litellm":       midum.config.LITELLM_MODEL,
     }.get(provider_key, "")
 
 
@@ -146,6 +147,11 @@ def _known_models_for_provider(provider_key: str) -> list:
         return _list_gemini_web_model_options()
     if provider_key == "ollama_cloud":
         return list(dict.fromkeys(midum.config.OLLAMA_CLOUD_FALLBACK_MODELS))
+    if provider_key == "litellm":
+        # The GUI shows a dedicated service/model/key picker for LiteLLM
+        # (see attachLitellmPicker in the frontend JS) instead of a flat model
+        # list -- the choices depend on which service is picked.
+        return []
     return [midum.config.MODEL_NAME]
 
 
@@ -241,6 +247,7 @@ PROVIDER_OPTIONS = [
     ("Gemini (Web)",    "gemini_web"),
     ("Gemini (API)",    "gemini_api"),
     ("Groq",            "groq"),
+    ("LiteLLM (any provider)", "litellm"),
 ]
 _PROVIDER_LABEL_TO_KEY = {label: key for label, key in PROVIDER_OPTIONS}
 _PROVIDER_KEY_TO_LABEL = {key: label for label, key in PROVIDER_OPTIONS}
@@ -622,6 +629,26 @@ class Api:
         self._current_chat_id  = uuid.uuid4().hex
         self._chat_title       = None
         self._display_log      = []
+
+        # ── Edit Prompt / Regenerate Response (most-recent-turn only) ──────
+        # Marks the slice of self._session.history / self._display_log that
+        # the CURRENT tab's most recent user-initiated turn occupies, so it
+        # can be cleanly popped back off for "Edit Prompt" (put the raw text
+        # back in the input box, remove the turn) or "Regenerate Response"
+        # (keep the user message, drop only what came after it, re-run).
+        # None/None means "no editable turn right now" (fresh tab, or the
+        # last turn was already consumed by an edit). Tab-scoped exactly
+        # like _display_log itself -- see _snapshot_gui_state/
+        # _load_tab_gui_state/_blank_gui_state and load_chat().
+        self._turn_seq                 = 0
+        self._last_turn_history_start  = None
+        self._last_turn_display_start  = None
+        self._last_turn_display_end    = None
+        # Serializes edit_last_prompt()/regenerate_last_response() against
+        # each other (and against themselves being double-clicked) -- both
+        # mutate _session.history/_display_log and must never run
+        # concurrently.
+        self._gui_edit_lock    = threading.Lock()
         # Explain Mode's per-source progress: source name -> current part
         # index (0-based, into knowledge_base.build_pdf_source_parts).
         # Reset whenever the chat/session resets -- a walkthrough is scoped
@@ -714,6 +741,7 @@ class Api:
         # the chat pane. Separate from the plain-text log line the console
         # already gets from _on_log_line's "-> Executing: ..." interception.
         midum.set_tool_call_hook(self._handle_tool_call)
+        midum.set_tool_start_hook(self._handle_tool_start)
 
         # Wires the persistent WSL2 shell (shell_session.py) to the Shell
         # tab -- every command run there, whether issued by the model via
@@ -815,6 +843,25 @@ class Api:
         flow_name = sched.get("flow_name")
         self._push_event("log", {"text": f"⏰ [Schedule '{sched.get('id')}'] ran flow '{flow_name}' -> {str(result)[:200]}\n"})
         self._push_event("schedule_ran", {"schedule_id": sched.get("id"), "flow_name": flow_name, "result": str(result)[:500]})
+
+    def _handle_tool_start(self, name: str, args: dict, agent_name: str = None):
+        """Called by orchestration.py right BEFORE a tool executes, with the
+        exact arguments it is about to run with. Pushes a 'tool_start' event
+        so the chat pane's tool pill can show the call immediately instead of
+        waiting for the result (see _handle_tool_call for the finished
+        call + result). Sub-agent calls and say() get no pill, so they're
+        skipped here."""
+        if agent_name or name == "say":
+            return
+        try:
+            safe_args = json.loads(json.dumps(args, default=str))
+        except Exception:
+            safe_args = {k: str(v) for k, v in (args or {}).items()} if isinstance(args, dict) else {}
+        if isinstance(safe_args, dict):
+            for k, v in list(safe_args.items()):
+                if isinstance(v, str) and len(v) > 4000:
+                    safe_args[k] = v[:4000] + f"… [{len(v)} chars total]"
+        self._push_event("tool_start", {"name": name, "args": safe_args})
 
     def _handle_tool_call(self, name: str, args: dict, result: str, agent_name: str = None):
         """Called by orchestration.py right after every tool call executes,
@@ -1422,9 +1469,46 @@ class Api:
             midum.config.GROQ_MODEL = model_id
         elif provider_key == "ollama_cloud":
             midum.config.OLLAMA_CLOUD_MODEL = model_id
+        elif provider_key == "litellm":
+            midum.config.LITELLM_MODEL = model_id
 
         self._push_event("log", {"text": f"🔀 [Provider switched: {label} — {model_id or '(auto)'}]\n"})
         return self.get_status()
+
+    # ── LiteLLM (any provider) helpers for the Model tab / Settings picker ──────
+    # Thin pass-throughs to providers/litellm_backend.py. Everything here is
+    # safe to call whether or not the litellm package is installed.
+    def litellm_catalog(self):
+        b = midum.providers_litellm_backend
+        try:
+            return {"available": b._LITELLM_AVAILABLE, "message": b._litellm_load_msg,
+                    "providers": b.list_litellm_providers()}
+        except Exception as e:
+            return {"available": False, "message": str(e), "providers": []}
+
+    def litellm_provider_models(self, provider: str):
+        return midum.providers_litellm_backend.list_provider_models(provider)
+
+    def litellm_refresh_models(self, provider: str):
+        return midum.providers_litellm_backend.fetch_live_models(provider)
+
+    def litellm_provider_status(self, provider: str):
+        return midum.providers_litellm_backend.provider_status(provider)
+
+    def litellm_save_credentials(self, provider: str, api_key=None, api_base=None):
+        r = midum.providers_litellm_backend.save_provider_credentials(provider, api_key, api_base)
+        if r.get("ok"):
+            self._push_event("log", {"text": f"🔑 [LiteLLM: saved credentials for '{provider}']\n"})
+        return r
+
+    def litellm_test(self, model: str):
+        return midum.providers_litellm_backend.test_connection(model)
+
+    def litellm_install(self):
+        self._push_event("log", {"text": "📦 [Installing litellm via pip — this can take a minute...]\n"})
+        r = midum.providers_litellm_backend.install_litellm()
+        self._push_event("log", {"text": "✅ [litellm installed]\n" if r.get("ok") else f"⚠️ [litellm install failed: {r.get('error')}]\n"})
+        return r
 
     # ── Persisted GUI settings (default model + theme colors) ────────────
     _SETTINGS_FILENAME = "gui_settings.json"
@@ -2174,6 +2258,13 @@ class Api:
         self._display_log = list(data.get("display", []))
         self._voice_stream_tag = None
         self._voice_stream_idx = None
+        # A freshly loaded chat has no in-memory "most recent turn" to edit
+        # or regenerate yet -- those markers describe positions in THIS
+        # process's _display_log/_session.history, not anything persisted
+        # to disk, so they can't be reconstructed from the loaded file.
+        self._last_turn_history_start = None
+        self._last_turn_display_start = None
+        self._last_turn_display_end = None
         # Restore KB Only / Explain Mode toggle state + walkthrough progress
         # exactly as they were when this chat was last saved, so an
         # in-progress KB/Explain walkthrough can be continued seamlessly
@@ -2382,6 +2473,11 @@ class Api:
             'explain_page_progress': {},
             'render_surface_code': None,
             'render_surface_title': None,
+            # See __init__ -- fresh tab, no editable turn yet.
+            'turn_seq': 0,
+            'last_turn_history_start': None,
+            'last_turn_display_start': None,
+            'last_turn_display_end': None,
         }
 
     def _snapshot_gui_state(self) -> dict:
@@ -2395,6 +2491,14 @@ class Api:
             'explain_page_progress': dict(self._explain_page_progress),
             'render_surface_code': self._render_surface_code,
             'render_surface_title': self._render_surface_title,
+            # Edit Prompt / Regenerate Response markers -- see __init__.
+            # Must travel with the rest of this tab's GUI state or
+            # switching tabs could leave them pointing at another tab's
+            # _display_log/_session.history indices.
+            'turn_seq': self._turn_seq,
+            'last_turn_history_start': self._last_turn_history_start,
+            'last_turn_display_start': self._last_turn_display_start,
+            'last_turn_display_end': self._last_turn_display_end,
         }
 
     def _save_active_tab_gui_state(self):
@@ -2434,6 +2538,13 @@ class Api:
         self._explain_page_progress       = state['explain_page_progress']
         self._render_surface_code         = state['render_surface_code']
         self._render_surface_title        = state['render_surface_title']
+        # Edit Prompt / Regenerate Response markers -- see __init__. Old
+        # tabs saved before this feature existed won't have these keys, so
+        # fall back to "no editable turn" rather than KeyError.
+        self._turn_seq                    = state.get('turn_seq', 0)
+        self._last_turn_history_start     = state.get('last_turn_history_start')
+        self._last_turn_display_start     = state.get('last_turn_display_start')
+        self._last_turn_display_end       = state.get('last_turn_display_end')
         # Same reasoning as load_chat(): never auto-reopen a Render Surface
         # belonging to the tab being switched TO -- force-close whatever
         # panel is on screen (it belonged to the tab being left).
@@ -2863,6 +2974,16 @@ class Api:
         if not user_input:
             return {"ok": False, "error": "empty"}
 
+        # Mark where THIS turn starts in both logs, before appending
+        # anything for it, so edit_last_prompt()/regenerate_last_response()
+        # can later pop exactly this turn back off and nothing else. See
+        # __init__ for why these are tab-scoped GUI state.
+        self._turn_seq += 1
+        this_turn_id = self._turn_seq
+        self._last_turn_history_start = len(self._session.history)
+        self._last_turn_display_start = len(self._display_log)
+        self._last_turn_display_end = None
+
         self._display_log.append(("user", user_input))
         if not self._chat_title:
             self._set_chat_title_from_first_message(user_input)
@@ -2924,9 +3045,44 @@ class Api:
 
         threading.Thread(
             target=self._run_turn,
-            args=(list(self._session.snapshot()), kb_only, kb_context_msg),
+            args=(list(self._session.snapshot()), kb_only, kb_context_msg, this_turn_id),
             daemon=True,
         ).start()
+        # turn_id lets the frontend attach the "Edit Prompt" hover button
+        # to this exact user row right away -- it doesn't need to wait for
+        # the response to finish (or even start), matching the requirement
+        # that editing can abort a still-in-progress response.
+        return {"ok": True, "turn_id": this_turn_id}
+
+    def send_interjection(self, text: str):
+        """Queue a live steering message while a turn is still executing.
+
+        Deliberately NOT send_message: it never starts a new turn, never
+        touches self._thinking, and never appends to self._session.history
+        directly. It just drops the text into the shared interjection queue
+        (state.py), which process_chat_turn (orchestration.py) drains and
+        folds into the model's conversation as a synthetic tool-response
+        message right after the next tool call finishes -- see
+        state.queue_interjection / orchestration.py's tool-call loop.
+
+        Still recorded in _display_log (tagged "interjection", distinct from
+        a normal "user" turn) purely so it shows up on reload/tab-switch and
+        in exports -- that persistence is independent of, and doesn't affect,
+        whether/when the model actually sees it.
+        """
+        text = (text or "").strip()
+        if not text:
+            return {"ok": False, "error": "empty"}
+        if not self._thinking:
+            # Nothing running right now for this to steer -- the frontend
+            # already gates this (sendMessage() only takes this path while
+            # state.thinking is true), so reaching here means the turn
+            # finished in the gap between the click and this call landing.
+            return {"ok": False, "error": "not_busy"}
+        import state as _state
+        _state.queue_interjection(text)
+        self._display_log.append(("interjection", text))
+        self._persist_current_chat()
         return {"ok": True}
 
     def _build_kb_only_context_message(self, kb_sources: list, explain_mode: bool = False, user_input: str = "", explain_mode_type: str = "part") -> str:
@@ -3193,7 +3349,16 @@ class Api:
         )
         return f"{header}{rendered}{explain_block}"
 
-    def _run_turn(self, history_snapshot: list, kb_only: bool = False, kb_context_msg: str = None):
+    def _run_turn(self, history_snapshot: list, kb_only: bool = False, kb_context_msg: str = None, turn_id: int = None):
+        # turn_id is only set for a turn started directly from send_message
+        # or regenerate_last_response() -- i.e. one "most recent turn" the
+        # Edit Prompt / Regenerate Response buttons are allowed to act on.
+        # Agent-follow-up continuations (see the `start_followup` branch in
+        # the `finally` block below) pass turn_id=None on purpose: they
+        # append MORE content after that turn's own markers, so leaving
+        # _last_turn_display_end unset for them makes the staleness check
+        # in _pop_last_turn() correctly refuse to edit/regenerate a turn
+        # that's no longer really "the last thing in the chat".
         try:
             midum._abort_event.clear()
             permissions.set_kb_only_mode(kb_only)
@@ -3238,6 +3403,13 @@ class Api:
                 for lang, body in visuals:
                     block = f"```{lang}\n{body}\n```"
                     self._display_log.append(("midum", block))
+                if turn_id is not None:
+                    # Freezes the expected length of _display_log for this
+                    # turn -- _pop_last_turn() refuses to act if anything
+                    # else (an agent follow-up, another message) appended
+                    # after this point, instead of silently deleting the
+                    # wrong rows.
+                    self._last_turn_display_end = len(self._display_log)
             if cleaned_reply:
                 self._push_event("reply", {"text": cleaned_reply})
             for lang, body in visuals:
@@ -3248,10 +3420,24 @@ class Api:
             threading.Thread(target=midum.python_trigger_memory_update, args=(tool_outputs, reply), daemon=True).start()
 
             self._push_event("status", {"text": "Ready", "level": "ok"})
+            if turn_id is not None:
+                # Tells the frontend this turn is now the editable
+                # "most recent" one -- see appendRow()/handleTurnReady() in
+                # the JS for how the Edit Prompt / Regenerate Response
+                # buttons get attached to exactly its two rows.
+                self._push_event("turn_ready", {"turn_id": turn_id})
         except Exception as e:
             self._push_event("error_line", {"text": f"[Engine error: {e}]"})
             self._push_event("status", {"text": "Error", "level": "err"})
             self._persist_current_chat()
+            if turn_id is not None:
+                # Even a failed turn is still "the most recent turn" --
+                # its (possibly empty) reply was still appended above via
+                # the normal display_log/session.history path, so it's
+                # still safe to edit/regenerate.
+                with self._persist_lock:
+                    self._last_turn_display_end = len(self._display_log)
+                self._push_event("turn_ready", {"turn_id": turn_id})
         finally:
             permissions.set_kb_only_mode(False)
             # Atomically: clear _thinking AND drain any agent-done notes
@@ -3332,6 +3518,105 @@ class Api:
         self._push_event("status", {"text": "Aborted", "level": "err"})
         self._push_event("log", {"text": "🛑 Execution pipeline aborted by user\n"})
         return {"ok": True}
+
+    # ── Edit Prompt / Regenerate Response ─────────────────────────────────
+    # Both act on the single most recent user-initiated turn only (see the
+    # _turn_seq/_last_turn_* markers set in send_message/_run_turn above).
+    # "Edit Prompt" removes the turn entirely (user message + whatever the
+    # model produced for it) and hands the raw prompt text back to the
+    # frontend to drop into the input box. "Regenerate Response" keeps the
+    # user message and only removes what came after it, then re-runs.
+    def edit_last_prompt(self, turn_id: int):
+        return self._pop_last_turn(turn_id, put_back_prompt=True)
+
+    def regenerate_last_response(self, turn_id: int):
+        return self._pop_last_turn(turn_id, put_back_prompt=False)
+
+    def _pop_last_turn(self, turn_id: int, put_back_prompt: bool) -> dict:
+        if not self._gui_edit_lock.acquire(blocking=False):
+            return {"ok": False, "error": "busy"}
+        try:
+            # Stale click guard: the frontend only shows these buttons on
+            # the latest turn, but a click that was already in flight when
+            # a newer turn started (or a tab switch swapped these markers
+            # out from under us) must not touch the wrong rows.
+            if turn_id != self._turn_seq:
+                return {"ok": False, "error": "stale"}
+            if self._last_turn_history_start is None or self._last_turn_display_start is None:
+                return {"ok": False, "error": "no_turn"}
+
+            # If this exact turn is still generating, stop it and wait for
+            # _run_turn's own thread to actually finish (it still appends
+            # whatever partial reply comes back and clears _thinking in its
+            # `finally` block -- see _run_turn) before touching history, so
+            # we can never truncate out from under that thread mid-write.
+            if self._thinking:
+                midum._abort_event.set()
+                waited = 0.0
+                while self._thinking and waited < 30.0:
+                    time.sleep(0.05)
+                    waited += 0.05
+                if self._thinking:
+                    return {"ok": False, "error": "still_busy"}
+                # A brand-new turn (agent follow-up chaining, see the
+                # `finally` block in _run_turn) may have started the
+                # instant this one finished -- re-check staleness now that
+                # we know _thinking settled.
+                if turn_id != self._turn_seq:
+                    return {"ok": False, "error": "stale"}
+
+            # Nothing else may have appended to the log after this turn's
+            # own reply finished (an agent follow-up note, for instance) --
+            # if it has, the recorded end-marker won't match and we refuse
+            # rather than guess which rows to delete.
+            if (self._last_turn_display_end is not None
+                    and len(self._display_log) != self._last_turn_display_end):
+                return {"ok": False, "error": "stale"}
+
+            start_h = self._last_turn_history_start
+            start_d = self._last_turn_display_start
+
+            prompt_text = None
+            with self._persist_lock:
+                if start_d < len(self._display_log) and self._display_log[start_d][0] == "user":
+                    prompt_text = self._display_log[start_d][1]
+                if put_back_prompt:
+                    del self._display_log[start_d:]
+                else:
+                    del self._display_log[start_d + 1:]
+
+            with self._session._lock:
+                if put_back_prompt:
+                    del self._session.history[start_h:]
+                else:
+                    del self._session.history[start_h + 1:]
+
+            if put_back_prompt:
+                self._last_turn_history_start = None
+                self._last_turn_display_start = None
+                self._last_turn_display_end = None
+                self._persist_current_chat()
+                return {"ok": True, "text": prompt_text or ""}
+
+            # Regenerate: the user message is still sitting at the end of
+            # history/display_log exactly as send_message would have left
+            # it -- re-run the turn the same way send_message does, just
+            # without re-appending the prompt. Reuses the same turn_id
+            # (it's still the same prompt, only the answer is new), so
+            # _run_turn will overwrite _last_turn_display_end with the new
+            # reply's end position once it completes.
+            self._last_turn_display_end = None
+            self._persist_current_chat()
+            self._thinking = True
+            self._push_event("status", {"text": "Executing turns...", "level": "busy"})
+            threading.Thread(
+                target=self._run_turn,
+                args=(list(self._session.snapshot()), False, None, turn_id),
+                daemon=True,
+            ).start()
+            return {"ok": True}
+        finally:
+            self._gui_edit_lock.release()
 
     # ── Inline ask (approval / choice / text / file) ─────────────────────
     def _handle_gui_ask(self, kind: str, payload: dict) -> str:
@@ -5016,7 +5301,7 @@ input,textarea{font-family:inherit;}
 #conv-tabbar-row{
   flex:0 0 auto;width:100%;min-height:34px;
   display:flex;align-items:flex-start;justify-content:center;padding:0 10px;
-  position:relative;z-index:900;
+  position:relative;top:20px;z-index:900;
   -webkit-app-region:drag;
   background:transparent;
 }
@@ -5376,6 +5661,35 @@ html.liquid-glass-on:not(.blobs-off) #titlebar-close:hover::before{
   background-image:none !important;
   border-color:#e81123 !important;
 }
+/* Chat-row action chips (copy/edit/regenerate) -- same small circular-chip
+   recipe as the titlebar buttons just above: opaque-ish fill + diagonal
+   sheen + a thin top-lit edge, rather than the flat .icon-btn treatment,
+   since these sit directly on top of message bubbles/blobs and need a
+   touch more definition to still read as a distinct floating control.
+   Covers .row-edit-btn/.row-regen-btn too -- both always carry the base
+   .row-copy-btn class alongside their own (see attachEditButton/
+   attachRegenButton in the JS). Rest-state opacity is still handled by
+   the plain (non-glass) .row:hover .row-copy-btn rule above -- glass only
+   changes what it looks like once visible, not when it appears. */
+html.liquid-glass-on.has-bg-image .row-copy-btn,
+html.liquid-glass-on:not(.blobs-off) .row-copy-btn{
+  background-color:var(--glass-fill-strong) !important;
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
+  border:1px solid var(--glass-edge-dim);
+  box-shadow:inset 0 1px 0 var(--glass-edge-dim);
+  transition:background-color .15s var(--ease), box-shadow .15s var(--ease), border-color .15s var(--ease), color .15s var(--ease);
+}
+html.liquid-glass-on.has-bg-image .row-copy-btn:hover,
+html.liquid-glass-on:not(.blobs-off) .row-copy-btn:hover{
+  background-color:var(--glass-fill-strong) !important;
+  border-color:var(--glass-edge);
+  box-shadow:inset 0 1px 0 var(--glass-edge);
+}
+html.liquid-glass-on.has-bg-image .row-copy-btn.copied,
+html.liquid-glass-on:not(.blobs-off) .row-copy-btn.copied{
+  border-color:var(--green);
+  box-shadow:inset 0 1px 0 var(--glass-edge);
+}
 html.liquid-glass-on.has-bg-image .conv-tab:not(.active):hover,
 html.liquid-glass-on:not(.blobs-off) .conv-tab:not(.active):hover,
 html.liquid-glass-on.has-bg-image .conv-tab-icon-btn:hover,
@@ -5706,6 +6020,9 @@ body.render-surface-active #settings-panel-toggle .ghost-btn{
 .row:hover .row-copy-btn{opacity:1;}
 .row-copy-btn:hover{background:var(--border2);color:var(--text);}
 .row-copy-btn.copied{opacity:1;color:var(--green);}
+.row-edit-btn:hover{background:var(--border2);color:var(--accent);}
+.row-regen-btn:hover{background:var(--border2);color:var(--accent);}
+.row-edit-btn:disabled,.row-regen-btn:disabled{opacity:.5;cursor:default;}
 .bubble{border-radius:18px;padding:10px 16px;font-size:14px;line-height:1.5;max-width:78%;white-space:pre-wrap;word-wrap:break-word;
   user-select:text;-webkit-user-select:text;cursor:text;}
 .bubble *{user-select:text;-webkit-user-select:text;}
@@ -5723,6 +6040,32 @@ body.render-surface-active #settings-panel-toggle .ghost-btn{
 .row.system, .row.error{align-items:center;text-align:center;}
 .row.system .bubble{background:transparent;color:var(--subtext);font-size:12px;}
 .row.error .bubble{background:transparent;color:var(--red);font-size:12px;}
+/* Interjection pill -- a live steering message sent through the prompt box
+   while Midum is still "Executing turns..." on a previous message (see
+   sendMessage()/Api.send_interjection in the JS/Python below). Deliberately
+   NOT a normal chat bubble: it spans the full chat column width (same max
+   width as #chat-col, not the 78% cap ordinary bubbles use) so it reads as
+   a steering bar laid across the conversation rather than another turn.
+   Rendered in the same Glass Surface language as the titlebar/tool-call
+   pills (--glass-fill/--glass-sheen/--glass-edge) when Liquid Glass is on;
+   falls back to a flat translucent pill otherwise via the plain rule below. */
+.row.interjection{align-items:stretch;}
+.row.interjection .bubble{
+  max-width:100%;width:100%;border-radius:999px;box-sizing:border-box;
+  padding:9px 20px;font-size:12.5px;font-weight:600;letter-spacing:.1px;
+  display:flex;align-items:center;gap:8px;
+  background:var(--surface2);border:1px solid var(--border2);color:var(--text);
+}
+.row.interjection .bubble::before{
+  content:"\21B4";flex:0 0 auto;font-size:13px;color:var(--accent);
+}
+html.liquid-glass-on.has-bg-image .row.interjection .bubble,
+html.liquid-glass-on:not(.blobs-off) .row.interjection .bubble{
+  background-color:var(--glass-fill) !important;
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
+  border:1px solid var(--glass-edge-dim);
+  box-shadow:inset 0 1px 0 var(--glass-edge-dim), var(--glass-glow);
+}
 .row.tool{align-items:flex-start;}
 .tool-line{display:flex;gap:6px;font-size:10px;color:var(--subtext);align-items:center;cursor:pointer;user-select:none;}
 .tool-line:hover{color:var(--text);}
@@ -5757,6 +6100,211 @@ body.render-surface-active #settings-panel-toggle .ghost-btn{
 .agent-tool-line:hover{opacity:.85;font-style:normal;}
 .agent-tool-dot{background:var(--muted);}
 .agent-tool-row .tool-detail{opacity:.9;}
+
+/* ── Grouped tool-call pills ─────────────────────────────────────────────
+   Every stretch of tool calls (until Midum say()s / replies) collapses into
+   ONE "Ran N tools" pill (.tg-pill). Expanding it drops the group into one
+   small pill per call (.tc-pill); clicking a call pill opens its glass
+   panel (.tc-panel) with the actual call + the tool's return.
+   Base look is already a soft frosted chip; with Liquid Glass on, the
+   block further below swaps in the shared --glass-* tokens so these match
+   every other glass surface in the app. Only compositor-friendly
+   properties animate (transform/opacity/grid rows) -- no backdrop-filter,
+   for the same reason the rest of the glass system avoids it. */
+.row.tool-group{align-items:flex-start;padding:4px 0;}
+.tg-head{display:flex;align-items:center;gap:6px;max-width:100%;}
+.tg-pill,.tc-pill{
+  -webkit-appearance:none;appearance:none;font-family:inherit;cursor:pointer;user-select:none;
+  position:relative;overflow:hidden;
+  display:inline-flex;align-items:center;max-width:100%;
+  color:var(--subtext);
+  border:1px solid color-mix(in srgb, white 10%, var(--border2));
+  background-color:color-mix(in srgb, var(--surface) 80%, transparent);
+  background-image:linear-gradient(150deg, color-mix(in srgb, white 9%, transparent) 0%, color-mix(in srgb, white 3%, transparent) 34%, transparent 62%);
+  box-shadow:inset 0 1px 0 color-mix(in srgb, white 13%, transparent), inset 0 -1px 0 color-mix(in srgb, white 4%, transparent), 0 6px 16px -12px rgba(0,0,0,.6);
+  transition:background-color .18s var(--ease), border-color .18s var(--ease), color .18s var(--ease), box-shadow .18s var(--ease), transform .18s var(--ease);
+}
+.tg-pill:hover,.tc-pill:hover{
+  color:var(--text);
+  border-color:color-mix(in srgb, var(--accent) 38%, var(--border2));
+  background-color:color-mix(in srgb, var(--surface2) 88%, transparent);
+}
+.tg-pill:active,.tc-pill:active{transform:scale(.985);}
+.tg-pill:focus-visible,.tc-pill:focus-visible{
+  outline:none;
+  box-shadow:0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent), inset 0 1px 0 color-mix(in srgb, white 13%, transparent);
+}
+
+/* main "Ran N tools" pill */
+.tg-pill{height:34px;padding:0 12px 0 11px;gap:8px;border-radius:999px;font-size:12.5px;font-weight:600;}
+.tg-icon{display:inline-flex;color:var(--accent);opacity:.9;}
+.tg-label{color:var(--text);letter-spacing:.005em;white-space:nowrap;}
+.tg-extra{
+  font-family:"JetBrains Mono","Cascadia Code",Consolas,monospace;font-size:11px;font-weight:500;
+  color:var(--subtext);max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  padding-left:8px;border-left:1px solid var(--border2);
+}
+.tg-extra:empty{display:none;}
+.tg-chev,.tc-chev{display:inline-flex;opacity:.65;transition:transform .25s var(--ease), opacity .2s;}
+.tool-group.open .tg-chev{transform:rotate(90deg);opacity:.95;}
+
+/* status dots */
+.tg-dot,.tc-dot{
+  width:7px;height:7px;border-radius:50%;flex:0 0 auto;
+  background:color-mix(in srgb, var(--green) 78%, transparent);
+  transition:background .2s;
+}
+/* Active (running) state: the status dot becomes the orbit spinner. Every
+   length of the original 70px loader is expressed in --u (= size / 70) so it
+   scales cleanly down to pill size. */
+.tool-group.live .tg-dot,.tc.pending .tc-dot{
+  --sz:24px;--u:calc(var(--sz) / 70);
+  width:var(--sz);height:var(--sz);border-radius:0;position:relative;
+  background:
+    radial-gradient(farthest-side,lightskyblue 90%,#0000) center/calc(16 * var(--u)) calc(16 * var(--u)),
+    radial-gradient(farthest-side,green   90%,#0000) bottom/calc(12 * var(--u)) calc(12 * var(--u));
+  background-repeat:no-repeat;
+  animation:l17 1s infinite linear;
+}
+.tc.pending .tc-dot{--sz:20px;}
+.tool-group.live .tg-dot::before,.tc.pending .tc-dot::before{
+  content:"";
+  position:absolute;
+  width:calc(8 * var(--u));
+  aspect-ratio:1;
+  inset:auto 0 calc(16 * var(--u));
+  margin:auto;
+  background:#ccc;
+  border-radius:50%;
+  transform-origin:50% calc(100% + 10 * var(--u));
+  animation:inherit;
+  animation-duration:.5s;
+}
+@keyframes l17{ 100%{transform:rotate(1turn)} }
+.tool-group.has-err:not(.live) .tg-dot{background:var(--yellow);}
+.tc.err .tc-dot{background:var(--red);}
+.tc.stale .tc-dot{background:var(--muted);}
+/* soft light sweep while the group is still working */
+.tool-group.live .tg-pill{border-color:color-mix(in srgb, var(--accent) 34%, var(--border2));}
+.tool-group.live .tg-pill::after{
+  content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(100deg, transparent 32%, color-mix(in srgb, white 13%, transparent) 50%, transparent 68%);
+  transform:translateX(-100%);animation:tgSweep 2.4s ease-in-out infinite;
+}
+@keyframes tgSweep{ to{transform:translateX(100%);} }
+
+/* expand / collapse (animated via grid rows so height auto works) */
+.tg-body,.tc-detail{display:grid;grid-template-rows:0fr;transition:grid-template-rows .3s var(--ease);width:100%;}
+.tool-group.open > .tg-body,.tc.open > .tc-detail{grid-template-rows:1fr;}
+.tg-body-inner,.tc-detail-inner{min-height:0;overflow:hidden;}
+
+/* the dropped-down list of individual call pills */
+.tg-list{
+  display:flex;flex-direction:column;align-items:flex-start;gap:6px;
+  margin:8px 0 2px 16px;padding:3px 0 3px 16px;
+  border-left:1px solid color-mix(in srgb, white 12%, var(--border2));
+}
+.tc{position:relative;display:flex;flex-direction:column;align-items:flex-start;width:100%;max-width:100%;}
+.tc::before{
+  content:"";position:absolute;left:-16px;top:14px;width:12px;height:1px;
+  background:color-mix(in srgb, white 12%, var(--border2));
+}
+@keyframes tcDrop{ from{opacity:0;transform:translateY(-6px) scale(.97);} to{opacity:1;transform:none;} }
+.tool-group.open .tc{animation:tcDrop .34s var(--ease) both;animation-delay:calc(var(--i,0) * 36ms);}
+
+/* individual call pill */
+.tc-pill{height:28px;padding:0 10px 0 9px;gap:7px;border-radius:999px;font-size:12px;}
+.tc-name{
+  font-family:"JetBrains Mono","Cascadia Code",Consolas,monospace;font-size:11.5px;font-weight:600;
+  color:var(--text);white-space:nowrap;
+}
+.tc-preview{
+  font-family:"JetBrains Mono","Cascadia Code",Consolas,monospace;font-size:11px;
+  color:var(--subtext);opacity:.85;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.tc-preview:empty,.tc-time:empty{display:none;}
+.tc.pending .tc-preview{font-style:italic;}
+.tc-time{font-size:10px;color:var(--subtext);opacity:.7;font-variant-numeric:tabular-nums;}
+.tc.open .tc-chev{transform:rotate(90deg);opacity:.95;}
+.tc.open .tc-pill{color:var(--text);border-color:color-mix(in srgb, var(--accent) 45%, var(--border2));}
+.tc.agent{opacity:.62;transition:opacity .2s;}
+.tc.agent:hover,.tc.agent.open{opacity:1;}
+.tc-agent{
+  font-size:9.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+  color:var(--accent);background:var(--accent-faint);padding:1px 7px;border-radius:999px;
+}
+
+/* the call + return panel */
+.tc-detail{width:min(580px,100%);visibility:hidden;transition:grid-template-rows .3s var(--ease), visibility 0s linear .3s;}
+.tc.open > .tc-detail{visibility:visible;transition-delay:0s;}
+.tc-panel{
+  margin:6px 1px 3px;padding:10px 12px 12px;border-radius:18px;
+  border:1px solid color-mix(in srgb, white 10%, var(--border2));
+  background-color:color-mix(in srgb, var(--surface) 78%, transparent);
+  background-image:linear-gradient(150deg, color-mix(in srgb, white 8%, transparent) 0%, color-mix(in srgb, white 2%, transparent) 30%, transparent 55%);
+  box-shadow:inset 0 1px 0 color-mix(in srgb, white 12%, transparent), 0 10px 24px -14px rgba(0,0,0,.65);
+}
+.tc-block + .tc-block{margin-top:10px;}
+.tc-block-head{
+  display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;
+  font-size:9.5px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--subtext);
+}
+.tc-copy{
+  width:20px;height:20px;border-radius:50%;border:none;background:transparent;color:var(--subtext);
+  font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;
+  opacity:.7;transition:opacity .15s, background .15s, color .15s;
+}
+.tc-copy:hover{background:var(--border2);color:var(--text);opacity:1;}
+.tc-copy.copied{color:var(--green);opacity:1;}
+.tc-panel pre{
+  margin:0;padding:9px 11px;border-radius:12px;
+  background-color:color-mix(in srgb, white 4%, transparent);
+  background-image:linear-gradient(150deg, color-mix(in srgb, white 7%, transparent) 0%, color-mix(in srgb, white 2%, transparent) 35%, transparent 65%);
+  border:1px solid color-mix(in srgb, white 9%, transparent);
+  box-shadow:inset 0 1px 0 color-mix(in srgb, white 8%, transparent);
+  color:var(--text);font-size:11.5px;line-height:1.5;
+  font-family:"JetBrains Mono","Cascadia Code",Consolas,monospace;
+  white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto;user-select:text;
+}
+.tc.err .tc-result{color:color-mix(in srgb, var(--red) 72%, var(--text));}
+.tc.pending .tc-result{opacity:.6;font-style:italic;}
+
+/* Liquid glass: same tokens + recipe as every other glass surface above */
+html.liquid-glass-on.has-bg-image .tg-pill,
+html.liquid-glass-on:not(.blobs-off) .tg-pill,
+html.liquid-glass-on.has-bg-image .tc-pill,
+html.liquid-glass-on:not(.blobs-off) .tc-pill,
+html.liquid-glass-on.has-bg-image .tc-panel,
+html.liquid-glass-on:not(.blobs-off) .tc-panel{
+  background-color:var(--glass-fill) !important;
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
+  border-color:var(--glass-edge) !important;
+  box-shadow:inset 0 1px 0 var(--glass-edge), inset 0 -1px 0 var(--glass-edge-dim), var(--glass-glow) !important;
+}
+html.liquid-glass-on.has-bg-image .tc-panel pre,
+html.liquid-glass-on:not(.blobs-off) .tc-panel pre{
+  background-color:color-mix(in srgb, white calc(var(--glass-pct) * 0.08), transparent);
+  background-image:linear-gradient(150deg, var(--glass-sheen-soft) 0%, transparent 60%);
+  border-color:var(--glass-edge-dim);
+  box-shadow:inset 0 1px 0 var(--glass-edge-dim);
+}
+html.liquid-glass-on.has-bg-image .tg-pill:hover,
+html.liquid-glass-on:not(.blobs-off) .tg-pill:hover,
+html.liquid-glass-on.has-bg-image .tc-pill:hover,
+html.liquid-glass-on:not(.blobs-off) .tc-pill:hover{
+  background-color:var(--glass-fill-strong) !important;
+}
+html.liquid-glass-on.has-bg-image .tc.open > .tc-pill,
+html.liquid-glass-on:not(.blobs-off) .tc.open > .tc-pill,
+html.liquid-glass-on.has-bg-image .tool-group.live .tg-pill,
+html.liquid-glass-on:not(.blobs-off) .tool-group.live .tg-pill{
+  box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--accent) 50%, transparent), inset 0 1px 0 var(--glass-edge), var(--glass-glow) !important;
+}
+@media (prefers-reduced-motion: reduce){
+  .tool-group.live .tg-pill::after{animation:none;display:none;}
+  .tool-group.open .tc{animation:none;}
+  .tg-body,.tc-detail{transition:none;}
+}
 @keyframes toolPulse{
   0%{  transform:scale(0.7); box-shadow:0 0 0 0 rgba(16,185,129,.55); }
   50%{ transform:scale(1.25); box-shadow:0 0 0 4px rgba(16,185,129,0); }
@@ -6247,6 +6795,15 @@ const SHELL_HISTORY_CAP = 1000;
 // whenever a new turn starts, whenever a tool call interrupts the flow, and
 // once the turn is fully done -- each of those should start a fresh bubble.
 let _currentMidumRow = null;
+// Companion to _currentMidumRow, tracking the most recent live USER row
+// (see appendRow) -- both back the Edit Prompt / Regenerate Response
+// buttons, which only ever attach to the single latest turn's two rows.
+let _currentUserRow  = null;
+// turn_id the backend assigned to the in-flight/just-finished turn (see
+// Api.send_message / Api.regenerate_last_response) -- attached to new
+// rows as they're created so their edit/regen buttons call back with the
+// right id, and used to guard against stale clicks.
+let _pendingTurnId   = null;
 
 function api(name, ...args){ return window.pywebview.api[name](...args); }
 
@@ -7763,6 +8320,9 @@ function buildStaticRow(tag, text){
   } else if (tag === "system"){
     row.className = "row system";
     row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+  } else if (tag === "interjection"){
+    row.className = "row interjection";
+    row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
   } else if (tag === "error"){
     row.className = "row error";
     row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
@@ -7800,8 +8360,23 @@ function buildTurnBlock(turnIndex){
   const wrap = document.createElement("div");
   wrap.className = "turn-block";
   wrap.dataset.turnIndex = String(turnIndex);
+  // Consecutive persisted "toolcall" records fold into ONE "Ran N tools"
+  // group (same grouping the live view does) -- any other row (say/reply,
+  // system, error, ...) closes it, so the next tool call starts a new group.
+  let group = null;
   _histTurns[turnIndex].forEach(([tag, text])=>{
-    wrap.appendChild(buildStaticRow(tag, text));
+    if (tag === "toolcall"){
+      let data;
+      try { data = JSON.parse(text); } catch(e){ data = {name: "", args: {}, result: text}; }
+      if (data.name === "say") return;
+      if (!group){ group = createToolGroup(); wrap.appendChild(group); }
+      const tc = buildToolCallPill({name: data.name || "tool"});
+      _tcSetData(tc, data.args, data.result);
+      _tgAdd(group, tc);
+    } else {
+      group = null;
+      wrap.appendChild(buildStaticRow(tag, text));
+    }
   });
   return wrap;
 }
@@ -7870,62 +8445,244 @@ function setActiveToolDot(el){
   if (_activeToolDot) _activeToolDot.classList.add("active");
 }
 
-// FIFO queue of tool-call rows awaiting their 'tool_call' detail event
-// (name/args/result), pushed in appendRow() the instant a tool starts and
+// ── Grouped tool-call pills ───────────────────────────────────────────────────────────────
+// Every stretch of tool calls becomes ONE ".tool-group" row holding a
+// "Ran N tools" pill. The group keeps absorbing tool calls until Midum
+// delivers text (say() / a reply), the user speaks, an error lands, or the
+// turn finishes -- then it's closed and the next tool call starts a fresh
+// group. Expanding the group drops it into one small pill per call
+// (".tc"); clicking a call pill reveals the actual call + the tool return.
+const _TG_ICON_TOOL = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>';
+const _TG_ICON_CHEV = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>';
+
+let _currentToolGroup = null;   // the .tool-group row still accepting live tool calls
+
+// FIFO queue of call pills (".tc") awaiting their 'tool_call' detail event
+// (name/args/result). Pushed the instant a tool starts (appendRow "tool"),
 // consumed by attachToolCallDetail() once the call finishes. Matched by
-// tool name first (handles the rare case of overlapping calls), otherwise
-// just the oldest unresolved row.
+// tool name first (handles the rare overlapping-call case), otherwise the
+// oldest unresolved pill.
 let _pendingToolRows = [];
 
-function attachToolCallDetail(name, args, result){
-  let row = null;
-  const idx = _pendingToolRows.findIndex(r=>r.dataset.toolName === name);
-  if (idx !== -1){ row = _pendingToolRows[idx]; _pendingToolRows.splice(idx, 1); }
-  else if (_pendingToolRows.length){ row = _pendingToolRows.shift(); }
-  if (!row) return;
-  const detail = row.querySelector(".tool-detail");
-  if (!detail) return;
-  const argsStr = (args && Object.keys(args).length) ? JSON.stringify(args, null, 2) : "(no arguments)";
-  detail.innerHTML = `
-    <div class="tool-detail-label">Call</div>
-    <pre>${escapeHtml(name)}(${escapeHtml(argsStr)})</pre>
-    <div class="tool-detail-label">Result</div>
-    <pre>${escapeHtml(result || "(empty)")}</pre>`;
+function _tgArgsStr(args){
+  return (args && typeof args === "object" && Object.keys(args).length) ? JSON.stringify(args, null, 2) : "(no arguments)";
 }
 
-// A sub-agent's own tool calls arrive as ONE complete event (call + result
-// together, see Api._handle_tool_call's agent_name branch) rather than the
-// two-stage placeholder-then-attach flow normal Supervisor tool calls use
-// -- there's no matching "-> Executing:" console line pushed for these (see
-// Api._on_log_line), so there's no pending row to attach to. Rendered as a
-// single dim/grey row, visually distinct from the Supervisor's own
-// tool-call cards, so background agent activity doesn't read as if the
-// Supervisor itself were doing it.
-function appendAgentToolRow(agent, name, args, result){
-  const col = chatCol();
+// Short one-line hint of what the call was about (first non-empty argument).
+function _tgPreview(args){
+  if (!args || typeof args !== "object") return "";
+  for (const k of Object.keys(args)){
+    const v = args[k];
+    if (v === null || v === undefined) continue;
+    let s = typeof v === "string" ? v : (typeof v === "object" ? JSON.stringify(v) : String(v));
+    s = s.replace(/\s+/g, " ").trim();
+    if (!s) continue;
+    return s.length > 48 ? s.slice(0, 47) + "…" : s;
+  }
+  return "";
+}
+
+function _tgLooksLikeError(result){
+  return /^\s*(error|tool exception|traceback|exception|failed)\b/i.test(String(result || ""));
+}
+
+function _tgDuration(ms){
+  if (!(ms >= 0)) return "";
+  if (ms < 1000) return Math.max(1, Math.round(ms)) + "ms";
+  return (ms < 10000 ? (ms / 1000).toFixed(1) : Math.round(ms / 1000)) + "s";
+}
+
+function createToolGroup(){
   const row = document.createElement("div");
-  row.className = "row tool tool-row agent-tool-row";
-  const argsStr = (args && Object.keys(args).length) ? JSON.stringify(args, null, 2) : "(no arguments)";
-  row.dataset.toolName = `${agent} → ${name}`;
+  row.className = "row tool-group";
   row.innerHTML = `
-    <div class="tool-line agent-tool-line expandable">
-      <span class="tool-dot agent-tool-dot"></span><span class="gear">🤖</span><span>${escapeHtml(agent)} → ${escapeHtml(name)}</span>
-      <span class="chevron">▶</span>
-      <button class="row-copy-btn" title="Copy tool call" style="margin-left:6px;">⧉</button>
+    <div class="tg-head">
+      <button type="button" class="tg-pill" aria-expanded="false">
+        <span class="tg-dot"></span>
+        <span class="tg-icon">${_TG_ICON_TOOL}</span>
+        <span class="tg-label">Ran 0 tools</span>
+        <span class="tg-extra"></span>
+        <span class="tg-chev">${_TG_ICON_CHEV}</span>
+      </button>
+      <button type="button" class="row-copy-btn" title="Copy tool calls">⧉</button>
     </div>
-    <div class="tool-detail">
-      <div class="tool-detail-label">Call</div>
-      <pre>${escapeHtml(name)}(${escapeHtml(argsStr)})</pre>
-      <div class="tool-detail-label">Result</div>
-      <pre>${escapeHtml(result || "(empty)")}</pre>
-    </div>`;
-  row.querySelector(".tool-line").onclick = (e)=>{
-    if (e.target.closest(".row-copy-btn")) return;
-    row.classList.toggle("open");
+    <div class="tg-body" inert><div class="tg-body-inner"><div class="tg-list"></div></div></div>`;
+  const pill = row.querySelector(".tg-pill");
+  const body = row.querySelector(".tg-body");
+  pill.onclick = ()=>{
+    const open = !row.classList.contains("open");
+    row.classList.toggle("open", open);
+    pill.setAttribute("aria-expanded", open ? "true" : "false");
+    body.inert = !open;
   };
   wireRowCopyBtn(row);
-  col.appendChild(row);
-  scrollToBottom();
+  return row;
+}
+
+// Re-derives the group's label / live hint / error tint from its call pills.
+function _tgRefresh(groupRow){
+  if (!groupRow) return;
+  let own = 0, running = null, errs = 0;
+  groupRow.querySelectorAll(".tg-list > .tc").forEach(el=>{
+    own++;
+    if (el.classList.contains("pending")) running = el;
+    if (el.classList.contains("err")) errs++;
+  });
+  const label = groupRow.querySelector(".tg-label");
+  const extra = groupRow.querySelector(".tg-extra");
+  // X = number of tool calls inside this group.
+  label.textContent = `Ran ${own} ${own === 1 ? "tool" : "tools"}`;
+  extra.textContent = running ? (running.dataset.toolName || "") : "";
+  groupRow.classList.toggle("has-err", errs > 0);
+}
+
+function _tgAdd(groupRow, el){
+  const list = groupRow.querySelector(".tg-list");
+  el.style.setProperty("--i", Math.min(list.children.length, 8));
+  list.appendChild(el);
+  _tgRefresh(groupRow);
+}
+
+// The group live tool calls currently flow into (created on demand).
+function _tgLiveGroup(){
+  if (!_currentToolGroup || !_currentToolGroup.isConnected){
+    _currentToolGroup = createToolGroup();
+    _currentToolGroup.classList.add("live");
+    chatCol().appendChild(_currentToolGroup);
+  }
+  return _currentToolGroup;
+}
+
+// Stops the current group from absorbing more calls (Midum said something,
+// the user spoke, an error landed, or the turn finished).
+function closeToolGroup(){
+  if (_currentToolGroup){
+    _currentToolGroup.classList.remove("live");
+    _tgRefresh(_currentToolGroup);
+  }
+  _currentToolGroup = null;
+}
+
+// Turn ended with calls that never reported back (aborted / crashed).
+function settleStaleToolPills(){
+  _pendingToolRows.forEach(el=>{
+    el.classList.remove("pending");
+    el.classList.add("stale");
+    const pv = el.querySelector(".tc-preview");
+    if (pv) pv.textContent = "no result";
+    const res = el.querySelector(".tc-result");
+    if (res) res.textContent = "(no result received)";
+    _tgRefresh(el.closest(".tool-group"));
+  });
+  _pendingToolRows = [];
+}
+
+// One call pill. info: {name, agent?, pending?}
+function buildToolCallPill(info){
+  const el = document.createElement("div");
+  el.className = "tc" + (info.agent ? " agent" : "") + (info.pending ? " pending" : "");
+  el.dataset.toolName = info.name || "";
+  el.innerHTML = `
+    <button type="button" class="tc-pill" aria-expanded="false">
+      <span class="tc-dot"></span>
+      ${info.agent ? `<span class="tc-agent">${escapeHtml(info.agent)}</span>` : ""}
+      <span class="tc-name">${escapeHtml(info.name || "tool")}</span>
+      <span class="tc-preview"></span>
+      <span class="tc-time"></span>
+      <span class="tc-chev">${_TG_ICON_CHEV}</span>
+    </button>
+    <div class="tc-detail" inert><div class="tc-detail-inner"><div class="tc-panel">
+      <div class="tc-block">
+        <div class="tc-block-head"><span>Call</span><button type="button" class="tc-copy" data-copy="call" title="Copy call">⧉</button></div>
+        <pre class="tc-call"></pre>
+      </div>
+      <div class="tc-block">
+        <div class="tc-block-head"><span>Return</span><button type="button" class="tc-copy" data-copy="result" title="Copy return">⧉</button></div>
+        <pre class="tc-result"></pre>
+      </div>
+    </div></div></div>`;
+  const pill = el.querySelector(".tc-pill");
+  const detail = el.querySelector(".tc-detail");
+  pill.onclick = ()=>{
+    const open = !el.classList.contains("open");
+    el.classList.toggle("open", open);
+    pill.setAttribute("aria-expanded", open ? "true" : "false");
+    detail.inert = !open;
+  };
+  el.querySelectorAll(".tc-copy").forEach(btn=>{
+    btn.onclick = async (e)=>{
+      e.stopPropagation();
+      const d = el._tc || {};
+      const ok = await copyTextToClipboard(btn.dataset.copy === "call" ? (d.call || "") : (d.result || ""));
+      if (ok) flashCopyFeedback(btn);
+    };
+  });
+  if (info.pending){
+    el.dataset.t0 = String(Date.now());
+    el.querySelector(".tc-preview").textContent = "running…";
+    el.querySelector(".tc-call").textContent = `${info.name || "tool"}(…)`;
+    el.querySelector(".tc-result").textContent = "Waiting for result…";
+  }
+  return el;
+}
+
+// Fills a call pill with its finished call + return and settles its state.
+function _tcSetData(el, args, result){
+  const name = el.dataset.toolName || "tool";
+  const resStr = (result === null || result === undefined) ? "" : String(result);
+  const callText = `${name}(${_tgArgsStr(args)})`;
+  el._tc = { name: el._tcLabel || name, call: callText, result: resStr };
+  el.querySelector(".tc-call").textContent = callText;
+  el.querySelector(".tc-result").textContent = resStr || "(empty)";
+  el.querySelector(".tc-preview").textContent = _tgPreview(args);
+  el.classList.remove("pending", "stale");
+  el.classList.toggle("err", _tgLooksLikeError(resStr));
+  if (el.dataset.t0){
+    const dur = Date.now() - Number(el.dataset.t0);
+    el.querySelector(".tc-time").textContent = dur >= 50 ? _tgDuration(dur) : "";
+    delete el.dataset.t0;
+  }
+}
+
+// Shows a running tool's call in its pill BEFORE the result exists (fired by
+// the 'tool_start' event, which the backend pushes right after the
+// "-> Executing" line and before the tool actually runs).
+function attachToolCallArgs(name, args){
+  if (name === "say") return;
+  const el = _pendingToolRows.find(r=>r.dataset.toolName === name && !r._argsShown);
+  if (!el) return;
+  el._argsShown = true;
+  const callText = `${name}(${_tgArgsStr(args)})`;
+  el._tc = { name: el._tcLabel || name, call: callText, result: "" };
+  el.querySelector(".tc-call").textContent = callText;
+  el.querySelector(".tc-preview").textContent = _tgPreview(args) || "running…";
+}
+
+function attachToolCallDetail(name, args, result){
+  // say() is rendered as the reply bubble itself, never as a tool pill.
+  if (name === "say") return;
+  let el = null;
+  const idx = _pendingToolRows.findIndex(r=>r.dataset.toolName === name);
+  if (idx !== -1){ el = _pendingToolRows[idx]; _pendingToolRows.splice(idx, 1); }
+  else if (_pendingToolRows.length && !String(name || "").startsWith("[")){ el = _pendingToolRows.shift(); }
+  if (!el){
+    // No "-> Executing" placeholder was pushed for this call (e.g. Render
+    // Surface calls only report here) -- add an already-finished pill.
+    el = buildToolCallPill({name});
+    _tcSetData(el, args, result);
+    _tgAdd(_tgLiveGroup(), el);
+    scrollToBottom();
+    return;
+  }
+  _tcSetData(el, args, result);
+  _tgRefresh(el.closest(".tool-group"));
+}
+
+// A sub-agent's own tool calls (agent_tool_call events) are intentionally NOT
+// shown in the chat pane: the "Ran N tools" pills only cover Midum's own
+// calls. Agent activity still reaches the Log pane via the normal log events.
+function appendAgentToolRow(agent, name, args, result){
+  return;
 }
 
 function animateWords(container){
@@ -7962,12 +8719,15 @@ function appendRow(tag, text){
   const col = chatCol();
   const row = document.createElement("div");
   if (tag === "user"){
+    closeToolGroup();          // a new user turn always starts fresh tool group(s) too
     _currentMidumRow = null;   // a new user turn always starts a fresh Midum bubble
     row.className = "row user";
     row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">⧉</button></div><div class="bubble user">${renderUserContent(text)}</div>`;
     wireRowCopyBtn(row);
+    _currentUserRow = row;
   } else if (tag === "midum"){
     setActiveToolDot(null);
+    closeToolGroup();   // say() / a reply ends the current "Ran N tools" group
     // If a bubble is already streaming for this response (an earlier
     // say() call, or a reply following one), append into it instead of
     // creating a new row -- keeps exactly one "Midum" label per response
@@ -7990,6 +8750,11 @@ function appendRow(tag, text){
     wireRowCopyBtn(row);
     col.appendChild(row);
     _currentMidumRow = row;
+    // The first content chunk of a live reply is exactly when a
+    // Regenerate button becomes meaningful (there's now something to
+    // hover/regenerate) -- reuses whatever turn id sendMessage() or
+    // regenerateLastResponse() most recently stashed here.
+    if (_pendingTurnId !== null) attachRegenButton(_currentMidumRow, _pendingTurnId);
     animateWords(row.querySelector(".bubble"));
     renderPendingMermaid();
     renderPendingMath();
@@ -7999,61 +8764,41 @@ function appendRow(tag, text){
   } else if (tag === "system"){
     row.className = "row system";
     row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+  } else if (tag === "interjection"){
+    // A live steering message sent through the prompt box while a previous
+    // turn was still executing -- see sendMessage()/Api.send_interjection.
+    // Deliberately not a ".row.user" bubble: it doesn't start a new turn,
+    // so it shouldn't look like one.
+    row.className = "row interjection";
+    row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
   } else if (tag === "error"){
     row.className = "row error";
     row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
     setActiveToolDot(null);
+    closeToolGroup();
   } else if (tag === "tool"){
     _currentMidumRow = null;   // a tool call breaks any in-progress Midum bubble
-    row.className = "row tool tool-row";
     const nameMatch = /-> Executing: '([^']+)'/.exec(text);
-    row.dataset.toolName = nameMatch ? nameMatch[1] : "";
-    row.innerHTML = `
-      <div class="tool-line expandable">
-        <span class="tool-dot"></span><span class="gear">⚙</span><span>${escapeHtml(text)}</span>
-        <span class="chevron">▶</span>
-        <button class="row-copy-btn" title="Copy tool call" style="margin-left:6px;">⧉</button>
-      </div>
-      <div class="tool-detail"><div class="tool-detail-label">Waiting for result…</div></div>`;
-    row.querySelector(".tool-line").onclick = (e)=>{
-      if (e.target.closest(".row-copy-btn")) return;
-      row.classList.toggle("open");
-    };
-    wireRowCopyBtn(row);
-    col.appendChild(row);
-    setActiveToolDot(row.querySelector(".tool-dot"));
-    _pendingToolRows.push(row);
+    const toolName = nameMatch ? nameMatch[1] : "";
+    // say() is shown as the reply bubble itself (and closes the current
+    // tool group) -- it never gets a tool pill of its own.
+    if (toolName === "say") return;
+    const tc = buildToolCallPill({name: toolName || String(text || "").trim() || "tool", pending: true});
+    _pendingToolRows.push(tc);
+    _tgAdd(_tgLiveGroup(), tc);
     scrollToBottom();
     return;
   } else if (tag === "toolcall"){
-    // Persisted, already-resolved tool-call record (see Api._handle_tool_call) --
-    // replayed from a saved chat's display log, so call+result are both known
-    // up front. No placeholder / _pendingToolRows entry needed since there's no
-    // live 'tool_call' event coming later to attach detail to (that's the
-    // difference from the "tool" branch above, which is for a LIVE turn).
+    // Persisted, already-resolved tool-call record (see Api._handle_tool_call):
+    // call + result are both known up front, so it's added as a finished pill
+    // (no _pendingToolRows entry -- there's no live 'tool_call' event coming
+    // later to attach detail to).
     let data;
     try { data = JSON.parse(text); } catch(e){ data = {name: "", args: {}, result: text}; }
-    row.className = "row tool tool-row";
-    const argsStr = (data.args && Object.keys(data.args).length) ? JSON.stringify(data.args, null, 2) : "(no arguments)";
-    row.dataset.toolName = data.name || "";
-    row.innerHTML = `
-      <div class="tool-line expandable">
-        <span class="tool-dot"></span><span class="gear">⚙</span><span>-> Executing: '${escapeHtml(data.name || "")}'</span>
-        <span class="chevron">▶</span>
-        <button class="row-copy-btn" title="Copy tool call" style="margin-left:6px;">⧉</button>
-      </div>
-      <div class="tool-detail">
-        <div class="tool-detail-label">Call</div>
-        <pre>${escapeHtml(data.name || "")}(${escapeHtml(argsStr)})</pre>
-        <div class="tool-detail-label">Result</div>
-        <pre>${escapeHtml(data.result || "(empty)")}</pre>
-      </div>`;
-    row.querySelector(".tool-line").onclick = (e)=>{
-      if (e.target.closest(".row-copy-btn")) return;
-      row.classList.toggle("open");
-    };
-    wireRowCopyBtn(row);
-    col.appendChild(row);
+    if (data.name === "say") return;
+    const tc = buildToolCallPill({name: data.name || "tool"});
+    _tcSetData(tc, data.args, data.result);
+    _tgAdd(_tgLiveGroup(), tc);
     scrollToBottom();
     return;
   }
@@ -8089,6 +8834,18 @@ function rowPlainText(row){
     const b = row.querySelector(".bubble");
     return bubblePlainText(b);
   }
+  if (row.classList.contains("tool-group")){
+    const parts = [];
+    row.querySelectorAll(".tg-list > .tc").forEach(el=>{
+      const d = el._tc;
+      if (!d){ parts.push(`[Tool call: ${el.dataset.toolName || "tool"}]`); return; }
+      let out = `[Tool call: ${d.name}]`;
+      if (d.call) out += `\n${d.call}`;
+      if (d.result) out += `\n-> ${d.result}`;
+      parts.push(out);
+    });
+    return parts.join("\n\n");
+  }
   if (row.classList.contains("tool")){
     const name = row.dataset.toolName || "tool";
     const pres = row.querySelectorAll(".tool-detail pre");
@@ -8102,6 +8859,10 @@ function rowPlainText(row){
   if (row.classList.contains("system")){
     const b = row.querySelector(".bubble");
     return "[System] " + (b ? b.innerText.trim() : "");
+  }
+  if (row.classList.contains("interjection")){
+    const b = row.querySelector(".bubble");
+    return "[Interjection] " + (b ? b.innerText.trim() : "");
   }
   if (row.classList.contains("error")){
     const b = row.querySelector(".bubble");
@@ -8151,6 +8912,111 @@ function wireRowCopyBtn(row){
   };
 }
 
+// ── Edit Prompt / Regenerate Response ──────────────────────────────────
+// Only the single most recent live turn ever has these buttons -- they're
+// attached directly to _currentUserRow/_currentMidumRow as those rows are
+// created (see appendRow / sendMessage), and removed along with those
+// rows the moment the turn is edited, regenerated, or superseded by a new
+// message. Never rebuilt from persisted history (buildStaticRow never
+// adds them) -- Api only tracks an editable turn for the live in-memory
+// state of the CURRENTLY open tab, see gui/app.py's _last_turn_* markers.
+
+// Removes any leftover buttons from an older turn whose row is still on
+// screen (chat history keeps growing -- those rows are never deleted on
+// their own). Called right before a new live turn starts.
+function clearOldTurnButtons(){
+  document.querySelectorAll(".row-edit-btn, .row-regen-btn").forEach(b => b.remove());
+}
+
+function attachEditButton(row, turnId){
+  if (!row) return;
+  const labelRow = row.querySelector(".row-label-row");
+  if (!labelRow || labelRow.querySelector(".row-edit-btn")) return;
+  row.dataset.turnId = String(turnId);
+  const btn = document.createElement("button");
+  btn.className = "row-copy-btn row-edit-btn";
+  btn.title = "Edit prompt";
+  btn.textContent = "✎";
+  btn.onclick = (e)=>{ e.stopPropagation(); editLastPrompt(turnId, btn); };
+  labelRow.appendChild(btn);
+}
+
+function attachRegenButton(row, turnId){
+  if (!row) return;
+  const labelRow = row.querySelector(".row-label-row");
+  if (!labelRow || labelRow.querySelector(".row-regen-btn")) return;
+  row.dataset.turnId = String(turnId);
+  const btn = document.createElement("button");
+  btn.className = "row-copy-btn row-regen-btn";
+  btn.title = "Regenerate response";
+  btn.textContent = "↻";
+  btn.onclick = (e)=>{ e.stopPropagation(); regenerateLastResponse(turnId, btn); };
+  labelRow.appendChild(btn);
+}
+
+// Removes `fromRow` (if includeFromRow) or everything AFTER it, through
+// to the end of the chat column. Safe because these buttons only ever
+// exist on the LATEST turn, so "this row and everything after" is always
+// exactly that turn's own rows (prompt + response + any tool-call rows in
+// between) -- nothing else can have been appended after it live.
+function removeRowsFrom(fromRow, includeFromRow){
+  if (!fromRow) return;
+  let node = includeFromRow ? fromRow : fromRow.nextElementSibling;
+  while (node){
+    const next = node.nextElementSibling;
+    node.remove();
+    node = next;
+  }
+}
+
+async function editLastPrompt(turnId, btn){
+  if (btn) btn.disabled = true;
+  let res;
+  try {
+    res = await api("edit_last_prompt", turnId);
+  } catch (e) {
+    res = null;
+  }
+  if (!res || !res.ok){
+    if (btn) btn.disabled = false;
+    return;
+  }
+  const userRow = _currentUserRow;
+  removeRowsFrom(userRow, true);
+  _currentUserRow = null;
+  _currentMidumRow = null;
+  _pendingTurnId = null;
+  const input = document.getElementById("msg-input");
+  input.value = res.text || "";
+  autosizeMsgInput();
+  input.focus();
+  state.thinking = false;
+  setActiveToolDot(null);
+  setStatus("Ready", "ok");
+}
+
+async function regenerateLastResponse(turnId, btn){
+  if (state.thinking) return;
+  if (btn) btn.disabled = true;
+  _pendingTurnId = turnId;   // the fresh midum row about to stream in reuses this turn's id
+  let res;
+  try {
+    res = await api("regenerate_last_response", turnId);
+  } catch (e) {
+    res = null;
+  }
+  if (!res || !res.ok){
+    if (btn) btn.disabled = false;
+    _pendingTurnId = null;
+    return;
+  }
+  removeRowsFrom(_currentUserRow, false);
+  _currentMidumRow = null;
+  setActiveToolDot(null);
+  state.thinking = true;
+  setStatus("Executing turns...", "busy");
+}
+
 // Copy-to-clipboard for individual markdown code blocks. Code blocks are
 // injected into the DOM dynamically (streamed/rendered chat content), so a
 // single delegated listener on the chat column -- rather than wiring each
@@ -8181,7 +9047,10 @@ function scrollToBottom(){
 function clearChat(){
   chatCol().innerHTML = "";
   _pendingToolRows = [];
+  _currentToolGroup = null;
   _currentMidumRow = null;
+  _currentUserRow = null;
+  _pendingTurnId = null;
   // Reset windowed-history state too -- otherwise a brand-new chat (or one
   // started fresh after "New session") would still think it's showing a
   // partially-scrolled window of some previous chat's log, and the
@@ -8193,6 +9062,7 @@ function clearChat(){
 
 // ── Ask cards --------------------------------------------------------------
 function appendAsk(id, kind, payload){
+  closeToolGroup();   // an inline question/approval card ends the current tool group
   const col = chatCol();
   const row = document.createElement("div");
   row.className = "row midum";
@@ -8273,19 +9143,39 @@ function autosizeMsgInput(){
 }
 
 async function sendMessage(){
-  if (state.thinking) return;
   const input = document.getElementById("msg-input");
   const text = input.value.trim();
   if (!text) return;
+  if (state.thinking){
+    // Midum is still "Executing turns..." on a previous message -- this
+    // doesn't start a new turn, it steers the one already running. Shown
+    // as a wide interjection pill (not a normal user bubble) and queued
+    // server-side via send_interjection; orchestration.process_chat_turn
+    // folds it into the model's context right after the next tool call
+    // finishes (see state.queue_interjection).
+    input.value = "";
+    autosizeMsgInput();
+    appendRow("interjection", text);
+    await api("send_interjection", text);
+    return;
+  }
   input.value = "";
   autosizeMsgInput();
+  clearOldTurnButtons();   // this message supersedes whatever turn had them
   appendRow("user", text);
   setActiveToolDot(null);
   setStatus("Executing turns...", "busy");
   state.thinking = true;
   const kbOnlyActive = !!(state.kbOnly && state.kbSources.length);
   const explainActive = !!(kbOnlyActive && state.explainMode);
-  await api("send_message", text, kbOnlyActive, kbOnlyActive ? state.kbSources : [], explainActive, state.explainModeType);
+  const res = await api("send_message", text, kbOnlyActive, kbOnlyActive ? state.kbSources : [], explainActive, state.explainModeType);
+  if (res && res.ok && typeof res.turn_id !== "undefined"){
+    _pendingTurnId = res.turn_id;
+    // Edit Prompt can attach right away -- it doesn't need the response to
+    // exist yet, and clicking it while still "Executing turns..." is
+    // exactly the "abort an in-progress response" case.
+    attachEditButton(_currentUserRow, res.turn_id);
+  }
 }
 
 function setStatus(text, level){
@@ -8506,9 +9396,20 @@ window.__midumEvent = function(evt){
   else if (kind === "tool_line"){ appendRow("tool", payload.text); }
   else if (kind === "shell_line"){ appendShellLine(payload); }
   else if (kind === "tool_call"){ attachToolCallDetail(payload.name, payload.args, payload.result); }
+  else if (kind === "tool_start"){ attachToolCallArgs(payload.name, payload.args); }
   else if (kind === "agent_tool_call"){ appendAgentToolRow(payload.agent, payload.name, payload.args, payload.result); }
   else if (kind === "log"){ appendLog(payload.text); }
-  else if (kind === "done"){ state.thinking = false; setActiveToolDot(null); _currentMidumRow = null; refreshTitlebarInfo(); buildConversationTabs(); }
+  else if (kind === "turn_ready"){
+    // Safety-net (re)attach -- covers turns whose only content came in a
+    // way that bypassed the inline attach points in sendMessage()/
+    // appendRow() (e.g. a reply that arrived with visuals but no plain
+    // text chunk first). Idempotent: attachEditButton/attachRegenButton
+    // both no-op if the button is already there.
+    _pendingTurnId = payload.turn_id;
+    if (_currentUserRow) attachEditButton(_currentUserRow, payload.turn_id);
+    if (_currentMidumRow) attachRegenButton(_currentMidumRow, payload.turn_id);
+  }
+  else if (kind === "done"){ state.thinking = false; setActiveToolDot(null); closeToolGroup(); settleStaleToolPills(); _currentMidumRow = null; refreshTitlebarInfo(); buildConversationTabs(); }
   else if (kind === "projects"){ populateProjects(payload.projects, payload.active); }
   else if (kind === "ask"){ appendAsk(payload.id, payload.kind, payload.payload); }
   else if (kind === "mcp_changed"){ if (state.activeTab === "MCP") refreshMcpList(); }
@@ -8962,6 +9863,7 @@ function buildSidebar(){
   };
   enhanceSelect(document.getElementById("project-select"));
   enhanceSelect(document.getElementById("settings-provider"));
+  attachLitellmPicker({ providerSelId: "settings-provider", modelInputId: "settings-model", prefix: "st" });
   document.getElementById("new-session-btn").onclick = async ()=>{
     await api("new_session"); clearChat(); applyKbState(null); refreshHistory(); refreshTitlebarInfo(); buildConversationTabs();
   };
@@ -9986,6 +10888,7 @@ function appendVoiceTranscript(role, text){
       _voiceStreamRow.bubbleEl.innerHTML = renderMidumContent(_voiceStreamRow.rawText);
     }
   } else {
+    closeToolGroup();   // a new spoken bubble (either side) ends the current tool group
     const col = chatCol();
     const row = document.createElement("div");
     row.className = isUser ? "row user" : "row midum";
@@ -10043,7 +10946,7 @@ function buildModelPane(box){
     <div id="ctx-tokens-status" style="font-size:10px;color:var(--subtext);margin-top:6px;"></div>
     <div style="font-size:10px;color:var(--muted);margin-top:4px;">How much context your model actually has. The summarizer uses this to know when it's approaching the limit and needs to compact older turns -- default 32000, raise it if your model supports a bigger window.</div>
     <div class="divider"></div>
-    <div style="font-size:10px;color:var(--muted);">Local (Ollama) runs fully offline and is the default on every launch. Switching providers here only affects this running session.</div>
+    <div style="font-size:10px;color:var(--muted);">Local (Ollama) runs fully offline and is the default on every launch. Switching providers here only affects this running session. Want a service that isn't listed? Choose <b>LiteLLM (any provider)</b> — it covers 100+ (OpenAI, Anthropic, Mistral, xAI, DeepSeek, Azure, Bedrock, any OpenAI-compatible server…).</div>
   `;
   (async ()=>{
     const info = await api("get_providers");
@@ -10054,6 +10957,7 @@ function buildModelPane(box){
     fillModelList(info.models);
   })();
   enhanceSelect(document.getElementById("provider-select"));
+  attachLitellmPicker({ providerSelId: "provider-select", modelInputId: "model-input", prefix: "mp" });
   document.getElementById("provider-select").onchange = async (e)=>{
     const r = await api("select_provider", e.target.value);
     fillModelList(r.models); document.getElementById("model-input").value = r.default_model;
@@ -10096,6 +11000,238 @@ function fillModelList(models){
   const dl = document.getElementById("model-list");
   dl.innerHTML = "";
   (models||[]).forEach(m=>{ const o=document.createElement("option"); o.value=m; dl.appendChild(o); });
+}
+
+// ── LiteLLM (any provider) picker ---------------------------------------------
+// When the Provider dropdown is set to "LiteLLM (any provider)", the plain
+// free-text MODEL box is swapped for a guided picker:
+//     1. SERVICE  -- searchable list of every provider LiteLLM supports, with
+//                    one-click chips for the popular ones
+//     2. MODEL    -- suggestions for that service (⟳ fetches the live list)
+//     3. API KEY  -- saved per service into the secrets file, status shown
+//     4. (Advanced) Base URL for self-hosted / OpenAI-compatible endpoints
+//     5. Test     -- one tiny request to confirm key + model actually work
+// The original <input> (modelInputId) stays the single source of truth and
+// always holds the composed LiteLLM id ("<service>/<model>"), so the existing
+// Apply / Save-settings code paths need no changes -- the picker just keeps
+// that hidden input in sync, and re-reads it whenever code sets its .value.
+const LITELLM_LABEL = "LiteLLM (any provider)";
+let _litellmCatalogPromise = null;
+function litellmCatalog(force){
+  if (!_litellmCatalogPromise || force) _litellmCatalogPromise = api("litellm_catalog");
+  return _litellmCatalogPromise;
+}
+
+function attachLitellmPicker(opts){
+  const provSel = document.getElementById(opts.providerSelId);
+  const modelInput = document.getElementById(opts.modelInputId);
+  if (!provSel || !modelInput || modelInput.dataset.llAttached) return;
+  modelInput.dataset.llAttached = "1";
+  const pfx = opts.prefix;
+  const inputStyle = "height:32px;border-radius:16px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 10px;width:100%;box-sizing:border-box;";
+  const smallBtn = "height:22px;font-size:10px;padding:0 8px;border-radius:11px;";
+
+  const picker = document.createElement("div");
+  picker.style.cssText = "display:none;flex-direction:column;gap:6px;margin-top:2px;";
+  picker.innerHTML = `
+    <div class="ll-warn" style="display:none;font-size:11px;padding:8px 10px;border-radius:10px;border:1px solid var(--border2);background:var(--surface);">
+      <div>The <b>litellm</b> package isn't installed yet.</div>
+      <button class="btn ll-install" style="margin-top:6px;background:var(--accent);color:#fff;">Install LiteLLM</button>
+      <div class="ll-install-msg" style="font-size:10px;color:var(--subtext);margin-top:4px;"></div>
+    </div>
+    <div style="font-size:10px;color:var(--subtext);">Use any AI service through LiteLLM. Pick a service, a model, add your API key — done.</div>
+    <div class="field-label" style="margin-top:2px;">1 · SERVICE</div>
+    <input class="ll-svc" list="${pfx}-ll-svc-list" placeholder="Search all services… (openai, anthropic, groq, mistral…)" autocomplete="off" spellcheck="false" style="${inputStyle}"/>
+    <datalist id="${pfx}-ll-svc-list"></datalist>
+    <div class="ll-chips" style="display:flex;flex-wrap:wrap;gap:4px;"></div>
+    <div class="hdr-row" style="margin-top:2px;"><div class="field-label">2 · MODEL</div>
+      <button class="ghost-btn ll-fetch" title="Ask this service which models your key can use" style="${smallBtn}">⟳ Fetch list</button></div>
+    <input class="ll-mdl" list="${pfx}-ll-mdl-list" placeholder="Pick or type a model name" autocomplete="off" spellcheck="false" style="${inputStyle}"/>
+    <datalist id="${pfx}-ll-mdl-list"></datalist>
+    <div class="field-label" style="margin-top:2px;">3 · API KEY</div>
+    <div style="display:flex;gap:6px;">
+      <input class="ll-key" type="password" placeholder="Paste API key" autocomplete="off" spellcheck="false" style="${inputStyle}flex:1;"/>
+      <button class="btn ll-savekey" style="background:var(--accent);color:#fff;">Save</button>
+    </div>
+    <div class="ll-keystatus" style="font-size:10px;color:var(--subtext);"></div>
+    <details class="ll-adv">
+      <summary style="font-size:10px;color:var(--subtext);cursor:pointer;">Advanced — custom Base URL (self-hosted / OpenAI-compatible)</summary>
+      <input class="ll-base" placeholder="Optional" autocomplete="off" spellcheck="false" style="${inputStyle}margin-top:6px;"/>
+      <div style="font-size:9px;color:var(--muted);margin-top:4px;">Saved together with the key above. Leave empty to use the service's normal endpoint.</div>
+    </details>
+    <div class="ll-note" style="font-size:10px;color:var(--muted);"></div>
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:2px;">
+      <div style="font-size:10px;color:var(--subtext);min-width:0;">Will use: <code class="ll-preview" style="word-break:break-all;">—</code></div>
+      <button class="ghost-btn ll-test" style="${smallBtn}flex:none;">Test</button>
+    </div>
+    <div class="ll-msg" style="font-size:10px;color:var(--subtext);min-height:12px;"></div>
+  `;
+  modelInput.insertAdjacentElement("afterend", picker);
+
+  const q = (s)=>picker.querySelector(s);
+  const svcIn = q(".ll-svc"), mdlIn = q(".ll-mdl"), keyIn = q(".ll-key"), baseIn = q(".ll-base");
+  const statusEl = q(".ll-keystatus"), noteEl = q(".ll-note"), prevEl = q(".ll-preview");
+  const msgEl = q(".ll-msg"), warnEl = q(".ll-warn"), advEl = q(".ll-adv"), chipsEl = q(".ll-chips");
+  const nativeVal = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+  let writing = false, currentSvc = null, listsFilled = false, knownIds = new Set();
+
+  const compose = ()=>{
+    const s = svcIn.value.trim(), m = mdlIn.value.trim();
+    return s && m ? `${s}/${m}` : m;
+  };
+  function writeBack(){
+    writing = true; nativeVal.set.call(modelInput, compose()); writing = false;
+    prevEl.textContent = compose() || "—";
+  }
+  function fillList(id, values, labels){
+    const dl = document.getElementById(id);
+    if (!dl) return;
+    dl.innerHTML = "";
+    (values||[]).forEach(v=>{
+      const o = document.createElement("option"); o.value = v;
+      if (labels && labels[v] && labels[v] !== v) o.label = labels[v];
+      dl.appendChild(o);
+    });
+  }
+  function renderStatus(st){
+    let html;
+    if (st.has_key) html = `<span style="color:#34d399;">✓ Key saved (${escapeHtml(st.key_hint || "")})</span>`;
+    else if (st.env_set) html = `<span style="color:#34d399;">✓ Using ${escapeHtml(st.env_var)} from your environment</span>`;
+    else if (!st.needs_key) html = "No API key needed for this service.";
+    else html = `<span style="color:#fbbf24;">No key yet</span> — paste one above` + (st.env_var ? `, or set <code>${escapeHtml(st.env_var)}</code>` : "") + ".";
+    statusEl.innerHTML = html;
+    noteEl.textContent = st.note || "";
+    keyIn.placeholder = st.has_key ? "Replace saved key…" : "Paste API key";
+    baseIn.placeholder = st.base_hint ? `e.g. ${st.base_hint}` : "Optional";
+    baseIn.value = st.api_base || "";
+    advEl.open = !!st.api_base || svcIn.value.trim() === "azure";
+  }
+
+  async function loadService(svc, prefillModel){
+    currentSvc = svc;
+    msgEl.textContent = "";
+    if (!svc){
+      fillList(`${pfx}-ll-mdl-list`, []); statusEl.textContent = ""; noteEl.textContent = "";
+      return;
+    }
+    if (knownIds.size && !knownIds.has(svc)){
+      noteEl.textContent = `"${svc}" isn't in LiteLLM's provider list — double-check the spelling.`;
+    }
+    const [models, st] = await Promise.all([
+      api("litellm_provider_models", svc), api("litellm_provider_status", svc),
+    ]);
+    if (currentSvc !== svc) return;   // user already moved on
+    fillList(`${pfx}-ll-mdl-list`, models || []);
+    renderStatus(st);
+    if (prefillModel && !mdlIn.value.trim() && st.suggested_model){
+      mdlIn.value = st.suggested_model;
+      writeBack();
+    }
+  }
+
+  function chooseService(svc){
+    svc = (svc || "").trim();
+    if (svc === currentSvc) return;
+    svcIn.value = svc;
+    mdlIn.value = "";          // models don't carry over between services
+    writeBack();
+    loadService(svc, true);
+  }
+
+  async function refresh(){
+    const on = provSel.value === LITELLM_LABEL;
+    picker.style.display = on ? "flex" : "none";
+    modelInput.style.display = on ? "none" : "";
+    // The Model tab has a "MODEL  ⟳" header row above the input; the picker
+    // brings its own numbered labels (and its own fetch button), so hide it.
+    const hdr = modelInput.previousElementSibling;
+    if (hdr && hdr.classList.contains("hdr-row")) hdr.style.display = on ? "none" : "";
+    if (!on) return;
+
+    const cat = await litellmCatalog();
+    warnEl.style.display = cat.available ? "none" : "block";
+    if (!listsFilled && cat.providers && cat.providers.length){
+      listsFilled = true;
+      const labels = {};
+      cat.providers.forEach(p=>{ labels[p.id] = p.label; knownIds.add(p.id); });
+      fillList(`${pfx}-ll-svc-list`, cat.providers.map(p=>p.id), labels);
+      cat.providers.filter(p=>p.popular).slice(0, 9).forEach(p=>{
+        const b = document.createElement("button");
+        b.type = "button"; b.className = "ghost-btn"; b.textContent = p.label.replace(/ \(.*\)$/, "");
+        b.style.cssText = smallBtn; b.title = p.id;
+        b.onclick = ()=>chooseService(p.id);
+        chipsEl.appendChild(b);
+      });
+    }
+
+    // Re-read the composed id (set by loadSettingsPanel / select_provider /
+    // saved settings) and split it back into service + model.
+    const full = (nativeVal.get.call(modelInput) || "").trim();
+    const i = full.indexOf("/");
+    const svc = i > 0 ? full.slice(0, i) : "";
+    const mdl = i > 0 ? full.slice(i + 1) : full;
+    svcIn.value = svc; mdlIn.value = mdl;
+    prevEl.textContent = full || "—";
+    if (svc !== currentSvc) loadService(svc, false);
+  }
+
+  // Any code that does `modelInput.value = ...` (init, provider switch,
+  // loading saved settings) re-syncs the picker automatically.
+  Object.defineProperty(modelInput, "value", {
+    get(){ return nativeVal.get.call(modelInput); },
+    set(v){ nativeVal.set.call(modelInput, v); if (!writing) refresh(); },
+    configurable: true,
+  });
+  provSel.addEventListener("change", refresh);
+
+  svcIn.addEventListener("change", ()=>chooseService(svcIn.value));
+  mdlIn.addEventListener("input", writeBack);
+
+  async function saveCreds(){
+    const svc = svcIn.value.trim();
+    if (!svc){ msgEl.textContent = "Choose a service first."; return false; }
+    const r = await api("litellm_save_credentials", svc, keyIn.value.trim() || null, baseIn.value.trim());
+    if (!r.ok){ msgEl.textContent = `Couldn't save: ${r.error}`; return false; }
+    keyIn.value = "";
+    renderStatus(await api("litellm_provider_status", svc));
+    msgEl.textContent = "Saved.";
+    return true;
+  }
+  q(".ll-savekey").onclick = saveCreds;
+
+  q(".ll-fetch").onclick = async ()=>{
+    const svc = svcIn.value.trim();
+    if (!svc){ msgEl.textContent = "Choose a service first."; return; }
+    if (keyIn.value.trim() && !(await saveCreds())) return;
+    msgEl.textContent = "Fetching…";
+    const r = await api("litellm_refresh_models", svc);
+    fillList(`${pfx}-ll-mdl-list`, r.models || []);
+    msgEl.textContent = r.live
+      ? `Loaded ${r.models.length} models from ${svc}. Click the Model box to browse.`
+      : `Showing LiteLLM's built-in list (${(r.models||[]).length}). Add a key to fetch the live list.`;
+  };
+
+  q(".ll-test").onclick = async ()=>{
+    const id = compose();
+    if (!id){ msgEl.textContent = "Pick a service and model first."; return; }
+    if (keyIn.value.trim() && !(await saveCreds())) return;
+    msgEl.style.color = "var(--subtext)";
+    msgEl.textContent = `Testing ${id}…`;
+    const r = await api("litellm_test", id);
+    msgEl.style.color = r.ok ? "#34d399" : "#f87171";
+    msgEl.textContent = r.ok ? `✓ Works — replied "${r.reply}" in ${r.ms} ms. Now press Apply/Save.` : `✗ ${r.error}`;
+  };
+
+  q(".ll-install").onclick = async (e)=>{
+    const btn = e.target, out = q(".ll-install-msg");
+    btn.disabled = true; out.textContent = "Installing — this can take a minute…";
+    const r = await api("litellm_install");
+    btn.disabled = false;
+    if (r.ok){ out.textContent = "Installed."; listsFilled = false; chipsEl.innerHTML = ""; await litellmCatalog(true); currentSvc = null; refresh(); }
+    else out.textContent = r.error || "Install failed.";
+  };
+
+  refresh();
 }
 
 function buildParamsPane(box){

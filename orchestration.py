@@ -12,12 +12,14 @@ from providers.gemini_api_backend import _gemini_api_chat, consult_gemini_api, d
 from providers.gemini_reasoning import consult_gemini
 from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _call_gemini_web_primary, _gemini_webapi_load_msg, delegate_to_gemini_web, set_gemini_web_model
 from providers.groq_backend import _groq_chat_with_fallback, consult_groq, delegate_to_groq, list_groq_models, set_groq_model, set_groq_model_by_index
+from providers.litellm_backend import _litellm_chat_with_fallback
 from providers.ollama_cloud_backend import _ollama_cloud_chat_with_fallback, consult_ollama_cloud, delegate_to_ollama_cloud, list_ollama_cloud_models, set_ollama_cloud_model
 from screen_capture import capture_screen_to_ram, fallback_click_grid, fallback_click_text, fallback_find_text, type_text
 from skills import list_skills, load_skill
-from state import _abort_event, _action_loop_event, _action_loop_lock, _action_loop_state
+from state import _abort_event, _action_loop_event, _action_loop_lock, _action_loop_state, drain_interjections
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
 from tools.render_surface_tools import write_render_code, edit_render_code, close_render_surface, save_render_surface, list_saved_render_surfaces, load_render_surface, delete_saved_render_surface
+from tools.ambient_surface_tools import show_ambient_surface, edit_ambient_surface, move_ambient_surface, close_ambient_surface, list_ambient_surfaces
 from permissions import enforce_tool_permission, filter_tools_schema, mcp_permission_key
 from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, execute_wsl_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
 from multi_agent import start_agent, send_agent_task, get_agent_report, list_agents, stop_agent, resume_agent, forget_agent, delegate_agent_task_to_supervisor, tell_supervisor_to_inform_user, get_current_agent_name, attach_agent_knowledge, list_agent_knowledge, attach_agent_skills, list_agent_skills
@@ -87,7 +89,7 @@ def get_gemini_reasoning(user_input: str, conversation_history: list) -> str | N
     execution brain), this consult step is skipped entirely — there's no
     benefit to a strong model consulting a plan from itself.
     """
-    if config.MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq", "ollama_cloud"):
+    if config.MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq", "ollama_cloud", "litellm"):
         # Primary model IS OpenRouter or Gemini-web already — skip the
         # separate consult call, it would just be the same model (or the
         # same account's Gemini session) reasoning about itself twice.
@@ -215,6 +217,16 @@ def set_tool_call_hook(fn):
     """Install/replace the tool-call detail hook. Pass None to remove it."""
     global _tool_call_hook
     _tool_call_hook = fn
+
+# Companion to _tool_call_hook that fires BEFORE the tool runs, with just
+# (tool_name, arguments_dict, agent_name=...). Lets the GUI show the exact
+# call in its tool pill right away instead of waiting for the result.
+_tool_start_hook = None
+
+def set_tool_start_hook(fn):
+    """Install/replace the tool-start hook. Pass None to remove it."""
+    global _tool_start_hook
+    _tool_start_hook = fn
 
 def wait(seconds: float) -> str:
     """Pauses thread execution for the specified duration."""
@@ -597,6 +609,37 @@ def _call_groq_primary(messages, result_q, model_override: str = None):
         result_q.put(("err", e))
 
 
+def _call_litellm_primary(messages, result_q, model_override: str = None):
+    """
+    Run a chat completion through the LiteLLM package on a background thread —
+    used when MODEL_PROVIDER == "litellm" (ANY LiteLLM-supported provider
+    driving Midum directly), OR when a caller forces it for a single sub-turn
+    via _call_primary_model(provider_override="litellm").
+
+    config.LITELLM_MODEL is a "<provider>/<model>" string; LiteLLM picks the
+    right API shape, auth and endpoint from the prefix (see
+    providers/litellm_backend.py). Tool calls come back already normalised to
+    the same shape as every other provider; the legacy free-text <tool_call>
+    fallback is still run as a safety net because we can't vouch for native
+    tool-calling quality on every model a user might point this at.
+    """
+    try:
+        use_model = model_override or config.LITELLM_MODEL
+        resp = _litellm_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(tools))
+
+        if not resp["message"].get("tool_calls"):
+            raw_content = resp["message"].get("content") or ""
+            legacy_calls, cleaned_content = _extract_legacy_tool_calls(raw_content)
+            if legacy_calls:
+                legacy_calls = legacy_calls[:1]   # one tool at a time
+                resp["message"]["tool_calls"] = legacy_calls
+                resp["message"]["content"]    = cleaned_content
+
+        result_q.put(("ok", resp))
+    except Exception as e:
+        result_q.put(("err", e))
+
+
 def _call_ollama_cloud_primary(messages, result_q, model_override: str = None):
     """
     Run an Ollama Cloud chat completion on a background thread — used when
@@ -653,6 +696,8 @@ def _call_primary_model(messages, result_q, provider_override: str = None, model
         _call_groq_primary(messages, result_q, model_override=model_override)
     elif provider == "ollama_cloud":
         _call_ollama_cloud_primary(messages, result_q, model_override=model_override)
+    elif provider == "litellm":
+        _call_litellm_primary(messages, result_q, model_override=model_override)
     else:
         _call_ollama(messages, result_q)
 
@@ -1177,6 +1222,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 "gemini_api": "Gemini-API",
                 "groq": "Groq",
                 "ollama_cloud": "Ollama Cloud",
+                "litellm": "LiteLLM",
             }.get(effective_provider, "Ollama")
             return f"[{provider_name} error: {payload}]", turn_tool_outputs
         response   = payload
@@ -1312,6 +1358,11 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             func_name, arguments = _mcp_autoroute_tool_call(func_name, arguments)
 
             print(f" -> Executing: '{func_name}'")
+            if _tool_start_hook:
+                try:
+                    _tool_start_hook(func_name, arguments, agent_name=get_current_agent_name())
+                except Exception as _start_hook_err:
+                    print(f"⚠️ [tool_start_hook failed: {_start_hook_err}]")
             tool_images = None
 
             # ── Hard retry cap ────────────────────────────────────────────────
@@ -2072,6 +2123,46 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             elif func_name == "delete_saved_render_surface":
                 tool_output = delete_saved_render_surface(arguments.get("name", ""))
 
+            elif func_name == "show_ambient_surface":
+                tool_output = show_ambient_surface(
+                    arguments.get("code", ""),
+                    arguments.get("x"),
+                    arguments.get("y"),
+                    arguments.get("width"),
+                    arguments.get("height"),
+                    surface_id=arguments.get("surface_id", ""),
+                    title=arguments.get("title", ""),
+                    corner_radius=arguments.get("corner_radius", 0),
+                    background=arguments.get("background", ""),
+                    coordinate_space=arguments.get("coordinate_space", "canvas"),
+                    focusable=arguments.get("focusable", False),
+                    capture_visible=arguments.get("capture_visible", False),
+                    auto_close_seconds=arguments.get("auto_close_seconds", 0)
+                )
+
+            elif func_name == "edit_ambient_surface":
+                tool_output = edit_ambient_surface(
+                    arguments.get("old_code", ""),
+                    arguments.get("new_code", ""),
+                    surface_id=arguments.get("surface_id", "")
+                )
+
+            elif func_name == "move_ambient_surface":
+                tool_output = move_ambient_surface(
+                    surface_id=arguments.get("surface_id", ""),
+                    x=arguments.get("x"),
+                    y=arguments.get("y"),
+                    width=arguments.get("width"),
+                    height=arguments.get("height"),
+                    coordinate_space=arguments.get("coordinate_space", "canvas")
+                )
+
+            elif func_name == "close_ambient_surface":
+                tool_output = close_ambient_surface(arguments.get("surface_id", ""))
+
+            elif func_name == "list_ambient_surfaces":
+                tool_output = list_ambient_surfaces()
+
             elif func_name == "call_discord":
                 tool_output = call_discord(
                     arguments.get("opening_message", ""),
@@ -2369,6 +2460,25 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             if tool_images:
                 msg["images"] = tool_images
             conversation_history.append(msg)
+
+            # ── User interjection ────────────────────────────────────────────
+            # A steering message the user typed into the prompt box WHILE this
+            # turn was executing (see state.queue_interjection /
+            # gui/app.py's Api.send_interjection). Delivered right here --
+            # immediately after the tool call above finishes -- as its own
+            # synthetic tool-role message, so the very next model call sees
+            # it in-context and can adjust course before taking another step.
+            interjected = drain_interjections()
+            if interjected:
+                conversation_history.append({
+                    "role": "tool",
+                    "content": (
+                        "[USER INTERJECTION -- sent live while you were mid-task. "
+                        "This is not a tool result; it's a steering note from the "
+                        "user. Read it and adjust your next step accordingly]:\n"
+                        f"{interjected}"
+                    ),
+                })
 
         if needs_lookup:
             conversation_history.append({

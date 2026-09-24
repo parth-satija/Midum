@@ -4,6 +4,7 @@ ddgs
 gemini_webapi
 google-genai
 keyboard
+litellm
 loguru
 mammoth
 mcp

@@ -29,6 +29,8 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
         model_id = config.GROQ_MODEL
     elif provider == "omniroute":
         model_id = config.OMNIROUTE_MODEL
+    elif provider == "litellm":
+        model_id = config.LITELLM_MODEL
     else:
         model_id = MODEL_NAME
     if _IS_LINUX:

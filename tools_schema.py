@@ -2836,6 +2836,177 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "show_ambient_surface",
+            "description": (
+                "Show an AMBIENT SURFACE: a small rounded-rectangle widget, written in "
+                "HTML+CSS+JS exactly like a Render Surface, that floats OVER the user's "
+                "current screen (on top of whatever app they're using) instead of "
+                "living inside the Midum window. Use it for quick, in-context help "
+                "tied to what's on screen -- explaining an error or a UI element right "
+                "next to it, annotating/translating some visible text, a timer or "
+                "checklist that should stay visible while they work elsewhere. "
+                "YOU choose where it appears and how big it is: x, y (top-left corner) "
+                "and width, height are CANVAS coordinates -- the same 1024px-wide grid "
+                "as fallback_view_screen / fallback_click_grid / fallback_find_text, so "
+                "read a position off a screenshot and use it directly (place the "
+                "widget beside the thing it explains, not on top of it). Pass "
+                "coordinate_space='screen' for raw screen pixels. The host draws the "
+                "well-rounded card, its thin border, and a circular close (x) button "
+                "just outside the top-right rounded corner -- do NOT draw your own "
+                "close button or rounded outer frame; just fill the box (html/body "
+                "margin:0, height:100%, designed for the exact width x height you "
+                "pick; the corners are clipped for you). The card is white by default; "
+                "set `background` or style <body> for a dark/tinted look. The code runs "
+                "in a sandboxed iframe: it can `await midum.call(name, args)` to run "
+                "any Midum tool/MCP tool/Flow, `midum.close()` to dismiss itself, and "
+                "`parent.postMessage(data, '*')` to send input back to you as a new "
+                "chat turn prefixed '[Ambient Surface input: <id>]'. By default it "
+                "never steals keyboard focus and is hidden from your own screenshots. "
+                "Keep widgets compact and glanceable; for big/long-lived UIs use "
+                "write_render_code instead. Reusing a surface_id replaces that widget; "
+                "up to 8 can be open at once. Prefer edit_ambient_surface / "
+                "move_ambient_surface for small changes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "A complete, self-contained HTML document (inline <style>/<script> "
+                            "fine). Design it for exactly width x height; it is clipped to the "
+                            "rounded card."
+                        )
+                    },
+                    "x": {"type": "integer", "description": "Left edge of the widget (canvas coordinates by default)."},
+                    "y": {"type": "integer", "description": "Top edge of the widget (canvas coordinates by default)."},
+                    "width": {"type": "integer", "description": "Widget width (canvas units by default; ~1024 = full screen width). Minimum is roughly 80x60 real pixels."},
+                    "height": {"type": "integer", "description": "Widget height (canvas units by default)."},
+                    "surface_id": {
+                        "type": "string",
+                        "description": "Optional short name (letters/digits/_/-) to refer to this widget later. Reusing an id replaces that widget. Auto-assigned if omitted."
+                    },
+                    "title": {"type": "string", "description": "Optional label shown only in list_ambient_surfaces (not drawn on the widget)."},
+                    "corner_radius": {
+                        "type": "integer",
+                        "description": "Corner radius in CSS px. Default 48; values under 40 are raised to 40 so the close button stays usable."
+                    },
+                    "background": {
+                        "type": "string",
+                        "description": "CSS colour for the card behind your content, e.g. '#111827' or 'rgba(20,20,30,.92)'. Default white."
+                    },
+                    "coordinate_space": {
+                        "type": "string",
+                        "enum": ["canvas", "screen"],
+                        "description": "'canvas' (default): the screenshot grid space. 'screen': raw physical screen pixels."
+                    },
+                    "focusable": {
+                        "type": "boolean",
+                        "description": "Default false: never steals keyboard focus from the user's app. Set true only if the widget has text inputs the user must type into."
+                    },
+                    "capture_visible": {
+                        "type": "boolean",
+                        "description": "Default false: widget is excluded from screenshots/OCR/screen-share so your own fallback_view_screen doesn't see it. Set true to make it capturable."
+                    },
+                    "auto_close_seconds": {
+                        "type": "integer",
+                        "description": "If > 0, the widget dismisses itself after this many seconds (good for transient hints)."
+                    }
+                },
+                "required": ["code", "x", "y", "width", "height"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_ambient_surface",
+            "description": (
+                "Make a targeted edit to the HTML/CSS/JS of an already-open Ambient "
+                "Surface without resending the whole document; it re-renders in place "
+                "at the same position and size. old_code must be an EXACT, "
+                "character-for-character, UNIQUE substring of what you last wrote for "
+                "that widget. Errors (no change) if it isn't found or matches more than "
+                "once. surface_id may be omitted only when exactly one widget is open. "
+                "For a large change, call show_ambient_surface again with the same id."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_code": {"type": "string", "description": "Exact, unique snippet to find in the widget's current code."},
+                    "new_code": {"type": "string", "description": "Text to replace it with."},
+                    "surface_id": {"type": "string", "description": "Which widget to edit (optional if only one is open)."}
+                },
+                "required": ["old_code", "new_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_ambient_surface",
+            "description": (
+                "Reposition and/or resize an open Ambient Surface without touching its "
+                "content -- e.g. slide it next to a different element, or shrink it. "
+                "Pass only the values you want to change (any of x, y, width, height); "
+                "the rest stay as they are. Same coordinate rules as "
+                "show_ambient_surface (canvas coordinates by default). surface_id may "
+                "be omitted only when exactly one widget is open."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "surface_id": {"type": "string", "description": "Which widget to move (optional if only one is open)."},
+                    "x": {"type": "integer", "description": "New left edge."},
+                    "y": {"type": "integer", "description": "New top edge."},
+                    "width": {"type": "integer", "description": "New width."},
+                    "height": {"type": "integer", "description": "New height."},
+                    "coordinate_space": {
+                        "type": "string",
+                        "enum": ["canvas", "screen"],
+                        "description": "'canvas' (default) or raw 'screen' pixels."
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "close_ambient_surface",
+            "description": (
+                "Dismiss an Ambient Surface and discard its code (memory only, nothing "
+                "on disk). Pass surface_id to close that one, 'all' to close every open "
+                "Ambient Surface, or omit it to close the most recently opened one. The "
+                "user can also dismiss any widget with its own close (x) button, so an "
+                "unknown id usually just means it's already gone."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "surface_id": {"type": "string", "description": "Widget id, 'all', or omit for the most recent."}
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_ambient_surfaces",
+            "description": (
+                "List every Ambient Surface currently on screen: id, title, position and "
+                "size (canvas + screen pixels), code size, and any the user recently "
+                "dismissed. Check this before editing/moving/closing one, since the user "
+                "may have closed some."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "call_discord",
             "description": (
                 "Join a Discord VOICE CHANNEL and hold a live, two-way SPOKEN conversation with "
