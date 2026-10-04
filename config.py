@@ -135,7 +135,17 @@ def set_startup_dir(path: str) -> str:
 #                are "<provider>/<model>" (e.g. "anthropic/claude-sonnet-4-5").
 #                Provider + model + API key are all picked in the GUI's Model tab.
 #                See providers/litellm_backend.py.
-MODEL_PROVIDER = "gemini_web"   # "ollama" | "openrouter" | "gemini_web" | "gemini_api" | "groq" | "ollama_cloud" | "omniroute" | "litellm"
+# "openai_web"  — use ChatGPT, accessed through the `llm_cookie_bridge` library
+#                (account session-cookie sign-in, no API key, no per-token
+#                metering) as the PRIMARY execution brain. Same shape as
+#                "gemini_web" but talks to chatgpt.com's internal endpoints
+#                instead of gemini.google.com's. Every tool-calling step is
+#                a real web request built from a resent transcript (no
+#                confirmed persistent server-side session in this library —
+#                see providers/openai_web_backend.py), so expect real
+#                latency on multi-hop tool loops, same caveat as gemini_web.
+#                See OPENAI_WEB_HOP_TIMEOUT below.
+MODEL_PROVIDER = "gemini_web"   # "ollama" | "openrouter" | "gemini_web" | "gemini_api" | "groq" | "ollama_cloud" | "omniroute" | "litellm" | "openai_web"
 
 # ── OpenRouter model selection ────────────────────────────────────────────────
 # Used when MODEL_PROVIDER == "openrouter" (primary), and always used for
@@ -351,6 +361,21 @@ GEMINI_WEB_TOTAL_TASK_TIMEOUT = 1800
 # else results are formatted for Gemini.
 GEMINI_WEB_TOOL_RESULT_MARKER = "[TOOL_RESULT]"
 
+# ── OpenAI-web (llm_cookie_bridge) primary-execution settings ─────────────────
+# Used only when MODEL_PROVIDER == "openai_web". Drives the ENTIRE tool-calling
+# loop through llm_cookie_bridge's LLMCookieBridge("chatgpt") client (see
+# providers/openai_web_backend.py). Unlike gemini_webapi's ChatSession, this
+# library doesn't guarantee a persistent multi-turn session across calls, so
+# each hop resends the accumulated transcript as one prompt.
+OPENAI_WEB_HOP_TIMEOUT        = 120
+OPENAI_WEB_TOTAL_TASK_TIMEOUT = 1800
+
+# Marker prefixed to every tool-result message injected into the ChatGPT-web
+# transcript, so ChatGPT can reliably tell an injected tool result apart from
+# a genuine new user message. Keep this exact string in sync anywhere else
+# results are formatted for OpenAI-web.
+OPENAI_WEB_TOOL_RESULT_MARKER = "[TOOL_RESULT]"
+
 # ── Legacy / weak native-tool-calling models ────────────────────────────────
 LEGACY_TOOLCALL_MODELS = (
     "qwen2.5-coder",
@@ -454,6 +479,18 @@ SECRETS_TEMPLATE = {
     # account's web session than the official API above.
     "GEMINI_SECURE_1PSID": "",
     "GEMINI_SECURE_1PSIDTS": "",
+    # Browser session cookie (NOT an API key) for MODEL_PROVIDER="openai_web"
+    # (providers/openai_web_backend.py, via the `llm_cookie_bridge` library).
+    # Log into https://chatgpt.com, open DevTools -> Application -> Cookies ->
+    # chatgpt.com, and copy the '__Secure-next-auth.session-token' value.
+    # If the site instead issued numbered chunks (.0, .1, ... -- common for
+    # ChatGPT, since NextAuth splits a session JWT across cookies once it's
+    # too long for one ~4KB cookie), leave CHATGPT_SESSION_TOKEN blank and
+    # paste each chunk into CHATGPT_SESSION_TOKEN_0/_1/... instead -- they're
+    # reassembled in order automatically.
+    "CHATGPT_SESSION_TOKEN": "",
+    "CHATGPT_SESSION_TOKEN_0": "",
+    "CHATGPT_SESSION_TOKEN_1": "",
     # https://discord.com/developers/applications -- used by
     # providers/discord_voice.py (call_discord/end_discord_call tools) to
     # join a Discord voice channel and hold a live two-way spoken

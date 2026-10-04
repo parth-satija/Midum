@@ -1,5 +1,5 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
-from config import DOMAIN_INDEX, DOMAIN_SKILLS_INDEX, PATHS_FILE, RESPONSE_MEMORY, SKILLS_DIR
+from config import DOMAIN_INDEX, DOMAIN_SKILLS_INDEX, PATHS_FILE, RESPONSE_MEMORY, SKILLS_DIR, STORAGE_DIR
 from config import _IS_LINUX, _IS_WINDOWS, _IS_MAC
 # STARTUP_DIR is intentionally NOT imported by name here -- see config.py's
 # get_startup_dir()/set_startup_dir() docstring. Importing the name directly
@@ -790,6 +790,21 @@ def _get_indexed(key: str, index: int) -> dict | None:
     return items[index]
 
 
+def get_active_workspace_path() -> str:
+    """Read the persisted active workspace path from GUI settings."""
+    settings_path = os.path.join(STORAGE_DIR, "gui_settings.json")
+    try:
+        with open(settings_path, "r", encoding="utf-8") as settings_file:
+            settings = json.load(settings_file)
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+    active_workspace = settings.get("active_workspace", "")
+    if not isinstance(active_workspace, str) or not active_workspace.strip():
+        return ""
+    return os.path.abspath(os.path.expanduser(active_workspace.strip()))
+
+
 def list_directory(path: str) -> str:
     """
     List a directory as a numbered indexed table.
@@ -797,6 +812,8 @@ def list_directory(path: str) -> str:
     Follow up with open_path(path, index) or cd_into(path, index).
     """
     try:
+        if path == "current":
+            path = get_active_workspace_path()
         if not os.path.exists(path):
             return f"Path does not exist: {path}"
         raw = sorted(os.listdir(path))
@@ -1332,13 +1349,13 @@ def explore_path(path):
 
 
 
-def execute_terminal_command(command, working_directory=None):
+def execute_terminal_command(command, working_directory=None, is_long_running=False):
     try:
         cwd = working_directory if working_directory else config.get_startup_dir()
         if _IS_WINDOWS:
             result = subprocess.run(
                 ["powershell", "-Command", command],
-                capture_output=True, text=True, timeout=30, cwd=cwd
+                capture_output=True, text=True, timeout=30 if not is_long_running else None, cwd=cwd
             )
         else:
             result = subprocess.run(

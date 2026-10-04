@@ -54,6 +54,7 @@ For detailed subsystem specifications, consult the dedicated documentation files
 3. **[LLM Providers & Gateway Routing](llm_providers.md)**: Comprehensive guide to Google Gemini (API + Web), OpenRouter, Groq, OmniRoute, model fallback strategies, and dynamic switching.
 4. **[Tools & Execution Subsystems](tools_execution.md)**: Reference manual for native OS automation, Windows UI Automation (UIA), OCR fallbacks, Chrome DevTools Protocol (CDP), and MCP servers.
 5. **[Render Surface & IPC Architecture](render_surface.md)**: Engineering guide for the sandboxed iframe render panel, `midum.call` bidirectional IPC, asset streaming, and persistent storage.
+6. **[Ambient Surface Architecture](ambient_surface.md)**: Floating over-the-screen widgets (model-chosen position and size, rounded card with an outside-corner close button) built on the same sandbox and `midum.call` bridge.
 
 ---
 
@@ -68,7 +69,8 @@ midum_pkg/
 │   ├── agents_supervision.md  # Multi-agent worker framework
 │   ├── llm_providers.md       # AI model providers & gateways
 │   ├── tools_execution.md     # Native tools, UIA, CDP & MCP
-│   └── render_surface.md      # Sandboxed HTML/JS panel & IPC
+│   ├── render_surface.md      # Sandboxed HTML/JS panel & IPC
+│   └── ambient_surface.md     # Floating on-screen widgets
 │
 ├── storage/                   # Persistent runtime state & memory
 │   ├── master.md              # Global system instructions & state

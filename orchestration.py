@@ -11,15 +11,16 @@ from memory import set_current_goal, update_memory
 from providers.gemini_api_backend import _gemini_api_chat, consult_gemini_api, delegate_to_gemini_api, set_gemini_api_model
 from providers.gemini_reasoning import consult_gemini
 from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _call_gemini_web_primary, _gemini_webapi_load_msg, delegate_to_gemini_web, set_gemini_web_model
+from providers.openai_web_backend import _OPENAI_WEB_AVAILABLE, _call_openai_web_primary, _openai_web_load_msg, delegate_to_openai_web
 from providers.groq_backend import _groq_chat_with_fallback, consult_groq, delegate_to_groq, list_groq_models, set_groq_model, set_groq_model_by_index
 from providers.litellm_backend import _litellm_chat_with_fallback
 from providers.ollama_cloud_backend import _ollama_cloud_chat_with_fallback, consult_ollama_cloud, delegate_to_ollama_cloud, list_ollama_cloud_models, set_ollama_cloud_model
 from screen_capture import capture_screen_to_ram, fallback_click_grid, fallback_click_text, fallback_find_text, type_text
 from skills import list_skills, load_skill
-from state import _abort_event, _action_loop_event, _action_loop_lock, _action_loop_state, drain_interjections
+from state import _abort_event, _action_loop_event, _action_loop_lock, _action_loop_state, drain_interjections, run_abortable
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
 from tools.render_surface_tools import write_render_code, edit_render_code, close_render_surface, save_render_surface, list_saved_render_surfaces, load_render_surface, delete_saved_render_surface
-from tools.ambient_surface_tools import show_ambient_surface, edit_ambient_surface, move_ambient_surface, close_ambient_surface, list_ambient_surfaces
+from tools.ambient_surface_tools import show_ambient_surface, edit_ambient_surface, move_ambient_surface, close_ambient_surface, list_ambient_surfaces, save_ambient_surface, list_saved_ambient_surfaces, load_ambient_surface, delete_saved_ambient_surface
 from permissions import enforce_tool_permission, filter_tools_schema, mcp_permission_key
 from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, execute_wsl_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
 from multi_agent import start_agent, send_agent_task, get_agent_report, list_agents, stop_agent, resume_agent, forget_agent, delegate_agent_task_to_supervisor, tell_supervisor_to_inform_user, get_current_agent_name, attach_agent_knowledge, list_agent_knowledge, attach_agent_skills, list_agent_skills
@@ -89,7 +90,7 @@ def get_gemini_reasoning(user_input: str, conversation_history: list) -> str | N
     execution brain), this consult step is skipped entirely — there's no
     benefit to a strong model consulting a plan from itself.
     """
-    if config.MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq", "ollama_cloud", "litellm"):
+    if config.MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq", "ollama_cloud", "litellm", "openai_web"):
         # Primary model IS OpenRouter or Gemini-web already — skip the
         # separate consult call, it would just be the same model (or the
         # same account's Gemini session) reasoning about itself twice.
@@ -698,6 +699,8 @@ def _call_primary_model(messages, result_q, provider_override: str = None, model
         _call_ollama_cloud_primary(messages, result_q, model_override=model_override)
     elif provider == "litellm":
         _call_litellm_primary(messages, result_q, model_override=model_override)
+    elif provider == "openai_web":
+        _call_openai_web_primary(messages, result_q, model_override=model_override)
     else:
         _call_ollama(messages, result_q)
 
@@ -1223,6 +1226,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 "groq": "Groq",
                 "ollama_cloud": "Ollama Cloud",
                 "litellm": "LiteLLM",
+                "openai_web": "OpenAI-web",
             }.get(effective_provider, "Ollama")
             return f"[{provider_name} error: {payload}]", turn_tool_outputs
         response   = payload
@@ -1432,13 +1436,13 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     tool_output = f"[PATH RESOLVED: {res_msg}] {tool_output}"
 
             elif func_name == "search_internet":
-                tool_output = search_internet(arguments.get("query"))
+                tool_output = run_abortable(search_internet, arguments.get("query"))
 
             elif func_name == "open_url":
                 url     = arguments.get("url", "")
                 browser = arguments.get("browser", "chrome")
                 print(f"   [open_url] {url}")
-                tool_output = open_url(url, browser)
+                tool_output = run_abortable(open_url, url, browser)
 
             elif func_name == "list_directory":
                 tool_output = list_directory(arguments.get("path", STARTUP_DIR))
@@ -1495,7 +1499,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
 
             elif func_name == "ocr_snapshot":
                 print("   [OCR Snapshot] Capturing screen...")
-                tool_output = ocr_snapshot()
+                tool_output = run_abortable(ocr_snapshot)
 
             elif func_name == "click_ocr_index":
                 tool_output = click_ocr_index(
@@ -1506,7 +1510,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             elif func_name == "read_browser_page":
                 tab_index = int(arguments.get("tab_index", 0))
                 print(f"   [CDP] Reading browser page tab={tab_index}")
-                tool_output = read_browser_page(tab_index)
+                tool_output = run_abortable(read_browser_page, tab_index)
 
             elif func_name == "list_browser_tabs":
                 print("   [CDP] Listing browser tabs")
@@ -1529,14 +1533,14 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                         tab_index = int(arguments.get("tab_index", 0))
                     print(f"   [CDP] snapshot browser tab={tab_index}"
                           + (f" filter={filter_type}" if filter_type else ""))
-                    tool_output = snapshot_browser_elements(tab_index, filter_type)
+                    tool_output = run_abortable(snapshot_browser_elements, tab_index, filter_type)
                 else:
                     print(f"   [UIA] snapshot '{target}'"
                           + (f" filter={filter_type}" if filter_type else ""))
                     if ui_navigator is None:
                         tool_output = _uia_unavailable_message()
                     else:
-                        tool_output = ui_navigator.snapshot_ui(target, filter_type)
+                        tool_output = run_abortable(ui_navigator.snapshot_ui, target, filter_type)
 
             elif func_name in ("act", "act_on_element", "act_on_browser_element"):
                 target       = arguments.get("target") or arguments.get("window_title", "")
@@ -1554,13 +1558,14 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     if not target and "tab_index" in arguments:
                         tab_index = int(arguments.get("tab_index", 0))
                     print(f"   [CDP] act #{index} action={action} tab={tab_index}")
-                    tool_output = act_on_browser_element(index, action, text_to_type, tab_index)
+                    tool_output = run_abortable(act_on_browser_element, index, action, text_to_type, tab_index)
                 else:
                     print(f"   [UIA] act #{index} action={action} in '{target}'")
                     if ui_navigator is None:
                         tool_output = _uia_unavailable_message()
                     else:
-                        tool_output = ui_navigator.act_on_element_by_index(
+                        tool_output = run_abortable(
+                            ui_navigator.act_on_element_by_index,
                             target, index, action, text_to_type
                         )
 
@@ -1568,7 +1573,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 script    = arguments.get("script", "")
                 tab_index = int(arguments.get("tab_index", 0))
                 print(f"   [CDP] run_js: {script[:60]}")
-                tool_output = run_js_in_browser(script, tab_index)
+                tool_output = run_abortable(run_js_in_browser, script, tab_index)
 
             elif func_name == "execute_terminal_command":
                 cmd = arguments.get("command", "").strip()
@@ -1589,8 +1594,11 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                             needs_lookup = True
                             unknown_cmd  = cmd
                             print(f"   [ℹ️  '{cmd.split()[0]}' not in commands.md]")
-                        tool_output = execute_terminal_command(
-                            cmd, working_directory=arguments.get("working_directory")
+                        tool_output = run_abortable(
+                            execute_terminal_command,
+                            cmd,
+                            working_directory=arguments.get("working_directory"),
+                            is_long_running=arguments.get("is_long_running", False),
                         )
 
             elif func_name == "execute_wsl_command":
@@ -1599,15 +1607,17 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     tool_output = "Error: No command provided."
                 else:
                     print(f"   [WSL2 shell] > {wsl_cmd}")
-                    tool_output = execute_wsl_command(
-                        wsl_cmd, timeout=arguments.get("timeout", 60)
+                    tool_output = run_abortable(
+                        execute_wsl_command, wsl_cmd, timeout=arguments.get("timeout", 60)
                     )
 
             elif func_name == "execute_python_code":
                 py_code = arguments.get("code", "")
                 py_timeout = arguments.get("timeout", 15)
                 print(f"   [Python sandbox] Executing {len(py_code)} chars")
-                tool_output = execute_python_code(py_code, int(py_timeout) if py_timeout else 15)
+                tool_output = run_abortable(
+                    execute_python_code, py_code, int(py_timeout) if py_timeout else 15
+                )
 
             elif func_name == "fallback_view_screen":
                 b64_img = capture_screen_to_ram()
@@ -1840,6 +1850,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 )
             elif func_name == "set_gemini_web_model":
                 tool_output = set_gemini_web_model(arguments.get("model_name", ""))
+            elif func_name == "delegate_to_openai_web":
+                tool_output = delegate_to_openai_web(
+                    arguments.get("task", ""),
+                    arguments.get("context", ""),
+                    int(arguments.get("max_steps", 10))
+                )
             elif func_name == "read_file_smart":
                 tool_output = read_file_smart(arguments.get("path", ""))
             elif func_name == "read_file_chunk":
@@ -2062,7 +2078,11 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 tool_output = list_flows_formatted()
 
             elif func_name == "run_flow":
-                tool_output = run_flow(arguments.get("name", ""))
+                # Pass the full `arguments` dict through as the flow's `args`
+                # too -- if the model included extra keys beyond "name"
+                # (matching an Argument node's declared name), they flow
+                # straight through to that node instead of being dropped.
+                tool_output = run_flow(arguments.get("name", ""), arguments)
 
             elif func_name == "ask_user_text":
                 print(f"   [GUI] Asking user for text input...")
@@ -2154,7 +2174,8 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     y=arguments.get("y"),
                     width=arguments.get("width"),
                     height=arguments.get("height"),
-                    coordinate_space=arguments.get("coordinate_space", "canvas")
+                    coordinate_space=arguments.get("coordinate_space", "canvas"),
+                    duration_ms=arguments.get("duration_ms")
                 )
 
             elif func_name == "close_ambient_surface":
@@ -2162,6 +2183,29 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
 
             elif func_name == "list_ambient_surfaces":
                 tool_output = list_ambient_surfaces()
+
+            elif func_name == "save_ambient_surface":
+                tool_output = save_ambient_surface(
+                    arguments.get("name", ""),
+                    surface_id=arguments.get("surface_id", "")
+                )
+
+            elif func_name == "list_saved_ambient_surfaces":
+                tool_output = list_saved_ambient_surfaces()
+
+            elif func_name == "load_ambient_surface":
+                tool_output = load_ambient_surface(
+                    arguments.get("name", ""),
+                    surface_id=arguments.get("surface_id", ""),
+                    x=arguments.get("x"),
+                    y=arguments.get("y"),
+                    width=arguments.get("width"),
+                    height=arguments.get("height"),
+                    coordinate_space=arguments.get("coordinate_space", "canvas")
+                )
+
+            elif func_name == "delete_saved_ambient_surface":
+                tool_output = delete_saved_ambient_surface(arguments.get("name", ""))
 
             elif func_name == "call_discord":
                 tool_output = call_discord(
@@ -2301,6 +2345,11 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     "offload_to_gemini":    "delegate_to_gemini_web",
                     "delegate_gw":          "delegate_to_gemini_web",
                     "set_gemini_model":     "set_gemini_web_model",
+                    # OpenAI-web (ChatGPT via llm_cookie_bridge)
+                    "delegate_chatgpt":     "delegate_to_openai_web",
+                    "delegate_openai":      "delegate_to_openai_web",
+                    "offload_to_chatgpt":   "delegate_to_openai_web",
+                    "delegate_ow":          "delegate_to_openai_web",
                     # UI snapshot/act — all old names → unified tools
                     "snapshot_ui":              "snapshot",
                     "snapshot_browser_elements": "snapshot",
@@ -2456,29 +2505,34 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             tool_output = tool_output.replace("<", "&lt;").replace(">", "&gt;")
             turn_tool_outputs.append(tool_output)
 
+            # ── User interjection ────────────────────────────────────────────
+            # A steering message the user typed into the prompt box WHILE this
+            # turn was executing (see state.queue_interjection /
+            # gui/app.py's Api.send_interjection). Folded directly into THIS
+            # tool call's own result content -- deliberately NOT a second,
+            # separate "tool"-role message: providers/gemini_api_backend.py's
+            # _sanitize_messages_for_gemini_api() pairs every "tool" message
+            # 1:1 with the one preceding assistant tool_calls entry (Midum only
+            # ever emits one tool call per step), so a second, orphaned "tool"
+            # message here has no function_call to pair with and Google's API
+            # 400s with "function_response.name: Name cannot be empty".
+            # Appending to the same message keeps the pairing 1:1 for every
+            # provider while still reaching the model immediately after this
+            # tool call, read like part of the tool response rather than a
+            # tool call itself.
+            interjected = drain_interjections()
+            if interjected:
+                tool_output += (
+                    "\n\n[USER INTERJECTION -- sent live while you were mid-task. "
+                    "This is not part of the tool result above; it's a steering "
+                    "note from the user. Read it and adjust your next step "
+                    f"accordingly]:\n{interjected}"
+                )
+
             msg = {"role": "tool", "content": tool_output}
             if tool_images:
                 msg["images"] = tool_images
             conversation_history.append(msg)
-
-            # ── User interjection ────────────────────────────────────────────
-            # A steering message the user typed into the prompt box WHILE this
-            # turn was executing (see state.queue_interjection /
-            # gui/app.py's Api.send_interjection). Delivered right here --
-            # immediately after the tool call above finishes -- as its own
-            # synthetic tool-role message, so the very next model call sees
-            # it in-context and can adjust course before taking another step.
-            interjected = drain_interjections()
-            if interjected:
-                conversation_history.append({
-                    "role": "tool",
-                    "content": (
-                        "[USER INTERJECTION -- sent live while you were mid-task. "
-                        "This is not a tool result; it's a steering note from the "
-                        "user. Read it and adjust your next step accordingly]:\n"
-                        f"{interjected}"
-                    ),
-                })
 
         if needs_lookup:
             conversation_history.append({

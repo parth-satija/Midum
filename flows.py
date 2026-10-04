@@ -74,6 +74,7 @@
 #      make saved flows discoverable and callable as tools.
 # =============================================================================
 
+import ast
 import importlib
 import json
 import keyword
@@ -160,6 +161,49 @@ def classify_tool_kind(tool_name: str, description: str = "") -> str:
     return "action"
 
 
+def _extract_get_argument_calls(code: str) -> list:
+    """Best-effort static scan for get_argument(...) calls inside a Python
+    Code node's source, so those calls double as external flow parameters
+    just like an Argument node -- see flow_arguments() below. Parsed via
+    `ast` rather than regex so real Python syntax (nested calls, string
+    quoting, etc) is handled correctly. A call whose name/default can't be
+    statically resolved (e.g. the name is a variable, not a literal
+    string) is silently skipped -- it just doesn't get a schema entry;
+    the underlying get_argument() call still works fine at run time.
+    Returns a list of {"name","type","description","required","default"}
+    dicts in the same shape flow_arguments() uses for Argument nodes."""
+    out = []
+    try:
+        tree = ast.parse(code or "")
+    except Exception:
+        return out
+    for call_node in ast.walk(tree):
+        if not isinstance(call_node, ast.Call):
+            continue
+        func = call_node.func
+        func_name = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else None)
+        if func_name != "get_argument" or not call_node.args:
+            continue
+        name_arg = call_node.args[0]
+        if not (isinstance(name_arg, ast.Constant) and isinstance(name_arg.value, str)):
+            continue
+        arg_name = name_arg.value
+        default_val, arg_type = "", "string"
+        if len(call_node.args) > 1:
+            try:
+                default_val = ast.literal_eval(call_node.args[1])
+                if isinstance(default_val, bool):
+                    arg_type = "boolean"
+                elif isinstance(default_val, int):
+                    arg_type = "integer"
+                elif isinstance(default_val, float):
+                    arg_type = "number"
+            except Exception:
+                default_val = ""
+        out.append({"name": arg_name, "type": arg_type, "description": "", "required": False, "default": default_val})
+    return out
+
+
 # =============================================================================
 # 2. Graph -> Python compilation
 # =============================================================================
@@ -192,10 +236,70 @@ _MCP_NODE_RE = re.compile(r"^mcp::([^:]+)::(.+)$")
 _FLOW_NODE_RE = re.compile(r"^flow::(.+)$")
 
 
-def _data_source_ref(nodes: dict, node_id):
+_NUMERIC_OPS = {
+    "add", "subtract", "multiply", "divide",
+    "greater_than", "less_than", "greater_equal", "less_equal",
+}
+
+
+def _operation_expr(nodes: dict, node_id: str, visiting: frozenset = frozenset()) -> str:
+    """Build an inline Python expression for an 'op::calc' (Operation)
+    node -- unlike a variable/tool/etc. data source, an Operation node has
+    no declaration line of its own; it's resolved as a nested expression
+    wherever it's referenced (recursing through `_data_source_ref` for its
+    A/B pins, so operations can chain: Operation -> Operation -> ...).
+    `visiting` guards against a cyclical wiring (A wired from an Operation
+    that's (indirectly) wired from itself) turning into infinite recursion
+    -- such a cycle degrades to a literal `None` at the point it repeats,
+    same spirit as the sequence-walk's own cycle guard in `_emit_block`.
+    """
+    if node_id in visiting or node_id not in nodes:
+        return "None"
+    visiting = visiting | {node_id}
+    node = nodes[node_id]
+    data = node.get("data") or {}
+    op = (data.get("op") or "add").strip() or "add"
+    a_id = _pin_source(node, "input_1")
+    b_id = _pin_source(node, "input_2")
+    a_ref = _data_source_ref(nodes, a_id, visiting) if a_id else None
+    b_ref = _data_source_ref(nodes, b_id, visiting) if b_id else None
+    a = a_ref if a_ref else repr(data.get("a", ""))
+    b = b_ref if b_ref else repr(data.get("b", ""))
+    if op in _NUMERIC_OPS:
+        a = f"_flow_num({a})"
+        b = f"_flow_num({b})"
+    if op == "divide":
+        return f"(({a}) / ({b}) if ({b}) not in (0, 0.0) else 0)"
+    if op == "subtract":
+        return f"(({a}) - ({b}))"
+    if op == "multiply":
+        return f"(({a}) * ({b}))"
+    if op == "equals":
+        return f"(({a}) == ({b}))"
+    if op == "not_equals":
+        return f"(({a}) != ({b}))"
+    if op == "greater_than":
+        return f"(({a}) > ({b}))"
+    if op == "less_than":
+        return f"(({a}) < ({b}))"
+    if op == "greater_equal":
+        return f"(({a}) >= ({b}))"
+    if op == "less_equal":
+        return f"(({a}) <= ({b}))"
+    if op == "and":
+        return f"(({a}) and ({b}))"
+    if op == "or":
+        return f"(({a}) or ({b}))"
+    if op == "concat":
+        return f"(str({a}) + str({b}))"
+    return f"(({a}) + ({b}))"  # default / "add"
+
+
+def _data_source_ref(nodes: dict, node_id, visiting: frozenset = frozenset()):
     """
     If `node_id` is a node that can act as a DATA source for a downstream
-    pin (a variable node's data-out, a loop's per-item data-out, or a
+    pin (a variable node's data-out, an argument node's data-out, an
+    operation node's computed result, a loop's per-item data-out, or a
     tool/mcp node's Object-out), return the Python expression a consumer
     should reference. Returns None if `node_id` doesn't produce data (e.g.
     it's a plain action tool with no Object pin, or doesn't exist).
@@ -206,9 +310,15 @@ def _data_source_ref(nodes: dict, node_id):
     ntype = node.get("name", "")
     if ntype == "variable":
         return f"_var_{node_id}"
+    if ntype == "argument":
+        return f"_arg_{node_id}"
+    if ntype == "op::calc":
+        return _operation_expr(nodes, node_id, visiting)
     if ntype == "logic::loop":
         return f"_loop_item_{node_id}"
-    if ntype.startswith("tool::") or ntype.startswith("mcp::"):
+    if ntype.startswith("tool::") or ntype.startswith("mcp::") or ntype == "python":
+        # (a "python" node's Object-out is whatever it assigned to a local
+        # `result` variable -- see _codegen_python)
         # Only a real data source if this node was actually created with an
         # Object-out pin (output/hybrid kind) — that shows up as the
         # "output_2" key simply existing on the node, whether or not it's
@@ -330,6 +440,47 @@ def _codegen_ai_choose(node: dict, node_id: str, nodes: dict) -> list:
         f"_out_{node_id} = _flow_ai_choose({question_src}, {opts_src})",
         f"_flow_results.append(_out_{node_id})",
     ]
+
+
+def _codegen_print(node: dict, node_id: str, nodes: dict) -> list:
+    """'Print' node -- the flow's way of producing an output: prints the
+    wired-in Value (or its typed fallback) to stdout, same as any other
+    Python print(), and also records it into `_flow_results` so it's what
+    a Print-terminated flow returns / what the Tools tab's output box
+    shows when run interactively."""
+    data = node.get("data") or {}
+    src_id = _pin_source(node, "input_2")
+    ref = _data_source_ref(nodes, src_id) if src_id else None
+    val_src = ref if ref else repr(data.get("value", ""))
+    var = f"_printed_{node_id}"
+    return [
+        "# --- Print ---",
+        f"{var} = {val_src}",
+        f"print({var})",
+        f"_flow_results.append({var})",
+    ]
+
+
+def _codegen_python(node: dict, node_id: str, nodes: dict) -> list:
+    """'Python Code' node -- the user's own Python statements, inlined
+    verbatim (dedented to column 0, then re-indented by the caller like
+    every other emitted line) directly into the flow function's body at
+    this exact point in the sequence. `get_argument(name, default=None)`
+    is available inside the code as a closure bound to this flow's own
+    `args` dict (see compile_flow's preamble) -- calling it both reads a
+    caller-supplied parameter AND registers that parameter in the flow's
+    external schema (see _extract_get_argument_calls/flow_arguments),
+    exactly like an Argument node does structurally. Assigning to a local
+    variable named `result` anywhere in the code exposes it on this
+    node's Object-out (_out_<node_id>) for downstream wiring, the same
+    convention a hybrid tool/AI node's Object-out follows."""
+    data = node.get("data") or {}
+    code = (data.get("code") or "").replace("\r\n", "\n")
+    lines = ["# --- Python Code ---"]
+    lines.extend(code.split("\n") if code.strip() else ["pass"])
+    lines.append(f"_out_{node_id} = locals().get('result')")
+    lines.append(f"_flow_results.append(_out_{node_id})")
+    return lines
 
 
 def _condition_src(node: dict, node_id: str, nodes: dict) -> str:
@@ -474,10 +625,24 @@ def _emit_block(node_id, nodes: dict, indent: int, visited: set, out: list, warn
             node_id = (_pin_targets(node, "output_1") or [None])[0]
             continue
 
-        if ntype == "variable":
+        if ntype == "print":
+            lines = _codegen_print(node, node_id, nodes)
+            out.extend(pad + line for line in lines)
+            node_id = (_pin_targets(node, "output_1") or [None])[0]
+            continue
+
+        if ntype == "python":
+            lines = _codegen_python(node, node_id, nodes)
+            out.extend(pad + line for line in lines)
+            _emit_variable_captures(node, node_id, nodes, pad, out)
+            node_id = (_pin_targets(node, "output_1") or [None])[0]
+            continue
+
+        if ntype in ("variable", "argument", "op::calc"):
             # Never reached via the sequence walk (nothing wires a Sequence
-            # pin into a variable node) -- if we somehow got here, skip it
-            # rather than crash.
+            # pin into a variable/argument/operation node -- they're pure
+            # data sources) -- if we somehow got here, skip it rather than
+            # crash.
             return
 
         out.append(pad + f"# TODO: no codegen registered yet for node type '{ntype}'")
@@ -497,6 +662,32 @@ def _codegen_variable_declarations(nodes: dict) -> list:
         raw_val = data.get("value", "")
         label = _sanitize_identifier_fragment(data.get("name", ""), f"var_{node_id}")
         lines.append(f"    _var_{node_id} = {raw_val!r} or None  # {label}")
+    return lines
+
+
+def _codegen_argument_declarations(nodes: dict) -> list:
+    """One `_arg_<id> = _flow_coerce_arg(...)` line per Argument node, up
+    front (same treatment as `_codegen_variable_declarations`) -- pulls
+    from the flow's own `args` dict (whatever the caller passed to
+    run_flow()/the generated function), falling back to the node's typed
+    default, and coercing to the declared type so an 'integer'/'number'/
+    'boolean' argument doesn't stay a raw string just because it arrived
+    that way from the Tools tab or a model tool call."""
+    lines = []
+    for node_id, node in nodes.items():
+        if node.get("name") != "argument":
+            continue
+        data = node.get("data") or {}
+        arg_name = (data.get("name") or "").strip()
+        arg_type = (data.get("type") or "string").strip() or "string"
+        default_raw = data.get("default", "")
+        label = _sanitize_identifier_fragment(arg_name, f"arg_{node_id}")
+        if arg_name:
+            lines.append(
+                f"    _arg_{node_id} = _flow_coerce_arg((args or {{}}).get({arg_name!r}, {default_raw!r} or None), {arg_type!r})  # {label}"
+            )
+        else:
+            lines.append(f"    _arg_{node_id} = {default_raw!r} or None  # (unnamed argument node -- give it a name)")
     return lines
 
 
@@ -523,6 +714,16 @@ def compile_flow(name: str, graph: dict) -> str:
         )
 
     body_lines = ["    _flow_results = []"]
+    # Available to every Python Code node inlined below -- a closure bound
+    # to this flow's own `args` dict, so get_argument("name", default)
+    # inside a node's code reads a caller-supplied parameter the same way
+    # an Argument node's _arg_<id> does (see _codegen_argument_declarations
+    # above and _extract_get_argument_calls/flow_arguments for how these
+    # calls double as the flow's own external schema entries). Cheap and
+    # harmless to define even in a flow with no Python Code nodes at all.
+    body_lines.append("    def get_argument(name, default=None):")
+    body_lines.append("        return (args or {}).get(name, default)")
+    body_lines.extend(_codegen_argument_declarations(nodes))
     body_lines.extend(_codegen_variable_declarations(nodes))
 
     if not nodes:
@@ -551,12 +752,17 @@ def compile_flow(name: str, graph: dict) -> str:
     body = "\n".join(body_lines) if body_lines else "    pass"
 
     header = (
-        f"def {name}():\n"
+        f"def {name}(args: dict = None):\n"
         f'    """\n'
         f"    Auto-generated from the Flows tab's node graph. Edit the graph in\n"
         f"    the GUI and click Save to regenerate this function — manual edits\n"
         f"    made directly to this function body will be OVERWRITTEN the next\n"
         f"    time this flow is saved.\n"
+        f"\n"
+        f"    `args` holds whatever was passed to run_flow(name, args) -- each\n"
+        f"    Argument node in the graph reads its own value out of this dict\n"
+        f"    by name (see the _arg_<id> lines below), falling back to its\n"
+        f"    configured default when the key is missing or args is None.\n"
         f'    """\n'
     )
     return header + body + "\n"
@@ -581,13 +787,36 @@ _FLOW_TOOLS_HEADER = (
     "import main as _midum\n\n\n"
     "def _call_mcp_tool_step(server, tool_name, args):\n"
     "    return _midum.call_mcp_tool(server, tool_name, args)\n\n\n"
-    "def _call_flow_step(flow_name):\n"
+    "def _call_flow_step(flow_name, args=None):\n"
     "    \"\"\"Run another saved flow by name, as a step of THIS flow -- lets\n"
     "    flows compose. Beware self-reference (a flow calling itself, directly\n"
     "    or through a cycle of other flows) -- flow_tools.py has no cycle\n"
     "    detection at call time, so that will recurse until Python's own\n"
     "    recursion limit kicks in, not fail gracefully.\"\"\"\n"
-    "    return _midum.run_flow(flow_name)\n\n\n"
+    "    return _midum.run_flow(flow_name, args)\n\n\n"
+    "def _flow_coerce_arg(value, type_name):\n"
+    "    \"\"\"Best-effort coercion of an external flow argument (an Argument\n"
+    "    node's value, sourced from run_flow()'s `args` dict -- often a plain\n"
+    "    string typed into the Tools tab, or whatever JSON type a model tool\n"
+    "    call passed) to the type declared on that Argument node, so\n"
+    "    'integer'/'number'/'boolean' arguments behave as their real type\n"
+    "    downstream instead of staying strings. Falls back to returning the\n"
+    "    value unchanged if coercion fails.\"\"\"\n"
+    "    if value is None:\n"
+    "        return None\n"
+    "    t = (type_name or 'string').lower()\n"
+    "    try:\n"
+    "        if t == 'integer':\n"
+    "            return int(float(value))\n"
+    "        if t == 'number':\n"
+    "            return float(value)\n"
+    "        if t == 'boolean':\n"
+    "            if isinstance(value, bool):\n"
+    "                return value\n"
+    "            return str(value).strip().lower() in ('1', 'true', 'yes', 'on')\n"
+    "    except Exception:\n"
+    "        return value\n"
+    "    return value\n\n\n"
     "def _flow_iter(value):\n"
     "    \"\"\"Best-effort coercion of a wired-in value into something a\n"
     "    `for` loop can iterate: a real list/tuple passes through, a JSON\n"
@@ -676,6 +905,7 @@ _REQUIRED_HEADER_SNIPPETS = (
     "def _call_flow_step(",
     "def _flow_iter(",
     "def _flow_num(",
+    "def _flow_coerce_arg(",
     "def _flow_consult_ai(",
     "def _flow_ai_choose(",
 )
@@ -826,29 +1056,81 @@ def flow_description(name: str) -> str:
     return desc.strip() or f"Runs the '{name}' flow (a saved sequence of tool calls from the Flows tab)."
 
 
+def flow_arguments(name: str) -> list:
+    """Every Argument node's declared external parameter for `name`, as
+    {"name","type","description","required","default"} -- read straight out
+    of the graph last saved for this flow (see get_flow_graph()). Powers
+    both this flow's JSON-schema properties/required (list_flow_schemas(),
+    get_promoted_flow_schemas()) and the Tools tab's per-flow argument
+    input fields. Duplicate argument names (two Argument nodes sharing one
+    name) collapse to the first one encountered; an Argument node left
+    unnamed is skipped since it has nothing to key `args` by."""
+    graph = get_flow_graph(name)
+    nodes = _extract_nodes(graph)
+    out = []
+    seen = set()
+    for node in nodes.values():
+        if node.get("name") != "argument":
+            continue
+        data = node.get("data") or {}
+        arg_name = (data.get("name") or "").strip()
+        if not arg_name or arg_name in seen:
+            continue
+        seen.add(arg_name)
+        out.append({
+            "name": arg_name,
+            "type": (data.get("type") or "string").strip() or "string",
+            "description": (data.get("description") or "").strip(),
+            "required": str(data.get("required", "")).strip().lower() in ("yes", "true", "1"),
+            "default": data.get("default", ""),
+        })
+    # A Python Code node's own get_argument("name", default) calls double
+    # as external parameters too, exactly like an Argument node -- see
+    # _extract_get_argument_calls's docstring for the parsing approach.
+    for node in nodes.values():
+        if node.get("name") != "python":
+            continue
+        code = (node.get("data") or {}).get("code") or ""
+        for arg in _extract_get_argument_calls(code):
+            if arg["name"] and arg["name"] not in seen:
+                seen.add(arg["name"])
+                out.append(arg)
+    return out
+
+
 def list_flow_schemas() -> list:
     """One {"name","description","properties","required","promoted"} entry per
     saved flow -- same shape as list_tool_schemas() for native tools, so the
-    Tools tab's Flows dropdown can list them uniformly. Flows take no
-    external parameters (their steps get values from what was wired up /
-    typed into each node when the flow was built). "promoted" reflects
+    Tools tab's Flows dropdown can list them uniformly. "properties"/
+    "required" are now built from the flow's own Argument nodes (see
+    flow_arguments()) rather than always empty -- a flow with no Argument
+    nodes still reports {} / [] exactly as before. "promoted" reflects
     whether this flow currently has its own always-on tool schema (see the
     PROMOTED FLOWS section below) -- purely informational here, doesn't
-    change how run_flow(name) behaves."""
+    change how run_flow(name, args) behaves."""
     out = []
     for name in list_flows():
+        args = flow_arguments(name)
         out.append({
             "name": name,
             "description": flow_description(name),
-            "properties": {},
-            "required": [],
+            "properties": {
+                a["name"]: {"type": a["type"], "description": a["description"]}
+                for a in args
+            },
+            "required": [a["name"] for a in args if a["required"]],
             "promoted": is_flow_promoted(name),
         })
     return out
 
 
 def run_flow(name: str, args: dict = None) -> str:
-    """Import flow_tools.py fresh and call the named flow function."""
+    """Import flow_tools.py fresh and call the named flow function, passing
+    `args` (a plain dict) through to it -- each Argument node in the flow's
+    graph pulls its own value out of this dict by name (see
+    _codegen_argument_declarations()). `args` is optional/keyword so a
+    flow with no Argument nodes, or one saved before argument support
+    existed and not yet re-saved, still runs unchanged."""
     if name not in list_flows():
         return f"Error: no saved flow named '{name}'."
     try:
@@ -862,7 +1144,13 @@ def run_flow(name: str, args: dict = None) -> str:
         return f"Error: '{name}' is listed but flow_tools.{name} is not a callable function."
 
     try:
-        result = fn()
+        try:
+            result = fn(args=args)
+        except TypeError:
+            # Backward compat: this flow was saved before argument support
+            # was added (its generated function takes no `args` param) and
+            # hasn't been re-saved from the Flows tab yet.
+            result = fn()
         return str(result)
     except Exception as e:
         return f"Error: flow '{name}' raised an exception during execution: {e}"
@@ -993,12 +1281,23 @@ def get_promoted_flow_schemas() -> list:
     for name in get_promoted_flows():
         if name not in valid_names:
             continue
+        args = flow_arguments(name)
+        parameters = {
+            "type": "object",
+            "properties": {
+                a["name"]: {"type": a["type"], "description": a["description"]}
+                for a in args
+            },
+        }
+        required = [a["name"] for a in args if a["required"]]
+        if required:
+            parameters["required"] = required
         schemas.append({
             "type": "function",
             "function": {
                 "name": name,
                 "description": f"[FLOW] {flow_description(name)}".strip(),
-                "parameters": {"type": "object", "properties": {}},
+                "parameters": parameters,
             },
         })
     return schemas

@@ -477,3 +477,16 @@ Let’s look at why counting six individual 5-second a
 [2026-09-24 12:26] Action completed: ### Comprehensive Technical Report: The IAS15 Algorithm
 
 The **IAS15** (*Implicit integrator with Adaptive timeStepping, 15th order*) algorithm is a s
+[2026-09-24 20:11] Action completed: ### Comprehensive Guide to Limits of Functions
+
+---
+
+### 1. Introduction to Limits
+In calculus, a **limit** describes the behavior of a function as it
+[2026-09-25 00:16] Action completed: I have successfully completed the test of the action loop and handled the user's interjection to wait for 10 seconds. The task is now finished!
+[2026-09-25 01:14] Action completed: I have created an ambient surface for you! It's a handy interactive checklist and scratchpad widget floating on your screen. You can add tasks, check
+[2026-09-25 01:15] Action completed: I have moved the scratchpad widget to the top corner of your screen!
+[2026-09-25 01:15] Action completed: I have moved the scratchpad widget to the top-right corner of your screen!
+[2026-09-25 01:15] Action completed: I have moved the scratchpad widget over to your second monitor!
+[2026-09-25 01:16] Action completed: I have removed the scratchpad widget from your screen.
+[2026-09-25 01:41] Action completed: I have successfully added the requested instruction to your instructions file, made the To-do List widget wider (now 380px), and saved the updated lay

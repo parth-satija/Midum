@@ -73,10 +73,13 @@ import knowledge_base as _knowledge_base
 import concurrent.futures
 import tools.user_prompt_tools as _user_prompt_tools
 import tools.render_surface_tools as _render_surface_tools
+import tools.ambient_surface_tools as _ambient_surface_tools
+from gui.ambient_surface import AmbientSurfaceManager
 
 import config
 import main as midum
 import permissions
+import midum_mcp.filesystem_policy as fs_policy
 
 CHATS_DIR = os.path.join(midum.STORAGE_DIR, "chats")
 
@@ -133,6 +136,7 @@ def _default_model_for_provider(provider_key: str) -> str:
         "groq":          midum.config.GROQ_MODEL,
         "ollama_cloud":  midum.config.OLLAMA_CLOUD_MODEL,
         "litellm":       midum.config.LITELLM_MODEL,
+        "openai_web":    "(default)",
     }.get(provider_key, "")
 
 
@@ -152,6 +156,13 @@ def _known_models_for_provider(provider_key: str) -> list:
         # (see attachLitellmPicker in the frontend JS) instead of a flat model
         # list -- the choices depend on which service is picked.
         return []
+    if provider_key == "openai_web":
+        # llm_cookie_bridge talks to the ChatGPT web app's default model for
+        # the logged-in account -- the library doesn't expose a model= param
+        # to pick a different one, so there's nothing real to list. A single
+        # "(default)" entry keeps the Model tab's dropdown looking consistent
+        # with every other provider instead of showing an empty field.
+        return ["(default)"]
     return [midum.config.MODEL_NAME]
 
 
@@ -246,6 +257,7 @@ PROVIDER_OPTIONS = [
     ("OpenRouter",      "openrouter"),
     ("Gemini (Web)",    "gemini_web"),
     ("Gemini (API)",    "gemini_api"),
+    ("ChatGPT (Web)",   "openai_web"),
     ("Groq",            "groq"),
     ("LiteLLM (any provider)", "litellm"),
 ]
@@ -626,6 +638,17 @@ class Api:
         # tab's state in here, then loads the incoming tab's state (or
         # blanks, for a brand-new tab) into those attributes.
         self._tab_gui_state    = {}
+
+        # GUI-only "preview" pointer: set to an agent tab's id while the
+        # person is looking at that sub-agent's (read-only) conversation
+        # tab in the titlebar strip, else None. Deliberately NOT the same
+        # thing as conversation_tabs' own active-tab pointer (which
+        # self._session.history always tracks) -- an agent tab must never
+        # actually become "the" active conversation, since _on_agent_done/
+        # _on_agent_inform below append straight to self._session.history
+        # assuming it's always the Supervisor's own. See
+        # switch_conversation_tab / list_conversation_tabs / _agent_tab_display.
+        self._viewing_agent_tab_id = None
         self._current_chat_id  = uuid.uuid4().hex
         self._chat_title       = None
         self._display_log      = []
@@ -736,6 +759,23 @@ class Api:
         # would silently keep calling a stale None hook forever.
         _render_surface_tools._gui_render_hook = self._handle_render
 
+        # ── Ambient Surfaces ──────────────────────────────────────────────
+        # Floating over-the-screen widgets (see tools/ambient_surface_tools.py
+        # and gui/ambient_surface.py). Same rebinding caveat as above: the
+        # hook must be set on the tools module itself.
+        self._ambient = AmbientSurfaceManager(
+            call_tool=self._ambient_call_tool,
+            on_submit=self._ambient_submit,
+            on_event=lambda t: self._push_event("log", {"text": t}),
+        )
+        _ambient_surface_tools._gui_ambient_hook = self._ambient.handle
+        # Sync the persisted "hide ambient surfaces from screenshots" toggle.
+        try:
+            self._ambient.set_hide_from_capture(
+                self.get_settings().get("ambient_hide_from_capture", True))
+        except Exception:
+            pass
+
         # Structured tool-call detail (name + args + result) for every tool
         # executed during a turn -- powers the expandable tool-call cards in
         # the chat pane. Separate from the plain-text log line the console
@@ -763,6 +803,16 @@ class Api:
         # _on_agent_done, just for an interim message instead of the final
         # report.
         midum.set_agent_inform_hook(self._on_agent_inform)
+
+        # Fired the instant a sub-agent's conversation tab actually OPENS
+        # (its worker thread picked up a queued task) -- see
+        # multi_agent.set_agent_started_hook and Api._on_agent_started
+        # below. Without this, the tab strip only repaints on other agent
+        # events (created/stopped/finished/mid-task message), which can
+        # leave a working agent's tab invisible for up to the worker
+        # loop's 0.5s poll interval, or longer if nothing else happens to
+        # trigger a rebuild in the meantime.
+        midum.set_agent_started_hook(self._on_agent_started)
 
         self._pending_ask = {}  # ask_id -> threading.Event / result box
 
@@ -892,6 +942,16 @@ class Api:
                 "args": safe_args,
                 "result": str(result)[:8000],
             })
+            # Persist this call into the agent's OWN transcript too, not
+            # just the live event above -- otherwise a call that already
+            # ran is gone the moment nobody's actively watching the live
+            # stream (e.g. clicking into that agent's conversation tab
+            # after some calls already happened) has nothing to replay.
+            # 'say' is excluded exactly like the Supervisor's own path
+            # below, since it's already recorded as a transcript entry by
+            # multi_agent.py's own _agent_say_hook the instant it's called.
+            if name != "say":
+                midum.record_agent_tool_call(agent_name, name, safe_args, result)
             return
 
         self._push_event("tool_call", {
@@ -1222,7 +1282,7 @@ class Api:
     # renderPendingCodeHighlight() in the frontend JS). Pure string
     # transform, safe to call for every code block rendered, including ones
     # re-rendered from a loaded chat history.
-    _PYGMENTS_STYLE = "one-dark"
+    _PYGMENTS_STYLE = "monokai"
 
     def highlight_code(self, code: str, lang: str = ""):
         """Returns Pygments-highlighted HTML (span soup, no wrapping
@@ -1471,6 +1531,9 @@ class Api:
             midum.config.OLLAMA_CLOUD_MODEL = model_id
         elif provider_key == "litellm":
             midum.config.LITELLM_MODEL = model_id
+        # "openai_web": no per-provider model setting exists (llm_cookie_bridge
+        # has no model= param to pin) -- switching MODEL_PROVIDER above is the
+        # entire story, same as every other config write for this provider.
 
         self._push_event("log", {"text": f"🔀 [Provider switched: {label} — {model_id or '(auto)'}]\n"})
         return self.get_status()
@@ -1703,6 +1766,10 @@ class Api:
             "liquid_glass_enabled": False,
             "liquid_glass_opacity": 55,
             "liquid_glass_sheen_enabled": True,
+            # Ambient Surfaces are excluded from screenshots/OCR/screen-share
+            # by default (the user still sees them). Turn off to let the
+            # model's own screenshots include the floating widgets.
+            "ambient_hide_from_capture": True,
             "bg_image": dict(self._DEFAULT_BG_IMAGE),
             "workspaces": [],
             "active_workspace": "",
@@ -1756,6 +1823,8 @@ class Api:
                     defaults["liquid_glass_opacity"] = max(35, min(75, int(saved["liquid_glass_opacity"])))
                 if isinstance(saved.get("liquid_glass_sheen_enabled"), bool):
                     defaults["liquid_glass_sheen_enabled"] = saved["liquid_glass_sheen_enabled"]
+                if isinstance(saved.get("ambient_hide_from_capture"), bool):
+                    defaults["ambient_hide_from_capture"] = saved["ambient_hide_from_capture"]
                 if isinstance(saved.get("bg_image"), dict):
                     defaults["bg_image"].update(saved["bg_image"])
                 if isinstance(saved.get("workspaces"), list):
@@ -1858,6 +1927,8 @@ class Api:
                 current["liquid_glass_opacity"] = max(35, min(75, int(settings["liquid_glass_opacity"])))
             if isinstance(settings.get("liquid_glass_sheen_enabled"), bool):
                 current["liquid_glass_sheen_enabled"] = settings["liquid_glass_sheen_enabled"]
+            if isinstance(settings.get("ambient_hide_from_capture"), bool):
+                current["ambient_hide_from_capture"] = settings["ambient_hide_from_capture"]
             if isinstance(settings.get("bg_image"), dict):
                 # Path changes only ever come through pick_background_image /
                 # clear_background_image (which persist immediately), so
@@ -1875,9 +1946,22 @@ class Api:
             # Apply the provider/model live for the current session too, so
             # "Save" doesn't require a restart to take effect.
             self.apply_model(current["provider"], current["model"])
+            try:
+                self._ambient.set_hide_from_capture(current["ambient_hide_from_capture"])
+            except Exception:
+                pass
 
             self._push_event("log", {"text": "💾 [Settings saved — will be restored on next launch]\n"})
             return {"ok": True, "settings": current}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def set_ambient_hide_from_capture(self, enabled: bool):
+        """Live-apply the SETTINGS toggle to every open Ambient Surface (the
+        checkbox calls this on change; the value is persisted by Save)."""
+        try:
+            self._ambient.set_hide_from_capture(bool(enabled))
+            return {"ok": True, "hidden": bool(enabled)}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -2236,6 +2320,7 @@ class Api:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+        self._viewing_agent_tab_id = None
         self._current_chat_id = data.get("id", chat_id)
         self._chat_title = data.get("title")
         history = data.get("history") or []
@@ -2316,6 +2401,7 @@ class Api:
             return {"ok": False, "error": str(e)}
 
         try:
+            self._viewing_agent_tab_id = None
             # Resync the OUTGOING tab's stored history before touching any
             # of self._session/_display_log/etc. -- same reasoning as
             # switch_conversation_tab: those attributes are about to be
@@ -2412,6 +2498,7 @@ class Api:
             return {"ok": False, "error": "Busy — wait for the current run to finish or abort first."}
         import conversation_tabs
         try:
+            self._viewing_agent_tab_id = None
             self._save_active_tab_gui_state()
             self._reset_session_memory_file()
             self._session.reset()  # reassigns self._session.history to a brand-new list
@@ -2551,6 +2638,46 @@ class Api:
         self._render_surface_open = False
         self._push_event('render_surface_close', {})
 
+    def _agent_tab_display(self, tab_id: str) -> list:
+        """Builds a replay-ready 'display' list (the same (tag, text) tuple
+        shape as self._display_log -- see appendRow()'s branches in the
+        frontend JS) from a sub-agent's own transcript, so clicking that
+        agent's conversation tab in the titlebar strip shows its actual
+        tool calls and messages, just like a normal chat tab. Read-only:
+        this never touches self._session.history or conversation_tabs'
+        active-tab pointer -- see switch_conversation_tab for why an agent
+        tab must never actually become 'the' active conversation."""
+        import conversation_tabs
+        tab = conversation_tabs.get_tab(tab_id)
+        if not tab or tab['kind'] != 'agent':
+            return []
+        transcript = midum.get_agent_transcript(tab['owner'])
+        display = []
+        for entry in transcript:
+            role = entry.get('role')
+            if role == 'tool':
+                try:
+                    payload = json.dumps({
+                        'name': entry.get('tool_name'),
+                        'args': entry.get('args') or {},
+                        'result': entry.get('result', ''),
+                    }, default=str)
+                except Exception:
+                    payload = json.dumps({'name': entry.get('tool_name'), 'args': {}, 'result': str(entry.get('result', ''))})
+                display.append(('toolcall', payload))
+            elif role == 'user':
+                # A task the Supervisor handed this agent -- not literally
+                # something "the user" typed, so it's tagged "system"
+                # (a neutral/dim bubble) rather than "user", with a label
+                # making clear what it actually is.
+                display.append(('system', f"\U0001f4cb Task: {entry.get('content', '')}"))
+            elif role == 'assistant':
+                # say() narration, tell_supervisor_to_inform_user() messages,
+                # and the final report all land here -- all genuinely this
+                # agent's own words, so rendered as normal reply bubbles.
+                display.append(('midum', entry.get('content', '')))
+        return display
+
     def list_conversation_tabs(self):
         # Every open conversation tab -- id, title, kind, message count, and
         # which one is active. Backs the titlebar's tab strip.
@@ -2571,6 +2698,19 @@ class Api:
         # messages yet, or agent tabs, which have no sidebar entry at all).
         import conversation_tabs
         rows = conversation_tabs.list_tabs()
+        # If we're previewing an agent tab (see switch_conversation_tab),
+        # that tab never actually becomes conversation_tabs' own active
+        # tab -- so override which row reports active:true here purely for
+        # the strip's highlighting, without touching the real active tab
+        # (self._session.history keeps pointing at it the whole time).
+        # Self-heals if the previewed tab closed since the last check
+        # (e.g. the agent finished -- see _on_agent_done) rather than
+        # leaving the strip with no active row at all.
+        if self._viewing_agent_tab_id and not any(r["id"] == self._viewing_agent_tab_id for r in rows):
+            self._viewing_agent_tab_id = None
+        if self._viewing_agent_tab_id:
+            for row in rows:
+                row["active"] = (row["id"] == self._viewing_agent_tab_id)
         for row in rows:
             if row["kind"] != "user":
                 continue
@@ -2760,6 +2900,7 @@ class Api:
             return {'ok': False, 'error': 'Busy \u2014 wait for the current run to finish or abort first.'}
         import conversation_tabs
         try:
+            self._viewing_agent_tab_id = None
             self._save_active_tab_gui_state()
             self._reset_session_memory_file()
             self._session.reset()  # reassigns self._session.history to a brand-new list
@@ -2780,8 +2921,27 @@ class Api:
         if self._thinking:
             return {'ok': False, 'error': 'Busy \u2014 wait for the current run to finish or abort first.'}
         import conversation_tabs
-        if conversation_tabs.get_tab(tab_id) is None:
+        tab = conversation_tabs.get_tab(tab_id)
+        if tab is None:
             return {'ok': False, 'error': f"No tab '{tab_id}' is open."}
+
+        if tab['kind'] == 'agent':
+            # Agent tabs are VIEW-ONLY. Never let one become conversation_tabs'
+            # own active tab or point self._session.history at it -- 
+            # _on_agent_done/_on_agent_inform below append straight to
+            # self._session.history/self._session.append assuming it's
+            # always the Supervisor's own conversation, and a background
+            # sub-agent thread is concurrently mutating this same list on
+            # its own. Track the preview separately instead (see
+            # list_conversation_tabs) and just hand back a read-only
+            # rendering of that agent's transcript.
+            self._viewing_agent_tab_id = tab_id
+            return {'ok': True, 'tabs': conversation_tabs.list_tabs(),
+                    'display': self._agent_tab_display(tab_id),
+                    'kb_state': self._blank_gui_state()['kb_state'], 'readonly': True,
+                    'agent_name': tab['owner']}
+
+        self._viewing_agent_tab_id = None
         if tab_id == conversation_tabs.get_active_tab_id():
             return {'ok': True, 'tabs': conversation_tabs.list_tabs(),
                     'display': self._display_log, 'kb_state': self._kb_state}
@@ -2811,6 +2971,7 @@ class Api:
         if tab['kind'] == 'agent':
             return {'ok': False, 'error': "That tab belongs to a sub-agent that's still working \u2014 it'll close on its own once the task finishes."}
 
+        self._viewing_agent_tab_id = None
         try:
             if conversation_tabs.tab_count() <= 1:
                 # Last tab open -- reset it in place rather than closing it.
@@ -3515,6 +3676,19 @@ class Api:
 
     def abort(self):
         midum._abort_event.set()
+        # Also force-cancel anything already in flight on an MCP server
+        # (e.g. a Filesystem MCP call) rather than just letting the
+        # already-shared _abort_event polling loop notice on its own --
+        # this actively cancels the underlying asyncio task instead of only
+        # abandoning the wait on it. Native tool calls (run_abortable, see
+        # state.py) are already covered by _abort_event.set() above with no
+        # extra call needed.
+        try:
+            n = midum.abort_active_mcp_calls()
+            if n:
+                self._push_event("log", {"text": f"🛑 Cancelled {n} in-flight MCP call(s)\n"})
+        except Exception as _abort_mcp_err:
+            print(f"⚠️ [abort_active_mcp_calls failed: {_abort_mcp_err}]")
         self._push_event("status", {"text": "Aborted", "level": "err"})
         self._push_event("log", {"text": "🛑 Execution pipeline aborted by user\n"})
         return {"ok": True}
@@ -3552,6 +3726,10 @@ class Api:
             # we can never truncate out from under that thread mid-write.
             if self._thinking:
                 midum._abort_event.set()
+                try:
+                    midum.abort_active_mcp_calls()
+                except Exception as _abort_mcp_err:
+                    print(f"⚠️ [abort_active_mcp_calls failed: {_abort_mcp_err}]")
                 waited = 0.0
                 while self._thinking and waited < 30.0:
                     time.sleep(0.05)
@@ -3741,6 +3919,11 @@ class Api:
             self._push_event("render_surface_open", {"code": code, "title": title})
             return f"Render Surface '{name}' loaded and opened ({len(code)} chars)."
 
+        if kind == "get":
+            # Read-only: current source, used by voice-mode delegation
+            # (tools/surface_delegate_tools.py) to revise the open surface.
+            return self._render_surface_code if (self._render_surface_open and self._render_surface_code) else ""
+
         return f"[RENDER SURFACE ERROR] unknown action '{kind}'."
 
     # ── Render Surface -> tool/MCP/Flow bridge ────────────────────────
@@ -3882,6 +4065,36 @@ class Api:
             except Exception:
                 items.append({"name": fname[:-5], "title": fname[:-5], "saved_at": ""})
         return {"ok": True, "items": items}
+
+    # ── Ambient Surface bridges ───────────────────────────────────────
+    def _ambient_call_tool(self, surface_id, tool_name, args):
+        """midum.call(...) from inside an Ambient Surface."""
+        result = self._call_any_tool_from_surface(tool_name, args)
+        try:
+            self._handle_tool_call(f"[Ambient Surface {surface_id}] {tool_name}", args or {}, result)
+        except Exception:
+            pass
+        try:
+            json.dumps(result)
+            return result
+        except Exception:
+            return str(result)
+
+    def _ambient_submit(self, surface_id, data):
+        """parent.postMessage(...) from an Ambient Surface -> new chat turn."""
+        try:
+            rendered = json.dumps(data, default=str)
+        except Exception:
+            rendered = str(data)
+        return self.send_message(f"[Ambient Surface input: {surface_id}]\n{rendered}")
+
+    def _close_ambient_surfaces(self):
+        """Overlay windows must not outlive the app (pywebview stays alive
+        while ANY window is open)."""
+        try:
+            self._ambient.close_all()
+        except Exception:
+            pass
 
     def render_surface_submit(self, data):
         """Called from JS whenever the sandboxed Render Surface iframe posts
@@ -4597,13 +4810,16 @@ class Api:
         result = midum.demote_flow(name)
         return {"ok": True, "message": result}
 
-    def run_flow(self, name: str):
+    def run_flow(self, name: str, args: dict = None):
         """Run a saved flow the same way a native tool is run from the
         Tools tab -- in a background thread, pushing the result back as a
-        'tool_result' event so the same output box can show it."""
+        'tool_result' event so the same output box can show it. `args`
+        mirrors run_tool()'s `args` dict: one key per Argument node the
+        flow declares (see list_flow_schemas()'s 'properties'), collected
+        from the Tools tab's per-flow argument fields."""
         def worker():
             try:
-                out = midum.run_flow(name)
+                out = midum.run_flow(name, args)
                 self._push_event("tool_result", {"output": str(out)})
             except Exception as e:
                 self._push_event("tool_result", {"output": f"Flow exception:\n{e}\n\n{traceback.format_exc()}"})
@@ -4874,6 +5090,19 @@ class Api:
     def get_agent_transcript_ui(self, name: str):
         return {"transcript": midum.get_agent_transcript(name)}
 
+    def _on_agent_started(self, name: str, role: str):
+        """Fired by multi_agent.py (on the AGENT'S OWN worker thread) the
+        instant a sub-agent's conversation tab actually opens -- i.e. it
+        just started working a queued task (see
+        multi_agent.set_agent_started_hook / register_agent_tab). Just
+        re-pushes "agents_changed", the same event create_agent_ui/
+        send_agent_task_ui/etc already push -- the frontend's handler for
+        it already calls buildConversationTabs() (and refreshes the Agents
+        pane if it's open), so this needs no new JS: it just makes sure
+        that refresh also happens right when the tab shows up, not only
+        when the agent was created, queued, or finished."""
+        self._push_event("agents_changed", {})
+
     def _on_agent_done(self, name: str, role: str, report: str):
         """Fired by multi_agent.py (on the AGENT'S OWN worker thread) the
         instant a sub-agent's Action Loop stops and its report is ready.
@@ -4915,6 +5144,21 @@ class Api:
         self._persist_current_chat()
         self._push_event("system_line", {"text": f"🤖 [Agent '{name}' finished its task]"})
         self._push_event("agents_changed", {})
+
+        # If the person was previewing THIS agent's conversation tab (see
+        # switch_conversation_tab), it just closed underneath them --
+        # conversation_tabs.unregister_agent_tab already ran, in
+        # multi_agent.py's own `finally` block, before this hook fired.
+        # Snap the chat pane back to the real active conversation instead
+        # of leaving it stuck showing a transcript for a tab that no
+        # longer exists (agents_changed above only refreshes the tab
+        # STRIP, not whatever's currently rendered in the chat pane).
+        import conversation_tabs
+        if self._viewing_agent_tab_id and conversation_tabs.get_tab(self._viewing_agent_tab_id) is None:
+            self._viewing_agent_tab_id = None
+            self._push_event("agent_tab_closed_while_viewing", {
+                "display": self._display_log, "kb_state": self._kb_state,
+            })
 
         # If the Supervisor was idle, we already claimed _thinking above
         # (inside the lock, atomically with the check) -- safe to start the
@@ -5038,6 +5282,22 @@ class Api:
         msg = permissions.reset_all_permissions()
         return {"ok": True, "message": msg}
 
+    # ── Filesystem MCP approval password ────────────────────────────────
+    # Backs the "ask_password" permission level (see permissions.py /
+    # midum_mcp/filesystem_policy.py). Deliberately NOT reachable through
+    # any model tool -- these Api methods are only ever called from this
+    # GUI's Permissions pane, on the GUI thread, from a user click.
+    def get_filesystem_password_status(self):
+        return {"configured": fs_policy.is_filesystem_password_set()}
+
+    def set_filesystem_password(self, password: str):
+        msg = fs_policy.set_filesystem_mcp_password(password)
+        return {"ok": not msg.lower().startswith("error"), "message": msg}
+
+    def remove_filesystem_password(self):
+        msg = fs_policy.clear_filesystem_mcp_password()
+        return {"ok": not msg.lower().startswith("error"), "message": msg}
+
     def _destroy_window_safe(self):
         """window.destroy() tears down the QWebEngineView (Chromium's Qt
         widget), and Qt widgets may only be destroyed on the GUI thread --
@@ -5050,6 +5310,7 @@ class Api:
         supported way to schedule GUI work from elsewhere. Falls back to
         a direct call only if Qt genuinely isn't available.
         """
+        self._close_ambient_surfaces()
         fn = self.window.destroy
         try:
             try:
@@ -5103,6 +5364,7 @@ class Api:
             midum.stop_scheduler()
         except Exception:
             pass
+        self._close_ambient_surfaces()
         self._closing = True
         return None
 
@@ -5205,6 +5467,26 @@ html,body{margin:0;padding:0;height:100%;background:var(--bg);color:var(--text);
 body{display:flex;flex-direction:column;}
 button{font-family:inherit;cursor:pointer;}
 input,textarea{font-family:inherit;}
+input[type="checkbox"]{
+  appearance:none;-webkit-appearance:none;position:relative;display:inline-block;
+  flex:0 0 auto;width:34px !important;height:20px !important;margin:0;
+  border:1px solid var(--border2);border-radius:999px;background:var(--surface2);
+  cursor:pointer;vertical-align:middle;transition:background-color .18s var(--ease),border-color .18s var(--ease),box-shadow .18s var(--ease);
+}
+input[type="checkbox"]::after{
+  content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;
+  border-radius:50%;background:var(--subtext);box-shadow:0 1px 3px rgba(0,0,0,.3);
+  transition:left .18s var(--ease),background-color .18s var(--ease);
+}
+input[type="checkbox"]:checked{
+  background:var(--accent);border-color:var(--accent);
+}
+input[type="checkbox"]:checked::after{
+  left:16px;background:var(--text);
+}
+input[type="checkbox"]:focus-visible{
+  outline:none;box-shadow:0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
+}
 /* Scrollbars: sized and weighted to read as a deliberate, professional
    surface rather than the bare OS default -- wide enough to grab, a
    visible track so the thumb has somewhere to sit, and a hover/active
@@ -5387,6 +5669,13 @@ input,textarea{font-family:inherit;}
   background:var(--panel);border:1px solid var(--border2);
   display:flex;align-items:center;justify-content:space-between;padding:0 18px;
 }
+#topbar::before{
+  content:"";position:absolute;z-index:0;left:-1px;right:-1px;top:-38px;bottom:-1px;
+  border:1px solid var(--border2);border-bottom:none;
+  border-radius:var(--radius) var(--radius) 0 0;background:var(--panel);
+  pointer-events:none;
+}
+#topbar > *{position:relative;z-index:1;}
 #left-cluster{display:flex;align-items:center;gap:12px;flex:0 0 auto;position:relative;}
 #brand{position:absolute;top:-20px;left:2px;font-size:11px;font-weight:700;color:var(--accent);white-space:nowrap;}
 .icon-btn{
@@ -5397,8 +5686,17 @@ input,textarea{font-family:inherit;}
 .icon-btn:hover{background:var(--border2);}
 .icon-btn.active{background:var(--accent);}
 #status-row{display:flex;align-items:center;gap:6px;}
+#status-row{
+  width:150px;height:40px;flex:0 0 150px;box-sizing:border-box;
+  padding:0 12px;border-radius:999px;position:relative;left:8px;overflow:hidden;justify-content:center;
+  border:1px solid color-mix(in srgb, white 10%, var(--border2));
+  background-color:color-mix(in srgb, var(--surface) 80%, transparent);
+  background-image:linear-gradient(150deg, color-mix(in srgb, white 9%, transparent) 0%, color-mix(in srgb, white 3%, transparent) 34%, transparent 62%);
+  box-shadow:inset 0 1px 0 color-mix(in srgb, white 13%, transparent), inset 0 -1px 0 color-mix(in srgb, white 4%, transparent), 0 6px 16px -12px rgba(0,0,0,.6);
+  transition:background-color .18s var(--ease),border-color .18s var(--ease),box-shadow .18s var(--ease);
+}
 #status-dot{width:8px;height:8px;border-radius:50%;background:var(--yellow);transition:background .2s;}
-#status-label{font-size:12px;color:var(--subtext);white-space:nowrap;}
+#status-label{font-size:12px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 
 /* Centered pill tab bar — 80% width of top bar, fully rounded bar + tabs */
 #tabbar-wrap{width:80%;max-width:80%;flex:0 0 80%;display:flex;justify-content:center;}
@@ -5418,6 +5716,18 @@ input,textarea{font-family:inherit;}
 }
 .tab-btn:hover{background:var(--surface2);}
 .tab-btn.active{background:transparent;color:var(--text);font-weight:600;}
+#tabbar .tab-btn:nth-of-type(1) .ic{color:#67e8f9;}
+#tabbar .tab-btn:nth-of-type(2) .ic{color:#c4b5fd;}
+#tabbar .tab-btn:nth-of-type(3) .ic{color:#bef264;}
+#tabbar .tab-btn:nth-of-type(4) .ic{color:#f9a8d4;}
+#tabbar .tab-btn:nth-of-type(5) .ic{color:#fcd34d;}
+#tabbar .tab-btn:nth-of-type(6) .ic{color:#6ee7b7;}
+#tabbar .tab-btn:nth-of-type(7) .ic{color:#fdba74;}
+#tabbar .tab-btn:nth-of-type(8) .ic{color:#7dd3fc;}
+#tabbar .tab-btn:nth-of-type(9) .ic{color:#f0abfc;}
+#tabbar .tab-btn:nth-of-type(10) .ic{color:#86efac;}
+#tabbar .tab-btn:nth-of-type(11) .ic{color:#fda4af;}
+#tabbar .tab-btn:nth-of-type(12) .ic{color:#93c5fd;}
 
 #right-cluster{flex:0 0 auto;}
 #abort-btn{
@@ -5568,6 +5878,7 @@ html.blob-hidden #blob-layer{opacity:0;}
   background:transparent !important;
   border:none !important;
 }
+#topbar::before{background:transparent;border-color:transparent;}
 /* A background image behaves exactly like the ambient blobs layer: panes
    stay fully transparent (their base rule above) so the image shows
    straight through the whole window, not tinted/dimmed by a translucent
@@ -5598,6 +5909,9 @@ html.blobs-off:not(.has-bg-image) #topbar{
   background:var(--panel) !important;
   border:1px solid var(--border2) !important;
 }
+html.blobs-off:not(.has-bg-image) #topbar::before{
+  background:var(--panel);border-color:var(--border2);
+}
 .pane-hidden{opacity:0;pointer-events:none;}
 
 /* ── Liquid-glass surfaces (SETTINGS → toggle) ──────────────────────────────────────
@@ -5625,9 +5939,11 @@ html.blobs-off:not(.has-bg-image) #topbar{
    also why the transition below is short and limited to those same
    properties: enough to not feel like a hard cut, never long/continuous
    enough to look like it's still "working".
-     Code/log/terminal surfaces (.code-area, pre.code-block, #shell-terminal,
-   code.inline-code) are intentionally left out -- glassing those hurts
-   monospace legibility for no real benefit. Text-entry fields (input/
+     Code/log surfaces (.code-area) are intentionally left out -- glassing
+   those hurts monospace legibility for no real benefit. Markdown code blocks
+   and inline code are included as readable content accents. The Shell
+   terminal is included separately because it is an interactive pane surface.
+   Text-entry fields (input/
    textarea/select, minus the checkbox/radio/range/color types which have
    their own native chrome) are covered generically by tag rather than by
    id/class, since there are dozens of ad-hoc ones scattered through the
@@ -5639,6 +5955,13 @@ html.liquid-glass-on:not(.blobs-off) #app-titlebar{
   background-color:var(--glass-fill) !important;
   background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
   border-bottom:1px solid var(--glass-edge-dim) !important;
+}
+html.liquid-glass-on.has-bg-image #titlebar-model-pill,
+html.liquid-glass-on:not(.blobs-off) #titlebar-model-pill{
+  background-color:var(--glass-fill) !important;
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
+  border-color:var(--glass-edge) !important;
+  box-shadow:inset 0 1px 0 var(--glass-edge), inset 0 -1px 0 var(--glass-edge-dim), var(--glass-glow) !important;
 }
 /* Titlebar buttons: visible glass chips at rest (not just on hover) so
    they read as part of the glass surface, same idea as .icon-btn's
@@ -5698,6 +6021,8 @@ html.liquid-glass-on:not(.blobs-off) .conv-tab-icon-btn:hover{
 }
 html.liquid-glass-on.has-bg-image #tabbar,
 html.liquid-glass-on:not(.blobs-off) #tabbar,
+html.liquid-glass-on.has-bg-image #status-row,
+html.liquid-glass-on:not(.blobs-off) #status-row,
 html.liquid-glass-on.has-bg-image #conv-tabbar,
 html.liquid-glass-on:not(.blobs-off) #conv-tabbar,
 html.liquid-glass-on.has-bg-image #conv-tab-group-menu,
@@ -5740,8 +6065,26 @@ html.liquid-glass-on.has-bg-image .mcp-row,
 html.liquid-glass-on:not(.blobs-off) .mcp-row,
 html.liquid-glass-on.has-bg-image .tools-args,
 html.liquid-glass-on:not(.blobs-off) .tools-args,
+html.liquid-glass-on.has-bg-image .perm-row,
+html.liquid-glass-on:not(.blobs-off) .perm-row,
 html.liquid-glass-on.has-bg-image .perm-opt,
 html.liquid-glass-on:not(.blobs-off) .perm-opt,
+html.liquid-glass-on.has-bg-image .ptt-slot-row,
+html.liquid-glass-on:not(.blobs-off) .ptt-slot-row,
+html.liquid-glass-on.has-bg-image textarea.code-area,
+html.liquid-glass-on:not(.blobs-off) textarea.code-area,
+html.liquid-glass-on.has-bg-image pre.code-block,
+html.liquid-glass-on:not(.blobs-off) pre.code-block,
+html.liquid-glass-on.has-bg-image code.inline-code,
+html.liquid-glass-on:not(.blobs-off) code.inline-code,
+html.liquid-glass-on.has-bg-image #shell-terminal,
+html.liquid-glass-on:not(.blobs-off) #shell-terminal,
+html.liquid-glass-on.has-bg-image input[type="checkbox"],
+html.liquid-glass-on:not(.blobs-off) input[type="checkbox"],
+html.liquid-glass-on.has-bg-image #pdf-levels,
+html.liquid-glass-on:not(.blobs-off) #pdf-levels,
+html.liquid-glass-on.has-bg-image #pdf-tree,
+html.liquid-glass-on:not(.blobs-off) #pdf-tree,
 html.liquid-glass-on.has-bg-image #flow-drawer,
 html.liquid-glass-on:not(.blobs-off) #flow-drawer,
 html.liquid-glass-on.has-bg-image .flow-drawer-item,
@@ -5762,12 +6105,19 @@ html.liquid-glass-on.has-bg-image .capability-picker-row,
 html.liquid-glass-on:not(.blobs-off) .capability-picker-row,
 html.liquid-glass-on.has-bg-image .flowchart-wrap,
 html.liquid-glass-on:not(.blobs-off) .flowchart-wrap,
+html.liquid-glass-on.has-bg-image .perm-fs-pw-box,
+html.liquid-glass-on:not(.blobs-off) .perm-fs-pw-box,
 html.liquid-glass-on.has-bg-image table.md-table{
   background-color:var(--glass-fill) !important;
   background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
   border-color:var(--glass-edge) !important;
   box-shadow:inset 0 1px 0 var(--glass-edge), inset 0 -1px 0 var(--glass-edge-dim), var(--glass-glow) !important;
   transition:background-color .18s var(--ease), box-shadow .18s var(--ease), border-color .18s var(--ease);
+}
+html.liquid-glass-on.has-bg-image input[type="checkbox"]:checked,
+html.liquid-glass-on:not(.blobs-off) input[type="checkbox"]:checked{
+  background-color:color-mix(in srgb, var(--accent) 72%, var(--glass-fill)) !important;
+  border-color:var(--accent) !important;
 }
 /* Small/round controls read better a touch more opaque than big flat
    surfaces (icon glyphs and short labels need more contrast to stay
@@ -6101,6 +6451,25 @@ html.liquid-glass-on:not(.blobs-off) .row.interjection .bubble{
 .agent-tool-dot{background:var(--muted);}
 .agent-tool-row .tool-detail{opacity:.9;}
 
+/* ── Icons ─────────────────────────────────────────────────────────────────
+   One consistent stroke-icon set (see icon() in the script). Sized in em so
+   an icon scales with whatever text/button it sits in, and coloured with
+   currentColor so it follows hover / active / theme changes for free. */
+.ic{width:1.15em;height:1.15em;flex:none;vertical-align:-.22em;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;pointer-events:none;}
+.ic-fill{fill:currentColor;}
+.ic-play,.ic-stop,.ic-star-fill,.ic-dot{stroke-width:1.6;}
+/* semantic tints only where an icon stands alone as a status marker */
+.log-view .ic-alert,.row.system .ic-alert{color:var(--yellow);}
+.log-view .ic-check-circle,.log-view .ic-check,.row.system .ic-check-circle{color:var(--green);}
+.log-view .ic-x-circle,.row.system .ic-x-circle{color:var(--red);}
+/* Log pane (a div instead of a textarea so it can hold icons) */
+div.code-area.log-view{
+  width:100%;flex:1;min-height:0;box-sizing:border-box;overflow:auto;
+  background:var(--tool-bg);color:var(--tool-text);border:1px solid var(--border);
+  border-radius:16px;padding:10px;font-family:Consolas,"Cascadia Code",monospace;font-size:12px;
+  white-space:pre-wrap;word-break:break-word;user-select:text;cursor:text;
+}
+
 /* ── Grouped tool-call pills ─────────────────────────────────────────────
    Every stretch of tool calls (until Midum say()s / replies) collapses into
    ONE "Ran N tools" pill (.tg-pill). Expanding it drops the group into one
@@ -6310,7 +6679,7 @@ html.liquid-glass-on:not(.blobs-off) .tool-group.live .tg-pill{
   50%{ transform:scale(1.25); box-shadow:0 0 0 4px rgba(16,185,129,0); }
   100%{transform:scale(0.7); box-shadow:0 0 0 0 rgba(16,185,129,0); }
 }
-pre.code-block{background:var(--tool-bg);color:var(--tool-text);border-radius:12px;padding:10px;
+pre.code-block{background:var(--tool-bg);color:var(--text);border-radius:12px;padding:10px;
   overflow-x:auto;font-family:"JetBrains Mono","Cascadia Code","Fira Code",Consolas,monospace;
   font-size:12.5px;line-height:1.55;font-feature-settings:"liga" 1,"calt" 1;}
 .code-block-wrap{position:relative;}
@@ -6323,7 +6692,7 @@ pre.code-block{background:var(--tool-bg);color:var(--tool-text);border-radius:12
 .code-block-wrap:hover .code-copy-btn{opacity:1;}
 .code-copy-btn:hover{background:var(--border2);color:var(--text);}
 .code-copy-btn.copied{opacity:1;color:var(--green);}
-code.inline-code{background:var(--surface2);color:var(--tool-text);border-radius:4px;padding:1px 5px;
+code.inline-code{background:var(--surface2);color:var(--accent);border-radius:4px;padding:1px 5px;
   font-family:"JetBrains Mono","Cascadia Code","Fira Code",Consolas,monospace;font-size:12.5px;}
 .bubble h1,.bubble h2,.bubble h3,.bubble h4,.bubble h5,.bubble h6{margin:.4em 0;}
 .bubble h4{font-size:1em;}
@@ -6441,8 +6810,24 @@ textarea.code-area{
 .perm-opt:hover{background:var(--surface2);}
 .perm-opt.active[data-level="always"]{background:var(--green);color:#fff;}
 .perm-opt.active[data-level="ask"]{background:var(--yellow);color:#1a1400;}
+.perm-opt.active[data-level="ask_password"]{background:var(--accent);color:#fff;}
 .perm-opt.active[data-level="deny"]{background:var(--red);color:#fff;}
 .perm-empty{font-size:11px;color:var(--subtext);padding:10px;text-align:center;}
+
+/* Filesystem MCP approval-password box, shown at the top of the
+   Permissions pane -- sets the credential backing the "Password" level
+   above. Fully separate control from the per-tool segmented buttons. */
+.perm-fs-pw-box{background:var(--panel);border:1px solid var(--border);border-radius:14px;
+  padding:10px 12px;margin-top:10px;display:flex;flex-direction:column;gap:8px;}
+.perm-fs-pw-hdr{display:flex;align-items:center;justify-content:space-between;gap:8px;}
+.perm-fs-pw-title{font-size:11px;font-weight:700;color:var(--text);}
+.perm-fs-pw-status{font-size:10px;padding:2px 8px;border-radius:8px;border:1px solid var(--border2);}
+.perm-fs-pw-status.set{color:var(--green);border-color:var(--green);}
+.perm-fs-pw-status.unset{color:var(--subtext);}
+.perm-fs-pw-row{display:flex;gap:8px;}
+.perm-fs-pw-row input{flex:1;height:30px;border-radius:10px;border:1px solid var(--border2);
+  background:var(--surface);color:var(--text);padding:0 10px;outline:none;font-size:12px;}
+.perm-fs-pw-hint{font-size:10px;color:var(--subtext);line-height:1.4;}
 
 /* Flows tab -- node-graph editor (Drawflow, loaded from CDN on first
    visit). Left: grouped node drawer, drag items onto the canvas. Right:
@@ -6650,7 +7035,7 @@ textarea.code-area{
     <div id="conv-tabbar"><div id="conv-tab-highlight"></div></div>
     <button class="conv-tab-icon-btn" id="conv-tab-new-btn" title="New tab">+</button>
     <div id="conv-tab-group-wrap">
-      <button class="conv-tab-icon-btn" id="conv-tab-group-btn" title="Tab groups">⌄</button>
+      <button class="conv-tab-icon-btn" id="conv-tab-group-btn" title="Tab groups"><svg class="ic ic-chevron-down" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
       <div id="conv-tab-group-menu"></div>
     </div>
   </div>
@@ -6669,8 +7054,8 @@ textarea.code-area{
   <div id="topbar-wrap">
     <div id="topbar">
       <div id="left-cluster">
-        <div id="brand">⚡ Midum</div>
-        <button class="icon-btn" id="sidebar-toggle" title="Toggle sidebar">☰</button>
+        <div id="brand"><svg class="ic ic-zap" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg> Midum</div>
+        <button class="icon-btn" id="sidebar-toggle" title="Toggle sidebar"><svg class="ic ic-menu" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
         <div id="status-row">
           <div id="status-dot"></div>
           <div id="status-label">Initializing...</div>
@@ -6691,16 +7076,16 @@ textarea.code-area{
     <div class="pane-wrap" id="chat-pane-wrap">
       <div class="pane">
         <button class="icon-btn" id="copy-chat-btn" title="Copy full conversation"
-          style="position:absolute;top:10px;right:10px;z-index:5;">⧉</button>
+          style="position:absolute;top:10px;right:10px;z-index:5;"><svg class="ic ic-copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
         <button class="icon-btn" id="reopen-render-surface-btn" title="Reopen last Render Surface"
-          style="position:absolute;top:52px;right:10px;z-index:5;">🖼</button>
+          style="position:absolute;top:52px;right:10px;z-index:5;"><svg class="ic ic-image" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></button>
         <div id="chat-scroll"><div id="chat-col"></div></div>
         <div id="input-row">
           <div style="width:100%;max-width:760px;position:relative;">
-            <div id="kb-only-badge"><span>🔒</span><span id="kb-only-badge-text">KB Only — internet disabled, answering from selected PDF sources</span></div>
+            <div id="kb-only-badge"><span><svg class="ic ic-lock" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span><span id="kb-only-badge-text">KB Only — internet disabled, answering from selected PDF sources</span></div>
             <div id="kb-explain-actions-row" style="display:none;gap:6px;margin-bottom:8px;">
-              <button id="kb-next-part-btn" style="flex:1;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;">Next Part →</button>
-              <button id="kb-open-source-btn" style="flex:0 0 auto;padding:0 14px;height:30px;border-radius:14px;border:1px solid var(--border2);background:var(--surface2);color:var(--text);font-size:11px;font-weight:600;">📄 Open Source</button>
+              <button id="kb-next-part-btn" style="flex:1;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;">Next Part <svg class="ic ic-arrow-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M12 5l7 7-7 7"/></svg></button>
+              <button id="kb-open-source-btn" style="flex:0 0 auto;padding:0 14px;height:30px;border-radius:14px;border:1px solid var(--border2);background:var(--surface2);color:var(--text);font-size:11px;font-weight:600;"><svg class="ic ic-file" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg> Open Source</button>
             </div>
             <div id="path-picker">
               <div id="path-picker-crumb"></div>
@@ -6721,13 +7106,13 @@ textarea.code-area{
                 <button class="kb-mode-btn" id="kb-mode-part-btn" data-mode="part">Part-by-Part</button>
                 <button class="kb-mode-btn" id="kb-mode-page-btn" data-mode="page">Page-by-Page</button>
               </div>
-              <button id="kb-start-explanation-btn" style="display:none;width:100%;margin-top:8px;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;">▶ Start Explanation</button>
+              <button id="kb-start-explanation-btn" style="display:none;width:100%;margin-top:8px;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;"><svg class="ic ic-play ic-fill" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4l14 8-14 8z"/></svg> Start Explanation</button>
               <div class="kb-only-hint" id="kb-explain-hint" style="display:none;">Walks through the selected source(s) part by part (one sub-sub-heading per response) — say "next" to continue.</div>
             </div>
             <div id="input-box">
-              <button class="icon-btn" id="kb-toggle-btn" title="Knowledge Base options">▾</button>
+              <button class="icon-btn" id="kb-toggle-btn" title="Knowledge Base options"><svg class="ic ic-chevron-down" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
               <textarea id="msg-input" placeholder="Message Midum..." rows="1"></textarea>
-              <button id="send-btn">↑</button>
+              <button id="send-btn"><svg class="ic ic-arrow-up" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
             </div>
             <div id="send-hint">Enter to send</div>
           </div>
@@ -6743,8 +7128,8 @@ textarea.code-area{
       <div class="pane" id="render-surface-pane">
         <div id="render-surface-header">
           <span id="render-surface-title">Render Surface</span>
-          <button class="icon-btn" id="render-surface-save" title="Save this Render Surface">💾</button>
-          <button class="icon-btn" id="render-surface-close" title="Close">✕</button>
+          <button class="icon-btn" id="render-surface-save" title="Save this Render Surface"><svg class="ic ic-save" viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/></svg></button>
+          <button class="icon-btn" id="render-surface-close" title="Close"><svg class="ic ic-x" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
         </div>
         <iframe id="render-surface-frame" sandbox="allow-scripts allow-forms allow-popups allow-modals" referrerpolicy="strict-origin-when-cross-origin"></iframe>
       </div>
@@ -6760,8 +7145,8 @@ textarea.code-area{
 // the "PANELS" section in buildSidebar's settings overlay) so they no
 // longer eat into the horizontal tab bar's space.
 const TABS = [
-  ["Chat","💬"], ["Voice","🎤"], ["Model","🧬"],
-  ["System Core","🧠"], ["Knowledge","📚"], ["Skills","🛠"], ["Tools","🔧"], ["Shell","💻"], ["Flows","🔗"], ["Agents","🤖"], ["MCP","🔌"], ["Permissions","🔐"]
+  ["Chat","message"], ["Voice","mic"], ["Model","cpu"],
+  ["System Core","sparkles"], ["Knowledge","book-open"], ["Skills","layers"], ["Tools","wrench"], ["Shell","terminal"], ["Flows","link"], ["Agents","bot"], ["MCP","plug"], ["Permissions","lock"]
   // "Surfaces" used to live here as a top tab, but it's a sidebar quick-
   // access button now (see #sidebar-surfaces-btn in buildSidebar) -- it's
   // a "jump to my saved surfaces" shortcut, not a work area someone tabs
@@ -6778,6 +7163,11 @@ let state = {
   kbSources: [],
   explainMode: false,
   explainModeType: "part",   // "part" (Part-by-Part) or "page" (Page-by-Page)
+  // Non-null (the sub-agent's name) while previewing a read-only agent
+  // conversation tab -- see switchConvTab/setViewingAgentTab. Blocks
+  // sendMessage() and lets appendAgentToolRow live-append rows for that
+  // one agent while it's the tab on screen.
+  viewingAgentTab: null,
 };
 
 let voiceState = { running: false, connecting: false };
@@ -6804,6 +7194,161 @@ let _currentUserRow  = null;
 // rows as they're created so their edit/regen buttons call back with the
 // right id, and used to guard against stale clicks.
 let _pendingTurnId   = null;
+
+// ── Icon set ───────────────────────────────────────────────────────────────
+// Every emoji / pictograph in the UI is drawn from this one stroke-icon set
+// (24x24, 2px round strokes, currentColor) so they all match the wrench in
+// the tool-call pills and follow the surrounding text colour and size.
+//   icon("name")   -> inline <svg> markup (use inside innerHTML / templates)
+//   iconHtml(v)    -> icon name, ready-made svg, or a legacy emoji -> svg
+//   iconizeHtml(s) -> swaps known emoji inside already-escaped HTML for icons
+//                     (used for Python-sent log / system lines, which still
+//                     carry emoji)
+const _ICONS = {
+  "wrench": '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  "message": '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  "mic": '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v4"/><path d="M8 23h8"/>',
+  "cpu": '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/>',
+  "sparkles": '<path d="M9.94 15.5A2 2 0 0 0 8.5 14.06l-6.14-1.58a.5.5 0 0 1 0-.96L8.5 9.94A2 2 0 0 0 9.94 8.5l1.58-6.14a.5.5 0 0 1 .96 0l1.58 6.14a2 2 0 0 0 1.44 1.44l6.14 1.58a.5.5 0 0 1 0 .96l-6.14 1.58a2 2 0 0 0-1.44 1.44l-1.58 6.14a.5.5 0 0 1-.96 0z"/><path d="M20 3v4M22 5h-4M4 17v2M5 18H3"/>',
+  "book-open": '<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>',
+  "layers": '<path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>',
+  "terminal": '<path d="M4 17l6-6-6-6"/><path d="M12 19h8"/>',
+  "code": '<path d="M16 18l6-6-6-6"/><path d="M8 6l-6 6 6 6"/>',
+  "link": '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  "bot": '<rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4H8M2 14h2M20 14h2M15 13v2M9 13v2"/>',
+  "plug": '<path d="M12 22v-5M9 8V2M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z"/>',
+  "lock": '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  "key": '<path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.78 7.78 5.5 5.5 0 0 1 7.78-7.78zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>',
+  "package": '<path d="M16.5 9.4l-9-5.19"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96 12 12.01l8.73-5.05M12 22.08V12"/>',
+  "octagon-x": '<path d="M7.86 2h8.28L22 7.86v8.28L16.14 22H7.86L2 16.14V7.86z"/><path d="M15 9l-6 6M9 9l6 6"/>',
+  "clipboard": '<path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/>',
+  "file": '<path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/>',
+  "file-text": '<path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7M16 13H8M16 17H8M10 9H8"/>',
+  "folder": '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>',
+  "chart": '<path d="M18 20V10M12 20V4M6 20v-6"/>',
+  "image": '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>',
+  "save": '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
+  "trash": '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M10 11v6M14 11v6"/>',
+  "settings": '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+  "alert": '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4M12 17h.01"/>',
+  "help": '<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01"/>',
+  "check-circle": '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="M22 4 12 14.01l-3-3"/>',
+  "x-circle": '<circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/>',
+  "check": '<path d="M20 6 9 17l-5-5"/>',
+  "x": '<path d="M18 6 6 18M6 6l12 12"/>',
+  "play": '<path d="M6 4l14 8-14 8z"/>',
+  "stop": '<rect x="6" y="6" width="12" height="12" rx="2"/>',
+  "chevron-right": '<path d="M9 18l6-6-6-6"/>',
+  "chevron-left": '<path d="M15 18l-6-6 6-6"/>',
+  "chevron-down": '<path d="M6 9l6 6 6-6"/>',
+  "arrow-up": '<path d="M12 19V5M5 12l7-7 7 7"/>',
+  "arrow-left": '<path d="M19 12H5M12 19l-7-7 7-7"/>',
+  "arrow-right": '<path d="M5 12h14M12 5l7 7-7 7"/>',
+  "menu": '<path d="M3 12h18M3 6h18M3 18h18"/>',
+  "zap": '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/>',
+  "clock": '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+  "shuffle": '<path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/>',
+  "repeat": '<path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>',
+  "braces": '<path d="M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5c0 1.1.9 2 2 2h1M16 21h1a2 2 0 0 0 2-2v-5c0-1.1.9-2 2-2a2 2 0 0 1-2-2V5a2 2 0 0 0-2-2h-1"/>',
+  "target": '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
+  "tag": '<path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><path d="M7 7h.01"/>',
+  "star": '<path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/>',
+  "star-fill": '<path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/>',
+  "scissors": '<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.12 15.88M14.47 14.48 20 20M8.12 8.12 12 12"/>',
+  "pencil": '<path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>',
+  "copy": '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  "refresh": '<path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
+  "rotate-ccw": '<path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>',
+  "power": '<path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10"/>',
+  "moon": '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>',
+  "sun": '<circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>',
+  "megaphone": '<path d="M3 11l18-5v12L3 14v-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/>',
+  "dot": '<circle cx="12" cy="12" r="6"/>'
+};
+const _ICON_FILLED = new Set(["dot", "play", "star-fill", "stop"]);
+function icon(name, extraClass){
+  const p = _ICONS[name];
+  if (!p) return "";
+  return '<svg class="ic ic-' + name + (_ICON_FILLED.has(name) ? " ic-fill" : "") + (extraClass ? " " + extraClass : "") + '" viewBox="0 0 24 24" aria-hidden="true">' + p + '</svg>';
+}
+const _EMOJI_ICON = {
+  "💬": "message",
+  "🎤": "mic",
+  "🧬": "cpu",
+  "🧠": "sparkles",
+  "📚": "book-open",
+  "🛠": "layers",
+  "🔧": "wrench",
+  "💻": "terminal",
+  "🐚": "terminal",
+  "🔗": "link",
+  "🤖": "bot",
+  "🔌": "plug",
+  "🔐": "lock",
+  "🔒": "lock",
+  "🔑": "key",
+  "📦": "package",
+  "🛑": "octagon-x",
+  "📋": "clipboard",
+  "📄": "file",
+  "📁": "folder",
+  "📂": "folder",
+  "📊": "chart",
+  "🖼": "image",
+  "💾": "save",
+  "🗑": "trash",
+  "⚙": "settings",
+  "❓": "help",
+  "✅": "check-circle",
+  "❌": "x-circle",
+  "✓": "check",
+  "✕": "x",
+  "✗": "x",
+  "⚠": "alert",
+  "⚡": "zap",
+  "⏰": "clock",
+  "⏳": "clock",
+  "🔀": "shuffle",
+  "🔁": "repeat",
+  "🧩": "braces",
+  "📝": "file-text",
+  "📜": "file-text",
+  "🎯": "target",
+  "🏷": "tag",
+  "⭐": "star",
+  "★": "star-fill",
+  "✂": "scissors",
+  "✏": "pencil",
+  "✎": "pencil",
+  "☰": "menu",
+  "⌄": "chevron-down",
+  "▾": "chevron-down",
+  "↑": "arrow-up",
+  "←": "arrow-left",
+  "↻": "refresh",
+  "⟳": "refresh",
+  "↺": "rotate-ccw",
+  "⧉": "copy",
+  "⏻": "power",
+  "🌙": "moon",
+  "☀": "sun",
+  "▶": "play",
+  "◀": "chevron-left",
+  "⏹": "stop",
+  "⬤": "dot",
+  "📢": "megaphone"
+};
+const _EMOJI_RE = new RegExp("(" + Object.keys(_EMOJI_ICON).join("|") + ")\\uFE0F?", "g");
+function iconizeHtml(html){
+  return String(html).replace(_EMOJI_RE, (m, e)=>icon(_EMOJI_ICON[e]) || m);
+}
+function iconHtml(v){
+  if (v === null || v === undefined) return "";
+  v = String(v);
+  if (_ICONS[v]) return icon(v);
+  if (v.charAt(0) === "<") return v;
+  return iconizeHtml(escapeHtml(v));
+}
 
 function api(name, ...args){ return window.pywebview.api[name](...args); }
 
@@ -6963,7 +7508,7 @@ function _renderPathPickerList(filterText, errorText){
   }
   list.innerHTML = pathPicker.filtered.map((e, i)=>
     `<div class="path-picker-row${i===0?' active':''}" data-i="${i}" title="${escapeHtml(e.is_dir ? 'Click: open   ·   Shift+Click: insert this folder\'s path (no quotes)' : 'Click: insert this file\'s path (no quotes)')}">`
-    + `<span class="path-picker-icon">${e.is_dir ? "📁" : "📄"}</span>`
+    + `<span class="path-picker-icon">${icon(e.is_dir ? "folder" : "file")}</span>`
     + `<span class="path-picker-name">${escapeHtml(e.name)}</span>`
     + `</div>`
   ).join("");
@@ -7145,35 +7690,35 @@ async function _loadCapabilityLevel(){
     if (depth === 1){
       const cats = await api("list_native_tool_categories");
       capabilityPicker.entries = (cats || []).map(c=>({
-        label: c.name, icon: "📂", count: c.count, is_leaf: false,
+        label: c.name, icon: "folder", count: c.count, is_leaf: false,
       }));
     } else {
       const tools = await api("list_native_tools_by_category", capabilityPicker.stack[1].label);
       capabilityPicker.entries = (tools || []).map(t=>({
-        label: t.name, desc: t.desc, icon: "🔧", is_leaf: true,
+        label: t.name, desc: t.desc, icon: "wrench", is_leaf: true,
       }));
     }
   } else if (root === "mcp"){
     if (depth === 1){
       const servers = await api("list_mcp_servers_for_picker");
       capabilityPicker.entries = (servers || []).map(s=>({
-        label: s.name, icon: s.connected ? "🔌" : "⚠️", count: s.count, is_leaf: false,
+        label: s.name, icon: s.connected ? "plug" : "alert", count: s.count, is_leaf: false,
       }));
     } else {
       const tools = await api("list_mcp_tools_by_server", capabilityPicker.stack[1].label);
       capabilityPicker.entries = (tools || []).map(t=>({
-        label: t.name, desc: t.desc, icon: "🔌", is_leaf: true,
+        label: t.name, desc: t.desc, icon: "plug", is_leaf: true,
       }));
     }
   } else if (root === "skills"){
     const items = await api("list_skills_capability");
-    capabilityPicker.entries = (items || []).map(i=>({ label: i.name, desc: i.desc, icon: "🧠", is_leaf: true }));
+    capabilityPicker.entries = (items || []).map(i=>({ label: i.name, desc: i.desc, icon: "sparkles", is_leaf: true }));
   } else if (root === "flows"){
     const items = await api("list_flows_capability");
-    capabilityPicker.entries = (items || []).map(i=>({ label: i.name, desc: i.desc, icon: "🔗", is_leaf: true }));
+    capabilityPicker.entries = (items || []).map(i=>({ label: i.name, desc: i.desc, icon: "link", is_leaf: true }));
   } else if (root === "kbs"){
     const items = await api("list_kbs_capability");
-    capabilityPicker.entries = (items || []).map(i=>({ label: i.name, desc: i.desc, icon: "📚", is_leaf: true }));
+    capabilityPicker.entries = (items || []).map(i=>({ label: i.name, desc: i.desc, icon: "book-open", is_leaf: true }));
   } else {
     capabilityPicker.entries = [];
   }
@@ -7224,7 +7769,7 @@ function _renderCapabilityPickerList(filterText){
   list.innerHTML = capabilityPicker.filtered.map((e, i)=>
     `<div class="capability-picker-row${i===0?' active':''}" data-i="${i}" `
     + `title="${escapeHtml(e.is_leaf ? 'Click: insert this name' : 'Click: open')}">`
-    + `<span class="capability-picker-icon">${e.icon || (e.is_leaf ? "•" : "📁")}</span>`
+    + `<span class="capability-picker-icon">${iconHtml(e.icon || (e.is_leaf ? "•" : "folder"))}</span>`
     + `<span class="capability-picker-main">`
     + `<span class="capability-picker-name">${escapeHtml(e.label)}</span>`
     + (e.desc ? `<span class="capability-picker-desc">${escapeHtml(e.desc)}</span>` : ``)
@@ -7550,7 +8095,7 @@ function buildTabbar(){
     const b = document.createElement("button");
     b.className = "tab-btn" + (name === "Chat" ? " active" : "");
     b.dataset.name = name;
-    b.innerHTML = `<span>${icon}</span><span>${name}</span>`;
+    b.innerHTML = `<span>${iconHtml(icon)}</span><span>${name}</span>`;
     b.onclick = ()=>switchTab(name);
     bar.appendChild(b);
   });
@@ -7588,8 +8133,8 @@ async function buildConversationTabs(){
     const el = document.createElement("div");
     el.className = "conv-tab" + (t.active ? " active" : "") + (t.kind === "agent" ? " agent" : "");
     el.title = t.title;
-    el.innerHTML = `<span class="conv-tab-title">${escapeHtml(t.kind === "agent" ? "🤖 " : "")}${escapeHtml(t.title)}</span>` +
-      (t.kind === "agent" ? "" : `<button class="conv-tab-close" title="Close tab">✕</button>`);
+    el.innerHTML = `<span class="conv-tab-title">${(t.kind === "agent" ? icon("bot") + " " : "")}${escapeHtml(t.title)}</span>` +
+      (t.kind === "agent" ? "" : `<button class="conv-tab-close" title="Close tab">${icon("x")}</button>`);
     el.onclick = ()=>{ if (t.active) return; switchConvTab(t.id); };
     const closeBtn = el.querySelector(".conv-tab-close");
     if (closeBtn){
@@ -7623,8 +8168,26 @@ async function switchConvTab(tabId){
   clearChat();
   renderHistoryWindow(r.display || []);
   applyKbState(r.kb_state);
+  setViewingAgentTab(r.readonly ? (r.agent_name || "agent") : null);
   await buildConversationTabs();
   refreshTitlebarInfo();
+}
+
+// Toggles the read-only "previewing a sub-agent's tab" state: disables the
+// message box (agent tabs are look-only -- see Api.switch_conversation_tab)
+// and remembers which agent, if any, is on screen so a LIVE
+// "agent_tool_call" event for that same agent (see appendAgentToolRow) can
+// append straight into the chat pane instead of only showing up the next
+// time the tab is clicked.
+function setViewingAgentTab(agentName){
+  state.viewingAgentTab = agentName || null;
+  const input = document.getElementById("msg-input");
+  const btn = document.getElementById("send-btn");
+  if (input){
+    input.disabled = !!agentName;
+    input.placeholder = agentName ? `Viewing "${agentName}" \u2014 read-only` : "Message Midum...";
+  }
+  if (btn) btn.disabled = !!agentName;
 }
 
 async function newConvTab(){
@@ -7632,6 +8195,7 @@ async function newConvTab(){
   if (!r.ok){ showAlert(r.error, "Error"); return; }
   clearChat();
   applyKbState(r.kb_state);
+  setViewingAgentTab(null);
   await buildConversationTabs();
   refreshTitlebarInfo();
 }
@@ -7646,6 +8210,7 @@ async function closeConvTab(tabId){
     clearChat();
     renderHistoryWindow(r.display || []);
     applyKbState(r.kb_state);
+    setViewingAgentTab(null);
   }
   await buildConversationTabs();
   refreshTitlebarInfo();
@@ -7770,7 +8335,7 @@ function renderInline(text){
   // .textContent.
   const _codeBlocks = [];
   t = t.replace(/```([\w_]*)\n([\s\S]*?)```/g, (m,lang,body)=>{
-    const html = `<div class="code-block-wrap"><button class="code-copy-btn" title="Copy code">⧉</button><pre class="code-block" data-lang="${lang}">${body}</pre></div>`;
+    const html = `<div class="code-block-wrap"><button class="code-copy-btn" title="Copy code">${icon("copy")}</button><pre class="code-block" data-lang="${lang}">${body}</pre></div>`;
     _codeBlocks.push(html);
     return `\u0000CODEBLOCK${_codeBlocks.length - 1}\u0000`;
   });
@@ -8031,7 +8596,7 @@ function renderFlowchartSVG(data){
     });
 
     svg += `</svg>`;
-    return `<div class="flowchart-wrap"><div style="font-size:11px;color:var(--subtext);margin-bottom:6px;">📊 ${escapeHtml(data.title || "Flowchart")}</div>${svg}</div>`;
+    return `<div class="flowchart-wrap"><div style="font-size:11px;color:var(--subtext);margin-bottom:6px;">${icon("chart")} ${escapeHtml(data.title || "Flowchart")}</div>${svg}</div>`;
   } catch (e) {
     return null;
   }
@@ -8084,7 +8649,7 @@ async function renderPendingMermaid(){
   } catch (e) {
     pending.forEach(el=>{
       el.dataset.mermaidDone = "1";
-      el.outerHTML = `<div class="code-block-wrap"><button class="code-copy-btn" title="Copy code">⧉</button><pre class="code-block">${escapeHtml(el.textContent || "")}</pre></div>`;
+      el.outerHTML = `<div class="code-block-wrap"><button class="code-copy-btn" title="Copy code">${icon("copy")}</button><pre class="code-block">${escapeHtml(el.textContent || "")}</pre></div>`;
     });
     return;
   }
@@ -8097,7 +8662,7 @@ async function renderPendingMermaid(){
       el.innerHTML = svg;
     } catch (e) {
       const wrap = el.closest(".flowchart-wrap") || el;
-      wrap.outerHTML = `<div class="code-block-wrap"><button class="code-copy-btn" title="Copy code">⧉</button><pre class="code-block">${escapeHtml(src)}</pre></div>`;
+      wrap.outerHTML = `<div class="code-block-wrap"><button class="code-copy-btn" title="Copy code">${icon("copy")}</button><pre class="code-block">${escapeHtml(src)}</pre></div>`;
     }
   }
 }
@@ -8242,11 +8807,11 @@ function renderMidumContent(text){
           const fname = `${base}.png`;
           return `<div class="img-frame">
             <img src="data:image/png;base64,${img.data_b64}" alt="${escapeHtml(title)}"/>
-            <a class="img-save-btn" href="data:image/png;base64,${img.data_b64}" download="${escapeHtml(fname)}" title="Save image">💾</a>
+            <a class="img-save-btn" href="data:image/png;base64,${img.data_b64}" download="${escapeHtml(fname)}" title="Save image">${icon("save")}</a>
           </div>`;
         }).join('');
         renderedBlock = `<div class="flowchart-wrap">
-                           <div style="font-size:11px;color:var(--subtext);margin-bottom:6px;">🖼️ ${escapeHtml(title)}</div>
+                           <div style="font-size:11px;color:var(--subtext);margin-bottom:6px;">${icon("image")} ${escapeHtml(title)}</div>
                            ${imagesHtml}
                          </div>`;
       }
@@ -8254,7 +8819,7 @@ function renderMidumContent(text){
       // Fallback for malformed JSON
     }
 
-    out += renderedBlock || `<div class="code-block-wrap"><button class="code-copy-btn" title="Copy code">⧉</button><pre class="code-block" data-lang="${lang === "mermaid" ? "" : "json"}">${escapeHtml(body)}</pre></div>`;
+    out += renderedBlock || `<div class="code-block-wrap"><button class="code-copy-btn" title="Copy code">${icon("copy")}</button><pre class="code-block" data-lang="${lang === "mermaid" ? "" : "json"}">${escapeHtml(body)}</pre></div>`;
     lastIndex = FLOWCHART_FENCE_RE.lastIndex;
   }
   const rest = text.slice(lastIndex);
@@ -8311,15 +8876,15 @@ function buildStaticRow(tag, text){
   const row = document.createElement("div");
   if (tag === "user"){
     row.className = "row user";
-    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">⧉</button></div><div class="bubble user">${renderUserContent(text)}</div>`;
+    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">${icon("copy")}</button></div><div class="bubble user">${renderUserContent(text)}</div>`;
     wireRowCopyBtn(row);
   } else if (tag === "midum"){
     row.className = "row midum";
-    row.innerHTML = `<div class="row-label-row"><button class="row-copy-btn" title="Copy response">⧉</button></div><div class="bubble midum">${renderMidumContent(text)}</div>`;
+    row.innerHTML = `<div class="row-label-row"><button class="row-copy-btn" title="Copy response">${icon("copy")}</button></div><div class="bubble midum">${renderMidumContent(text)}</div>`;
     wireRowCopyBtn(row);
   } else if (tag === "system"){
     row.className = "row system";
-    row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+    row.innerHTML = `<div class="bubble">${iconizeHtml(escapeHtml(text))}</div>`;
   } else if (tag === "interjection"){
     row.className = "row interjection";
     row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
@@ -8334,9 +8899,9 @@ function buildStaticRow(tag, text){
     row.dataset.toolName = data.name || "";
     row.innerHTML = `
       <div class="tool-line expandable">
-        <span class="tool-dot"></span><span class="gear">⚙</span><span>-> Executing: '${escapeHtml(data.name || "")}'</span>
-        <span class="chevron">▶</span>
-        <button class="row-copy-btn" title="Copy tool call" style="margin-left:6px;">⧉</button>
+        <span class="tool-dot"></span><span class="gear">${icon("wrench")}</span><span>-> Executing: '${escapeHtml(data.name || "")}'</span>
+        <span class="chevron">${icon("chevron-right")}</span>
+        <button class="row-copy-btn" title="Copy tool call" style="margin-left:6px;">${icon("copy")}</button>
       </div>
       <div class="tool-detail">
         <div class="tool-detail-label">Call</div>
@@ -8504,7 +9069,7 @@ function createToolGroup(){
         <span class="tg-extra"></span>
         <span class="tg-chev">${_TG_ICON_CHEV}</span>
       </button>
-      <button type="button" class="row-copy-btn" title="Copy tool calls">⧉</button>
+      <button type="button" class="row-copy-btn" title="Copy tool calls">${icon("copy")}</button>
     </div>
     <div class="tg-body" inert><div class="tg-body-inner"><div class="tg-list"></div></div></div>`;
   const pill = row.querySelector(".tg-pill");
@@ -8593,11 +9158,11 @@ function buildToolCallPill(info){
     </button>
     <div class="tc-detail" inert><div class="tc-detail-inner"><div class="tc-panel">
       <div class="tc-block">
-        <div class="tc-block-head"><span>Call</span><button type="button" class="tc-copy" data-copy="call" title="Copy call">⧉</button></div>
+        <div class="tc-block-head"><span>Call</span><button type="button" class="tc-copy" data-copy="call" title="Copy call">${icon("copy")}</button></div>
         <pre class="tc-call"></pre>
       </div>
       <div class="tc-block">
-        <div class="tc-block-head"><span>Return</span><button type="button" class="tc-copy" data-copy="result" title="Copy return">⧉</button></div>
+        <div class="tc-block-head"><span>Return</span><button type="button" class="tc-copy" data-copy="result" title="Copy return">${icon("copy")}</button></div>
         <pre class="tc-result"></pre>
       </div>
     </div></div></div>`;
@@ -8678,11 +9243,20 @@ function attachToolCallDetail(name, args, result){
   _tgRefresh(el.closest(".tool-group"));
 }
 
-// A sub-agent's own tool calls (agent_tool_call events) are intentionally NOT
-// shown in the chat pane: the "Ran N tools" pills only cover Midum's own
-// calls. Agent activity still reaches the Log pane via the normal log events.
+// A sub-agent's own tool calls (agent_tool_call events) don't show in the
+// SUPERVISOR's own "Ran N tools" pills -- those only cover Midum's own
+// calls. If the person is currently previewing THIS agent's (read-only)
+// conversation tab (see switchConvTab/setViewingAgentTab), append it live
+// as a finished tool-call pill via the same rendering appendRow("toolcall")
+// already uses to replay one from a tab's stored transcript -- otherwise
+// this call would only show up the next time the tab is clicked. Agent
+// activity always still reaches the Log pane via the normal log events
+// regardless of which tab is on screen.
 function appendAgentToolRow(agent, name, args, result){
-  return;
+  if (!state.viewingAgentTab || state.viewingAgentTab !== agent) return;
+  let payload;
+  try { payload = JSON.stringify({name, args, result}); } catch(e){ payload = JSON.stringify({name, args: {}, result: String(result)}); }
+  appendRow("toolcall", payload);
 }
 
 function animateWords(container){
@@ -8722,7 +9296,7 @@ function appendRow(tag, text){
     closeToolGroup();          // a new user turn always starts fresh tool group(s) too
     _currentMidumRow = null;   // a new user turn always starts a fresh Midum bubble
     row.className = "row user";
-    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">⧉</button></div><div class="bubble user">${renderUserContent(text)}</div>`;
+    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">${icon("copy")}</button></div><div class="bubble user">${renderUserContent(text)}</div>`;
     wireRowCopyBtn(row);
     _currentUserRow = row;
   } else if (tag === "midum"){
@@ -8746,7 +9320,7 @@ function appendRow(tag, text){
       return;
     }
     row.className = "row midum";
-    row.innerHTML = `<div class="row-label-row"><button class="row-copy-btn" title="Copy response">⧉</button></div><div class="bubble midum">${renderMidumContent(text)}</div>`;
+    row.innerHTML = `<div class="row-label-row"><button class="row-copy-btn" title="Copy response">${icon("copy")}</button></div><div class="bubble midum">${renderMidumContent(text)}</div>`;
     wireRowCopyBtn(row);
     col.appendChild(row);
     _currentMidumRow = row;
@@ -8763,7 +9337,7 @@ function appendRow(tag, text){
     return;
   } else if (tag === "system"){
     row.className = "row system";
-    row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+    row.innerHTML = `<div class="bubble">${iconizeHtml(escapeHtml(text))}</div>`;
   } else if (tag === "interjection"){
     // A live steering message sent through the prompt box while a previous
     // turn was still executing -- see sendMessage()/Api.send_interjection.
@@ -8896,10 +9470,10 @@ async function copyTextToClipboard(text){
 
 function flashCopyFeedback(btn){
   if (!btn) return;
-  const orig = btn.textContent;
-  btn.textContent = "✓";
+  const orig = btn.innerHTML;
+  btn.innerHTML = icon("check");
   btn.classList.add("copied");
-  setTimeout(()=>{ btn.textContent = orig; btn.classList.remove("copied"); }, 1000);
+  setTimeout(()=>{ btn.innerHTML = orig; btn.classList.remove("copied"); }, 1000);
 }
 
 function wireRowCopyBtn(row){
@@ -8936,7 +9510,7 @@ function attachEditButton(row, turnId){
   const btn = document.createElement("button");
   btn.className = "row-copy-btn row-edit-btn";
   btn.title = "Edit prompt";
-  btn.textContent = "✎";
+  btn.innerHTML = icon("pencil");
   btn.onclick = (e)=>{ e.stopPropagation(); editLastPrompt(turnId, btn); };
   labelRow.appendChild(btn);
 }
@@ -8949,7 +9523,7 @@ function attachRegenButton(row, turnId){
   const btn = document.createElement("button");
   btn.className = "row-copy-btn row-regen-btn";
   btn.title = "Regenerate response";
-  btn.textContent = "↻";
+  btn.innerHTML = icon("refresh");
   btn.onclick = (e)=>{ e.stopPropagation(); regenerateLastResponse(turnId, btn); };
   labelRow.appendChild(btn);
 }
@@ -9075,7 +9649,7 @@ function appendAsk(id, kind, payload){
   };
 
   if (kind === "text"){
-    card.innerHTML = `<div class="ask-hdr">❓ ${escapeHtml(payload.title||"Midum needs input")}</div>
+    card.innerHTML = `<div class="ask-hdr">${icon("help")} ${escapeHtml(payload.title||"Midum needs input")}</div>
       <div style="font-size:13px;margin-bottom:10px;">${escapeHtml(payload.prompt||"")}</div>
       <input type="text" placeholder="Type your answer..." />
       <div class="ask-actions">
@@ -9083,46 +9657,46 @@ function appendAsk(id, kind, payload){
         <button class="btn" data-act="submit" style="background:var(--accent);color:#fff;">Submit</button>
       </div>`;
     const input = card.querySelector("input");
-    const submit = ()=>{ const v=input.value.trim(); resolve(`❓ → "${v||"(empty)"}"`, v||"[USER SUBMITTED EMPTY TEXT]"); };
+    const submit = ()=>{ const v=input.value.trim(); resolve(`${icon("help")} → "${escapeHtml(v||"(empty)")}"`, v||"[USER SUBMITTED EMPTY TEXT]"); };
     card.querySelector('[data-act=submit]').onclick = submit;
-    card.querySelector('[data-act=cancel]').onclick = ()=>resolve("❓ cancelled", "[USER CANCELLED]");
+    card.querySelector('[data-act=cancel]').onclick = ()=>resolve(`${icon("help")} cancelled`, "[USER CANCELLED]");
     input.addEventListener("keydown", e=>{ if (e.key === "Enter") submit(); });
     setTimeout(()=>input.focus(), 30);
   } else if (kind === "approval"){
-    card.innerHTML = `<div class="ask-hdr">⚠ Midum requests approval</div>
+    card.innerHTML = `<div class="ask-hdr">${icon("alert")} Midum requests approval</div>
       <div style="font-weight:700;font-size:13px;">${escapeHtml(payload.message||"")}</div>
       <div style="font-size:12px;color:var(--subtext);margin:6px 0 10px;">${escapeHtml(payload.details||"")}</div>
       <div class="ask-actions">
-        <button class="ghost-btn" data-act="decline" style="color:var(--red);border-color:#3f0f0f;">❌ Decline</button>
-        <button class="btn" data-act="approve" style="background:var(--green);color:#fff;">✅ Approve</button>
+        <button class="ghost-btn" data-act="decline" style="color:var(--red);border-color:#3f0f0f;">${icon("x-circle")} Decline</button>
+        <button class="btn" data-act="approve" style="background:var(--green);color:#fff;">${icon("check-circle")} Approve</button>
       </div>`;
-    card.querySelector('[data-act=approve]').onclick = ()=>resolve("✅ Approved", "APPROVED");
-    card.querySelector('[data-act=decline]').onclick = ()=>resolve("❌ Declined", "DECLINED");
+    card.querySelector('[data-act=approve]').onclick = ()=>resolve(`${icon("check-circle")} Approved`, "APPROVED");
+    card.querySelector('[data-act=decline]').onclick = ()=>resolve(`${icon("x-circle")} Declined`, "DECLINED");
   } else if (kind === "choice"){
     const opts = (payload.options||[]).map(o=>`<button class="ask-opt-btn" data-v="${escapeHtml(o)}">${escapeHtml(o)}</button>`).join("");
-    card.innerHTML = `<div class="ask-hdr">❓ Midum has a question</div>
+    card.innerHTML = `<div class="ask-hdr">${icon("help")} Midum has a question</div>
       <div style="font-weight:700;font-size:13px;margin-bottom:10px;">${escapeHtml(payload.question||"")}</div>
       ${opts}
       ${payload.allow_custom !== false ? '<div style="display:flex;gap:6px;margin-top:6px;"><input type="text" placeholder="Something else..." style="flex:1;"/><button class="btn" data-act="custom">Other...</button></div>' : ""}`;
     card.querySelectorAll(".ask-opt-btn").forEach(b=>{
-      b.onclick = ()=>resolve(`❓ → "${b.dataset.v}"`, b.dataset.v);
+      b.onclick = ()=>resolve(`${icon("help")} → "${escapeHtml(b.dataset.v)}"`, b.dataset.v);
     });
     const customBtn = card.querySelector('[data-act=custom]');
     if (customBtn){
       const inp = card.querySelector('input[type=text]');
-      customBtn.onclick = ()=>{ const v=inp.value.trim(); if(v) resolve(`❓ → "${v}"`, v); };
+      customBtn.onclick = ()=>{ const v=inp.value.trim(); if(v) resolve(`${icon("help")} → "${escapeHtml(v)}"`, v); };
     }
   } else if (kind === "file"){
-    card.innerHTML = `<div class="ask-hdr">📁 Midum needs a file</div>
+    card.innerHTML = `<div class="ask-hdr">${icon("folder")} Midum needs a file</div>
       <div style="font-size:13px;margin-bottom:10px;">${escapeHtml(payload.prompt||"Select a file")}</div>
       <div class="ask-actions">
         <button class="ghost-btn" data-act="cancel">Cancel</button>
         <button class="btn" data-act="browse" style="background:var(--accent);color:#fff;">Browse...</button>
       </div>`;
-    card.querySelector('[data-act=cancel]').onclick = ()=>resolve("📁 cancelled", "[USER CANCELLED]");
+    card.querySelector('[data-act=cancel]').onclick = ()=>resolve(`${icon("folder")} cancelled`, "[USER CANCELLED]");
     card.querySelector('[data-act=browse]').onclick = async ()=>{
       const r = await api("pick_file", payload.must_exist !== false);
-      resolve(`📁 → ${r.path||"cancelled"}`, r.path || "[USER CANCELLED]");
+      resolve(`${icon("folder")} → ${escapeHtml(r.path||"cancelled")}`, r.path || "[USER CANCELLED]");
     };
   }
 
@@ -9146,6 +9720,10 @@ async function sendMessage(){
   const input = document.getElementById("msg-input");
   const text = input.value.trim();
   if (!text) return;
+  if (state.viewingAgentTab){
+    showAlert(`You're viewing "${state.viewingAgentTab}"'s conversation, which is read-only. Switch to one of your own tabs to send a message.`, "Read-only");
+    return;
+  }
   if (state.thinking){
     // Midum is still "Executing turns..." on a previous message -- this
     // doesn't start a new turn, it steers the one already running. Shown
@@ -9180,6 +9758,9 @@ async function sendMessage(){
 
 function setStatus(text, level){
   document.getElementById("status-label").textContent = text;
+  const row = document.getElementById("status-row");
+  row.classList.remove("status-ok", "status-busy", "status-err");
+  if (level) row.classList.add("status-" + level);
   const dot = document.getElementById("status-dot");
   dot.style.background = level === "ok" ? "var(--green)" : level === "err" ? "var(--red)" :
                          level === "busy" ? "var(--yellow)" : "var(--subtext)";
@@ -9209,7 +9790,7 @@ function updateKbOnlyBadge(){
   const modePageBtn = document.getElementById("kb-mode-page-btn");
   if (startBtn){
     startBtn.style.display = active ? "block" : "none";
-    startBtn.textContent = explainActive ? "▶ Restart Explanation" : "▶ Start Explanation";
+    startBtn.innerHTML = icon("play") + (explainActive ? " Restart Explanation" : " Start Explanation");
   }
   if (modeRow) modeRow.classList.toggle("show", active);
   if (modePartBtn) modePartBtn.classList.toggle("active", !isPageMode);
@@ -9414,6 +9995,18 @@ window.__midumEvent = function(evt){
   else if (kind === "ask"){ appendAsk(payload.id, payload.kind, payload.payload); }
   else if (kind === "mcp_changed"){ if (state.activeTab === "MCP") refreshMcpList(); }
   else if (kind === "agents_changed"){ if (state.activeTab === "Agents") refreshAgentsList(); buildConversationTabs(); }
+  else if (kind === "agent_tab_closed_while_viewing"){
+    // The agent conversation tab we were previewing just closed (its task
+    // finished -- see Api._on_agent_done) -- snap the chat pane back to
+    // the real active conversation Python already fell back to, instead
+    // of leaving it stuck showing a transcript for a tab that no longer
+    // exists. buildConversationTabs() (from the agents_changed event right
+    // before this one) has already dropped the closed tab from the strip.
+    clearChat();
+    renderHistoryWindow(payload.display || []);
+    applyKbState(payload.kb_state);
+    setViewingAgentTab(null);
+  }
   else if (kind === "schedule_ran"){ if (state.activeTab === "Schedule") showToolPane("Schedule"); }
   else if (kind === "tool_result"){ const box=document.getElementById("tool-output"); if(box) box.value = payload.output; }
   else if (kind === "voice_status"){ handleVoiceStatus(payload); }
@@ -9462,7 +10055,7 @@ window.__midumEvent = function(evt){
 
 function appendLog(text){
   const box = document.getElementById("log-box");
-  if (box){ box.textContent += text; box.scrollTop = box.scrollHeight; }
+  if (box){ box.insertAdjacentHTML("beforeend", iconizeHtml(escapeHtml(text))); box.scrollTop = box.scrollHeight; }
 }
 
 // ── Native modal dialogs (replaces confirm()/prompt()/alert()) -----------
@@ -9683,7 +10276,7 @@ function buildSurfacesPane(box){
       return;
     }
     if (!r.items.length){
-      bodyEl.innerHTML = `<div style="font-size:11px;color:var(--subtext);padding:10px;">No saved Render Surfaces yet. Open one and click 💾 in its header to save it.</div>`;
+      bodyEl.innerHTML = `<div style="font-size:11px;color:var(--subtext);padding:10px;">No saved Render Surfaces yet. Open one and click ${icon("save")} in its header to save it.</div>`;
       return;
     }
     bodyEl.innerHTML = r.items.map(it => `
@@ -9723,18 +10316,18 @@ function buildSidebar(){
   const el = document.getElementById("sidebar-inner");
   el.innerHTML = `
     <div id="sidebar-main-view">
-      <button class="ghost-btn" id="sidebar-surfaces-btn" style="width:100%;text-align:left;">🖼 Render Surfaces</button>
+      <button class="ghost-btn" id="sidebar-surfaces-btn" style="width:100%;text-align:left;">${icon("image")} Render Surfaces</button>
       <div class="divider"></div>
       <div class="hdr-row">
         <div class="section-label">WORKSPACE</div>
-        <button class="icon-btn" style="width:26px;height:26px;font-size:11px;" id="sidebar-close">✕</button>
+        <button class="icon-btn" style="width:26px;height:26px;font-size:11px;" id="sidebar-close">${icon("x")}</button>
       </div>
       <button class="btn" id="new-session-btn">New Chat</button>
       <select id="project-select"></select>
       <div class="btn-row">
         <button class="ghost-btn" id="proj-new">+ Project</button>
-        <button class="ghost-btn" id="proj-remove">🗑 Remove</button>
-        <button class="ghost-btn" id="proj-code">💻 Code</button>
+        <button class="ghost-btn" id="proj-remove">${icon("trash")} Remove</button>
+        <button class="ghost-btn" id="proj-code">${icon("code")} Code</button>
       </div>
       <div id="file-list"></div>
       <div class="divider"></div>
@@ -9743,33 +10336,33 @@ function buildSidebar(){
       <div class="divider"></div>
       <div class="hdr-row">
         <div class="section-label">SETTINGS</div>
-        <button class="icon-btn" style="width:22px;height:22px;font-size:10px;" id="settings-toggle">⚙</button>
+        <button class="icon-btn" style="width:22px;height:22px;font-size:10px;" id="settings-toggle">${icon("settings")}</button>
       </div>
       <div id="sidebar-footer">
-        <button class="ghost-btn" id="proj-term">🐚 Terminal</button>
-        <button class="ghost-btn" id="shutdown-btn" style="color:var(--red);">⏻ Shutdown</button>
+        <button class="ghost-btn" id="proj-term">${icon("terminal")} Terminal</button>
+        <button class="ghost-btn" id="shutdown-btn" style="color:var(--red);">${icon("power")} Shutdown</button>
       </div>
     </div>
     <div id="sidebar-settings-overlay">
       <div class="hdr-row">
-        <button id="settings-back-btn">←</button>
+        <button id="settings-back-btn">${icon("arrow-left")}</button>
         <div class="section-label">SETTINGS</div>
         <div style="width:26px;"></div>
       </div>
       <div class="field-label" style="margin:2px 0 0;">PANELS</div>
       <div class="btn-row" id="settings-panel-toggle">
-        <button class="ghost-btn" data-panel="Log" style="flex:1;">📜 Logs</button>
-        <button class="ghost-btn" data-panel="Parameters" style="flex:1;">⚙ Parameters</button>
+        <button class="ghost-btn" data-panel="Log" style="flex:1;">${icon("file-text")} Logs</button>
+        <button class="ghost-btn" data-panel="Parameters" style="flex:1;">${icon("settings")} Parameters</button>
       </div>
       <div class="field-label" style="margin:2px 0 0;">THEME</div>
       <div class="btn-row" id="settings-theme-toggle">
-        <button class="ghost-btn" data-theme="dark" style="flex:1;">🌙 Dark</button>
-        <button class="ghost-btn" data-theme="light" style="flex:1;">☀️ Light</button>
+        <button class="ghost-btn" data-theme="dark" style="flex:1;">${icon("moon")} Dark</button>
+        <button class="ghost-btn" data-theme="light" style="flex:1;">${icon("sun")} Light</button>
       </div>
       <div class="field-label" style="margin:4px 0 0;">PRESETS</div>
       <div class="btn-row">
         <select id="settings-preset-select" style="flex:1;"><option value="">Choose a preset…</option></select>
-        <button class="ghost-btn" id="settings-preset-delete" style="flex:0 0 auto;display:none;" title="Delete preset">✕</button>
+        <button class="ghost-btn" id="settings-preset-delete" style="flex:0 0 auto;display:none;" title="Delete preset">${icon("x")}</button>
       </div>
       <button class="ghost-btn" id="settings-preset-save" style="width:100%;">+ Save current as preset</button>
       <div class="hdr-row" style="margin-top:4px;">
@@ -9799,8 +10392,8 @@ function buildSidebar(){
         </label>
       </div>
       <div class="btn-row">
-        <button class="ghost-btn" id="bg-choose" style="flex:1;">🖼 Choose Image...</button>
-        <button class="ghost-btn" id="bg-clear" style="flex:0 0 auto;">✕</button>
+        <button class="ghost-btn" id="bg-choose" style="flex:1;">${icon("image")} Choose Image...</button>
+        <button class="ghost-btn" id="bg-clear" style="flex:0 0 auto;">${icon("x")}</button>
       </div>
       <div id="bg-filename" style="font-size:9px;color:var(--subtext);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></div>
       <div class="field-label" style="margin-top:2px;">Brightness</div>
@@ -9823,6 +10416,15 @@ function buildSidebar(){
       <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);margin-top:4px;">
         <input type="checkbox" id="settings-glass-sheen-enabled" checked style="width:14px;height:14px;"/> Frosted highlight
       </label>
+      <div class="hdr-row" style="margin-top:4px;">
+        <div class="field-label" style="margin:0;">AMBIENT SURFACES</div>
+        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);">
+          <input type="checkbox" id="settings-ambient-hide-capture" checked style="width:14px;height:14px;"/> Hide from screenshots
+        </label>
+      </div>
+      <div style="font-size:9px;color:var(--subtext);margin:-4px 0 2px;">
+        When on, floating widgets are invisible to Midum's own screenshots, OCR and screen-share (you still see them). Windows 10 2004+.
+      </div>
       <div class="field-label">DEFAULT PROVIDER</div>
       <select id="settings-provider"></select>
       <div class="field-label">DEFAULT MODEL</div>
@@ -9972,6 +10574,11 @@ function buildSidebar(){
   };
   document.getElementById("settings-glass-sheen-enabled").onchange = (e)=>{
     applyGlassSheen(e.target.checked);
+  };
+  document.getElementById("settings-ambient-hide-capture").onchange = (e)=>{
+    applyAmbientHideCapture(e.target.checked);
+    // Live-apply to any open widgets now; Save persists it for next launch.
+    api("set_ambient_hide_from_capture", e.target.checked);
   };
   document.getElementById("bg-choose").onclick = async ()=>{
     const r = await api("pick_background_image");
@@ -10272,6 +10879,17 @@ function applyGlassSheen(enabled){
   if (cb) cb.checked = _glassSheenEnabled;
 }
 
+// The "Hide from screenshots" toggle for Ambient Surfaces (SETTINGS →
+// AMBIENT SURFACES). UI state only -- the checkbox's onchange also calls
+// set_ambient_hide_from_capture to live-apply it to open widgets, and
+// saveSettingsPanel persists it. On by default (matches the old behavior).
+let _ambientHideCapture = true;
+function applyAmbientHideCapture(enabled){
+  _ambientHideCapture = enabled !== false;
+  const cb = document.getElementById("settings-ambient-hide-capture");
+  if (cb) cb.checked = _ambientHideCapture;
+}
+
 // Cache of the current bg config + baked data url. Slider drags call a
 // debounced re-bake (Python does the Pillow work) rather than a live CSS
 // filter, since a live filter was the actual source of the flashing.
@@ -10397,6 +11015,7 @@ async function loadSettingsPanel(){
   applyLiquidGlass(s.liquid_glass_enabled === true);
   applyGlassOpacity(s.liquid_glass_opacity != null ? s.liquid_glass_opacity : 55);
   applyGlassSheen(s.liquid_glass_sheen_enabled !== false);
+  applyAmbientHideCapture(s.ambient_hide_from_capture !== false);
   const blobsIndiv = s.blobs_individual || {};
   ["center","a","b","cursor"].forEach(key=>{
     applyBlobIndividual(key, blobsIndiv[key] !== false);
@@ -10444,6 +11063,7 @@ async function saveSettingsPanel(){
     liquid_glass_enabled: _glassEnabled,
     liquid_glass_opacity: _glassOpacity,
     liquid_glass_sheen_enabled: _glassSheenEnabled,
+    ambient_hide_from_capture: _ambientHideCapture,
     bg_image,
   });
   const status = document.getElementById("settings-status");
@@ -10458,6 +11078,7 @@ async function saveSettingsPanel(){
     applyLiquidGlass(r.settings.liquid_glass_enabled === true);
     applyGlassOpacity(r.settings.liquid_glass_opacity != null ? r.settings.liquid_glass_opacity : 55);
     applyGlassSheen(r.settings.liquid_glass_sheen_enabled !== false);
+    applyAmbientHideCapture(r.settings.ambient_hide_from_capture !== false);
     if (status) status.textContent = "Saved — will be remembered next launch.";
   } else if (status) {
     status.textContent = `Error: ${r.error}`;
@@ -10489,9 +11110,9 @@ function populateProjects(list, selectPath){
 function renderFileList(info){
   const box = document.getElementById("file-list");
   if (!box || !info) return;
-  let out = `📁 ${info.root}\n`;
-  (info.files||[]).forEach(f=>{ out += `  ${f.dir ? "📁" : "📄"} ${f.name}\n`; });
-  box.textContent = out;
+  let out = `${icon("folder")} ${escapeHtml(info.root)}\n`;
+  (info.files||[]).forEach(f=>{ out += `  ${icon(f.dir ? "folder" : "file")} ${escapeHtml(f.name)}\n`; });
+  box.innerHTML = out;
 }
 
 async function refreshHistory(){
@@ -10515,8 +11136,8 @@ async function refreshHistory(){
         <div class="history-ts">${(chat.updated_at||"").replace("T","  ")}</div>
       </div>
       <div class="history-actions">
-        <button class="mini-btn rename" title="Rename">✏️</button>
-        <button class="mini-btn del">🗑</button>
+        <button class="mini-btn rename" title="Rename">${icon("pencil")}</button>
+        <button class="mini-btn del">${icon("trash")}</button>
       </div>`;
     card.onclick = async ()=>{
       const r = await api("open_chat_in_new_tab", chat.id);
@@ -10573,8 +11194,8 @@ function buildLogPane(box){
   box.innerHTML = `
     <div class="hdr-row"><div class="section-label">ACTIVITY LOG</div>
       <button class="ghost-btn" id="log-clear" style="height:22px;font-size:10px;">Clear</button></div>
-    <textarea class="code-area" id="log-box" readonly style="color:var(--tool-text);background:var(--tool-bg);margin-top:6px;"></textarea>`;
-  document.getElementById("log-clear").onclick = ()=>{ document.getElementById("log-box").value=""; };
+    <div class="code-area log-view" id="log-box" style="margin-top:6px;"></div>`;
+  document.getElementById("log-clear").onclick = ()=>{ document.getElementById("log-box").innerHTML=""; };
 }
 
 // ── Shell tab -- persistent WSL2 terminal shared with the model ──────────
@@ -10595,7 +11216,7 @@ function shellLineHtml(line){
     // into an actual shell -- the origin (user vs model) is conveyed by a
     // small leading marker instead of a "[who]" bracket, so the line reads
     // like a genuine terminal transcript rather than a chat log.
-    const originMark = line.origin === "model" ? '<span style="color:var(--subtext);">🤖 </span>' : "";
+    const originMark = line.origin === "model" ? '<span style="color:var(--subtext);">' + icon("bot") + ' </span>' : "";
     const cwd = line.cwd || "";
     return `<div style="font-weight:600;white-space:pre-wrap;word-break:break-word;">${originMark}<span style="color:var(--subtext);">${escapeHtml(cwd)}</span> <span style="color:${color};">$</span> <span style="color:${color};">${escapeHtml(line.text)}</span></div>`;
   }
@@ -10712,7 +11333,7 @@ function buildVoicePane(box){
       <div id="voice-status-text" style="font-size:11px;color:var(--subtext);">Checking...</div>
     </div>
     <div style="display:flex;gap:8px;margin-top:10px;">
-      <button class="btn" id="voice-start-btn" style="background:var(--accent);color:#fff;flex:1;">🎤 Start talking</button>
+      <button class="btn" id="voice-start-btn" style="background:var(--accent);color:#fff;flex:1;">${icon("mic")} Start talking</button>
       <button class="ghost-btn" id="voice-mute-btn" style="display:none;">Mute</button>
     </div>
     <div id="voice-deps-warning" style="font-size:10px;color:var(--red);margin-top:6px;display:none;"></div>
@@ -10854,7 +11475,7 @@ function handleVoiceStatus(payload){
                    stopping:"Stopping...", stopped:"Not connected"};
   text.textContent = labels[st] || st;
   if (startBtn) {
-    startBtn.textContent = voiceState.running ? "⏹ Stop" : "🎤 Start talking";
+    startBtn.innerHTML = voiceState.running ? icon("stop") + " Stop" : icon("mic") + " Start talking";
     startBtn.style.background = voiceState.running ? "var(--red)" : "var(--accent)";
   }
   if (muteBtn) muteBtn.style.display = voiceState.running ? "inline-block" : "none";
@@ -10931,7 +11552,7 @@ function buildModelPane(box){
     <div class="field-label">PROVIDER</div>
     <select id="provider-select"></select>
     <div class="hdr-row" style="margin-top:8px;"><div class="field-label">MODEL</div>
-      <button class="ghost-btn" id="model-refresh" style="height:20px;font-size:10px;">⟳</button></div>
+      <button class="ghost-btn" id="model-refresh" style="height:20px;font-size:10px;">${icon("refresh")}</button></div>
     <input list="model-list" id="model-input" style="height:32px;border-radius:16px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 10px;"/>
     <datalist id="model-list"></datalist>
     <button class="btn" id="model-apply" style="margin-top:10px;background:var(--accent);color:#fff;">Apply</button>
@@ -11045,7 +11666,7 @@ function attachLitellmPicker(opts){
     <datalist id="${pfx}-ll-svc-list"></datalist>
     <div class="ll-chips" style="display:flex;flex-wrap:wrap;gap:4px;"></div>
     <div class="hdr-row" style="margin-top:2px;"><div class="field-label">2 · MODEL</div>
-      <button class="ghost-btn ll-fetch" title="Ask this service which models your key can use" style="${smallBtn}">⟳ Fetch list</button></div>
+      <button class="ghost-btn ll-fetch" title="Ask this service which models your key can use" style="${smallBtn}">${icon("refresh")} Fetch list</button></div>
     <input class="ll-mdl" list="${pfx}-ll-mdl-list" placeholder="Pick or type a model name" autocomplete="off" spellcheck="false" style="${inputStyle}"/>
     <datalist id="${pfx}-ll-mdl-list"></datalist>
     <div class="field-label" style="margin-top:2px;">3 · API KEY</div>
@@ -11095,8 +11716,8 @@ function attachLitellmPicker(opts){
   }
   function renderStatus(st){
     let html;
-    if (st.has_key) html = `<span style="color:#34d399;">✓ Key saved (${escapeHtml(st.key_hint || "")})</span>`;
-    else if (st.env_set) html = `<span style="color:#34d399;">✓ Using ${escapeHtml(st.env_var)} from your environment</span>`;
+    if (st.has_key) html = `<span style="color:#34d399;">${icon("check")} Key saved (${escapeHtml(st.key_hint || "")})</span>`;
+    else if (st.env_set) html = `<span style="color:#34d399;">${icon("check")} Using ${escapeHtml(st.env_var)} from your environment</span>`;
     else if (!st.needs_key) html = "No API key needed for this service.";
     else html = `<span style="color:#fbbf24;">No key yet</span> — paste one above` + (st.env_var ? `, or set <code>${escapeHtml(st.env_var)}</code>` : "") + ".";
     statusEl.innerHTML = html;
@@ -11219,7 +11840,7 @@ function attachLitellmPicker(opts){
     msgEl.textContent = `Testing ${id}…`;
     const r = await api("litellm_test", id);
     msgEl.style.color = r.ok ? "#34d399" : "#f87171";
-    msgEl.textContent = r.ok ? `✓ Works — replied "${r.reply}" in ${r.ms} ms. Now press Apply/Save.` : `✗ ${r.error}`;
+    msgEl.innerHTML = r.ok ? `${icon("check")} Works — replied "${escapeHtml(String(r.reply))}" in ${r.ms} ms. Now press Apply/Save.` : `${icon("x")} ${escapeHtml(String(r.error))}`;
   };
 
   q(".ll-install").onclick = async (e)=>{
@@ -11245,7 +11866,7 @@ function buildParamsPane(box){
     el.innerHTML = rows.map(([label,key])=>{
       let val = s[key];
       if (key==="model") val = `${s.provider} — ${s.model}`;
-      if (["gemini","ocr","uia"].includes(key)) val = val ? "✅ System Connected" : "⚠️ Unconnected";
+      if (["gemini","ocr","uia"].includes(key)) val = val ? `<span style="color:var(--green);">${icon("check-circle")} System Connected</span>` : `<span style="color:var(--yellow);">${icon("alert")} Unconnected</span>`;
       return `<div class="stat-row"><div class="stat-lbl">${label}</div><div class="stat-val">${val}</div></div>`;
     }).join("");
   }
@@ -11291,9 +11912,9 @@ function openPdfSourceViewer(name, startPageIndex){
     modal.style.cssText = "width:92vw;height:88vh;background:var(--panel);border:1px solid var(--border2);border-radius:20px;display:flex;flex-direction:column;overflow:hidden;";
     modal.innerHTML = `
       <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);">
-        <button class="ghost-btn" id="pv-prev" style="height:28px;">◀ Prev</button>
+        <button class="ghost-btn" id="pv-prev" style="height:28px;">${icon("chevron-left")} Prev</button>
         <div id="pv-page-label" style="font-size:12px;color:var(--subtext);">Page 1</div>
-        <button class="ghost-btn" id="pv-next" style="height:28px;">Next ▶</button>
+        <button class="ghost-btn" id="pv-next" style="height:28px;">Next ${icon("chevron-right")}</button>
         <div style="flex:1;font-size:11px;color:var(--subtext);">${escapeHtml(name)}</div>
         <button class="btn" id="pv-close" style="height:28px;background:var(--accent);color:#fff;">Close</button>
       </div>
@@ -11363,9 +11984,9 @@ function openPdfHeadingTagger(name){
     modal.style.cssText = "width:92vw;height:88vh;background:var(--panel);border:1px solid var(--border2);border-radius:20px;display:flex;flex-direction:column;overflow:hidden;";
     modal.innerHTML = `
       <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);">
-        <button class="ghost-btn" id="pht-prev" style="height:28px;">◀ Prev</button>
+        <button class="ghost-btn" id="pht-prev" style="height:28px;">${icon("chevron-left")} Prev</button>
         <div id="pht-page-label" style="font-size:12px;color:var(--subtext);">Page 1</div>
-        <button class="ghost-btn" id="pht-next" style="height:28px;">Next ▶</button>
+        <button class="ghost-btn" id="pht-next" style="height:28px;">Next ${icon("chevron-right")}</button>
         <div style="flex:1;font-size:11px;color:var(--subtext);">Click a line of text below, then tap a heading level to tag it.</div>
         <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--subtext);cursor:pointer;white-space:nowrap;" title="When on, tagging a line also finds every other line in the whole document with the same font/size/bold and tags it the same level automatically. Turn off to tag every line by hand.">
           <input type="checkbox" id="pht-auto-detect" checked style="cursor:pointer;"/> Auto-detect matching formatting
@@ -11412,7 +12033,7 @@ function openPdfHeadingTagger(name){
       listEl.innerHTML = items.map(h=>`<div style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text);">
           <span style="color:var(--accent);flex-shrink:0;">H${h.level}</span>
           <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(h.text)}</span>
-          <button class="pht-remove-tag" data-lid="${h.line_id}" style="background:none;border:none;color:var(--red);cursor:pointer;">✕</button>
+          <button class="pht-remove-tag" data-lid="${h.line_id}" style="background:none;border:none;color:var(--red);cursor:pointer;">${icon("x")}</button>
         </div>`).join("") || `<div style="color:var(--subtext);font-size:10px;">None yet.</div>`;
       listEl.querySelectorAll(".pht-remove-tag").forEach(btn=>{
         btn.onclick = ()=>{ delete headings[btn.dataset.lid]; refreshTaggedList(); renderOverlays(); };
@@ -11546,11 +12167,11 @@ function buildKnowledgePane(box){
     <textarea class="code-area" id="kb-box" style="margin-top:6px;"></textarea>
     <div class="hdr-row" style="margin-top:14px;">
       <select id="pdf-select" style="flex:1;margin-right:6px;"></select>
-      <button class="ghost-btn" id="pdf-tag" style="margin-right:6px;">🏷️ Tag Headings</button>
+      <button class="ghost-btn" id="pdf-tag" style="margin-right:6px;">${icon("tag")} Tag Headings</button>
       <button class="ghost-btn" id="pdf-add">+ Add PDF Source</button>
     </div>
     <div class="hdr-row" style="margin-top:6px;">
-      <button class="ghost-btn" id="pdf-warm" style="flex:1;" title="Extracts and caches text for every PDF source so Explain Mode parts load instantly. This can be slow for large/many PDFs, so it only runs when you click it.">⚡ Load Sources</button>
+      <button class="ghost-btn" id="pdf-warm" style="flex:1;" title="Extracts and caches text for every PDF source so Explain Mode parts load instantly. This can be slow for large/many PDFs, so it only runs when you click it.">${icon("zap")} Load Sources</button>
     </div>
     <div id="pdf-levels" style="margin-top:6px;background:var(--surface);border:1px solid var(--border);
          border-radius:14px;padding:8px 10px;font-size:11px;"></div>
@@ -11596,11 +12217,11 @@ function buildKnowledgePane(box){
 
   pdfWarmBtn.onclick = async ()=>{
     pdfWarmBtn.disabled = true;
-    pdfWarmBtn.textContent = "⚡ Loading sources…";
+    pdfWarmBtn.innerHTML = icon("zap") + " Loading sources…";
     const r = await api("warm_pdf_sources");
     if (!r || !r.ok){
       pdfWarmBtn.disabled = false;
-      pdfWarmBtn.textContent = "⚡ Load Sources";
+      pdfWarmBtn.innerHTML = icon("zap") + " Load Sources";
     }
     // On success the button stays disabled/"Loading…" until the backend
     // pushes a pdf_cache_warmed event (see onPdfCacheWarmed below), since
@@ -11609,8 +12230,8 @@ function buildKnowledgePane(box){
   window.onPdfCacheWarmed = ()=>{
     if (!pdfWarmBtn.isConnected) return;
     pdfWarmBtn.disabled = false;
-    pdfWarmBtn.textContent = "✓ Sources Loaded";
-    setTimeout(()=>{ if (pdfWarmBtn.isConnected) pdfWarmBtn.textContent = "⚡ Load Sources"; }, 2500);
+    pdfWarmBtn.innerHTML = icon("check") + " Sources Loaded";
+    setTimeout(()=>{ if (pdfWarmBtn.isConnected) pdfWarmBtn.innerHTML = icon("zap") + " Load Sources"; }, 2500);
   };
 
   function renderHeadingsList(headings){
@@ -11750,41 +12371,58 @@ function buildToolsPane(box){
   box.innerHTML = `
     <div class="hdr-row">
       <select id="tool-select" style="flex:1;margin-right:6px;"></select>
-      <button class="btn" id="tool-run" style="background:var(--accent);color:#fff;">▶ Run</button>
+      <button class="btn" id="tool-run" style="background:var(--accent);color:#fff;">${icon("play")} Run</button>
     </div>
     <div class="hdr-row" style="margin-top:6px;">
       <select id="flow-select" style="flex:1;margin-right:6px;"></select>
-      <button class="btn" id="flow-run" style="background:var(--accent2);color:#fff;">▶ Run Flow</button>
+      <button class="btn" id="flow-run" style="background:var(--accent2);color:#fff;">${icon("play")} Run Flow</button>
     </div>
     <div class="tools-args" id="tool-args"></div>
+    <div class="tools-args" id="flow-args"></div>
     <textarea class="code-area" id="tool-output" readonly style="color:var(--tool-text);background:var(--tool-bg);"></textarea>`;
   const sel = document.getElementById("tool-select");
   const flowSel = document.getElementById("flow-select");
   const argsBox = document.getElementById("tool-args");
+  const flowArgsBox = document.getElementById("flow-args");
   enhanceSelect(sel);
   enhanceSelect(flowSel);
   let schemas = [];
-  function buildArgs(name){
-    const schema = schemas.find(s=>s.name===name);
-    argsBox.innerHTML = "";
-    if (!schema) return;
-    const props = schema.properties || {};
-    const required = schema.required || [];
-    if (!Object.keys(props).length){ argsBox.innerHTML = `<div style="font-size:11px;color:var(--subtext);">No arguments required.</div>`; return; }
+  let flowSchemas = [];
+  // Shared by both the native-tool args box and the flow args box --
+  // renders one row per JSON-schema property into `box`, using `argAttr`
+  // as the data attribute each row's input/select is tagged with so the
+  // Run handler can find just its own box's fields (tool args and flow
+  // args are collected and submitted separately).
+  function buildArgFields(box, props, required, argAttr, emptyText){
+    box.innerHTML = "";
+    if (!Object.keys(props).length){ box.innerHTML = `<div style="font-size:11px;color:var(--subtext);">${emptyText}</div>`; return; }
     Object.entries(props).forEach(([argName, details])=>{
       const row = document.createElement("div"); row.className = "arg-row";
       const req = required.includes(argName) ? " *" : "";
       let inputHtml;
       if (details.enum){
-        inputHtml = `<select data-arg="${argName}">${details.enum.map(e=>`<option>${e}</option>`).join("")}</select>`;
+        inputHtml = `<select ${argAttr}="${argName}">${details.enum.map(e=>`<option>${e}</option>`).join("")}</select>`;
       } else {
-        inputHtml = `<input data-arg="${argName}" placeholder="${details.description||""}" type="${details.type==='integer'||details.type==='number'?'number':'text'}"/>`;
+        inputHtml = `<input ${argAttr}="${argName}" placeholder="${escapeHtml(details.description||"")}" type="${details.type==='integer'||details.type==='number'?'number':'text'}"/>`;
       }
-      row.innerHTML = `<label>${argName}${req}</label>${inputHtml}`;
-      argsBox.appendChild(row);
-      const enumSel = row.querySelector("select[data-arg]");
+      row.innerHTML = `<label>${escapeHtml(argName)}${req}</label>${inputHtml}`;
+      box.appendChild(row);
+      const enumSel = row.querySelector(`select[${argAttr}]`);
       if (enumSel) enhanceSelect(enumSel);
     });
+  }
+  function buildArgs(name){
+    const schema = schemas.find(s=>s.name===name);
+    if (!schema){ argsBox.innerHTML = ""; return; }
+    buildArgFields(argsBox, schema.properties || {}, schema.required || [], "data-arg", "No arguments required.");
+  }
+  // Flow arguments come from that flow's Argument nodes (see
+  // flows.flow_arguments() / list_flow_schemas()'s properties/required) --
+  // same shape as a native tool's schema, so the same row-builder applies.
+  function buildFlowArgs(name){
+    const schema = flowSchemas.find(s=>s.name===name);
+    if (!schema){ flowArgsBox.innerHTML = ""; return; }
+    buildArgFields(flowArgsBox, schema.properties || {}, schema.required || [], "data-flow-arg", "This flow takes no arguments.");
   }
   (async ()=>{
     schemas = await api("list_tool_schemas");
@@ -11792,12 +12430,14 @@ function buildToolsPane(box){
     if (schemas.length) buildArgs(schemas[0].name);
   })();
   (async ()=>{
-    const flowSchemas = await api("list_flow_schemas");
+    flowSchemas = await api("list_flow_schemas");
     flowSel.innerHTML = flowSchemas.length
       ? flowSchemas.map(s=>`<option value="${escapeHtml(s.name)}" title="${escapeHtml(s.description||'')}">${escapeHtml(s.name)}${s.promoted ? " [PROMOTED]" : ""}</option>`).join("")
       : `<option value="">No saved flows</option>`;
+    if (flowSchemas.length) buildFlowArgs(flowSchemas[0].name);
   })();
   sel.onchange = ()=>buildArgs(sel.value);
+  flowSel.onchange = ()=>buildFlowArgs(flowSel.value);
   document.getElementById("tool-run").onclick = async ()=>{
     const args = {};
     argsBox.querySelectorAll("[data-arg]").forEach(el=>{ if (el.value) args[el.dataset.arg] = el.value; });
@@ -11806,7 +12446,9 @@ function buildToolsPane(box){
   };
   document.getElementById("flow-run").onclick = async ()=>{
     if (!flowSel.value || flowSel.value === "No saved flows") return;
-    const r = await api("run_flow", flowSel.value);
+    const args = {};
+    flowArgsBox.querySelectorAll("[data-flow-arg]").forEach(el=>{ if (el.value) args[el.dataset.flowArg] = el.value; });
+    const r = await api("run_flow", flowSel.value, args);
     document.getElementById("tool-output").value = r.output;
   };
 }
@@ -11830,7 +12472,7 @@ async function buildSchedulePane(box){
       </select>
       <span id="sched-fields" style="display:flex;gap:6px;align-items:center;"></span>
       <button class="btn" id="sched-create" style="background:var(--accent);color:#fff;">+ Schedule</button>
-      <button class="ghost-btn" id="sched-refresh" title="Refresh">↻</button>
+      <button class="ghost-btn" id="sched-refresh" title="Refresh">${icon("refresh")}</button>
     </div>
     <div style="font-size:11px;color:var(--subtext);padding:6px 14px 0;">
       Scheduled Flows only run while Midum is open -- there's no background service. Missed runs while closed are not queued up; they just reschedule from whenever the app next opens.
@@ -11889,14 +12531,14 @@ async function buildSchedulePane(box){
       card.innerHTML = `
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
           <div>
-            <div style="font-weight:600;font-size:12px;">🔗 ${escapeHtml(s.flow_name)}</div>
+            <div style="font-weight:600;font-size:12px;">${icon("link")} ${escapeHtml(s.flow_name)}</div>
             <div style="font-size:11px;color:var(--subtext);">${escapeHtml(s.description || s.kind)}</div>
           </div>
           <div style="display:flex;gap:6px;align-items:center;">
             <label style="font-size:10px;display:flex;gap:4px;align-items:center;">
               <input type="checkbox" class="sched-enabled" ${s.enabled ? "checked" : ""}/> enabled
             </label>
-            <button class="mini-btn del" data-act="delete">🗑</button>
+            <button class="mini-btn del" data-act="delete">${icon("trash")}</button>
           </div>
         </div>
         <div style="font-size:10px;color:var(--subtext);margin-top:6px;display:flex;gap:14px;flex-wrap:wrap;">
@@ -11962,33 +12604,87 @@ const FLOW_NODE_GROUPS = [
   {
     group: "Control Flow",
     nodes: [
-      { type: "start", label: "Start", icon: "▶", inputs: 0, outputs: 1 },
-      { type: "end",   label: "End",   icon: "⏹", inputs: 1, outputs: 0 },
+      { type: "start", label: "Start", icon: "play", inputs: 0, outputs: 1 },
+      { type: "end",   label: "End",   icon: "stop", inputs: 1, outputs: 0 },
     ],
   },
   {
     group: "Logic",
     nodes: [
-      { type: "logic::if", label: "If", icon: "🔀", inputs: 2, outputs: 2, isLogic: true,
+      { type: "logic::if", label: "If", icon: "shuffle", inputs: 2, outputs: 2, isLogic: true,
         pinLabels: { in: ["Sequence", "Value"], out: ["True", "False"] } },
-      { type: "logic::loop", label: "Loop (For Each)", icon: "🔁", inputs: 2, outputs: 3, isLogic: true,
+      { type: "logic::loop", label: "Loop (For Each)", icon: "repeat", inputs: 2, outputs: 3, isLogic: true,
         pinLabels: { in: ["Sequence", "Iterable"], out: ["Body", "Item", "After"] } },
     ],
   },
   {
     group: "Variables",
     nodes: [
-      { type: "variable", label: "Variable", icon: "🧩", inputs: 1, outputs: 1, isVariable: true },
+      { type: "variable", label: "Variable", icon: "braces", inputs: 1, outputs: 1, isVariable: true },
+    ],
+  },
+  {
+    group: "Arguments",
+    nodes: [
+      // Pure data source (no Sequence pin at all, like Variable) -- reads
+      // one named key out of the flow's own `args` dict at run time (see
+      // flows.py's _codegen_argument_declarations / _flow_coerce_arg).
+      // This is what makes a flow's Argument nodes double as the flow's
+      // external parameter list -- list_flow_schemas() reads them back out
+      // of the saved graph to build the JSON-schema "properties"/"required"
+      // the Tools tab (and, for a promoted flow, the model) sees.
+      { type: "argument", label: "Argument", icon: "arrow-right", inputs: 0, outputs: 1, isArgument: true,
+        pinLabels: { in: [], out: ["Value"] } },
+    ],
+  },
+  {
+    group: "Operations",
+    nodes: [
+      // Pure data source too (no Sequence pin) -- computes A <op> B inline
+      // wherever it's referenced, so it can be wired straight into any
+      // data pin (an If's Value, a Variable's value-in, another
+      // Operation's A/B, a tool param, ...) without occupying a step of
+      // its own in the sequence.
+      { type: "op::calc", label: "Operation", icon: "zap", inputs: 2, outputs: 1, isOperation: true,
+        pinLabels: { in: ["A", "B"], out: ["Result"] } },
+    ],
+  },
+  {
+    group: "Code",
+    nodes: [
+      // Sequence node (in: Sequence, out: Sequence, Result) -- runs the
+      // user's own Python statements inlined directly into the flow
+      // function's body (see flows.py's _codegen_python). Inside the code,
+      // get_argument("name", default) reads a caller-supplied parameter
+      // AND registers it as one of the flow's own external parameters,
+      // exactly like an Argument node does (see flows.py's
+      // _extract_get_argument_calls/flow_arguments) -- so a Python node
+      // can define its own flow-level parameters without a separate
+      // Argument node for each one. Assigning to a local `result` variable
+      // exposes it on the Result pin for downstream wiring.
+      { type: "python", label: "Python Code", icon: "code", inputs: 1, outputs: 2, isPython: true,
+        pinLabels: { in: ["Sequence"], out: ["Sequence", "Result"] } },
+    ],
+  },
+  {
+    group: "Output",
+    nodes: [
+      // Sequence node (in: Sequence + Value, out: Sequence) -- the flow's
+      // way of "returning" something visible: prints the wired-in Value
+      // (or its typed fallback) and also records it as this step's result,
+      // exactly like a tool call would (see flows.py's _codegen_print).
+      { type: "print", label: "Print", icon: "terminal", inputs: 2, outputs: 1, isPrint: true,
+        pinLabels: { in: ["Sequence", "Value"], out: ["Sequence"] } },
     ],
   },
   {
     group: "AI",
     nodes: [
-      { type: "ai::prompt", label: "Prompt AI", icon: "🤖", inputs: 2, outputs: 2, isAI: true,
+      { type: "ai::prompt", label: "Prompt AI", icon: "bot", inputs: 2, outputs: 2, isAI: true,
         pinLabels: { in: ["Sequence", "Context"], out: ["Sequence", "Result"] } },
-      { type: "ai::summarize", label: "Ask AI to Summarize", icon: "📝", inputs: 2, outputs: 2, isAI: true,
+      { type: "ai::summarize", label: "Ask AI to Summarize", icon: "file-text", inputs: 2, outputs: 2, isAI: true,
         pinLabels: { in: ["Sequence", "Text"], out: ["Sequence", "Summary"] } },
-      { type: "ai::choose", label: "Ask AI to Choose", icon: "🎯", inputs: 2, outputs: 2, isAI: true,
+      { type: "ai::choose", label: "Ask AI to Choose", icon: "target", inputs: 2, outputs: 2, isAI: true,
         pinLabels: { in: ["Sequence", "Options"], out: ["Sequence", "Choice"] } },
     ],
   },
@@ -12049,6 +12745,35 @@ function _relabelAllPins(){
   });
 }
 
+// Wires the Pygments-highlight overlay for every not-yet-wired
+// `.flow-code-textarea` under `root` (a Python Code node's editor -- see
+// _flowNodeHtml's isPython branch) -- same Api.highlight_code bridge and
+// same ".code-block" CSS the chat's own fenced code blocks use (see
+// renderPendingCodeHighlight above), just re-run on a debounce as the
+// user types instead of once per rendered chat message. Idempotent via
+// data-hl-wired, so it's safe to call again after any bulk canvas change
+// (seeding a blank canvas, importing a saved flow, dropping a new node)
+// without double-wiring nodes that already have a listener attached.
+function _wireFlowCodeHighlight(root){
+  (root || document).querySelectorAll(".flow-code-textarea:not([data-hl-wired])").forEach(ta=>{
+    ta.dataset.hlWired = "1";
+    const pre = ta.previousElementSibling;
+    if (!pre || !pre.classList.contains("flow-code-highlight")) return;
+    let timer = null;
+    const refresh = async ()=>{
+      const code = ta.value;
+      pre.textContent = code;   // immediate plain fallback while highlighting resolves
+      try {
+        const html = await api("highlight_code", code, "python");
+        pre.innerHTML = html || escapeHtml(code);
+      } catch (e) { /* Pygments unavailable -- leave the plain text already set */ }
+    };
+    ta.addEventListener("input", ()=>{ clearTimeout(timer); timer = setTimeout(refresh, 250); });
+    ta.addEventListener("scroll", ()=>{ pre.scrollTop = ta.scrollTop; pre.scrollLeft = ta.scrollLeft; });
+    refresh();
+  });
+}
+
 const DRAWFLOW_CSS = "https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css";
 const DRAWFLOW_JS  = "https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js";
 
@@ -12077,7 +12802,7 @@ function _loadScriptOnce(src){
 function _flowNodeHtml(def){
   if (def.isVariable){
     return `<div class="flow-node-tool flow-node-variable">`
-         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">Variable</span></div>`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${iconHtml(def.icon)}</span><span class="flow-node-label">Variable</span></div>`
          + `<div class="flow-node-params">`
          + `<div class="flow-param-row"><span class="flow-param-label">name</span><input class="flow-param-input" type="text" df-name placeholder="my_variable"/></div>`
          + `<div class="flow-param-row"><span class="flow-param-label">value</span><input class="flow-param-input" type="text" df-value placeholder="default (used if nothing wired in)"/></div>`
@@ -12085,9 +12810,78 @@ function _flowNodeHtml(def){
          + `<div class="flow-node-pin-hint"><span>in: value</span><span>out: value</span></div>`
          + `</div>`;
   }
+  if (def.isArgument){
+    return `<div class="flow-node-tool flow-node-variable">`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${iconHtml(def.icon)}</span><span class="flow-node-label">Argument</span></div>`
+         + `<div class="flow-node-params">`
+         + `<div class="flow-param-row"><span class="flow-param-label">name</span><input class="flow-param-input" type="text" df-name placeholder="arg_name"/></div>`
+         + `<div class="flow-param-row"><span class="flow-param-label">type</span>`
+         + `<select class="flow-param-input" df-type>`
+         + `<option value="string">string</option><option value="integer">integer</option>`
+         + `<option value="number">number</option><option value="boolean">boolean</option>`
+         + `</select></div>`
+         + `<div class="flow-param-row"><span class="flow-param-label">required</span>`
+         + `<select class="flow-param-input" df-required><option value="no">no</option><option value="yes">yes</option></select></div>`
+         + `<div class="flow-param-row"><span class="flow-param-label">default</span><input class="flow-param-input" type="text" df-default placeholder="fallback if not passed in"/></div>`
+         + `<div class="flow-param-row"><span class="flow-param-label">description</span><input class="flow-param-input" type="text" df-description placeholder="shown in the Tools tab"/></div>`
+         + `</div>`
+         + `<div class="flow-node-pin-hint"><span>in: \u2014</span><span>out: value</span></div>`
+         + `</div>`;
+  }
+  if (def.isPython){
+    // The textarea's own text/caret are transparent and sit ABOVE a
+    // Pygments-highlighted <pre class="code-block"> (the same class/CSS
+    // the chat's own fenced code blocks use, and highlighted through the
+    // exact same Api.highlight_code bridge -- see _wireFlowCodeHighlight)
+    // painted underneath -- the classic "transparent textarea over a
+    // highlighted backdrop" trick, so what's on screen is colorized code
+    // but typing/selecting/caret behavior is still the browser's own
+    // plain textarea. df-code keeps Drawflow's normal two-way binding
+    // (this node's saved `code` value) working exactly like every other
+    // df-<param> field on other node types.
+    return `<div class="flow-node-tool flow-node-logic">`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${iconHtml(def.icon)}</span><span class="flow-node-label">Python Code</span></div>`
+         + `<div class="flow-node-params">`
+         + `<div class="flow-code-wrap" style="position:relative;">`
+         + `<pre class="code-block flow-code-highlight" data-lang="python" style="position:absolute;inset:0;margin:0;padding:6px;pointer-events:none;white-space:pre-wrap;word-break:break-word;font-family:Consolas,'Cascadia Code',monospace;font-size:11px;line-height:1.4;overflow:hidden;background:transparent;border-radius:6px;"></pre>`
+         + `<textarea class="flow-param-input flow-code-textarea" df-code spellcheck="false" placeholder="# use get_argument('name', default) to add a flow parameter\n# assign to result to expose a value on the Result pin" style="position:relative;z-index:1;display:block;width:100%;min-height:110px;box-sizing:border-box;font-family:Consolas,'Cascadia Code',monospace;font-size:11px;line-height:1.4;white-space:pre;overflow:auto;background:transparent;color:transparent;caret-color:var(--text);resize:vertical;"></textarea>`
+         + `</div>`
+         + `</div>`
+         + `<div class="flow-node-pin-hint"><span>in: seq</span><span class="flow-object-out">out: seq, ${icon("dot")} result</span></div>`
+         + `</div>`;
+  }
+  if (def.isPrint){
+    return `<div class="flow-node-tool flow-node-logic">`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${iconHtml(def.icon)}</span><span class="flow-node-label">Print</span></div>`
+         + `<div class="flow-node-params">`
+         + `<div class="flow-param-row"><span class="flow-param-label">value</span><input class="flow-param-input" type="text" df-value placeholder="fallback if Value pin unwired"/></div>`
+         + `</div>`
+         + `<div class="flow-node-pin-hint"><span>in: seq, value</span><span>out: seq</span></div>`
+         + `</div>`;
+  }
+  if (def.isOperation){
+    return `<div class="flow-node-tool flow-node-logic">`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${iconHtml(def.icon)}</span><span class="flow-node-label">Operation</span></div>`
+         + `<div class="flow-node-params">`
+         + `<div class="flow-param-row"><span class="flow-param-label">op</span>`
+         + `<select class="flow-param-input" df-op>`
+         + `<option value="add">A + B</option><option value="subtract">A \u2212 B</option>`
+         + `<option value="multiply">A \u00d7 B</option><option value="divide">A \u00f7 B</option>`
+         + `<option value="equals">A == B</option><option value="not_equals">A != B</option>`
+         + `<option value="greater_than">A &gt; B</option><option value="less_than">A &lt; B</option>`
+         + `<option value="greater_equal">A &gt;= B</option><option value="less_equal">A &lt;= B</option>`
+         + `<option value="and">A and B</option><option value="or">A or B</option>`
+         + `<option value="concat">A + B (text)</option>`
+         + `</select></div>`
+         + `<div class="flow-param-row"><span class="flow-param-label">a</span><input class="flow-param-input" type="text" df-a placeholder="fallback if A unwired"/></div>`
+         + `<div class="flow-param-row"><span class="flow-param-label">b</span><input class="flow-param-input" type="text" df-b placeholder="fallback if B unwired"/></div>`
+         + `</div>`
+         + `<div class="flow-node-pin-hint"><span>in: a, b</span><span>out: result</span></div>`
+         + `</div>`;
+  }
   if (def.isLogic && def.type === "logic::if"){
     return `<div class="flow-node-tool flow-node-logic">`
-         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">If</span></div>`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${iconHtml(def.icon)}</span><span class="flow-node-label">If</span></div>`
          + `<div class="flow-node-params">`
          + `<div class="flow-param-row"><span class="flow-param-label">op</span>`
          + `<select class="flow-param-input" df-op>`
@@ -12103,7 +12897,7 @@ function _flowNodeHtml(def){
   }
   if (def.isLogic && def.type === "logic::loop"){
     return `<div class="flow-node-tool flow-node-logic">`
-         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">Loop (For Each)</span></div>`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${iconHtml(def.icon)}</span><span class="flow-node-label">Loop (For Each)</span></div>`
          + `<div class="flow-node-params">`
          + `<div class="flow-param-row"><span class="flow-param-label">item</span><input class="flow-param-input" type="text" df-item_var placeholder="item (label only)"/></div>`
          + `</div>`
@@ -12112,17 +12906,17 @@ function _flowNodeHtml(def){
   }
   if (def.isAI && def.type === "ai::prompt"){
     return `<div class="flow-node-tool flow-node-ai">`
-         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">Prompt AI</span></div>`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${iconHtml(def.icon)}</span><span class="flow-node-label">Prompt AI</span></div>`
          + `<div class="flow-node-params">`
          + `<div class="flow-param-row"><span class="flow-param-label">prompt</span><input class="flow-param-input" type="text" df-prompt placeholder="Instruction to send to the AI"/></div>`
          + `<div class="flow-param-row"><span class="flow-param-label">context</span><input class="flow-param-input" type="text" df-context placeholder="fallback if Context pin unwired"/></div>`
          + `</div>`
-         + `<div class="flow-node-pin-hint"><span>in: seq, context</span><span class="flow-object-out">out: seq, ⬤ result</span></div>`
+         + `<div class="flow-node-pin-hint"><span>in: seq, context</span><span class="flow-object-out">out: seq, ${icon("dot")} result</span></div>`
          + `</div>`;
   }
   if (def.isAI && def.type === "ai::summarize"){
     return `<div class="flow-node-tool flow-node-ai">`
-         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">Ask AI to Summarize</span></div>`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${iconHtml(def.icon)}</span><span class="flow-node-label">Ask AI to Summarize</span></div>`
          + `<div class="flow-node-params">`
          + `<div class="flow-param-row"><span class="flow-param-label">text</span><input class="flow-param-input" type="text" df-text placeholder="fallback if Text pin unwired"/></div>`
          + `<div class="flow-param-row"><span class="flow-param-label">length</span>`
@@ -12130,22 +12924,22 @@ function _flowNodeHtml(def){
          + `<option value="short">short</option><option value="medium" selected>medium</option><option value="long">long</option>`
          + `</select></div>`
          + `</div>`
-         + `<div class="flow-node-pin-hint"><span>in: seq, text</span><span class="flow-object-out">out: seq, ⬤ summary</span></div>`
+         + `<div class="flow-node-pin-hint"><span>in: seq, text</span><span class="flow-object-out">out: seq, ${icon("dot")} summary</span></div>`
          + `</div>`;
   }
   if (def.isAI && def.type === "ai::choose"){
     return `<div class="flow-node-tool flow-node-ai">`
-         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">Ask AI to Choose</span></div>`
+         + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${iconHtml(def.icon)}</span><span class="flow-node-label">Ask AI to Choose</span></div>`
          + `<div class="flow-node-params">`
          + `<div class="flow-param-row"><span class="flow-param-label">question</span><input class="flow-param-input" type="text" df-question placeholder="What should the AI decide?"/></div>`
          + `<div class="flow-param-row"><span class="flow-param-label">options</span><input class="flow-param-input" type="text" df-options placeholder="fallback: comma,separated,options"/></div>`
          + `</div>`
-         + `<div class="flow-node-pin-hint"><span>in: seq, options</span><span class="flow-object-out">out: seq, ⬤ choice</span></div>`
+         + `<div class="flow-node-pin-hint"><span>in: seq, options</span><span class="flow-object-out">out: seq, ${icon("dot")} choice</span></div>`
          + `</div>`;
   }
   if (!def.params){
     return `<div class="flow-node flow-node-${def.type}">`
-         + `<div class="flow-node-icon">${def.icon}</div>`
+         + `<div class="flow-node-icon">${iconHtml(def.icon)}</div>`
          + `<div class="flow-node-label">${escapeHtml(def.label)}</div>`
          + `</div>`;
   }
@@ -12168,10 +12962,10 @@ function _flowNodeHtml(def){
       }).join("")
     : `<div class="flow-node-empty-params">No parameters</div>`;
   const objectOutHtml = def.kind && def.kind !== "action"
-    ? `<div class="flow-node-pin-hint"><span>in: seq${def.params.length?', params':''}</span><span class="flow-object-out">out: seq, ⬤ object</span></div>`
+    ? `<div class="flow-node-pin-hint"><span>in: seq${def.params.length?', params':''}</span><span class="flow-object-out">out: seq, ${icon("dot")} object</span></div>`
     : `<div class="flow-node-pin-hint"><span>in: seq${def.params.length?', params':''}</span><span>out: seq</span></div>`;
   return `<div class="flow-node-tool">`
-       + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${def.icon}</span><span class="flow-node-label">${escapeHtml(def.label)}</span>`
+       + `<div class="flow-node-tool-hdr"><span class="flow-node-icon">${iconHtml(def.icon)}</span><span class="flow-node-label">${escapeHtml(def.label)}</span>`
        + (def.kind ? `<span class="flow-node-kind-badge flow-node-kind-${def.kind}">${def.kind}</span>` : "")
        + `</div>`
        + `<div class="flow-node-params">${paramsHtml}</div>`
@@ -12202,12 +12996,12 @@ async function buildFlowsPane(box){
             <input id="flow-desc-input" placeholder="Description (for the Tools tab)" maxlength="300" autocomplete="off"
               style="height:24px;width:200px;border-radius:12px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 8px;font-size:11px;"/>
             <button class="btn" id="flow-save" style="height:24px;font-size:10px;background:var(--accent);color:#fff;">Save</button>
-            <button class="ghost-btn" id="flow-promote" title="Promote: give this flow its own tool schema so the model can call it directly by name, without discovery" style="height:24px;font-size:10px;" disabled>⭐ Promote</button>
-            <button class="ghost-btn" id="flow-delete" style="height:24px;font-size:10px;color:var(--red);" disabled>🗑 Delete</button>
+            <button class="ghost-btn" id="flow-promote" title="Promote: give this flow its own tool schema so the model can call it directly by name, without discovery" style="height:24px;font-size:10px;" disabled>${icon("star")} Promote</button>
+            <button class="ghost-btn" id="flow-delete" style="height:24px;font-size:10px;color:var(--red);" disabled>${icon("trash")} Delete</button>
             <button class="ghost-btn" id="flow-zoom-out" style="height:24px;width:28px;padding:0;">−</button>
             <button class="ghost-btn" id="flow-zoom-reset" style="height:24px;font-size:10px;">Reset</button>
             <button class="ghost-btn" id="flow-zoom-in" style="height:24px;width:28px;padding:0;">+</button>
-            <button class="ghost-btn" id="flow-delete-connection" style="height:24px;font-size:10px;color:var(--red);" disabled>✂ Break Connection</button>
+            <button class="ghost-btn" id="flow-delete-connection" style="height:24px;font-size:10px;color:var(--red);" disabled>${icon("scissors")} Break Connection</button>
             <button class="ghost-btn" id="flow-clear" style="height:24px;font-size:10px;color:var(--red);">Clear</button>
           </div>
         </div>
@@ -12259,7 +13053,7 @@ async function buildFlowsPane(box){
       item.className = "flow-drawer-item";
       item.draggable = true;
       item.title = def.desc || "";
-      item.innerHTML = `<span class="flow-drawer-item-icon">${def.icon}</span><span>${escapeHtml(def.label)}</span>`;
+      item.innerHTML = `<span class="flow-drawer-item-icon">${iconHtml(def.icon)}</span><span>${escapeHtml(def.label)}</span>`;
       item.ondragstart = (e)=>{ e.dataTransfer.setData("application/midum-node", def.type); e.dataTransfer.effectAllowed = "copy"; };
       groupEl.appendChild(item);
     });
@@ -12304,6 +13098,7 @@ async function buildFlowsPane(box){
       editor.addNode("start", 0, 1, 100, 160, "flow-node-start", {}, _flowNodeHtml(FLOW_NODE_DEFS.start));
       editor.addNode("end",   1, 0, 480, 160, "flow-node-end",   {}, _flowNodeHtml(FLOW_NODE_DEFS.end));
       _relabelAllPins();
+      _wireFlowCodeHighlight(canvasEl);
     }
 
     // Reflects the currently-loaded saved flow's promoted state on the
@@ -12314,7 +13109,7 @@ async function buildFlowsPane(box){
       if (!name){
         promoteBtnFlow.disabled = true;
         promoteBtnFlow.classList.remove("open");
-        promoteBtnFlow.textContent = "⭐ Promote";
+        promoteBtnFlow.innerHTML = icon("star") + " Promote";
         return;
       }
       promoteBtnFlow.disabled = false;
@@ -12325,7 +13120,7 @@ async function buildFlowsPane(box){
       } catch (e) { promoted = false; }
       promoteBtnFlow.dataset.promoted = promoted ? "1" : "";
       promoteBtnFlow.classList.toggle("open", promoted);
-      promoteBtnFlow.textContent = promoted ? "★ Promoted" : "⭐ Promote";
+      promoteBtnFlow.innerHTML = promoted ? icon("star-fill") + " Promoted" : icon("star") + " Promote";
       promoteBtnFlow.title = promoted
         ? "This flow is promoted -- it has its own tool schema and can be called directly by name. Click to demote."
         : "Promote: give this flow its own tool schema so the model can call it directly by name, without discovery. Click to promote.";
@@ -12357,6 +13152,7 @@ async function buildFlowsPane(box){
         editor.clear();
         editor.import(graph);
         _relabelAllPins();
+        _wireFlowCodeHighlight(canvasEl);
       } else {
         await showAlert(`'${name}' was saved before flow editing was added, so its node graph can't be reloaded. Rebuild it from scratch and Save to enable editing next time.`, "Graph Not Available");
         seedBlankCanvas();
@@ -12479,6 +13275,15 @@ async function buildFlowsPane(box){
       const initialData = {};
       if (def.isVariable){
         initialData.name = ""; initialData.value = "";
+      } else if (def.isArgument){
+        initialData.name = ""; initialData.type = "string"; initialData.required = "no";
+        initialData.default = ""; initialData.description = "";
+      } else if (def.isPython){
+        initialData.code = "";
+      } else if (def.isPrint){
+        initialData.value = "";
+      } else if (def.isOperation){
+        initialData.op = "add"; initialData.a = ""; initialData.b = "";
       } else if (def.type === "logic::if"){
         initialData.op = "truthy"; initialData.value = ""; initialData.compare = "";
       } else if (def.type === "logic::loop"){
@@ -12495,6 +13300,7 @@ async function buildFlowsPane(box){
       }
       editor.addNode(def.type, def.inputs, def.outputs, x, y, `flow-node-${def.type.replace(/[^A-Za-z0-9_]/g,'-')}`, initialData, _flowNodeHtml(def));
       _relabelAllPins();
+      _wireFlowCodeHighlight(canvasEl);
     }
 
     canvasEl.ondragover = (e)=>e.preventDefault();
@@ -12529,7 +13335,7 @@ function buildMcpPane(box){
     <div class="hdr-row">
       <div class="section-label">MCP SERVERS</div>
       <div>
-        <button class="ghost-btn" id="mcp-refresh" style="height:24px;">⟳</button>
+        <button class="ghost-btn" id="mcp-refresh" style="height:24px;">${icon("refresh")}</button>
         <button class="btn" id="mcp-add" style="background:var(--accent);color:#fff;">+ Add Server</button>
       </div>
     </div>
@@ -12554,7 +13360,7 @@ async function refreshMcpList(){
   const listEl = document.getElementById("mcp-list");
   if (!listEl) return;
   const {servers, sdk_available} = await api("list_mcp");
-  document.getElementById("mcp-banner").textContent = sdk_available ? "" : "⚠️ 'mcp' package not installed — run: pip install mcp";
+  document.getElementById("mcp-banner").innerHTML = sdk_available ? "" : icon("alert") + " 'mcp' package not installed — run: pip install mcp";
   listEl.innerHTML = "";
   if (!servers.length){
     listEl.innerHTML = `<div style="text-align:center;font-size:11px;color:var(--subtext);padding:24px 10px;">No MCP servers connected yet.<br>Use "+ Add Server" to connect one.</div>`;
@@ -12602,7 +13408,7 @@ function buildAgentsPane(box){
     <div class="hdr-row">
       <div class="section-label">AGENTS — SUPERVISOR</div>
       <div>
-        <button class="ghost-btn" id="agents-refresh" style="height:24px;">⟳</button>
+        <button class="ghost-btn" id="agents-refresh" style="height:24px;">${icon("refresh")}</button>
         <button class="btn" id="agents-add" style="background:var(--accent);color:#fff;">+ New Agent</button>
       </div>
     </div>
@@ -12911,12 +13717,51 @@ async function buildPermissionsPane(box){
       <div class="section-label">TOOL PERMISSIONS</div>
       <button class="ghost-btn" id="perm-reset" style="height:24px;font-size:10px;">Reset All to Always</button>
     </div>
-    <input type="text" id="perm-search" placeholder="Search tools..." class="perm-search" style="margin-top:6px;"/>
+    <div class="perm-fs-pw-box">
+      <div class="perm-fs-pw-hdr">
+        <div class="perm-fs-pw-title">🔑 Filesystem MCP Approval Password</div>
+        <div class="perm-fs-pw-status unset" id="perm-fs-pw-status">checking...</div>
+      </div>
+      <div class="perm-fs-pw-hint">Backs the "Password" level below. A tool set to "Password" pops the
+        same Approve/Decline dialog as "Ask", but Approve also requires typing this password.</div>
+      <div class="perm-fs-pw-row">
+        <input type="password" id="perm-fs-pw-input" placeholder="New approval password" autocomplete="new-password"/>
+        <button class="ghost-btn" id="perm-fs-pw-set" style="height:30px;font-size:11px;">Set</button>
+        <button class="ghost-btn" id="perm-fs-pw-remove" style="height:30px;font-size:11px;">Remove</button>
+      </div>
+    </div>
+    <input type="text" id="perm-search" placeholder="Search tools..." class="perm-search" style="margin-top:10px;"/>
     <div id="perm-list" style="flex:1;overflow-y:auto;margin-top:8px;"></div>
   `;
   const listEl = document.getElementById("perm-list");
   let targets = await api("list_permission_targets");
   let overrides = await api("get_permissions");
+
+  // ── Filesystem MCP approval password box ──────────────────────────────
+  const pwStatusEl = document.getElementById("perm-fs-pw-status");
+  const pwInputEl  = document.getElementById("perm-fs-pw-input");
+  async function refreshPwStatus(){
+    const st = await api("get_filesystem_password_status");
+    pwStatusEl.textContent = st.configured ? "Configured" : "Not set";
+    pwStatusEl.classList.toggle("set", !!st.configured);
+    pwStatusEl.classList.toggle("unset", !st.configured);
+  }
+  refreshPwStatus();
+  document.getElementById("perm-fs-pw-set").onclick = async ()=>{
+    const pw = pwInputEl.value;
+    if (!pw){ pwInputEl.focus(); return; }
+    const res = await api("set_filesystem_password", pw);
+    pwInputEl.value = "";
+    await refreshPwStatus();
+    if (res && res.message) showAlert(res.message, "Approval Password");
+  };
+  document.getElementById("perm-fs-pw-remove").onclick = async ()=>{
+    const ok = await showConfirm("Remove the Filesystem MCP approval password? Any tool set to \"Password\" will then be blocked outright until a new one is set.", "Remove Password", {danger:true, okLabel:"Remove"});
+    if (!ok) return;
+    const res = await api("remove_filesystem_password");
+    await refreshPwStatus();
+    if (res && res.message) showAlert(res.message, "Approval Password");
+  };
 
   function levelFor(key){ return overrides[key] || "always"; }
 
@@ -12931,6 +13776,7 @@ async function buildPermissionsPane(box){
       <div class="perm-seg" data-key="${escapeHtml(entry.key)}">
         <button class="perm-opt${lvl==='always'?' active':''}" data-level="always">Always</button>
         <button class="perm-opt${lvl==='ask'?' active':''}" data-level="ask">Ask</button>
+        <button class="perm-opt${lvl==='ask_password'?' active':''}" data-level="ask_password" title="Ask for approval, password required">Password</button>
         <button class="perm-opt${lvl==='deny'?' active':''}" data-level="deny">Deny</button>
       </div>
     </div>`;
@@ -13250,6 +14096,7 @@ window.addEventListener("pywebviewready", async ()=>{
     applyLiquidGlass(s.liquid_glass_enabled === true);
     applyGlassOpacity(s.liquid_glass_opacity != null ? s.liquid_glass_opacity : 55);
     applyGlassSheen(s.liquid_glass_sheen_enabled !== false);
+    applyAmbientHideCapture(s.ambient_hide_from_capture !== false);
     const blobsIndiv = s.blobs_individual || {};
     ["center","a","b","cursor"].forEach(key=>{
       applyBlobIndividual(key, blobsIndiv[key] !== false);

@@ -2,6 +2,7 @@ comtypes; sys_platform == "win32"
 customtkinter
 ddgs
 gemini_webapi
+llm-cookie-bridge
 google-genai
 keyboard
 litellm

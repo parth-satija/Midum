@@ -14,13 +14,38 @@ def _call_mcp_tool_step(server, tool_name, args):
     return _midum.call_mcp_tool(server, tool_name, args)
 
 
-def _call_flow_step(flow_name):
+def _call_flow_step(flow_name, args=None):
     """Run another saved flow by name, as a step of THIS flow -- lets
     flows compose. Beware self-reference (a flow calling itself, directly
     or through a cycle of other flows) -- flow_tools.py has no cycle
     detection at call time, so that will recurse until Python's own
     recursion limit kicks in, not fail gracefully."""
-    return _midum.run_flow(flow_name)
+    return _midum.run_flow(flow_name, args)
+
+
+def _flow_coerce_arg(value, type_name):
+    """Best-effort coercion of an external flow argument (an Argument
+    node's value, sourced from run_flow()'s `args` dict -- often a plain
+    string typed into the Tools tab, or whatever JSON type a model tool
+    call passed) to the type declared on that Argument node, so
+    'integer'/'number'/'boolean' arguments behave as their real type
+    downstream instead of staying strings. Falls back to returning the
+    value unchanged if coercion fails."""
+    if value is None:
+        return None
+    t = (type_name or 'string').lower()
+    try:
+        if t == 'integer':
+            return int(float(value))
+        if t == 'number':
+            return float(value)
+        if t == 'boolean':
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+    except Exception:
+        return value
+    return value
 
 
 def _flow_iter(value):
@@ -174,4 +199,102 @@ def hello():
     _flow_results.append(_out_3)
     return _flow_results[-1] if _flow_results else None
 # === END FLOW: hello ===
+
+# === FLOW: print_sum ===
+def print_sum(args: dict = None):
+    """
+    Auto-generated from the Flows tab's node graph. Edit the graph in
+    the GUI and click Save to regenerate this function — manual edits
+    made directly to this function body will be OVERWRITTEN the next
+    time this flow is saved.
+
+    `args` holds whatever was passed to run_flow(name, args) -- each
+    Argument node in the graph reads its own value out of this dict
+    by name (see the _arg_<id> lines below), falling back to its
+    configured default when the key is missing or args is None.
+    """
+    _flow_results = []
+    # --- Print ---
+    _printed_7 = ((_flow_num('8')) + (_flow_num('9')))
+    print(_printed_7)
+    _flow_results.append(_printed_7)
+    return _flow_results[-1] if _flow_results else None
+# === END FLOW: print_sum ===
+
+# === FLOW: flow5 ===
+def flow5(args: dict = None):
+    """
+    Auto-generated from the Flows tab's node graph. Edit the graph in
+    the GUI and click Save to regenerate this function — manual edits
+    made directly to this function body will be OVERWRITTEN the next
+    time this flow is saved.
+
+    `args` holds whatever was passed to run_flow(name, args) -- each
+    Argument node in the graph reads its own value out of this dict
+    by name (see the _arg_<id> lines below), falling back to its
+    configured default when the key is missing or args is None.
+    """
+    _flow_results = []
+    def get_argument(name, default=None):
+        return (args or {}).get(name, default)
+    # --- Prompt AI ---
+    _out_3 = _flow_consult_ai('hi', context='')
+    _flow_results.append(_out_3)
+    # --- Print ---
+    _printed_4 = _out_3
+    print(_printed_4)
+    _flow_results.append(_printed_4)
+    return _flow_results[-1] if _flow_results else None
+# === END FLOW: flow5 ===
+
+# === FLOW: ask_opinion ===
+def ask_opinion(args: dict = None):
+    """
+    Auto-generated from the Flows tab's node graph. Edit the graph in
+    the GUI and click Save to regenerate this function — manual edits
+    made directly to this function body will be OVERWRITTEN the next
+    time this flow is saved.
+
+    `args` holds whatever was passed to run_flow(name, args) -- each
+    Argument node in the graph reads its own value out of this dict
+    by name (see the _arg_<id> lines below), falling back to its
+    configured default when the key is missing or args is None.
+    """
+    _flow_results = []
+    def get_argument(name, default=None):
+        return (args or {}).get(name, default)
+    _arg_3 = _flow_coerce_arg((args or {}).get('query', 'hi' or None), 'string')  # query
+    # --- Prompt AI ---
+    _out_4 = _flow_consult_ai('Give your opinion on the query in the context.', context=_arg_3)
+    _flow_results.append(_out_4)
+    # --- Print ---
+    _printed_5 = _out_4
+    print(_printed_5)
+    _flow_results.append(_printed_5)
+    return _flow_results[-1] if _flow_results else None
+# === END FLOW: ask_opinion ===
+
+# === FLOW: create_godot_project ===
+def create_godot_project(args: dict = None):
+    """
+    Auto-generated from the Flows tab's node graph. Edit the graph in
+    the GUI and click Save to regenerate this function — manual edits
+    made directly to this function body will be OVERWRITTEN the next
+    time this flow is saved.
+
+    `args` holds whatever was passed to run_flow(name, args) -- each
+    Argument node in the graph reads its own value out of this dict
+    by name (see the _arg_<id> lines below), falling back to its
+    configured default when the key is missing or args is None.
+    """
+    _flow_results = []
+    def get_argument(name, default=None):
+        return (args or {}).get(name, default)
+    _arg_3 = _flow_coerce_arg((args or {}).get('project_path', '' or None), 'string')  # project_path
+    # --- Print ---
+    _printed_4 = (str('Godot project created at ') + str(_arg_3))
+    print(_printed_4)
+    _flow_results.append(_printed_4)
+    return _flow_results[-1] if _flow_results else None
+# === END FLOW: create_godot_project ===
 

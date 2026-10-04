@@ -2,11 +2,14 @@
 from config import MCP_SERVERS_FILE
 from config import MCP_PROMOTED_TOOLS_FILE
 from config import _MCP_SDK_AVAILABLE
+from state import _abort_event
 import asyncio
+import concurrent.futures
 import json
 import os
 import re
 import threading
+import uuid
 
 # --- from main.py, section 1 ---
 # MCP (MODEL CONTEXT PROTOCOL) SERVER SUPPORT
@@ -41,6 +44,67 @@ import threading
 #
 _MCP_SERVER_ORDER: list = []     # server names, in the order they were connected (gives indices)
 _MCP_SERVERS: dict      = {}     # name -> _MCPServerHandle
+
+
+# =============================================================================
+# TURN ABORTION -- cancel an in-flight MCP call even before its result
+# arrives, instead of blocking until the (possibly slow/hung) server
+# responds. Ctrl+Q's _abort_event (state.py) already stops process_chat_turn
+# BETWEEN tool calls; this registry is what lets it also reach INTO a call
+# that is already awaiting a response, which matters most for Filesystem
+# MCP calls -- a big recursive search_files, a write to a slow/network
+# drive, etc. can otherwise leave a turn stuck for a long time after the
+# user has already asked to abort.
+#
+# call_tool() below polls _abort_event in short slices instead of one long
+# blocking wait, and abort_active_mcp_calls() lets anything else (a "Stop"
+# button, a per-server abort) cancel in-flight calls on demand too.
+#
+# HOW THE CANCELLATION ACTUALLY PROPAGATES:
+# asyncio.run_coroutine_threadsafe() returns a concurrent.futures.Future
+# that is internally chained to the real asyncio Task running the coroutine
+# on the MCP event loop. Calling .cancel() on that Future while the Task is
+# still PENDING (i.e. the destination future hasn't been marked finished
+# yet -- true for as long as we're still waiting on it) successfully
+# schedules cancellation of the underlying Task via
+# loop.call_soon_threadsafe(task.cancel), which raises CancelledError
+# inside the coroutine at its next await point. That immediately stops US
+# waiting on it. NOTE: for a stdio-transport server, this stops the CLIENT
+# side cleanly and discards whatever response eventually shows up, but it
+# does not forcibly kill work already dispatched into the child process --
+# there's no portable way to reach into an arbitrary MCP server's internals
+# for that. In practice this is exactly what "abort the turn" means from
+# the model/user's point of view: Midum stops waiting and moves on.
+_active_mcp_calls: dict = {}   # call_id -> {"future", "server", "tool"}
+_active_mcp_calls_lock = threading.Lock()
+
+
+def abort_active_mcp_calls(server: str = None) -> int:
+    """
+    Immediately cancel every in-flight MCP tool call, optionally scoped to
+    one server name (e.g. abort_active_mcp_calls("filesystem")). Safe to
+    call from any thread (the GUI thread, a hotkey handler, etc.) -- it
+    only ever calls .cancel() on the Futures, never awaits anything itself.
+    Returns how many in-flight calls were signalled.
+    """
+    with _active_mcp_calls_lock:
+        targets = list(_active_mcp_calls.items())
+    signalled = 0
+    for call_id, info in targets:
+        if server is not None and info["server"] != server:
+            continue
+        if info["future"].cancel():
+            signalled += 1
+    return signalled
+
+
+def has_active_mcp_calls(server: str = None) -> bool:
+    with _active_mcp_calls_lock:
+        if server is None:
+            return bool(_active_mcp_calls)
+        return any(info["server"] == server for info in _active_mcp_calls.values())
+
+# =============================================================================
 
 
 class _MCPServerHandle:
@@ -324,13 +388,53 @@ class _MCPManager:
             return (f"Error: '{tool_name}' is not a tool on server '{name}'. "
                     f"Known tools: {known}. Call show_server_tools() to double-check.")
 
+        # ── Filesystem MCP policy gate: folder restriction, then password-
+        # protected approval for gated tools (write_file, edit_file, ...).
+        # No-ops instantly for any server other than the configured
+        # filesystem server name(s) -- see midum_mcp/filesystem_policy.py.
+        from midum_mcp.filesystem_policy import enforce_filesystem_policy
+        verdict, policy_msg = enforce_filesystem_policy(name, tool_name, arguments)
+        if verdict != "allowed":
+            return policy_msg
+
         async def _call():
             return await handle.session.call_tool(tool_name, arguments or {})
 
+        self._ensure_loop()
+        fut = asyncio.run_coroutine_threadsafe(_call(), self._loop)
+
+        call_id = uuid.uuid4().hex
+        with _active_mcp_calls_lock:
+            _active_mcp_calls[call_id] = {"future": fut, "server": name, "tool": tool_name}
+
+        timeout = handle.config.get("call_timeout", 60)
+        poll_interval = 0.15
+        elapsed = 0.0
         try:
-            result = self._run(_call(), timeout=handle.config.get("call_timeout", 60))
+            while True:
+                if _abort_event.is_set():
+                    fut.cancel()
+                    return (
+                        f"[ABORTED] The user aborted the turn while '{tool_name}' on '{name}' was "
+                        f"still in flight -- it has been cancelled and its result, if any ever "
+                        f"arrives, is discarded. Do not retry it as part of this (now-ended) turn."
+                    )
+                try:
+                    result = fut.result(timeout=poll_interval)
+                    break
+                except concurrent.futures.TimeoutError:
+                    elapsed += poll_interval
+                    if elapsed >= timeout:
+                        fut.cancel()
+                        return f"Error calling '{tool_name}' on '{name}': timed out after {timeout}s."
+                    continue
+        except concurrent.futures.CancelledError:
+            return f"[ABORTED] '{tool_name}' on '{name}' was cancelled."
         except Exception as e:
             return f"Error calling '{tool_name}' on '{name}': {e}"
+        finally:
+            with _active_mcp_calls_lock:
+                _active_mcp_calls.pop(call_id, None)
 
         parts = []
         for block in getattr(result, "content", []) or []:

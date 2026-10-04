@@ -2,6 +2,11 @@
 from midum_mcp.manager import _mcp_manager, _mcp_normalize_name, _mcp_resolve_name, get_promoted_tools
 from midum_mcp.manager import _MCP_SERVERS as _MANAGER_MCP_SERVERS
 from midum_mcp.manager import _MCP_SERVER_ORDER as _MANAGER_MCP_SERVER_ORDER
+from midum_mcp.manager import abort_active_mcp_calls, has_active_mcp_calls
+from midum_mcp.filesystem_policy import (
+    get_filesystem_policy, set_filesystem_allowed_roots, add_filesystem_blocked_subpath,
+    remove_filesystem_blocked_subpath,
+)
 from tools_schema import tools
 from permissions import get_permission, mcp_permission_key
 import json
@@ -245,5 +250,64 @@ def show_native_tool_schema(tool_name: str) -> str:
         },
         indent=2,
     )
+
+
+# =============================================================================
+# FILESYSTEM MCP EXTENSIONS -- turn abortion, folder restriction, and
+# password-protected approval. See midum_mcp/filesystem_policy.py for the
+# actual enforcement (wired into every call_mcp_tool dispatch already) --
+# these are just the model/GUI-facing management tools around it.
+# =============================================================================
+
+def abort_filesystem_mcp_calls() -> str:
+    """
+    INTERNAL -- not a model tool (see main.py; this is intentionally not
+    imported into the model's tool namespace or tools_schema.py). The turn
+    loop is synchronous: the model can't call a tool while a different tool
+    call is still blocking dispatch, so a model-callable "abort" could never
+    actually run during the window it would matter. Real callers are things
+    on a DIFFERENT thread than the turn loop -- see gui/app.py's Api.abort()
+    and _pop_last_turn(), which call midum.abort_active_mcp_calls() (no
+    server filter -- aborts whatever's in flight) right alongside setting
+    _abort_event, exactly like the Ctrl+Q/Stop-button path already does for
+    the between-tool-calls case. Kept here only as a thin, server-scoped
+    convenience wrapper for any other internal caller that wants it.
+    """
+    n = abort_active_mcp_calls("filesystem")
+    if n == 0:
+        return "No in-flight Filesystem MCP calls to abort."
+    return f"Signalled abort for {n} in-flight Filesystem MCP call(s)."
+
+
+def get_filesystem_mcp_policy() -> str:
+    """Show the current Filesystem MCP folder-restriction policy -- allowed
+    roots and blocked sub-paths. (Approval settings live entirely in the
+    Permissions tab and are not part of this policy.)"""
+    return json.dumps(get_filesystem_policy(), indent=2)
+
+
+def set_filesystem_mcp_allowed_roots(roots) -> str:
+    """Restrict the Filesystem MCP server to only these absolute root
+    folder(s). Accepts a list, or a single path string. Pass an empty list
+    to remove the extra restriction (falls back to the server's own launch
+    roots)."""
+    if isinstance(roots, str):
+        try:
+            roots = json.loads(roots) if roots.strip().startswith("[") else [roots]
+        except Exception:
+            roots = [roots]
+    return set_filesystem_allowed_roots(roots or [])
+
+
+def block_filesystem_mcp_subpath(path: str) -> str:
+    """Block one specific absolute sub-path on the Filesystem MCP, even if
+    it sits inside an otherwise-allowed root (e.g. a .git folder, a
+    secrets/ directory)."""
+    return add_filesystem_blocked_subpath(path)
+
+
+def unblock_filesystem_mcp_subpath(path: str) -> str:
+    """Remove a previously blocked sub-path on the Filesystem MCP."""
+    return remove_filesystem_blocked_subpath(path)
 
 

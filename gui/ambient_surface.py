@@ -44,8 +44,11 @@ import sys
 import threading
 import time
 import uuid
+import os
+import datetime
 
 import config
+import tools.ambient_surface_tools as _ambient_tools
 
 try:
     import webview  # pywebview -- same package/backend as gui/app.py
@@ -58,6 +61,8 @@ MAX_SURFACES = 8               # hard cap on simultaneously open widgets
 DEFAULT_RADIUS = 48            # CSS px; "well rounded"
 _INITIAL_WINDOW_MIN = (40, 40)  # pywebview/Qt min_size -- must not exceed MIN_*
 
+DEFAULT_MOVE_MS = 450          # glide duration for move_ambient_surface
+MAX_MOVE_MS = 3000
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _SAFE_COLOR_RE = re.compile(r"^[#A-Za-z0-9\s(),.%/+-]{1,80}$")
 
@@ -317,6 +322,48 @@ def _find_hwnd(title: str):
         return None
 
 
+_place_fn = None
+
+
+def _win_place(hwnd, rect) -> bool:
+    """Cheap per-frame reposition/resize (no style or affinity changes) used
+    by the move animation. Keeps z-order and never activates the window."""
+    global _place_fn
+    try:
+        if _place_fn is None:
+            import ctypes
+            from ctypes import wintypes
+            fn = ctypes.WinDLL("user32").SetWindowPos
+            fn.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                           ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            fn.restype = wintypes.BOOL
+            _place_fn = fn
+        SWP_NOZORDER, SWP_NOACTIVATE = 0x0004, 0x0010
+        x, y, w, h = rect
+        return bool(_place_fn(hwnd, None, int(x), int(y), int(w), int(h),
+                              SWP_NOZORDER | SWP_NOACTIVATE))
+    except Exception:
+        return False
+
+
+def _ease_in_out_cubic(t: float) -> float:
+    return 4 * t * t * t if t < 0.5 else 1 - ((-2 * t + 2) ** 3) / 2
+
+
+def _win_set_capture(hwnd, capture_visible: bool) -> bool:
+    """Toggle only the screenshot exclusion on an existing window."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        WDA_NONE, WDA_EXCLUDEFROMCAPTURE = 0x0, 0x11
+        fn = ctypes.WinDLL("user32").SetWindowDisplayAffinity
+        fn.argtypes = [wintypes.HWND, wintypes.DWORD]
+        fn.restype = wintypes.BOOL
+        return bool(fn(hwnd, WDA_NONE if capture_visible else WDA_EXCLUDEFROMCAPTURE))
+    except Exception:
+        return False  # Windows < 10 2004: widget simply stays capturable
+
+
 def _win_apply(hwnd, rect, focusable: bool, capture_visible: bool) -> bool:
     """Place the window in exact physical pixels, always on top, and apply
     the tool-window / no-activate / capture-exclusion styles."""
@@ -386,6 +433,9 @@ class _Surface:
         self.closed = False
         self.timer = None
         self.opened_at = time.time()
+        self.hwnd = None            # native handle once found (Windows)
+        self.cur_rect = rect        # where the window actually is right now
+        self.anim_id = 0            # bumped per move animation; older ones bail out
 
     @property
     def style_key(self):
@@ -438,12 +488,40 @@ class AmbientSurfaceManager:
         self._surfaces = {}        # sid -> _Surface, in opening order
         self._auto_id = 0
         self._dismissed = []       # [(sid, title, when)], newest last, max 10
+        # Global SETTINGS toggle ("Hide ambient surfaces from screenshots").
+        # On (default): surfaces are excluded from the model's screenshots /
+        # OCR / screen-share unless one asked for capture_visible=True.
+        # Off: every surface is capturable, whatever the model requested.
+        self._hide_from_capture = True
+
+    # ── Screenshot-exclusion setting ─────────────────────────────────────────
+    def _capture_visible_for(self, rec) -> bool:
+        """Effective 'visible to screenshots' for one surface: the surface's
+        own capture_visible request, or everything when the global hide
+        toggle is off."""
+        return bool(rec.capture_visible or not self._hide_from_capture)
+
+    def set_hide_from_capture(self, enabled) -> None:
+        """Apply the SETTINGS toggle. Takes effect immediately on every open
+        surface (display affinity only -- no move, restyle or flicker)."""
+        self._hide_from_capture = _truthy(enabled)
+        with self._lock:
+            recs = list(self._surfaces.values())
+        for rec in recs:
+            if rec.closed:
+                continue
+            hwnd = rec.hwnd or (_find_hwnd(rec.window_title)
+                                if sys.platform == "win32" else None)
+            if hwnd:
+                rec.hwnd = hwnd
+                _win_set_capture(hwnd, self._capture_visible_for(rec))
 
     # ── Entry point used by tools/ambient_surface_tools.py ───────────────────
     def handle(self, kind: str, payload: dict) -> str:
         handlers = {
             "show": self._show, "edit": self._edit, "move": self._move,
-            "close": self._close, "list": self._list,
+            "close": self._close, "list": self._list, "code": self._code,
+            "save": self._save, "load": self._load,
         }
         fn = handlers.get(kind)
         if fn is None:
@@ -638,10 +716,16 @@ class AmbientSurfaceManager:
                     break
                 time.sleep(0.05)
             if hwnd and not rec.closed:
-                applied = _win_apply(hwnd, rec.rect, rec.focusable, rec.capture_visible)
+                rec.hwnd = hwnd
+                applied = _win_apply(hwnd, rec.rect, rec.focusable,
+                                     self._capture_visible_for(rec))
+                if applied:
+                    rec.cur_rect = rec.rect
                 time.sleep(0.4)
-                if not rec.closed:
-                    _win_apply(hwnd, rec.rect, rec.focusable, rec.capture_visible)
+                # Skip the re-assert if a move animation already started.
+                if not rec.closed and rec.anim_id == 0:
+                    _win_apply(hwnd, rec.rect, rec.focusable,
+                               self._capture_visible_for(rec))
         if not applied and not rec.closed:
             self._pywebview_place(rec)
 
@@ -654,10 +738,49 @@ class AmbientSurfaceManager:
             pass
 
     def _apply_rect(self, rec):
-        hwnd = _find_hwnd(rec.window_title) if sys.platform == "win32" else None
-        if hwnd and _win_apply(hwnd, rec.rect, rec.focusable, rec.capture_visible):
+        """Instant placement."""
+        hwnd = rec.hwnd or (_find_hwnd(rec.window_title) if sys.platform == "win32" else None)
+        if hwnd and _win_apply(hwnd, rec.rect, rec.focusable,
+                               self._capture_visible_for(rec)):
+            rec.hwnd = hwnd
+            rec.cur_rect = rec.rect
             return
         self._pywebview_place(rec)
+        rec.cur_rect = rec.rect
+
+    def _animate(self, rec, a, b, ms):
+        """Glide the window from rect `a` to rect `b` (real px) over `ms` ms,
+        time-based ease-in-out so it stays smooth even if frames are slow.
+        Blocks the calling tool thread until done. A newer move on the same
+        surface bumps rec.anim_id, which makes this loop exit and lets the
+        new animation continue from wherever the window currently is."""
+        rec.anim_id += 1
+        my_id = rec.anim_id
+        hwnd = rec.hwnd or (_find_hwnd(rec.window_title) if sys.platform == "win32" else None)
+        if hwnd:
+            rec.hwnd = hwnd
+        dur = max(0.05, ms / 1000.0)
+        t0 = time.perf_counter()
+        while True:
+            if rec.closed or rec.anim_id != my_id:
+                return
+            t = min(1.0, (time.perf_counter() - t0) / dur)
+            e = _ease_in_out_cubic(t)
+            cur = tuple(int(round(a[i] + (b[i] - a[i]) * e)) for i in range(4))
+            if t >= 1.0:
+                cur = tuple(int(v) for v in b)
+            if hwnd:
+                _win_place(hwnd, cur)
+            else:
+                try:
+                    rec.window.resize(cur[2], cur[3])
+                    rec.window.move(cur[0], cur[1])
+                except Exception:
+                    pass
+            rec.cur_rect = cur
+            if t >= 1.0:
+                return
+            time.sleep(0.006)
 
     def _eval(self, rec, js):
         try:
@@ -687,15 +810,25 @@ class AmbientSurfaceManager:
 
     # ── move / resize ────────────────────────────────────────────────────────
     def _move(self, surface_id="", x=None, y=None, width=None, height=None,
-              coordinate_space="canvas"):
+              coordinate_space="canvas", duration_ms=None):
         if x is None and y is None and width is None and height is None:
             raise ValueError("Pass at least one of x, y, width, height.")
         rec = self._get(surface_id)
+        if duration_ms in (None, ""):
+            ms = DEFAULT_MOVE_MS
+        else:
+            ms = int(max(0.0, min(float(MAX_MOVE_MS), _num(duration_ms, "duration_ms"))))
         rect, adjusted = self._to_screen_rect(x, y, width, height,
                                               coordinate_space, current=rec.rect)
-        rec.rect = rect
-        self._apply_rect(rec)   # the shell re-runs layout() on resize itself
-        return f"Ambient surface '{rec.sid}' moved to {self._describe(rec, adjusted)}."
+        start = rec.cur_rect or rec.rect
+        rec.rect = rect                 # target; list/further moves use this
+        if ms <= 0 or tuple(start) == tuple(rect):
+            self._apply_rect(rec)       # instant (the shell re-runs layout() itself)
+            how = "instantly"
+        else:
+            self._animate(rec, tuple(start), tuple(rect), ms)
+            how = f"with a {ms} ms glide"
+        return f"Ambient surface '{rec.sid}' moved {how} to {self._describe(rec, adjusted)}."
 
     # ── close / list ─────────────────────────────────────────────────────────
     def _close(self, surface_id=""):
@@ -719,6 +852,90 @@ class AmbientSurfaceManager:
                             f"been dismissed. Open: {', '.join(self._surfaces) or 'none'}.")
         self._discard(rec)
         return f"Ambient surface '{rec.sid}' closed."
+
+    def _code(self, surface_id=""):
+        """Read-only: a widget's current source (voice-mode delegation uses
+        this to hand the coding model the code it should revise)."""
+        return self._get(surface_id).code
+
+    def _save(self, name, surface_id=""):
+        """Snapshot an open widget (code + look + canvas position/size) to
+        storage/ambient_surfaces/<name>.json -- the Ambient twin of the
+        Render Surface 'save' action."""
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("'name' is required to save.")
+        rec = self._get(surface_id)
+        cx, cy, cw, ch = self._canvas_of(rec.rect)
+        data = {
+            "name": name,
+            "title": rec.title or name,
+            "code": rec.code,
+            "x": cx, "y": cy, "width": cw, "height": ch,
+            "coordinate_space": "canvas",
+            "corner_radius": rec.radius,
+            "background": rec.background,
+            "focusable": rec.focusable,
+            "capture_visible": rec.capture_visible,
+            "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        try:
+            os.makedirs(_ambient_tools.AMBIENT_SURFACES_DIR, exist_ok=True)
+            with open(_ambient_tools._saved_ambient_path(name), "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            raise ValueError(f"Could not save '{name}': {e}")
+        self._log(f"\U0001F4BE Ambient surface saved as '{name}'.\n")
+        return f"Ambient surface '{rec.sid}' saved as '{name}'."
+
+    def _load(self, name, surface_id="", x=None, y=None, width=None,
+              height=None, coordinate_space="canvas"):
+        """Reopen a saved widget. Saved geometry is canvas-space; any of
+        x/y/width/height passed in override just those fields."""
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("'name' is required to load.")
+        path = _ambient_tools._saved_ambient_path(name)
+        if not os.path.exists(path):
+            raise ValueError(f"No saved Ambient Surface named '{name}'.")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            raise ValueError(f"Could not read saved surface '{name}': {e}")
+        code = data.get("code") or ""
+        if not code.strip():
+            raise ValueError(f"Saved surface '{name}' has no code.")
+
+        space = (coordinate_space or "canvas").strip().lower()
+        if space not in ("canvas", "screen"):
+            raise ValueError("coordinate_space must be 'canvas' or 'screen'.")
+        # Saved values are canvas units; convert to the requested space for
+        # any field the caller didn't override.
+        kx = 1.0 if space == "canvas" else float(config.SCALE_X)
+        ky = 1.0 if space == "canvas" else float(config.SCALE_Y)
+
+        def pick(override, key, k):
+            if override not in (None, ""):
+                return override
+            if data.get(key) is None:
+                raise ValueError(f"Saved surface '{name}' has no '{key}'; pass it explicitly.")
+            return data[key] * k
+
+        result = self._show(
+            code=code,
+            x=pick(x, "x", kx), y=pick(y, "y", ky),
+            width=pick(width, "width", kx), height=pick(height, "height", ky),
+            surface_id=surface_id or name,
+            title=data.get("title") or name,
+            corner_radius=data.get("corner_radius") or 0,
+            background=data.get("background") or "",
+            coordinate_space=space,
+            focusable=data.get("focusable", False),
+            capture_visible=data.get("capture_visible", False),
+            auto_close_seconds=0,
+        )
+        return f"Loaded saved Ambient Surface '{name}'. {result}"
 
     def _list(self):
         with self._lock:

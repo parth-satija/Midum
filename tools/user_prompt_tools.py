@@ -154,6 +154,61 @@ def ask_user_approval(message: str, details: str = "") -> str:
     return result["value"]
 
 
+def ask_user_password_approval(message: str, details: str = "") -> str:
+    """
+    Pop up an Approve / Decline GUI dialog identical in layout to
+    ask_user_approval, but Approve requires typing a password into a masked
+    field first — used to gate destructive or sensitive actions (e.g.
+    Filesystem MCP writes/edits/moves, see midum_mcp/filesystem_policy.py)
+    behind a credential the model itself never sees or holds.
+
+    Returns the raw text typed into the password field if the user clicked
+    Approve (even if it's blank or wrong — verifying it is the caller's job,
+    not this dialog's), '[USER DECLINED]' if they clicked Decline, or
+    '[USER CANCELLED]' if they closed the window without choosing either.
+    """
+    if _gui_ask_hook is not None:
+        return _gui_ask_hook("password_approval", {"message": message, "details": details})
+    if not _TKINTER_AVAILABLE:
+        return "[GUI ERROR] tkinter not available on this system — ask the user to approve in plain text instead."
+    result = {"value": "[USER CANCELLED]"}
+    root = _gui_root()
+    win = _tk.Toplevel(root)
+    win.title("Midum requests approval (password required)")
+    try: win.attributes("-topmost", True)
+    except Exception: pass
+
+    _tk.Label(win, text=message, wraplength=420, justify="left",
+              padx=16, font=("Segoe UI", 10, "bold")).pack(pady=(16, 4))
+    if details:
+        _tk.Label(win, text=details, wraplength=420, justify="left", padx=16).pack(pady=(0, 8))
+
+    _tk.Label(win, text="Password:", padx=16, anchor="w").pack(fill="x")
+    pw_entry = _tk.Entry(win, width=32, show="\u2022")
+    pw_entry.pack(padx=16, pady=(0, 10))
+    pw_entry.focus_set()
+
+    def approve(event=None):
+        result["value"] = pw_entry.get()
+        win.destroy()
+
+    def decline():
+        result["value"] = "[USER DECLINED]"
+        win.destroy()
+
+    pw_entry.bind("<Return>", approve)
+    btn_frame = _tk.Frame(win)
+    btn_frame.pack(pady=(0, 14))
+    _tk.Button(btn_frame, text="\u2705 Approve", command=approve, width=12, bg="#d7f5d7").pack(side="left", padx=8)
+    _tk.Button(btn_frame, text="\u274c Decline", command=decline, width=12, bg="#f5d7d7").pack(side="left", padx=8)
+
+    win.protocol("WM_DELETE_WINDOW", decline)
+    win.grab_set()
+    root.wait_window(win)
+    root.destroy()
+    return result["value"]
+
+
 def ask_user_choice(question: str, choice_1: str = "", choice_2: str = "",
                      choice_3: str = "", choice_4: str = "", allow_custom: bool = True) -> str:
     """

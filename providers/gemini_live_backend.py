@@ -48,6 +48,10 @@ from config import SECRETS_FILE
 from screen_capture import capture_screen_frame_jpeg_bytes
 from system_prompt import get_system_prompt
 from tools_schema import tools as _OPENAI_TOOLS
+from tools.surface_delegate_tools import (
+    VOICE_BLOCKED_TOOLS, VOICE_SURFACE_TOOL_NAMES, VOICE_SURFACE_TOOL_SCHEMAS,
+    call_voice_surface_tool,
+)
 
 try:
     from google import genai
@@ -126,6 +130,11 @@ def _build_live_tools():
         name = fn.get("name")
         if not name:
             continue
+        # The voice model can't code well: Render/Ambient Surface code is
+        # written by the default model via get_*_surface_made instead (see
+        # tools/surface_delegate_tools.py), so the code-taking tools stay hidden.
+        if name in VOICE_BLOCKED_TOOLS:
+            continue
         params = fn.get("parameters") or {"type": "object", "properties": {}}
         # Gemini rejects empty {"properties": {}} objects on some tools less
         # strictly than OpenAI, but it does require "type": "object" to be
@@ -134,6 +143,13 @@ def _build_live_tools():
             "name": name,
             "description": (fn.get("description") or "")[:1000],
             "parameters": params,
+        })
+    for t in VOICE_SURFACE_TOOL_SCHEMAS:
+        fn = t["function"]
+        declarations.append({
+            "name": fn["name"],
+            "description": (fn.get("description") or "")[:1000],
+            "parameters": fn["parameters"],
         })
     return [genai_types.Tool(function_declarations=declarations)]
 
@@ -244,6 +260,16 @@ class VoiceSession:
             "and brief -- a sentence or two before or after acting, not a written report. "
             "Call tools directly and immediately when the user asks for an action; don't "
             "narrate at length first. If you're interrupted mid-sentence, stop and listen."
+            "\n\nWIDGETS AND PANELS: you cannot write HTML/CSS/JS yourself. To put a small "
+            "widget over the user's screen (an explanation next to something they're looking "
+            "at, a timer, a checklist), call get_ambient_surface_made; to open a bigger panel "
+            "(dashboard, document, chart, tool) in the Midum window, call "
+            "get_render_surface_made. Put ALL the content to display into `request`, word for "
+            "word -- the coding model that builds it can't see the screen or hear the user. "
+            "For an on-screen widget, look at the screen first if you need to know where things "
+            "are, then place it beside the thing it explains. Say one short line before calling "
+            "(it takes a few seconds), and afterwards just confirm it's up. To change one that's "
+            "already showing, call the same tool again (same surface_id, or edit_current=true)."
         )
 
         live_cfg = genai_types.LiveConnectConfig(
@@ -481,8 +507,18 @@ class VoiceSession:
 
                             self.on_event("voice_tool_call", {"name": fc.name, "args": args})
                             try:
-                                from gui.dispatch import _dispatch_midum_tool
-                                result = _dispatch_midum_tool(fc.name, args)
+                                if fc.name in VOICE_BLOCKED_TOOLS:
+                                    result = (f"'{fc.name}' isn't available in voice mode. Use "
+                                              f"get_ambient_surface_made / get_render_surface_made "
+                                              f"and describe what you want built.")
+                                elif fc.name in VOICE_SURFACE_TOOL_NAMES:
+                                    # Code generation on the default model can take
+                                    # 10-60s: run it off the event loop so the mic
+                                    # drain / speaker playback tasks keep running.
+                                    result = await asyncio.to_thread(call_voice_surface_tool, fc.name, args)
+                                else:
+                                    from gui.dispatch import _dispatch_midum_tool
+                                    result = _dispatch_midum_tool(fc.name, args)
                             except Exception as e:
                                 result = f"Error executing '{fc.name}': {e}"
                             result_str = str(result)

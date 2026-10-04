@@ -49,6 +49,28 @@
 # never written to disk.
 _gui_ambient_hook = None
 
+# ── Persisted Ambient Surfaces ─────────────────────────────────────────────
+# Same idea as save_render_surface/load_render_surface: unlike a live widget
+# (RAM-only, gone when dismissed), a SAVED one survives across turns, sessions
+# and app restarts. One plain JSON file per saved surface under
+# storage/ambient_surfaces/, named after a sanitised `name`: its code, title,
+# look (corner radius / background / focusable / capture_visible) AND its
+# position + size in canvas coordinates (resolution-independent). list/delete
+# only touch disk, so they work with no GUI attached; save/load need the live
+# widget / a window to open, so they go through the GUI hook.
+import os
+import re
+
+from config import STORAGE_DIR
+
+AMBIENT_SURFACES_DIR = os.path.join(STORAGE_DIR, "ambient_surfaces")
+
+
+def _saved_ambient_path(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", (name or "").strip()).strip("_")
+    safe = safe or "untitled"
+    return os.path.join(AMBIENT_SURFACES_DIR, f"{safe}.json")
+
 _NO_GUI = ("[AMBIENT SURFACE ERROR] No GUI attached -- this tool only "
            "works inside the Midum desktop app.")
 
@@ -160,7 +182,8 @@ def edit_ambient_surface(old_code: str, new_code: str, surface_id: str = "") -> 
 
 def move_ambient_surface(surface_id: str = "", x=None, y=None,
                          width=None, height=None,
-                         coordinate_space: str = "canvas") -> str:
+                         coordinate_space: str = "canvas",
+                         duration_ms=None) -> str:
     """
     Reposition and/or resize an open Ambient Surface without touching its
     content. Pass only the values you want to change (any of x, y, width,
@@ -171,7 +194,7 @@ def move_ambient_surface(surface_id: str = "", x=None, y=None,
     return _call_hook("move", {
         "surface_id": surface_id, "x": x, "y": y,
         "width": width, "height": height,
-        "coordinate_space": coordinate_space,
+        "coordinate_space": coordinate_space, "duration_ms": duration_ms,
     })
 
 
@@ -184,6 +207,94 @@ def close_ambient_surface(surface_id: str = "") -> str:
     ✕ button, so an unknown id usually just means it was already closed.
     """
     return _call_hook("close", {"surface_id": surface_id})
+
+
+def save_ambient_surface(name: str, surface_id: str = "") -> str:
+    """
+    Save a snapshot of an OPEN Ambient Surface -- its HTML/CSS/JS, title,
+    look, and its current position and size (canvas coordinates) -- to disk
+    under `name`, so it can be brought back later with
+    load_ambient_surface(name), even in a future session or after the app
+    restarts. The live widget stays open and untouched; this only writes a
+    copy out. Saving again under a `name` that already exists OVERWRITES it.
+
+    `surface_id` selects which open widget to save; it may be omitted only
+    when exactly one Ambient Surface is open.
+    """
+    return _call_hook("save", {"name": name, "surface_id": surface_id})
+
+
+def list_saved_ambient_surfaces() -> str:
+    """
+    List every Ambient Surface previously saved with save_ambient_surface,
+    by name, with its title, size and when it was saved. Follow up with
+    load_ambient_surface(name) to put one back on screen, or
+    delete_saved_ambient_surface(name) to remove one. Works even with no GUI
+    attached, since it only reads from disk.
+    """
+    import json
+    os.makedirs(AMBIENT_SURFACES_DIR, exist_ok=True)
+    try:
+        files = sorted(f[:-5] for f in os.listdir(AMBIENT_SURFACES_DIR) if f.endswith(".json"))
+    except Exception as e:
+        return f"[AMBIENT SURFACE ERROR] Could not list saved surfaces: {e}"
+
+    if not files:
+        return ("No saved Ambient Surfaces yet. Use save_ambient_surface(name) "
+                "while one is open.")
+
+    lines = [f"Saved Ambient Surfaces ({len(files)}):"]
+    for safe_name in files:
+        path = os.path.join(AMBIENT_SURFACES_DIR, f"{safe_name}.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            real_name = data.get("name") or safe_name
+            title = data.get("title") or real_name
+            size = f", {data.get('width')}x{data.get('height')}" if data.get("width") else ""
+            saved_at = data.get("saved_at", "")
+            suffix = f", saved {saved_at}" if saved_at else ""
+            lines.append(f'- {real_name}  (title: "{title}"{size}{suffix})')
+        except Exception:
+            lines.append(f"- {safe_name}")
+    lines.append("\nUse load_ambient_surface(name) to put one back on screen.")
+    return "\n".join(lines)
+
+
+def load_ambient_surface(name: str, surface_id: str = "", x=None, y=None,
+                         width=None, height=None,
+                         coordinate_space: str = "canvas") -> str:
+    """
+    Put a previously SAVED Ambient Surface (see save_ambient_surface /
+    list_saved_ambient_surfaces) back on screen -- same effect as
+    show_ambient_surface, but the code, look, position and size come from
+    disk. By default it reopens exactly where and how big it was saved; pass
+    any of x, y, width, height to override just those (same coordinate rules
+    as show_ambient_surface; canvas by default). `surface_id` sets the id of
+    the opened widget (defaults to the saved name); reusing an id of an
+    already-open widget replaces it. Call list_saved_ambient_surfaces() first
+    if you're not sure of the exact name.
+    """
+    return _call_hook("load", {
+        "name": name, "surface_id": surface_id, "x": x, "y": y,
+        "width": width, "height": height, "coordinate_space": coordinate_space,
+    })
+
+
+def delete_saved_ambient_surface(name: str) -> str:
+    """
+    Permanently delete a saved Ambient Surface by name (see
+    list_saved_ambient_surfaces). Does not affect a widget currently on
+    screen -- only the saved copy on disk. Works even with no GUI attached.
+    """
+    path = _saved_ambient_path(name)
+    if not os.path.exists(path):
+        return f"[AMBIENT SURFACE ERROR] No saved Ambient Surface named '{name}'."
+    try:
+        os.remove(path)
+        return f"Deleted saved Ambient Surface '{name}'."
+    except Exception as e:
+        return f"[AMBIENT SURFACE ERROR] Could not delete '{name}': {e}"
 
 
 def list_ambient_surfaces() -> str:

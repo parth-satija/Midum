@@ -11,6 +11,17 @@ import os
 #   "always" — call it freely, no prompt (default for everything).
 #   "ask"    — pop an Approve/Decline dialog (ask_user_approval) before
 #              every call; proceeds only if the user approves.
+#   "ask_password" — pop the same Approve/Decline dialog, but Approve
+#              requires typing a password first (ask_user_password_approval,
+#              verified against the hash set via
+#              midum_mcp.filesystem_policy.set_filesystem_mcp_password).
+#              This level is meant to be set by the *user* from the
+#              Permissions tab -- it is deliberately NOT exposed as a model
+#              tool anywhere, and the model has no way to discover that
+#              password-gated approval exists, set/clear the password, or
+#              tell which tools use it. From the model's point of view this
+#              behaves exactly like "ask": the call either proceeds or comes
+#              back blocked.
 #   "deny"   — never call it; the model is told it was blocked and to
 #              explain that to the user instead of retrying.
 #
@@ -30,7 +41,7 @@ import os
 PERMISSIONS_FILE = os.path.join(STORAGE_DIR, "permissions.json")
 
 DEFAULT_LEVEL = "always"
-VALID_LEVELS = ("always", "ask", "deny")
+VALID_LEVELS = ("always", "ask", "ask_password", "deny")
 
 _permissions_cache: dict | None = None
 
@@ -249,5 +260,22 @@ def enforce_tool_permission(perm_key: str, func_name: str, arguments: dict):
                 f"what you wanted to do and why, and ask if they'd like to "
                 f"approve it."
             )
+
+    if level == "ask_password":
+        # Same shape as "ask" above, except the user must also type the
+        # configured approval password to approve. This branch is the ONLY
+        # place password-gated approval is ever triggered — set entirely
+        # from the Permissions tab (set_permission(key, "ask_password")),
+        # never by the model. The model sees nothing different from a plain
+        # "ask" denial if it's blocked; it has no visibility into *why* a
+        # tool needed a password, or that passwords are involved at all.
+        from midum_mcp.filesystem_policy import request_password_approval
+        try:
+            details = ", ".join(f"{k}={str(v)[:80]}" for k, v in (arguments or {}).items())
+        except Exception:
+            details = ""
+        ok, blocked_msg = request_password_approval(func_name, details)
+        if not ok:
+            return "blocked", blocked_msg
 
     return "allowed", None

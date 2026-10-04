@@ -92,6 +92,18 @@ def set_agent_done_hook(fn) -> None:
 # hook(name, role, message) -> None.
 _agent_inform_hook = None
 
+# Optional hook the front-end installs to be notified the MOMENT a
+# sub-agent's conversation tab actually OPENS (register_agent_tab, at the
+# top of _run_agent_task, on the agent's own worker thread) -- distinct
+# from create_agent()/send_agent_task()'s own "agents_changed" pushes,
+# which fire when the agent is spawned / a task is queued, NOT when the
+# worker thread actually picks that task up and its tab appears (that can
+# lag up to _worker_loop's 0.5s poll interval behind). Without this, a
+# tab-strip UI has no event to refresh on right when the tab shows up, and
+# would only repaint whenever something else next happened to call
+# list_tabs(). Signature: hook(name, role) -> None.
+_agent_started_hook = None
+
 
 def get_current_agent_name() -> str | None:
     """Return the name of the sub-agent whose worker thread is CURRENTLY
@@ -116,6 +128,19 @@ def set_agent_inform_hook(fn) -> None:
     whole task to complete."""
     global _agent_inform_hook
     _agent_inform_hook = fn
+
+
+def set_agent_started_hook(fn) -> None:
+    """Register a callback fired the instant a sub-agent's conversation tab
+    opens -- i.e. the moment its worker thread actually starts a queued
+    task (see register_agent_tab() in _run_agent_task below), not when the
+    task was merely queued. Pass None to remove. The front-end should use
+    this to refresh its tab strip right away (e.g. re-push "agents_changed"
+    or an equivalent event) so a newly-working agent's tab shows up
+    immediately instead of waiting for some unrelated event to trigger the
+    next repaint."""
+    global _agent_started_hook
+    _agent_started_hook = fn
 
 
 # ── Persistence (definitions only — not live history) ───────────────────────
@@ -347,6 +372,11 @@ def _run_agent_task(agent: dict, task: str) -> None:
     # they're looking at), and is torn down again in the `finally` block
     # below the moment this task ends, no matter how it ends.
     register_agent_tab(agent["name"], agent["role"], agent["history"])
+    if _agent_started_hook is not None:
+        try:
+            _agent_started_hook(agent["name"], agent["role"])
+        except Exception as e:
+            print(f"⚠️ [multi_agent] agent_started_hook failed: {e}")
     agent["history"].append({
         "role": "user",
         "content": (
@@ -781,6 +811,32 @@ def get_agent_transcript(name: str) -> list:
         if not agent:
             return []
         return list(agent["transcript"])
+
+
+def record_agent_tool_call(name: str, tool_name: str, args: dict, result) -> None:
+    """Append a tool-call record ({"role": "tool", ...}) to a sub-agent's
+    own transcript, alongside its existing "user" (task) and "assistant"
+    (say()/report) entries -- see _new_agent_record's 'transcript' field.
+    Without this, a sub-agent's individual tool calls were only ever
+    pushed as transient LIVE events (see gui/app.py's Api._handle_tool_call
+    -> "agent_tool_call"), never actually stored anywhere: reopening or
+    switching into that agent's conversation tab/monitor view after the
+    fact showed nothing, because there was nothing left to replay. Called
+    by the front-end's own tool-call hook right after a tool runs on this
+    agent's own worker thread (multi_agent.get_current_agent_name() is how
+    that hook knows which agent, if any, to attribute the call to). Safe
+    no-op if the agent isn't currently loaded."""
+    with _agents_lock:
+        agent = _agents.get((name or "").strip())
+        if not agent:
+            return
+        agent["transcript"].append({
+            "role": "tool",
+            "tool_name": tool_name,
+            "args": args if isinstance(args, dict) else {},
+            "result": str(result)[:8000],
+            "ts": time.time(),
+        })
 
 
 def list_agents_struct() -> dict:

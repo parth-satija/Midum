@@ -306,5 +306,593 @@
         }
       }
     }
+  },
+  "print_sum": {
+    "description": "prints sum",
+    "graph": {
+      "drawflow": {
+        "Home": {
+          "data": {
+            "1": {
+              "id": 1,
+              "name": "start",
+              "data": {},
+              "class": "flow-node-start",
+              "html": "<div class=\"flow-node flow-node-start\"><div class=\"flow-node-icon\"><svg class=\"ic ic-play ic-fill\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M6 4l14 8-14 8z\"/></svg></div><div class=\"flow-node-label\">Start</div></div>",
+              "typenode": false,
+              "inputs": {},
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "7",
+                      "output": "input_1"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 174.9090909090909,
+              "pos_y": 277
+            },
+            "2": {
+              "id": 2,
+              "name": "end",
+              "data": {},
+              "class": "flow-node-end",
+              "html": "<div class=\"flow-node flow-node-end\"><div class=\"flow-node-icon\"><svg class=\"ic ic-stop ic-fill\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><rect x=\"6\" y=\"6\" width=\"12\" height=\"12\" rx=\"2\"/></svg></div><div class=\"flow-node-label\">End</div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "7",
+                      "input": "output_1"
+                    }
+                  ]
+                }
+              },
+              "outputs": {},
+              "pos_x": 773,
+              "pos_y": 289.09090909090907
+            },
+            "6": {
+              "id": 6,
+              "name": "op::calc",
+              "data": {
+                "op": "add",
+                "a": "8",
+                "b": "9"
+              },
+              "class": "flow-node-op--calc",
+              "html": "<div class=\"flow-node-tool flow-node-logic\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\"><svg class=\"ic ic-zap\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M13 2 3 14h9l-1 8 10-12h-9l1-8z\"/></svg></span><span class=\"flow-node-label\">Operation</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row\"><span class=\"flow-param-label\">op</span><select class=\"flow-param-input\" df-op><option value=\"add\">A + B</option><option value=\"subtract\">A \u2212 B</option><option value=\"multiply\">A \u00d7 B</option><option value=\"divide\">A \u00f7 B</option><option value=\"equals\">A == B</option><option value=\"not_equals\">A != B</option><option value=\"greater_than\">A &gt; B</option><option value=\"less_than\">A &lt; B</option><option value=\"greater_equal\">A &gt;= B</option><option value=\"less_equal\">A &lt;= B</option><option value=\"and\">A and B</option><option value=\"or\">A or B</option><option value=\"concat\">A + B (text)</option></select></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">a</span><input class=\"flow-param-input\" type=\"text\" df-a placeholder=\"fallback if A unwired\"/></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">b</span><input class=\"flow-param-input\" type=\"text\" df-b placeholder=\"fallback if B unwired\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: a, b</span><span>out: result</span></div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": []
+                },
+                "input_2": {
+                  "connections": []
+                }
+              },
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "7",
+                      "output": "input_2"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 89,
+              "pos_y": 431
+            },
+            "7": {
+              "id": 7,
+              "name": "print",
+              "data": {
+                "value": ""
+              },
+              "class": "flow-node-print",
+              "html": "<div class=\"flow-node-tool flow-node-logic\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\"><svg class=\"ic ic-terminal\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M4 17l6-6-6-6\"/><path d=\"M12 19h8\"/></svg></span><span class=\"flow-node-label\">Print</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row\"><span class=\"flow-param-label\">value</span><input class=\"flow-param-input\" type=\"text\" df-value placeholder=\"fallback if Value pin unwired\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: seq, value</span><span>out: seq</span></div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "1",
+                      "input": "output_1"
+                    }
+                  ]
+                },
+                "input_2": {
+                  "connections": [
+                    {
+                      "node": "6",
+                      "input": "output_1"
+                    }
+                  ]
+                }
+              },
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "2",
+                      "output": "input_1"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 417.09090909090907,
+              "pos_y": 263
+            }
+          }
+        }
+      }
+    }
+  },
+  "flow5": {
+    "description": "prints reply for hi",
+    "graph": {
+      "drawflow": {
+        "Home": {
+          "data": {
+            "1": {
+              "id": 1,
+              "name": "start",
+              "data": {},
+              "class": "flow-node-start",
+              "html": "<div class=\"flow-node flow-node-start\"><div class=\"flow-node-icon\"><svg class=\"ic ic-play ic-fill\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M6 4l14 8-14 8z\"/></svg></div><div class=\"flow-node-label\">Start</div></div>",
+              "typenode": false,
+              "inputs": {},
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "3",
+                      "output": "input_1"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 16,
+              "pos_y": 162
+            },
+            "2": {
+              "id": 2,
+              "name": "end",
+              "data": {},
+              "class": "flow-node-end",
+              "html": "<div class=\"flow-node flow-node-end\"><div class=\"flow-node-icon\"><svg class=\"ic ic-stop ic-fill\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><rect x=\"6\" y=\"6\" width=\"12\" height=\"12\" rx=\"2\"/></svg></div><div class=\"flow-node-label\">End</div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "4",
+                      "input": "output_1"
+                    }
+                  ]
+                }
+              },
+              "outputs": {},
+              "pos_x": 791,
+              "pos_y": 122
+            },
+            "3": {
+              "id": 3,
+              "name": "ai::prompt",
+              "data": {
+                "prompt": "hi",
+                "context": ""
+              },
+              "class": "flow-node-ai--prompt",
+              "html": "<div class=\"flow-node-tool flow-node-ai\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\"><svg class=\"ic ic-bot\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><rect x=\"4\" y=\"8\" width=\"16\" height=\"12\" rx=\"2\"/><path d=\"M12 8V4H8M2 14h2M20 14h2M15 13v2M9 13v2\"/></svg></span><span class=\"flow-node-label\">Prompt AI</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row\"><span class=\"flow-param-label\">prompt</span><input class=\"flow-param-input\" type=\"text\" df-prompt placeholder=\"Instruction to send to the AI\"/></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">context</span><input class=\"flow-param-input\" type=\"text\" df-context placeholder=\"fallback if Context pin unwired\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: seq, context</span><span class=\"flow-object-out\">out: seq, <svg class=\"ic ic-dot ic-fill\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"6\"/></svg> result</span></div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "1",
+                      "input": "output_1"
+                    }
+                  ]
+                },
+                "input_2": {
+                  "connections": []
+                }
+              },
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "4",
+                      "output": "input_1"
+                    }
+                  ]
+                },
+                "output_2": {
+                  "connections": [
+                    {
+                      "node": "4",
+                      "output": "input_2"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 189,
+              "pos_y": 24
+            },
+            "4": {
+              "id": 4,
+              "name": "print",
+              "data": {
+                "value": ""
+              },
+              "class": "flow-node-print",
+              "html": "<div class=\"flow-node-tool flow-node-logic\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\"><svg class=\"ic ic-terminal\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M4 17l6-6-6-6\"/><path d=\"M12 19h8\"/></svg></span><span class=\"flow-node-label\">Print</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row\"><span class=\"flow-param-label\">value</span><input class=\"flow-param-input\" type=\"text\" df-value placeholder=\"fallback if Value pin unwired\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: seq, value</span><span>out: seq</span></div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "3",
+                      "input": "output_1"
+                    }
+                  ]
+                },
+                "input_2": {
+                  "connections": [
+                    {
+                      "node": "3",
+                      "input": "output_2"
+                    }
+                  ]
+                }
+              },
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "2",
+                      "output": "input_1"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 487,
+              "pos_y": 145
+            }
+          }
+        }
+      }
+    }
+  },
+  "ask_opinion": {
+    "description": "Use this to ask the opinion of a model on something",
+    "graph": {
+      "drawflow": {
+        "Home": {
+          "data": {
+            "1": {
+              "id": 1,
+              "name": "start",
+              "data": {},
+              "class": "flow-node-start",
+              "html": "<div class=\"flow-node flow-node-start\"><div class=\"flow-node-icon\"><svg class=\"ic ic-play ic-fill\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M6 4l14 8-14 8z\"/></svg></div><div class=\"flow-node-label\">Start</div></div>",
+              "typenode": false,
+              "inputs": {},
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "4",
+                      "output": "input_1"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 32,
+              "pos_y": 300
+            },
+            "2": {
+              "id": 2,
+              "name": "end",
+              "data": {},
+              "class": "flow-node-end",
+              "html": "<div class=\"flow-node flow-node-end\"><div class=\"flow-node-icon\"><svg class=\"ic ic-stop ic-fill\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><rect x=\"6\" y=\"6\" width=\"12\" height=\"12\" rx=\"2\"/></svg></div><div class=\"flow-node-label\">End</div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "5",
+                      "input": "output_1"
+                    }
+                  ]
+                }
+              },
+              "outputs": {},
+              "pos_x": 1144.4285714285713,
+              "pos_y": 295
+            },
+            "3": {
+              "id": 3,
+              "name": "argument",
+              "data": {
+                "name": "query",
+                "type": "string",
+                "required": "yes",
+                "default": "hi",
+                "description": "The query to ask opinion on. Include all context in it."
+              },
+              "class": "flow-node-argument",
+              "html": "<div class=\"flow-node-tool flow-node-variable\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\"><svg class=\"ic ic-arrow-right\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M5 12h14M12 5l7 7-7 7\"/></svg></span><span class=\"flow-node-label\">Argument</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row\"><span class=\"flow-param-label\">name</span><input class=\"flow-param-input\" type=\"text\" df-name placeholder=\"arg_name\"/></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">type</span><select class=\"flow-param-input\" df-type><option value=\"string\">string</option><option value=\"integer\">integer</option><option value=\"number\">number</option><option value=\"boolean\">boolean</option></select></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">required</span><select class=\"flow-param-input\" df-required><option value=\"no\">no</option><option value=\"yes\">yes</option></select></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">default</span><input class=\"flow-param-input\" type=\"text\" df-default placeholder=\"fallback if not passed in\"/></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">description</span><input class=\"flow-param-input\" type=\"text\" df-description placeholder=\"shown in the Tools tab\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: \u2014</span><span>out: value</span></div></div>",
+              "typenode": false,
+              "inputs": {},
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "4",
+                      "output": "input_2"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 29,
+              "pos_y": 24
+            },
+            "4": {
+              "id": 4,
+              "name": "ai::prompt",
+              "data": {
+                "prompt": "Give your opinion on the query in the context.",
+                "context": ""
+              },
+              "class": "flow-node-ai--prompt",
+              "html": "<div class=\"flow-node-tool flow-node-ai\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\"><svg class=\"ic ic-bot\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><rect x=\"4\" y=\"8\" width=\"16\" height=\"12\" rx=\"2\"/><path d=\"M12 8V4H8M2 14h2M20 14h2M15 13v2M9 13v2\"/></svg></span><span class=\"flow-node-label\">Prompt AI</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row\"><span class=\"flow-param-label\">prompt</span><input class=\"flow-param-input\" type=\"text\" df-prompt placeholder=\"Instruction to send to the AI\"/></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">context</span><input class=\"flow-param-input\" type=\"text\" df-context placeholder=\"fallback if Context pin unwired\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: seq, context</span><span class=\"flow-object-out\">out: seq, <svg class=\"ic ic-dot ic-fill\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"6\"/></svg> result</span></div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "1",
+                      "input": "output_1"
+                    }
+                  ]
+                },
+                "input_2": {
+                  "connections": [
+                    {
+                      "node": "3",
+                      "input": "output_1"
+                    }
+                  ]
+                }
+              },
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "5",
+                      "output": "input_1"
+                    }
+                  ]
+                },
+                "output_2": {
+                  "connections": [
+                    {
+                      "node": "5",
+                      "output": "input_2"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 401,
+              "pos_y": 312
+            },
+            "5": {
+              "id": 5,
+              "name": "print",
+              "data": {
+                "value": ""
+              },
+              "class": "flow-node-print",
+              "html": "<div class=\"flow-node-tool flow-node-logic\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\"><svg class=\"ic ic-terminal\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M4 17l6-6-6-6\"/><path d=\"M12 19h8\"/></svg></span><span class=\"flow-node-label\">Print</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row\"><span class=\"flow-param-label\">value</span><input class=\"flow-param-input\" type=\"text\" df-value placeholder=\"fallback if Value pin unwired\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: seq, value</span><span>out: seq</span></div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "4",
+                      "input": "output_1"
+                    }
+                  ]
+                },
+                "input_2": {
+                  "connections": [
+                    {
+                      "node": "4",
+                      "input": "output_2"
+                    }
+                  ]
+                }
+              },
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "2",
+                      "output": "input_1"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 786,
+              "pos_y": 288
+            }
+          }
+        }
+      }
+    }
+  },
+  "create_godot_project": {
+    "description": "",
+    "graph": {
+      "drawflow": {
+        "Home": {
+          "data": {
+            "1": {
+              "id": 1,
+              "name": "start",
+              "data": {},
+              "class": "flow-node-start",
+              "html": "<div class=\"flow-node flow-node-start\"><div class=\"flow-node-icon\"><svg class=\"ic ic-play ic-fill\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M6 4l14 8-14 8z\"/></svg></div><div class=\"flow-node-label\">Start</div></div>",
+              "typenode": false,
+              "inputs": {},
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "4",
+                      "output": "input_1"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 26,
+              "pos_y": 298
+            },
+            "2": {
+              "id": 2,
+              "name": "end",
+              "data": {},
+              "class": "flow-node-end",
+              "html": "<div class=\"flow-node flow-node-end\"><div class=\"flow-node-icon\"><svg class=\"ic ic-stop ic-fill\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><rect x=\"6\" y=\"6\" width=\"12\" height=\"12\" rx=\"2\"/></svg></div><div class=\"flow-node-label\">End</div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "4",
+                      "input": "output_1"
+                    }
+                  ]
+                }
+              },
+              "outputs": {},
+              "pos_x": 831,
+              "pos_y": 267
+            },
+            "3": {
+              "id": 3,
+              "name": "argument",
+              "data": {
+                "name": "project_path",
+                "type": "string",
+                "required": "yes",
+                "default": "",
+                "description": "the absolute path to the folder where the Godot project should be created"
+              },
+              "class": "flow-node-argument",
+              "html": "<div class=\"flow-node-tool flow-node-variable\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\"><svg class=\"ic ic-arrow-right\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M5 12h14M12 5l7 7-7 7\"/></svg></span><span class=\"flow-node-label\">Argument</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row\"><span class=\"flow-param-label\">name</span><input class=\"flow-param-input\" type=\"text\" df-name placeholder=\"arg_name\"/></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">type</span><select class=\"flow-param-input\" df-type><option value=\"string\">string</option><option value=\"integer\">integer</option><option value=\"number\">number</option><option value=\"boolean\">boolean</option></select></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">required</span><select class=\"flow-param-input\" df-required><option value=\"no\">no</option><option value=\"yes\">yes</option></select></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">default</span><input class=\"flow-param-input\" type=\"text\" df-default placeholder=\"fallback if not passed in\"/></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">description</span><input class=\"flow-param-input\" type=\"text\" df-description placeholder=\"shown in the Tools tab\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: \u2014</span><span>out: value</span></div></div>",
+              "typenode": false,
+              "inputs": {},
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "5",
+                      "output": "input_2"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 84,
+              "pos_y": -5
+            },
+            "4": {
+              "id": 4,
+              "name": "print",
+              "data": {
+                "value": ""
+              },
+              "class": "flow-node-print",
+              "html": "<div class=\"flow-node-tool flow-node-logic\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\"><svg class=\"ic ic-terminal\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M4 17l6-6-6-6\"/><path d=\"M12 19h8\"/></svg></span><span class=\"flow-node-label\">Print</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row\"><span class=\"flow-param-label\">value</span><input class=\"flow-param-input\" type=\"text\" df-value placeholder=\"fallback if Value pin unwired\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: seq, value</span><span>out: seq</span></div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": [
+                    {
+                      "node": "1",
+                      "input": "output_1"
+                    }
+                  ]
+                },
+                "input_2": {
+                  "connections": [
+                    {
+                      "node": "5",
+                      "input": "output_1"
+                    }
+                  ]
+                }
+              },
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "2",
+                      "output": "input_1"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 525,
+              "pos_y": 280
+            },
+            "5": {
+              "id": 5,
+              "name": "op::calc",
+              "data": {
+                "op": "concat",
+                "a": "Godot project created at ",
+                "b": ""
+              },
+              "class": "flow-node-op--calc",
+              "html": "<div class=\"flow-node-tool flow-node-logic\"><div class=\"flow-node-tool-hdr\"><span class=\"flow-node-icon\"><svg class=\"ic ic-zap\" viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M13 2 3 14h9l-1 8 10-12h-9l1-8z\"/></svg></span><span class=\"flow-node-label\">Operation</span></div><div class=\"flow-node-params\"><div class=\"flow-param-row\"><span class=\"flow-param-label\">op</span><select class=\"flow-param-input\" df-op><option value=\"add\">A + B</option><option value=\"subtract\">A \u2212 B</option><option value=\"multiply\">A \u00d7 B</option><option value=\"divide\">A \u00f7 B</option><option value=\"equals\">A == B</option><option value=\"not_equals\">A != B</option><option value=\"greater_than\">A &gt; B</option><option value=\"less_than\">A &lt; B</option><option value=\"greater_equal\">A &gt;= B</option><option value=\"less_equal\">A &lt;= B</option><option value=\"and\">A and B</option><option value=\"or\">A or B</option><option value=\"concat\">A + B (text)</option></select></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">a</span><input class=\"flow-param-input\" type=\"text\" df-a placeholder=\"fallback if A unwired\"/></div><div class=\"flow-param-row\"><span class=\"flow-param-label\">b</span><input class=\"flow-param-input\" type=\"text\" df-b placeholder=\"fallback if B unwired\"/></div></div><div class=\"flow-node-pin-hint\"><span>in: a, b</span><span>out: result</span></div></div>",
+              "typenode": false,
+              "inputs": {
+                "input_1": {
+                  "connections": []
+                },
+                "input_2": {
+                  "connections": [
+                    {
+                      "node": "3",
+                      "input": "output_1"
+                    }
+                  ]
+                }
+              },
+              "outputs": {
+                "output_1": {
+                  "connections": [
+                    {
+                      "node": "4",
+                      "output": "input_2"
+                    }
+                  ]
+                }
+              },
+              "pos_x": 396,
+              "pos_y": 61
+            }
+          }
+        }
+      }
+    }
   }
 }

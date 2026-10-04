@@ -319,7 +319,8 @@ tools = [
                 "type": "object",
                 "properties": {
                     "command":           {"type": "string", "description": "The exact PowerShell command to execute."},
-                    "working_directory": {"type": "string", "description": "Optional: absolute folder path to run from."}
+                    "working_directory": {"type": "string", "description": "Optional: absolute folder path to run from."},
+                    "is_long_running":   {"type": "boolean", "description": "Optional: set true if the command may take a long time, otherwise the command will timeout after 30 seconds (e.g., >30s). Default false."}
                 },
                 "required": ["command"],
             },
@@ -1306,6 +1307,47 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "delegate_to_openai_web",
+            "description": (
+                "Hand off an entire task to ChatGPT (via the web-app account session, "
+                "llm_cookie_bridge) as a real COWORKER, not just a text consultant — "
+                "same idea as delegate_to_gemini_web but running on ChatGPT's own "
+                "web-app account session instead of Gemini's. The ChatGPT sub-agent "
+                "gets FULL access to every tool Midum has and works through the task "
+                "independently in an ISOLATED conversation, then reports back a final "
+                "summary. Slower per-step than delegate_to_openrouter (each step is a "
+                "real chatgpt.com round trip, and this library resends the whole "
+                "transcript each hop rather than using a persistent server-side "
+                "session) — prefer delegate_to_openrouter unless the user specifically "
+                "asks for ChatGPT."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "The complete task to hand off, written as a self-contained "
+                            "instruction — the delegate has no other context except this "
+                            "and whatever you put in `context`."
+                        )
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional: relevant background the delegate needs (file contents, prior findings, constraints)."
+                    },
+                    "max_steps": {
+                        "type": "integer",
+                        "description": "Optional: cap on tool-call steps the delegate can take before it must report back. Default 10."
+                    }
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "wait",
             "description": "Pause execution for a specific number of seconds. Use this when waiting for an application to launch, a web page to load, or a background process to complete.",
             "parameters": {
@@ -1457,6 +1499,7 @@ tools = [
                 "List a directory as a numbered indexed table (IDX | TYPE | SIZE | NAME). "
                 "PREFERRED over explore_path — returns an index you can act on. "
                 "Follow up with open_path(path, index) to open a file or enter a subfolder."
+                "Use 'current' as path to get the current working directory."
             ),
             "parameters": {
                 "type": "object",
@@ -2948,6 +2991,8 @@ tools = [
             "description": (
                 "Reposition and/or resize an open Ambient Surface without touching its "
                 "content -- e.g. slide it next to a different element, or shrink it. "
+                "The widget GLIDES smoothly to the new spot (ease-in-out, ~450 ms by "
+                "default) instead of teleporting; the call returns once it arrives. "
                 "Pass only the values you want to change (any of x, y, width, height); "
                 "the rest stay as they are. Same coordinate rules as "
                 "show_ambient_surface (canvas coordinates by default). surface_id may "
@@ -2961,6 +3006,10 @@ tools = [
                     "y": {"type": "integer", "description": "New top edge."},
                     "width": {"type": "integer", "description": "New width."},
                     "height": {"type": "integer", "description": "New height."},
+                    "duration_ms": {
+                        "type": "integer",
+                        "description": "Glide duration in milliseconds. Default 450, max 3000; 0 = jump instantly."
+                    },
                     "coordinate_space": {
                         "type": "string",
                         "enum": ["canvas", "screen"],
@@ -3002,6 +3051,92 @@ tools = [
                 "may have closed some."
             ),
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_ambient_surface",
+            "description": (
+                "Save a snapshot of an OPEN Ambient Surface -- its HTML/CSS/JS, title, look, "
+                "and its current position and size -- to disk under `name`, so it can be "
+                "brought back later with load_ambient_surface(name), even in a future "
+                "session or after the app restarts. Unlike the live widget (memory only, "
+                "gone once dismissed), a saved one persists. The live widget stays open. "
+                "Saving under an existing name OVERWRITES it. surface_id picks which "
+                "widget; it may be omitted only when exactly one is open."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Name to save it under (letters, digits, spaces, _ or -)."},
+                    "surface_id": {"type": "string", "description": "Which open widget to save (optional if only one is open)."}
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_saved_ambient_surfaces",
+            "description": (
+                "List every Ambient Surface previously saved with save_ambient_surface (by "
+                "you or anyone), by name, with its title, size and when it was saved. "
+                "Follow up with load_ambient_surface(name) to put one back on screen, or "
+                "delete_saved_ambient_surface(name) to remove one."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_ambient_surface",
+            "description": (
+                "Put a previously SAVED Ambient Surface back on screen -- same effect as "
+                "show_ambient_surface, but the code, look, position and size come from "
+                "disk, so nothing needs regenerating. By default it reopens exactly where "
+                "and how big it was saved; pass any of x, y, width, height to override "
+                "just those (canvas coordinates by default). surface_id sets the id of the "
+                "opened widget (defaults to the saved name; an already-open id is "
+                "replaced). Call list_saved_ambient_surfaces() first if unsure of the name."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Exact saved name, from list_saved_ambient_surfaces()."},
+                    "surface_id": {"type": "string", "description": "Optional id for the opened widget."},
+                    "x": {"type": "integer", "description": "Override the left edge."},
+                    "y": {"type": "integer", "description": "Override the top edge."},
+                    "width": {"type": "integer", "description": "Override the width."},
+                    "height": {"type": "integer", "description": "Override the height."},
+                    "coordinate_space": {
+                        "type": "string",
+                        "enum": ["canvas", "screen"],
+                        "description": "Space for any overrides. 'canvas' (default) or raw 'screen' pixels."
+                    }
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_saved_ambient_surface",
+            "description": (
+                "Permanently delete a saved Ambient Surface by name (see "
+                "list_saved_ambient_surfaces). Does not affect a widget currently on "
+                "screen -- only the saved copy on disk."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Exact saved name, from list_saved_ambient_surfaces()."}
+                },
+                "required": ["name"],
+            },
         },
     },
     {
@@ -3224,6 +3359,70 @@ tools = [
                 "reasoning and tool-use pipeline -- a real chat interface to Midum over Discord."
             ),
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_filesystem_mcp_policy",
+            "description": (
+                "Show the current Filesystem MCP folder-restriction policy: allowed roots and "
+                "blocked sub-paths."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_filesystem_mcp_allowed_roots",
+            "description": (
+                "Restrict the Filesystem MCP server to only these absolute root folder(s). "
+                "Pass an empty list to remove the extra restriction and fall back to whatever "
+                "roots the server itself was launched with."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "roots": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Absolute folder paths the Filesystem MCP is allowed to touch."
+                    }
+                },
+                "required": ["roots"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "block_filesystem_mcp_subpath",
+            "description": (
+                "Block one specific absolute sub-path on the Filesystem MCP, even if it sits "
+                "inside an otherwise-allowed root (e.g. a .git folder, a secrets/ directory)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to block."}
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unblock_filesystem_mcp_subpath",
+            "description": "Remove a previously blocked sub-path on the Filesystem MCP.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to unblock."}
+                },
+                "required": ["path"],
+            },
         },
     },
 ]
