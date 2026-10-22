@@ -67,6 +67,14 @@
 # returns an explanatory error instead of doing anything.
 _gui_render_hook = None
 
+
+def _release_artifact_surface():
+    """The model is driving the surface directly: stop auto-refreshing any artifact preview into it."""
+    try:
+        import artifacts as _artifacts
+        _artifacts.clear_shown()
+    except Exception:
+        pass
 # ── Persisted Render Surfaces ──────────────────────────────────────────────
 # save_render_surface/load_render_surface let the model (or the user, via
 # the GUI's own picker) name and keep a snapshot of a Render Surface's
@@ -101,6 +109,7 @@ def _saved_surface_path(name: str) -> str:
 # all without leaving the sandboxed iframe or needing a postMessage round
 # trip. They work the same as any other native tool if called by the model
 # directly too.
+import base64
 import mimetypes
 
 try:
@@ -472,6 +481,7 @@ def write_render_code(code: str, title: str = "") -> str:
     if _gui_render_hook is None:
         return ("[RENDER SURFACE ERROR] No GUI attached -- this tool only "
                 "works inside the Midum desktop app.")
+    _release_artifact_surface()
     return _gui_render_hook("write", {"code": code, "title": title})
 
 
@@ -491,6 +501,7 @@ def edit_render_code(old_code: str, new_code: str) -> str:
     if _gui_render_hook is None:
         return ("[RENDER SURFACE ERROR] No GUI attached -- this tool only "
                 "works inside the Midum desktop app.")
+    _release_artifact_surface()
     return _gui_render_hook("edit", {"old_code": old_code, "new_code": new_code})
 
 
@@ -505,6 +516,7 @@ def close_render_surface() -> str:
     if _gui_render_hook is None:
         return ("[RENDER SURFACE ERROR] No GUI attached -- this tool only "
                 "works inside the Midum desktop app.")
+    _release_artifact_surface()
     return _gui_render_hook("close", {})
 
 
@@ -575,6 +587,7 @@ def load_render_surface(name: str) -> str:
     if _gui_render_hook is None:
         return ("[RENDER SURFACE ERROR] No GUI attached -- this tool only "
                 "works inside the Midum desktop app.")
+    _release_artifact_surface()
     return _gui_render_hook("load", {"name": name})
 
 

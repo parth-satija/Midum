@@ -71,6 +71,17 @@ _KB_ONLY_BLOCKED_TOOLS = {
     "read_local_file", "read_file_smart", "read_file_chunk",
     "list_directory", "open_path", "open_path_by_index", "find_file",
     "list_paths_indexed", "get_path",
+    # analyze_artifact sends the file to Gemini over the internet -- KB Only is
+    # a closed, offline context. (Local read_artifact/search_artifact/view_artifact
+    # stay allowed: those are files the user explicitly attached to this chat.)
+    "analyze_artifact",
+    # add_artifact_from_path reads an arbitrary file off the user's disk -- same reason the
+    # other local file-reading tools above are blocked in this closed context.
+    "add_artifact_from_path",
+    # Render-surface WebAPI/asset tools: webapi_fetch / search_web_assets / stream_web_asset go out
+    # to the open internet, and stream_asset reads an arbitrary local file by path -- none belong
+    # in a closed, offline KB Only context. (search_assets only lists files under storage/.)
+    "webapi_fetch", "search_web_assets", "stream_web_asset", "stream_asset",
 }
 
 

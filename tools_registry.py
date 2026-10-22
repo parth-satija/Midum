@@ -1366,6 +1366,61 @@ def execute_terminal_command(command, working_directory=None, is_long_running=Fa
     except Exception as e:
         return f"Execution failed: {str(e)}"
     
+# Last config.get_startup_dir() the live PowerShell session was synced to, so a
+# GUI workspace switch moves the shared terminal exactly once (see below).
+_live_ps_startup_dir = None
+
+
+def execute_terminal_command_live(command, working_directory=None, is_long_running=False):
+    """
+    The MODEL-FACING execute_terminal_command: runs `command` in the same
+    persistent PowerShell session that the GUI's Shell tab (PowerShell) and
+    the Editor's terminal panel show live -- so cwd, $variables, imported
+    modules and activated environments persist between calls, and the user
+    watches every command and its output stream in like a real terminal.
+
+    execute_terminal_command() above is deliberately left alone: Midum's own
+    helpers (open_url, path_resolver, ...) call it and parse its
+    "STDOUT:/STDERR:" result, and they must not spam the user's terminal.
+    """
+    global _live_ps_startup_dir
+    if not _IS_WINDOWS:
+        return execute_terminal_command(command, working_directory, is_long_running)
+    try:
+        from shell_session import get_shell_session
+        sess = get_shell_session("powershell")
+        if sess.ensure_ready():
+            # PowerShell session couldn't start -> old one-shot runner.
+            return execute_terminal_command(command, working_directory, is_long_running)
+
+        # Where should this command run? An explicit working_directory wins;
+        # otherwise the shared shell stays wherever it is -- it STARTS in the
+        # editor's active workspace folder (see shell_session.set_workspace_resolver)
+        # and follows `cd`s from the model, the user and the editor's workspace link.
+        cd_target = working_directory
+        if cd_target:
+            cd_out = sess.run(
+                "Set-Location -LiteralPath '" + str(cd_target).replace("'", "''") + "' -ErrorAction Stop",
+                origin="model", timeout=15,
+            )
+            if not cd_out.rstrip().endswith("[exit code 0]"):
+                return f"Execution failed: could not change directory to '{cd_target}': {cd_out.strip()}"
+
+        timeout = 300 if is_long_running else 30
+        output = sess.run(command, origin="model", timeout=timeout)
+        m = re.search(r"\n?\[exit code (\S*)\]\Z", output)
+        body, code = (output[:m.start()], m.group(1)) if m else (output, None)
+        result = (
+            f"STDOUT:\n{body}\nSTDERR:\n"
+            "(stderr is interleaved into STDOUT above -- this is a live, persistent terminal)"
+        )
+        if code is not None:
+            result += f"\n[exit code {code}]"
+        return result
+    except Exception as e:
+        return f"Execution failed: {str(e)}"
+
+
 def execute_wsl_command(command, timeout=60):
     """
     Run a bash command in YOUR OWN persistent WSL2 Linux terminal --

@@ -309,7 +309,11 @@ tools = [
         "function": {
             "name": "execute_terminal_command",
             "description": (
-                "Run a PowerShell command on the local Windows machine. "
+                "Run a PowerShell command on the local Windows machine, in a PERSISTENT PowerShell session: "
+                "the working directory, $variables and imported modules carry over between calls, "
+                "and the user watches every command and its output live in the Shell tab (PowerShell) "
+                "and the Editor's terminal panel, like a real terminal. stderr is interleaved into the output. "
+                "Do not run interactive programs that wait for keyboard input. "
                 "To open an app: ALWAYS use Start-Process with the full path from paths.md. "
                 "Example: Start-Process 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'. "
                 "NEVER use 'start chrome', 'start firefox', or any shorthand — always the full path. "

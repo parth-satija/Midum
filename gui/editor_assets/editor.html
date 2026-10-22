@@ -1,0 +1,1875 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Midum Editor</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#05070c;--panel:#0b0f19;--surface:#0d1220;--surface2:#121a2c;--border:#141a26;--border2:#1f2937;
+  --accent:#60a5fa;--accent-dim:#3b82f6;--accent-faint:#0f1e33;--text:#f3f4f6;--subtext:#9ca3af;--muted:#4b5563;
+  --green:#10b981;--red:#ef4444;--yellow:#f59e0b;
+  --ui:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"JetBrains Mono","Cascadia Code","Fira Code",Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font:12px/1.4 var(--ui);overflow:hidden;user-select:none;-webkit-user-select:none}
+button{font:inherit;color:inherit}
+#app{display:flex;height:100%;width:100%}
+/* ── sidebar ── */
+#side{width:260px;min-width:160px;max-width:70%;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;flex:0 0 auto;overflow:hidden}
+#side.hidden{display:none}
+#resizer{width:4px;margin-left:-2px;cursor:col-resize;flex:0 0 auto;z-index:5;position:relative}
+#resizer:hover,#resizer.drag{background:var(--accent)}
+.side-title{height:30px;display:flex;align-items:center;padding:0 10px;font-size:11px;font-weight:700;letter-spacing:.06em;color:var(--subtext);flex:0 0 auto}
+.side-title .sp{flex:1}
+.ib{background:none;border:0;border-radius:4px;width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;color:var(--subtext);cursor:pointer;padding:0}
+.ib:hover{background:var(--surface2);color:var(--text)}
+.ib svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.sec{display:flex;flex-direction:column;min-height:0}
+.sec.ws{flex:1 1 auto}
+.sec.art{flex:0 1 auto;max-height:45%;border-top:1px solid var(--border)}
+.sec-hdr{display:flex;align-items:center;height:24px;padding:0 4px 0 6px;font-size:11px;font-weight:700;letter-spacing:.04em;color:var(--text);cursor:pointer;text-transform:uppercase;flex:0 0 auto;background:var(--surface)}
+.sec-hdr .chev{width:14px;height:14px;transition:transform .12s;flex:0 0 auto}
+.sec.closed .sec-hdr .chev{transform:rotate(-90deg)}
+.sec-hdr .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-left:2px}
+.sec-hdr .cnt{background:var(--accent-faint);color:var(--accent);border-radius:9px;padding:0 6px;font-size:10px;margin-right:4px}
+.sec-hdr .acts{display:none}
+.sec-hdr:hover .acts{display:flex}
+.sec-body{overflow:auto;flex:1 1 auto;min-height:0;padding-bottom:6px;outline:none}
+.sec.closed .sec-body{display:none}
+.row{display:flex;align-items:center;height:22px;padding-right:8px;cursor:pointer;white-space:nowrap;color:var(--subtext);gap:5px}
+.row:hover{background:var(--surface2);color:var(--text)}
+.row.sel{background:var(--accent-faint);color:var(--text)}
+.row.act{color:var(--text);box-shadow:inset 2px 0 0 var(--accent)}
+.row .chev{width:14px;height:14px;flex:0 0 14px;color:var(--muted);transition:transform .1s;fill:none;stroke:currentColor;stroke-width:2.2}
+.row .chev.open{transform:rotate(90deg)}
+.row .gap{width:14px;flex:0 0 14px}
+.row .r-name{overflow:hidden;text-overflow:ellipsis}
+.row .r-badge{margin-left:auto;font-size:10px;color:var(--muted);padding-left:6px}
+.row .fold{width:15px;height:15px;flex:0 0 15px;fill:var(--accent-dim);opacity:.85}
+.row input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--accent);color:var(--text);border-radius:3px;height:18px;font:inherit;padding:0 4px;outline:none;user-select:text;-webkit-user-select:text}
+.fi{display:inline-flex;align-items:center;justify-content:center;min-width:17px;height:14px;padding:0 2px;border-radius:3px;font:700 8px/1 var(--ui);letter-spacing:-.2px;flex:0 0 auto}
+.empty-note{padding:10px 14px;color:var(--muted);font-size:11px;line-height:1.5}
+.empty-note button{margin-top:8px;display:block}
+.btn{background:var(--surface2);border:1px solid var(--border2);border-radius:5px;padding:4px 12px;cursor:pointer;color:var(--text)}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent-dim);border-color:var(--accent-dim);color:#fff}
+/* ── center ── */
+#center{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;background:var(--bg)}
+#tabs-wrap{display:flex;background:var(--panel);border-bottom:1px solid var(--border);flex:0 0 auto;height:34px}
+#tabs{display:flex;overflow-x:auto;overflow-y:hidden;flex:1 1 auto;scrollbar-width:none}
+#tabs::-webkit-scrollbar{display:none}
+#tabs-actions{display:flex;align-items:center;padding:0 4px;flex:0 0 auto}
+.tab{display:flex;align-items:center;gap:6px;height:34px;padding:0 6px 0 10px;border-right:1px solid var(--border);color:var(--subtext);cursor:pointer;min-width:84px;max-width:230px;flex:0 0 auto;position:relative}
+.tab:hover{background:var(--surface)}
+.tab.active{background:var(--bg);color:var(--text);box-shadow:inset 0 2px 0 var(--accent)}
+.tab.preview .t-name{font-style:italic}
+.tab.deleted .t-name{text-decoration:line-through;opacity:.7}
+.tab.dragover{box-shadow:inset 2px 0 0 var(--accent)}
+.t-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.t-badge{font-size:9px;color:var(--muted);border:1px solid var(--border2);border-radius:3px;padding:0 3px}
+.t-close{width:18px;height:18px;border-radius:4px;display:inline-flex;align-items:center;justify-content:center;margin-left:auto;opacity:0;flex:0 0 auto}
+.tab:hover .t-close,.tab.active .t-close,.tab.dirty .t-close{opacity:1}
+.t-close:hover{background:var(--surface2)}
+.t-close svg{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round}
+.t-close .dot{width:8px;height:8px;border-radius:50%;background:var(--text);display:block}
+.tab.dirty .t-close:hover .dot{display:none}
+.tab.dirty .t-close:hover::after{content:"\00d7";font-size:15px;line-height:1}
+#crumbs{height:22px;display:flex;align-items:center;padding:0 12px;color:var(--subtext);font-size:11px;gap:4px;flex:0 0 auto;overflow:hidden;white-space:nowrap;border-bottom:1px solid var(--border)}
+#crumbs .sep{color:var(--muted)}
+#crumbs .last{color:var(--text)}
+#banner{display:none;align-items:center;gap:10px;padding:6px 12px;font-size:12px;flex:0 0 auto;border-bottom:1px solid var(--border)}
+#banner.show{display:flex}
+#banner.warn{background:#3a2a07;color:#fcd34d}
+#banner.info{background:var(--accent-faint);color:var(--accent)}
+#banner .sp{flex:1}
+#banner .btn{padding:2px 10px}
+#editor-wrap{position:relative;flex:1 1 auto;min-height:0}
+#ed-monaco{position:absolute;inset:0;user-select:text;-webkit-user-select:text}
+.overlay-panel{position:absolute;inset:0;display:none;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:var(--subtext);text-align:center;padding:24px;background:var(--bg)}
+.overlay-panel.show{display:flex}
+#welcome h1{margin:0;font-size:22px;font-weight:600;color:var(--text);letter-spacing:.01em}
+#welcome .sub{color:var(--muted);margin-bottom:6px}
+#welcome .acts{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+#welcome .keys{margin-top:14px;display:grid;grid-template-columns:auto auto;gap:6px 18px;text-align:left;color:var(--subtext)}
+#welcome kbd{background:var(--surface2);border:1px solid var(--border2);border-radius:4px;padding:1px 6px;font:11px var(--mono);color:var(--text)}
+#welcome .recent{margin-top:14px;max-width:420px;text-align:left}
+#welcome .recent a{display:block;color:var(--accent);cursor:pointer;padding:1px 0}
+#welcome .recent a:hover{text-decoration:underline}
+#welcome .recent h3{margin:0 0 4px;font-size:11px;color:var(--subtext);text-transform:uppercase;letter-spacing:.05em}
+/* ── status bar ── */
+#status{height:22px;display:flex;align-items:center;background:var(--panel);border-top:1px solid var(--border);color:var(--subtext);font-size:11px;flex:0 0 auto;padding:0 4px}
+#status .sp{flex:1}
+#status .it{padding:0 8px;height:22px;display:inline-flex;align-items:center;cursor:default;white-space:nowrap}
+#status .it.btn2{cursor:pointer}
+#status .it.btn2:hover{background:var(--surface2);color:var(--text)}
+#status .it.on{color:var(--accent)}
+#status .it.warn{color:var(--yellow)}
+#status .it.err{color:var(--red)}
+.ai-del-line{background:rgba(239,68,68,.16)}
+.ai-del-text{text-decoration:line-through;text-decoration-color:rgba(239,68,68,.75);opacity:.7}
+.ai-zone{background:rgba(16,185,129,.12);color:var(--text);overflow:hidden;white-space:pre;tab-size:4;user-select:none;-webkit-user-select:none}
+.ai-zbar{position:absolute;top:0;bottom:0;width:4px}
+.ai-edit-line{background:rgba(234,179,8,.14)}
+.ai-gm-del,.ai-gm-edit{width:4px!important;margin-left:7px}
+.ai-gm-del{background:#ef4444}
+.ai-gm-edit{background:#eab308}
+/* ── floating ui ── */
+#btn-run{color:#3fb950}
+#btn-run svg{fill:currentColor;stroke:none}
+#btn-run:disabled{opacity:.35;color:inherit;cursor:default}
+/* terminal panel (shares Midum's persistent shells) */
+#term{display:none;flex:0 0 auto;flex-direction:column;background:var(--bg);border-top:1px solid var(--border2);min-height:90px}
+#term.open{display:flex}
+#term-rz{height:4px;margin-top:-2px;cursor:ns-resize;flex:0 0 auto;position:relative;z-index:2}
+#term-rz:hover,#term-rz.drag{background:var(--accent)}
+#term-hdr{display:flex;align-items:center;gap:6px;height:28px;padding:0 8px;background:var(--panel);border-bottom:1px solid var(--border);flex:0 0 auto}
+#term-hdr .sp{flex:1}
+#term-tabs{display:flex;gap:2px}
+.tt{background:none;border:0;border-bottom:2px solid transparent;color:var(--subtext);padding:4px 8px;cursor:pointer;font:inherit}
+.tt:hover{color:var(--text)}
+.tt.on{color:var(--text);border-bottom-color:var(--accent)}
+.tt:disabled{opacity:.4;cursor:default}
+#term-hdr label{display:inline-flex;align-items:center;gap:4px;color:var(--subtext);cursor:pointer;font-size:11px}
+#term-hdr .tb{background:none;border:1px solid var(--border2);border-radius:4px;color:var(--subtext);padding:0 8px;height:20px;cursor:pointer;font:inherit;font-size:11px}
+#term-hdr .tb:hover{color:var(--text);border-color:var(--accent)}
+#term-body{flex:1 1 auto;min-height:0;overflow-y:auto;padding:6px 10px;font:12px/1.5 var(--mono);user-select:text;-webkit-user-select:text;cursor:text}
+.tl{white-space:pre-wrap;word-break:break-word}
+.tl.c{font-weight:600}
+.tl.m{color:var(--subtext);font-style:italic}
+.tl .tw,.tl .tp{color:var(--subtext)}
+.tl .ts{color:var(--accent)}
+#term-prompt{display:flex;align-items:center;font-weight:600}
+#term-pl{color:var(--subtext);white-space:pre}
+#term-sym{color:var(--accent);margin:0 6px 0 4px}
+#term-in{flex:1;min-width:0;background:transparent;border:0;outline:0;color:var(--text);font:inherit;padding:0;user-select:text;-webkit-user-select:text}
+#menu{position:fixed;display:none;z-index:50;min-width:190px;background:var(--panel);border:1px solid var(--border2);border-radius:7px;padding:4px;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+#menu.show{display:block}
+#menu .mi{display:flex;padding:5px 12px;border-radius:4px;cursor:pointer;color:var(--text);gap:20px;align-items:center}
+#menu .mi:hover{background:var(--accent-faint)}
+#menu .mi.dis{opacity:.4;pointer-events:none}
+#menu .mi .k{margin-left:auto;color:var(--muted);font-size:11px}
+#menu .sepl{height:1px;background:var(--border2);margin:4px 2px}
+#modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:flex-start;justify-content:center;z-index:60;padding-top:15vh}
+#modal-bg.show{display:flex}
+#modal{background:var(--panel);border:1px solid var(--border2);border-radius:10px;padding:16px 18px;min-width:340px;max-width:520px;box-shadow:0 20px 50px rgba(0,0,0,.6)}
+#modal h2{margin:0 0 6px;font-size:14px}
+#modal p{margin:0 0 14px;color:var(--subtext);line-height:1.5;white-space:pre-wrap}
+#modal input{width:100%;margin-bottom:14px;background:var(--bg);border:1px solid var(--border2);color:var(--text);border-radius:5px;padding:6px 8px;font:inherit;outline:none;user-select:text;-webkit-user-select:text}
+#modal input:focus{border-color:var(--accent)}
+#modal .bt{display:flex;gap:8px;justify-content:flex-end}
+#quick-bg{position:fixed;inset:0;display:none;z-index:70;align-items:flex-start;justify-content:center;padding-top:10vh}
+#quick-bg.show{display:flex}
+#quick{width:min(560px,92%);background:var(--panel);border:1px solid var(--border2);border-radius:10px;box-shadow:0 20px 50px rgba(0,0,0,.6);overflow:hidden}
+#quick input{width:100%;border:0;border-bottom:1px solid var(--border2);background:var(--surface);color:var(--text);padding:10px 14px;font:13px var(--ui);outline:none;user-select:text;-webkit-user-select:text}
+#quick-list{max-height:320px;overflow:auto}
+#quick-list .qi{display:flex;align-items:center;gap:8px;padding:5px 14px;cursor:pointer;color:var(--text)}
+#quick-list .qi.sel{background:var(--accent-faint)}
+#quick-list .qi .d{color:var(--muted);font-size:11px;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%}
+#quick-list .none{padding:12px 14px;color:var(--muted)}
+#toasts{position:fixed;right:12px;bottom:30px;display:flex;flex-direction:column;gap:6px;z-index:80;pointer-events:none}
+.toast{background:var(--surface2);border:1px solid var(--border2);border-left:3px solid var(--accent);padding:7px 12px;border-radius:6px;max-width:340px;box-shadow:0 8px 20px rgba(0,0,0,.4);animation:tin .15s}
+.toast.err{border-left-color:var(--red)}
+@keyframes tin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+#fatal{position:absolute;inset:0;display:none;align-items:center;justify-content:center;flex-direction:column;gap:12px;background:var(--bg);z-index:90;color:var(--subtext);padding:30px;text-align:center}
+#fatal.show{display:flex}
+#fatal code{color:var(--red);font:11px var(--mono);max-width:560px;white-space:pre-wrap}
+.monaco-editor .scroll-decoration{display:none}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:5px;border:2px solid transparent;background-clip:padding-box}
+::-webkit-scrollbar-thumb:hover{background:var(--muted);background-clip:padding-box;border:2px solid transparent}
+.ai-edit-flash{background:var(--accent-faint);box-shadow:inset 3px 0 0 var(--accent)}
+#modal.wide{max-width:min(920px,92vw);min-width:540px;width:92vw}
+.aidiff{max-height:48vh;overflow:auto;background:var(--bg);border:1px solid var(--border2);border-radius:6px;padding:6px 0;margin:0 0 10px;font:12px/1.45 Consolas,"Cascadia Mono",monospace;user-select:text;-webkit-user-select:text}
+.aidiff div{padding:0 10px;white-space:pre}
+.aidiff .add{background:rgba(63,185,80,.16)}
+.aidiff .del{background:rgba(248,81,73,.16)}
+.aidiff .hunk{color:var(--subtext);opacity:.8}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <div class="side-title"><span>EXPLORER</span><span class="sp"></span>
+      <button class="ib" id="btn-openfile" title="Open File..."><svg viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg></button>
+      <button class="ib" id="btn-openfolder" title="Open Folder..."><svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
+    </div>
+    <div class="sec ws" id="sec-ws">
+      <div class="sec-hdr" id="ws-hdr"><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M6 9l6 6 6-6"/></svg><span class="nm" id="ws-name">No folder open</span>
+        <span class="acts">
+          <button class="ib" data-act="new-file" title="New File"><svg viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M12 11v6M9 14h6"/></svg></button>
+          <button class="ib" data-act="new-dir" title="New Folder"><svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><path d="M12 11v6M9 14h6"/></svg></button>
+          <button class="ib" data-act="refresh" title="Refresh"><svg viewBox="0 0 24 24"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.5 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.65 4.36A9 9 0 0 0 20.5 15"/></svg></button>
+          <button class="ib" data-act="collapse" title="Collapse All"><svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3M8 12h8"/></svg></button>
+        </span></div>
+      <div class="sec-body" id="tree" tabindex="0"></div>
+    </div>
+    <div class="sec art" id="sec-art">
+      <div class="sec-hdr" id="art-hdr"><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M6 9l6 6 6-6"/></svg><span class="nm">Chat Artifacts</span><span class="cnt" id="art-cnt">0</span></div>
+      <div class="sec-body" id="art-list"></div>
+    </div>
+  </div>
+  <div id="resizer"></div>
+  <div id="center">
+    <div id="tabs-wrap"><div id="tabs"></div>
+      <div id="tabs-actions"><button class="ib" id="btn-run" title="Run file (F5)" disabled><svg viewBox="0 0 24 24"><path d="M7 4v16l13-8z"/></svg></button><button class="ib" id="btn-toggle-side" title="Toggle Explorer (Ctrl+B)"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg></button></div></div>
+    <div id="crumbs"></div>
+    <div id="banner"></div>
+    <div id="editor-wrap">
+      <div id="ed-monaco"></div>
+      <div class="overlay-panel" id="welcome">
+        <h1>Midum Editor</h1>
+        <div class="sub">Edit any file on your computer, or the artifacts Midum creates.</div>
+        <div class="acts"><button class="btn primary" id="w-folder">Open Folder...</button><button class="btn" id="w-file">Open File...</button></div>
+        <div class="keys"><span>Quick open file</span><span><kbd>Ctrl</kbd> + <kbd>P</kbd></span><span>Command palette</span><span><kbd>F1</kbd></span><span>Save</span><span><kbd>Ctrl</kbd> + <kbd>S</kbd></span><span>Close tab</span><span><kbd>Ctrl</kbd> + <kbd>W</kbd></span><span>Toggle Explorer</span><span><kbd>Ctrl</kbd> + <kbd>B</kbd></span><span>AI suggestion</span><span><kbd>Tab</kbd> accept &middot; <kbd>Alt</kbd> + <kbd>&#92;</kbd> trigger</span></div>
+        <div class="recent" id="w-recent"></div>
+      </div>
+      <div class="overlay-panel" id="binary"><div id="binary-msg"></div><div class="acts"><button class="btn" id="b-reveal">Show in File Explorer</button></div></div>
+      <div id="fatal"><div style="font-size:15px;color:var(--text)">The code editor could not start</div><div id="fatal-msg"></div><code id="fatal-code"></code><button class="btn primary" id="fatal-retry">Retry</button></div>
+    </div>
+    <div id="term">
+      <div id="term-rz"></div>
+      <div id="term-hdr">
+        <span id="term-tabs"></span><span class="sp"></span>
+        <label title="When you open a folder here, cd both shells into it"><input type="checkbox" id="term-sync"> Link to workspace</label>
+        <button class="tb" id="term-ws" title="Open the terminal's current folder as the workspace">Folder → Workspace</button>
+        <button class="tb" id="term-clear">Clear</button>
+        <button class="tb" id="term-restart">Restart</button>
+        <button class="ib" id="term-close" title="Close terminal (Ctrl+`)"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+      </div>
+      <div id="term-body"><div id="term-out"></div><div id="term-prompt"><span id="term-pl"></span><span id="term-sym"></span><input id="term-in" autocomplete="off" spellcheck="false"></div></div>
+    </div>
+    <div id="status">
+      <span class="it" id="st-left"></span><span class="it btn2" id="st-term" title="Toggle terminal (Ctrl+`)">Terminal</span><span class="sp"></span>
+      <span class="it" id="st-pos"></span>
+      <span class="it" id="st-indent"></span>
+      <span class="it" id="st-enc"></span>
+      <span class="it btn2" id="st-eol" title="Change end of line sequence"></span>
+      <span class="it btn2" id="st-lang" title="Select language mode"></span>
+      <span class="it btn2" id="st-ai" title="AI inline suggestions"></span>
+      <span class="it btn2" id="st-wrap" title="Toggle word wrap (Alt+Z)"></span>
+      <span class="it btn2" id="st-auto" title="Toggle auto save"></span>
+    </div>
+  </div>
+</div>
+<div id="menu"></div>
+<div id="modal-bg"><div id="modal"></div></div>
+<div id="quick-bg"><div id="quick"><input id="quick-input" spellcheck="false" autocomplete="off"><div id="quick-list"></div></div></div>
+<div id="toasts"></div>
+
+<script>
+(function(){
+"use strict";
+var MONACO_BASE_RAW = "__MONACO_BASE__";
+var MONACO_BASE = /^https?:/.test(MONACO_BASE_RAW) ? MONACO_BASE_RAW : location.origin + MONACO_BASE_RAW;
+
+// Monaco rejects in-flight language-service requests with a bare "Canceled" error when a model is disposed
+// (e.g. closing a tab). It is expected and harmless; swallow exactly that and nothing else.
+window.addEventListener("unhandledrejection", function(e){
+  var r = e.reason;
+  if (r && (r.name === "Canceled" || r.message === "Canceled")) e.preventDefault();
+});
+
+/* ───────── helpers ───────── */
+var $ = function(s, r){ return (r || document).querySelector(s); };
+var esc = function(s){ return String(s).replace(/[&<>"']/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); };
+var sepOf = function(p){ return (/^[a-zA-Z]:/.test(p) || (p.indexOf("\\") >= 0 && p.indexOf("/") < 0)) ? "\\" : "/"; };
+var baseName = function(p){ return p.replace(/[\\\/]+$/, "").split(/[\\\/]/).pop() || p; };
+var dirName = function(p){
+  var q = p.replace(/[\\\/]+$/, ""), i = Math.max(q.lastIndexOf("\\"), q.lastIndexOf("/"));
+  if (i < 0) return p;
+  var d = q.slice(0, i);
+  if (/^[a-zA-Z]:$/.test(d)) return d + "\\";
+  return d === "" ? "/" : d;
+};
+var joinP = function(d, n){ return d.replace(/[\\\/]+$/, "") + sepOf(d) + n; };
+var extOf = function(n){ var i = n.lastIndexOf("."); return i > 0 ? n.slice(i + 1).toLowerCase() : ""; };
+var pkey = function(p){ var q = p.replace(/\\/g, "/"); return /^[a-zA-Z]:/.test(q) ? q.toLowerCase() : q; };
+var isUnder = function(p, root){ var a = pkey(p), b = pkey(root).replace(/\/+$/, ""); return a === b || a.indexOf(b + "/") === 0; };
+function fmtSize(n){ return n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(1) + " MB"; }
+function debounce(fn, ms){ var t; return function(){ var a = arguments, c = this; clearTimeout(t); t = setTimeout(function(){ fn.apply(c, a); }, ms); }; }
+
+var FI = {py:["PY","#5aa9e6"],pyw:["PY","#5aa9e6"],js:["JS","#e7c63a"],mjs:["JS","#e7c63a"],cjs:["JS","#e7c63a"],jsx:["JSX","#61dafb"],ts:["TS","#3b82f6"],tsx:["TSX","#3b82f6"],
+  json:["{}","#cbcb41"],jsonc:["{}","#cbcb41"],md:["MD","#60a5fa"],markdown:["MD","#60a5fa"],html:["<>","#e8693a"],htm:["<>","#e8693a"],css:["#","#a074c4"],scss:["#","#cd6799"],
+  svg:["SVG","#ffb13b"],yml:["YML","#d9534f"],yaml:["YML","#d9534f"],toml:["TML","#9c6f4b"],ini:["INI","#9ca3af"],cfg:["CFG","#9ca3af"],txt:["TXT","#9ca3af"],csv:["CSV","#34d399"],
+  sh:["SH","#4ade80"],bat:["BAT","#4ade80"],ps1:["PS","#60a5fa"],c:["C","#6b9fd8"],h:["H","#6b9fd8"],cpp:["C++","#6b9fd8"],cs:["C#","#7bc67b"],java:["JV","#e76f51"],
+  go:["GO","#4ec9d6"],rs:["RS","#e08a5b"],rb:["RB","#e05555"],php:["PHP","#8892bf"],sql:["SQL","#e0a458"],xml:["XML","#e8693a"],lock:["LCK","#6b7280"],mmd:["MMD","#f472b6"],
+  png:["IMG","#a78bfa"],jpg:["IMG","#a78bfa"],jpeg:["IMG","#a78bfa"],gif:["IMG","#a78bfa"],pdf:["PDF","#ef4444"],zip:["ZIP","#9ca3af"],log:["LOG","#9ca3af"]};
+function fileIcon(name){
+  var f = FI[extOf(name)];
+  var c = f ? f[1] : "#9ca3af";
+  return '<span class="fi" style="color:' + c + ';background:' + c + '22">' + esc(f ? f[0] : "\u00b7") + "</span>";
+}
+var CHEV = '<svg class="chev#" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>';
+var FOLDER = '<svg class="fold" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
+var X_SVG = '<svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+
+/* ───────── parent bridge (postMessage RPC) ───────── */
+var rpcSeq = 0, pending = {};
+function rpc(method){
+  var args = Array.prototype.slice.call(arguments, 1);
+  return new Promise(function(res, rej){
+    var id = ++rpcSeq;
+    pending[id] = {res: res, rej: rej};
+    parent.postMessage({__ed: "rpc", id: id, method: method, args: args}, "*");
+    if (!/^editor_pick/.test(method)){
+      setTimeout(function(){ if (pending[id]){ delete pending[id]; rej(new Error("timed out: " + method)); } }, 60000);
+    }
+  });
+}
+var eventQueue = [], booted = false;
+window.addEventListener("message", function(e){
+  if (e.source !== parent) return;
+  var d = e.data;
+  if (!d || !d.__ed) return;
+  if (d.__ed === "rpc_result"){
+    var p = pending[d.id]; if (!p) return; delete pending[d.id];
+    if (d.error) p.rej(new Error(d.error)); else p.res(d.result);
+  } else if (d.__ed === "theme"){
+    applyThemeVars(d.vars || {});
+  } else if (d.__ed === "event"){
+    if (booted) handleEvent(d.kind, d.payload); else eventQueue.push(d);
+  }
+});
+function postParent(msg){ try { parent.postMessage(msg, "*"); } catch (e) {} }
+
+/* ───────── theme ───────── */
+function toHex(c){
+  var cv = toHex._c || (toHex._c = document.createElement("canvas").getContext("2d"));
+  cv.fillStyle = "#000000"; cv.fillStyle = c;
+  var v = cv.fillStyle;
+  if (v.charAt(0) === "#") return v.length === 4 ? "#" + v[1] + v[1] + v[2] + v[2] + v[3] + v[3] : v;
+  var m = v.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  return m ? "#" + [m[1], m[2], m[3]].map(function(n){ return (+n).toString(16).padStart(2, "0"); }).join("") : "#000000";
+}
+function lum(h){ var r = parseInt(h.slice(1,3),16), g = parseInt(h.slice(3,5),16), b = parseInt(h.slice(5,7),16); return (0.299*r + 0.587*g + 0.114*b) / 255; }
+function cssVar(n){ return toHex(getComputedStyle(document.documentElement).getPropertyValue(n).trim() || "#000000"); }
+function applyThemeVars(vars){
+  Object.keys(vars).forEach(function(k){ if (vars[k]) document.documentElement.style.setProperty(k, vars[k]); });
+  if (monacoReady) defineTheme();
+}
+function defineTheme(){
+  var bg = cssVar("--bg"), panel = cssVar("--panel"), surf = cssVar("--surface"), surf2 = cssVar("--surface2"),
+      b = cssVar("--border2"), acc = cssVar("--accent"), text = cssVar("--text"), sub = cssVar("--subtext"), mut = cssVar("--muted");
+  var light = lum(bg) > 0.55;
+  monaco.editor.defineTheme("midum", {base: light ? "vs" : "vs-dark", inherit: true, rules: [], colors: {
+    "editor.background": bg, "editor.foreground": text, "editorGutter.background": bg,
+    "editorLineNumber.foreground": mut, "editorLineNumber.activeForeground": sub,
+    "editorCursor.foreground": acc, "editor.selectionBackground": acc + "44", "editor.inactiveSelectionBackground": acc + "22",
+    "editor.lineHighlightBackground": surf + "aa", "editor.lineHighlightBorder": "#00000000",
+    "editorIndentGuide.background1": b, "editorIndentGuide.activeBackground1": mut,
+    "editorWidget.background": panel, "editorWidget.border": b,
+    "editorSuggestWidget.background": panel, "editorSuggestWidget.border": b, "editorSuggestWidget.selectedBackground": surf2,
+    "editorHoverWidget.background": panel, "editorHoverWidget.border": b,
+    "input.background": surf, "input.border": b, "focusBorder": acc + "88",
+    "scrollbarSlider.background": mut + "55", "scrollbarSlider.hoverBackground": mut + "88", "scrollbarSlider.activeBackground": mut + "aa",
+    "minimap.background": bg, "editorBracketMatch.background": acc + "33", "editorBracketMatch.border": acc + "88",
+    "list.hoverBackground": surf2, "list.activeSelectionBackground": surf2, "list.focusBackground": surf2,
+    "quickInput.background": panel, "editorStickyScroll.background": panel, "editorStickyScrollHover.background": surf2,
+    "editorOverviewRuler.border": "#00000000", "editorGroup.border": b
+  }});
+  monaco.editor.setTheme("midum");
+}
+
+/* ───────── state ───────── */
+var S = {workspace: "", recent: [], tabs: [], active: null, expanded: new Set(), collapsed: {artifacts: false, workspace: false},
+         sideWidth: 260, sideHidden: false, fontSize: 13, wordWrap: false, minimap: true, autoSave: false, artifacts: [],
+         termOpen: false, termSync: true, termHeight: 240, termShell: "wsl", inlineAI: true, aiApprove: true};
+var T = {dirs: new Map(), sel: null, editing: null};
+var monacoReady = false, ED = null;
+
+var persist = debounce(function(){
+  rpc("editor_set_state", {
+    workspace: S.workspace, recent: S.recent, active: S.active, expanded: Array.from(S.expanded), collapsed: S.collapsed,
+    sideWidth: S.sideWidth, fontSize: S.fontSize, wordWrap: S.wordWrap, minimap: S.minimap, autoSave: S.autoSave,
+    termOpen: S.termOpen, termSync: S.termSync, termHeight: S.termHeight, termShell: S.termShell, inlineAI: S.inlineAI, aiApprove: S.aiApprove,
+    tabs: S.tabs.map(function(t){ return {key: t.key, kind: t.kind, path: t.path, id: t.id, name: t.name, preview: !!t.preview}; })
+  }).catch(function(){});
+}, 400);
+
+function activeTab(){ return S.tabs.find(function(t){ return t.key === S.active; }) || null; }
+
+/* ───────── toasts / menu / modal / quick pick ───────── */
+function toast(msg, kind){
+  var d = document.createElement("div"); d.className = "toast" + (kind === "err" ? " err" : ""); d.textContent = msg;
+  $("#toasts").appendChild(d);
+  setTimeout(function(){ d.remove(); }, kind === "err" ? 6000 : 2600);
+}
+function hideMenu(){ $("#menu").classList.remove("show"); }
+function showMenu(x, y, items){
+  var m = $("#menu");
+  m.innerHTML = items.map(function(it, i){
+    if (it.sep) return '<div class="sepl"></div>';
+    return '<div class="mi' + (it.disabled ? " dis" : "") + '" data-i="' + i + '"><span>' + esc(it.label) + '</span>' + (it.key ? '<span class="k">' + esc(it.key) + "</span>" : "") + "</div>";
+  }).join("");
+  m.classList.add("show");
+  var w = m.offsetWidth, h = m.offsetHeight;
+  m.style.left = Math.max(4, Math.min(x, innerWidth - w - 4)) + "px";
+  m.style.top = Math.max(4, Math.min(y, innerHeight - h - 4)) + "px";
+  m.onclick = function(e){
+    var el = e.target.closest(".mi"); if (!el) return;
+    var it = items[+el.dataset.i]; hideMenu();
+    if (it && it.action) it.action();
+  };
+}
+document.addEventListener("mousedown", function(e){ if (!e.target.closest("#menu")) hideMenu(); });
+window.addEventListener("blur", hideMenu);
+
+function modal(opts){
+  return new Promise(function(resolve){
+    var bg = $("#modal-bg"), box = $("#modal");
+    box.innerHTML = "<h2>" + esc(opts.title || "") + "</h2>" + (opts.message ? "<p>" + esc(opts.message) + "</p>" : "") +
+      (opts.input != null ? '<input id="modal-input" spellcheck="false" value="' + esc(opts.input) + '">' : "") +
+      '<div class="bt">' + opts.buttons.map(function(b, i){ return '<button class="btn' + (b.primary ? " primary" : "") + '" data-i="' + i + '">' + esc(b.label) + "</button>"; }).join("") + "</div>";
+    bg.classList.add("show");
+    var inp = $("#modal-input");
+    function done(v){ bg.classList.remove("show"); document.removeEventListener("keydown", onKey, true); resolve(v); }
+    function pick(i){ var b = opts.buttons[i]; done(inp && b.value === "ok" ? inp.value : b.value); }
+    function onKey(e){
+      if (e.key === "Escape"){ e.preventDefault(); e.stopPropagation(); done(null); }
+      else if (e.key === "Enter"){ e.preventDefault(); e.stopPropagation(); var p = opts.buttons.findIndex(function(b){ return b.primary; }); pick(p < 0 ? 0 : p); }
+    }
+    document.addEventListener("keydown", onKey, true);
+    box.onclick = function(e){ var b = e.target.closest("button[data-i]"); if (b) pick(+b.dataset.i); };
+    if (inp){ inp.focus(); var dot = inp.value.lastIndexOf("."); inp.setSelectionRange(0, dot > 0 ? dot : inp.value.length); }
+  });
+}
+function confirmDlg(title, message, okLabel){
+  return modal({title: title, message: message, buttons: [{label: "Cancel", value: null}, {label: okLabel || "OK", value: true, primary: true}]});
+}
+function promptDlg(title, value, message){
+  return modal({title: title, message: message || "", input: value || "", buttons: [{label: "Cancel", value: null}, {label: "OK", value: "ok", primary: true}]});
+}
+
+var quick = {items: [], sel: 0, source: null, onPick: null, seq: 0};
+function quickPick(opts){
+  quick.source = opts.source; quick.onPick = opts.onPick; quick.sel = 0; quick.items = [];
+  var bg = $("#quick-bg"), inp = $("#quick-input");
+  inp.placeholder = opts.placeholder || ""; inp.value = opts.initial || "";
+  bg.classList.add("show"); inp.focus();
+  runQuick();
+}
+function closeQuick(){ $("#quick-bg").classList.remove("show"); if (ED && activeTab() && activeTab().model) ED.focus(); }
+function runQuick(){
+  var q = $("#quick-input").value, my = ++quick.seq;
+  Promise.resolve(quick.source(q)).then(function(items){
+    if (my !== quick.seq) return;
+    quick.items = items || []; quick.sel = 0; renderQuick();
+  });
+}
+function renderQuick(){
+  var el = $("#quick-list");
+  if (!quick.items.length){ el.innerHTML = '<div class="none">No results</div>'; return; }
+  el.innerHTML = quick.items.map(function(it, i){
+    return '<div class="qi' + (i === quick.sel ? " sel" : "") + '" data-i="' + i + '">' + (it.icon || "") + "<span>" + esc(it.label) + '</span><span class="d">' + esc(it.detail || "") + "</span></div>";
+  }).join("");
+  var s = el.querySelector(".sel"); if (s) s.scrollIntoView({block: "nearest"});
+}
+$("#quick-input").addEventListener("input", debounce(runQuick, 70));
+$("#quick-input").addEventListener("keydown", function(e){
+  if (e.key === "Escape"){ e.preventDefault(); closeQuick(); }
+  else if (e.key === "ArrowDown"){ e.preventDefault(); quick.sel = Math.min(quick.items.length - 1, quick.sel + 1); renderQuick(); }
+  else if (e.key === "ArrowUp"){ e.preventDefault(); quick.sel = Math.max(0, quick.sel - 1); renderQuick(); }
+  else if (e.key === "Enter"){ e.preventDefault(); var it = quick.items[quick.sel]; closeQuick(); if (it) quick.onPick(it); }
+});
+$("#quick-list").addEventListener("click", function(e){
+  var el = e.target.closest(".qi"); if (!el) return;
+  var it = quick.items[+el.dataset.i]; closeQuick(); if (it) quick.onPick(it);
+});
+$("#quick-bg").addEventListener("mousedown", function(e){ if (e.target.id === "quick-bg") closeQuick(); });
+
+function copyText(t){
+  try { if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(t); } catch (e) {}
+  var ta = document.createElement("textarea"); ta.value = t; document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); } catch (e) {} ta.remove();
+}
+
+/* ───────── Monaco loading ───────── */
+var EXT_OVERRIDE = {toml: "ini", cfg: "ini", conf: "ini", env: "ini", mmd: "plaintext", jsonc: "json", lock: "plaintext", gitignore: "plaintext", log: "plaintext"};
+function langFor(name){
+  var lower = name.toLowerCase(), e = extOf(lower);
+  if (EXT_OVERRIDE[e]) return EXT_OVERRIDE[e];
+  var langs = monaco.languages.getLanguages(), i, l;
+  for (i = 0; i < langs.length; i++){ l = langs[i]; if (l.filenames && l.filenames.some(function(f){ return f.toLowerCase() === lower; })) return l.id; }
+  if (e) for (i = 0; i < langs.length; i++){ l = langs[i]; if (l.extensions && l.extensions.some(function(x){ return x.toLowerCase() === "." + e; })) return l.id; }
+  return "plaintext";
+}
+function loadMonaco(){
+  return new Promise(function(resolve, reject){
+    if (window.monaco){ resolve(); return; }
+    var s = document.createElement("script");
+    s.src = MONACO_BASE + "/loader.js";
+    s.onerror = function(){ reject(new Error("Could not load Monaco from " + MONACO_BASE)); };
+    s.onload = function(){
+      var parentBase = MONACO_BASE.replace(/\/vs$/, "/");
+      window.MonacoEnvironment = {getWorkerUrl: function(){
+        var code = "self.MonacoEnvironment={baseUrl:" + JSON.stringify(parentBase) + "};importScripts(" + JSON.stringify(MONACO_BASE + "/base/worker/workerMain.js") + ");";
+        return URL.createObjectURL(new Blob([code], {type: "text/javascript"}));
+      }};
+      window.require.config({paths: {vs: MONACO_BASE}});
+      window.require(["vs/editor/editor.main"], function(){ resolve(); }, function(err){ reject(err instanceof Error ? err : new Error(String(err && err.message || err))); });
+    };
+    document.head.appendChild(s);
+  });
+}
+function createEditor(){
+  monacoReady = true;
+  defineTheme();
+  try {
+    var ts = monaco.languages.typescript;
+    if (ts){ [ts.javascriptDefaults, ts.typescriptDefaults].forEach(function(d){ d.setDiagnosticsOptions({noSemanticValidation: true, noSyntaxValidation: false}); }); }
+    if (monaco.languages.json) monaco.languages.json.jsonDefaults.setDiagnosticsOptions({allowComments: true, validate: true});
+  } catch (e) {}
+  ED = monaco.editor.create($("#ed-monaco"), {
+    model: null, theme: "midum", automaticLayout: true,
+    fontFamily: '"JetBrains Mono","Cascadia Code","Fira Code",Consolas,monospace', fontSize: S.fontSize, fontLigatures: true,
+    minimap: {enabled: S.minimap}, wordWrap: S.wordWrap ? "on" : "off", bracketPairColorization: {enabled: true},
+    guides: {bracketPairs: true, indentation: true}, smoothScrolling: true, cursorSmoothCaretAnimation: "on",
+    renderWhitespace: "selection", scrollBeyondLastLine: false, padding: {top: 8}, mouseWheelZoom: true,
+    stickyScroll: {enabled: true}, tabSize: 4, insertSpaces: true, detectIndentation: true, renderLineHighlight: "all",
+    fixedOverflowWidgets: true, glyphMargin: true, inlineSuggest: {enabled: S.inlineAI, mode: 'subwordSmart', showToolbar: 'never'}
+  });
+  var K = monaco.KeyMod, C = monaco.KeyCode;
+  ED.addCommand(K.CtrlCmd | C.KeyS, function(){ saveActive(); });
+  ED.addCommand(K.CtrlCmd | K.Shift | C.KeyS, function(){ saveAll(); });
+  ED.addCommand(K.CtrlCmd | C.KeyW, function(){ if (S.active) closeTab(S.active); });
+  ED.addCommand(K.CtrlCmd | C.KeyP, function(){ openQuickOpen(); });
+  ED.addCommand(K.CtrlCmd | C.KeyB, function(){ toggleSide(); });
+  ED.addCommand(K.Alt | C.KeyZ, function(){ toggleWrap(); });
+  aiInit();
+  ED.onDidChangeCursorPosition(updatePos);
+  ED.onDidChangeCursorSelection(updatePos);
+  ED.onDidChangeConfiguration(function(e){
+    if (e.hasChanged(monaco.editor.EditorOption.fontSize)){
+      var fs = ED.getOption(monaco.editor.EditorOption.fontSize);
+      if (fs !== S.fontSize){ S.fontSize = fs; persist(); }
+    }
+  });
+}
+
+/* ───────── tabs / models ───────── */
+function newModel(tab, content){
+  var uri = tab.kind === "artifact" ? monaco.Uri.from({scheme: "artifact", authority: tab.id, path: "/" + tab.name}) : monaco.Uri.file(tab.path);
+  var old = monaco.editor.getModel(uri); if (old) old.dispose();
+  var model = monaco.editor.createModel(content, tab.lang, uri);
+  tab.model = model;
+  tab.savedAlt = model.getAlternativeVersionId();
+  tab.dirty = false;
+  model.onDidChangeContent(function(){
+    var wasDirty = tab.dirty, wasPrev = tab.preview;
+    tab.dirty = model.getAlternativeVersionId() !== tab.savedAlt;
+    if (tab.preview && tab.dirty) tab.preview = false;
+    if (wasDirty !== tab.dirty || wasPrev !== tab.preview) renderTabs();
+    if (tab.dirty) scheduleAutoSave(tab);
+    if (tab.key === S.active) renderStatus();
+  });
+}
+var autoTimers = {};
+function scheduleAutoSave(tab){
+  if (!S.autoSave || tab.readOnly || tab.conflict) return;
+  clearTimeout(autoTimers[tab.key]);
+  autoTimers[tab.key] = setTimeout(function(){ if (tab.dirty && S.tabs.indexOf(tab) >= 0) saveTab(tab); }, 1000);
+}
+function addTab(tab, replacePreview){
+  if (replacePreview){
+    var pi = S.tabs.findIndex(function(t){ return t.preview && !t.dirty; });
+    if (pi >= 0){ disposeTab(S.tabs[pi]); S.tabs.splice(pi, 1, tab); return; }
+  }
+  var ai = S.tabs.findIndex(function(t){ return t.key === S.active; });
+  S.tabs.splice(ai >= 0 ? ai + 1 : S.tabs.length, 0, tab);
+}
+function disposeTab(t){
+  if (t.model){ if (ED && ED.getModel() === t.model) ED.setModel(null); t.model.dispose(); t.model = null; }
+  clearTimeout(autoTimers[t.key]);
+}
+function findTab(key){ return S.tabs.find(function(t){ return t.key === key; }); }
+
+async function openFile(path, opts){
+  opts = opts || {};
+  var key = "file:" + pkey(path), tab = findTab(key);
+  if (tab){
+    if (!opts.preview) tab.preview = false;
+    activate(key);
+    if (opts.line) reveal(opts.line, opts.col);
+    return tab;
+  }
+  var r;
+  try { r = await rpc("editor_read_file", path); } catch (e) { toast("Could not open " + baseName(path) + ": " + e.message, "err"); return null; }
+  if (!r.ok){ toast("Could not open " + baseName(path) + ": " + r.error, "err"); return null; }
+  tab = {key: key, kind: "file", path: r.path || path, name: baseName(path), preview: !!opts.preview, mtime: r.mtime, size: r.size,
+         encoding: r.encoding || "utf-8", bom: !!r.bom, readOnly: r.writable === false, binary: !!r.binary, tooLarge: !!r.too_large, dirty: false, viewState: null};
+  tab.lang = langFor(tab.name);
+  if (!tab.binary && !tab.tooLarge) newModel(tab, r.content);
+  addTab(tab, !!opts.preview);
+  addRecent(dirName(tab.path));
+  activate(key);
+  if (opts.line) reveal(opts.line, opts.col);
+  return tab;
+}
+async function openArtifact(id, opts){
+  opts = opts || {};
+  var key = "artifact:" + id, tab = findTab(key);
+  if (tab){
+    if (!opts.preview) tab.preview = false;
+    activate(key);
+    pollOnce();
+    return tab;
+  }
+  var r;
+  try { r = await rpc("editor_open_artifact", id); } catch (e) { toast("Could not open artifact: " + e.message, "err"); return null; }
+  if (!r.ok){ toast(r.error || "Could not open artifact", "err"); return null; }
+  tab = {key: key, kind: "artifact", id: r.id, name: r.name, preview: !!opts.preview, version: r.version, readOnly: !r.editable,
+         origin: r.origin, artType: r.art_type, dirty: false, viewState: null};
+  tab.lang = langFor(tab.name);
+  newModel(tab, r.content);
+  addTab(tab, !!opts.preview);
+  activate(key);
+  return tab;
+}
+function reveal(line, col){
+  if (!ED) return;
+  ED.revealLineInCenter(line); ED.setPosition({lineNumber: line, column: col || 1}); ED.focus();
+}
+
+function activate(key, o){
+  o = o || {};
+  var cur = activeTab();
+  if (cur && cur.model && ED && ED.getModel() === cur.model) cur.viewState = ED.saveViewState();
+  S.active = key;
+  var t = activeTab();
+  if (t && t.model && ED){
+    ED.setModel(t.model);
+    ED.updateOptions({readOnly: !!t.readOnly || !!t.deleted});
+    if (t.viewState) ED.restoreViewState(t.viewState);
+    if (o.focus !== false) ED.focus();
+  } else if (ED){ ED.setModel(null); }
+  renderPanels(); renderTabs(); renderTree(); renderArtifacts(); renderCrumbs(); renderStatus(); renderBanner();
+  persist();
+}
+function renderPanels(){
+  var t = activeTab();
+  $("#welcome").classList.toggle("show", !t);
+  var bin = !!(t && (t.binary || t.tooLarge));
+  $("#binary").classList.toggle("show", bin);
+  if (bin) $("#binary-msg").textContent = t.name + (t.tooLarge ? " is too large to edit here (" + fmtSize(t.size) + ")." : " is a binary file (" + fmtSize(t.size) + ") and cannot be shown as text.");
+  $("#ed-monaco").style.visibility = (t && !bin) ? "visible" : "hidden";
+  if (!t) renderWelcome();
+}
+function renderWelcome(){
+  var h = "";
+  if (S.recent.length) h += "<h3>Recent folders</h3>" + S.recent.slice(0, 6).map(function(p){ return '<a data-folder="' + esc(p) + '">' + esc(baseName(p)) + ' <span style="color:var(--muted)">' + esc(p) + "</span></a>"; }).join("");
+  $("#w-recent").innerHTML = h;
+}
+function renderTabs(){
+  var el = $("#tabs");
+  el.innerHTML = S.tabs.map(function(t){
+    var cls = "tab" + (t.key === S.active ? " active" : "") + (t.preview ? " preview" : "") + (t.dirty ? " dirty" : "") + (t.deleted ? " deleted" : "");
+    var badge = t.kind === "artifact" ? '<span class="t-badge">' + (t.readOnly ? "ro" : "v" + t.version) + "</span>" : "";
+    return '<div class="' + cls + '" data-key="' + esc(t.key) + '" draggable="true" title="' + esc(t.path || ("Artifact: " + t.name)) + '">' + fileIcon(t.name) +
+      '<span class="t-name">' + esc(t.name) + "</span>" + badge + '<span class="t-close" data-close="1">' + (t.dirty ? '<i class="dot"></i>' : X_SVG) + "</span></div>";
+  }).join("");
+  var a = el.querySelector(".tab.active"); if (a) a.scrollIntoView({block: "nearest", inline: "nearest"});
+  postParent({__ed: "dirty", count: S.tabs.filter(function(t){ return t.dirty; }).length});
+}
+function renderCrumbs(){
+  var t = activeTab(), el = $("#crumbs");
+  if (!t){ el.innerHTML = ""; return; }
+  var parts;
+  if (t.kind === "artifact") parts = ["Chat Artifacts", t.name];
+  else {
+    var p = t.path, rel = S.workspace && isUnder(p, S.workspace) ? p.slice(S.workspace.length).replace(/^[\\\/]+/, "") : p;
+    parts = rel.split(/[\\\/]/).filter(Boolean);
+  }
+  el.innerHTML = parts.map(function(s, i){ return '<span class="' + (i === parts.length - 1 ? "last" : "") + '">' + esc(s) + "</span>"; }).join('<span class="sep">\u203a</span>');
+}
+function renderBanner(){
+  var t = activeTab(), el = $("#banner"), h = "", cls = "";
+  if (t && t.conflict){
+    cls = "warn";
+    h = "<span>" + esc(t.conflict.msg) + '</span><span class="sp"></span><button class="btn" data-b="reload">Reload</button><button class="btn" data-b="keep">Keep my version</button>';
+  } else if (t && t.deleted){
+    cls = "warn"; h = "<span>This file was deleted on disk. Save to recreate it.</span>";
+  } else if (t && t.kind === "artifact" && t.readOnly){
+    cls = "info"; h = '<span>This is a file you attached, so it is read-only here.</span><span class="sp"></span><button class="btn" data-b="copy">Save as copy</button>';
+  } else if (t && t.kind === "file" && t.readOnly){
+    cls = "info"; h = "<span>This file is read-only on disk.</span>";
+  }
+  el.className = h ? "show " + cls : ""; el.innerHTML = h;
+}
+$("#banner").addEventListener("click", function(e){
+  var b = e.target.closest("[data-b]"), t = activeTab(); if (!b || !t) return;
+  if (b.dataset.b === "reload") reloadTab(t);
+  else if (b.dataset.b === "keep"){
+    if (t.conflict && t.conflict.latest) Object.assign(t, t.conflict.latest);    // adopt the other side's stamp so polling stops flagging it
+    t.conflict = null; t.forceSave = true; renderBanner();
+    toast("Your version will overwrite the other change when you save.");
+  }
+  else if (b.dataset.b === "copy") saveAsCopy(t);
+});
+function updatePos(){
+  if (!ED || !activeTab() || !activeTab().model){ $("#st-pos").textContent = ""; return; }
+  var p = ED.getPosition(), s = ED.getSelection(), txt = "Ln " + p.lineNumber + ", Col " + p.column;
+  if (s && !s.isEmpty()){ var n = ED.getModel().getValueInRange(s).length; txt += " (" + n + " selected)"; }
+  $("#st-pos").textContent = txt;
+}
+function renderStatus(){
+  var t = activeTab();
+  renderRun();
+  var show = !!(t && t.model);
+  ["#st-pos", "#st-indent", "#st-enc", "#st-eol", "#st-lang"].forEach(function(s){ $(s).style.display = show ? "" : "none"; });
+  $("#st-wrap").textContent = "Wrap: " + (S.wordWrap ? "on" : "off"); $("#st-wrap").classList.toggle("on", S.wordWrap);
+  $("#st-auto").textContent = "Auto Save: " + (S.autoSave ? "on" : "off"); $("#st-auto").classList.toggle("on", S.autoSave); renderAiStatus();
+  if (!t){ $("#st-left").textContent = S.workspace ? S.workspace : ""; return; }
+  $("#st-left").textContent = t.kind === "artifact" ? "Artifact" + (t.readOnly ? " (read-only)" : " \u00b7 version " + t.version) + (t.dirty ? " \u00b7 unsaved" : "") : t.path;
+  if (!show) return;
+  var o = t.model.getOptions();
+  $("#st-indent").textContent = (o.insertSpaces ? "Spaces: " : "Tab Size: ") + o.tabSize;
+  $("#st-enc").textContent = (t.kind === "artifact" ? "UTF-8" : (t.encoding || "utf-8").toUpperCase());
+  $("#st-eol").textContent = t.model.getEOL() === "\r\n" ? "CRLF" : "LF";
+  var li = monaco.languages.getLanguages().find(function(l){ return l.id === t.model.getLanguageId(); });
+  $("#st-lang").textContent = li && li.aliases && li.aliases[0] ? li.aliases[0] : t.model.getLanguageId();
+  updatePos();
+}
+
+/* tab strip interactions */
+(function(){
+  var el = $("#tabs"), dragKey = null;
+  el.addEventListener("click", function(e){
+    var tab = e.target.closest(".tab"); if (!tab) return;
+    if (e.target.closest("[data-close]")) closeTab(tab.dataset.key); else activate(tab.dataset.key);
+  });
+  el.addEventListener("mousedown", function(e){ if (e.button === 1){ var tab = e.target.closest(".tab"); if (tab){ e.preventDefault(); closeTab(tab.dataset.key); } } });
+  el.addEventListener("dblclick", function(e){ var tab = e.target.closest(".tab"); if (tab){ var t = findTab(tab.dataset.key); if (t){ t.preview = false; renderTabs(); persist(); } } });
+  el.addEventListener("contextmenu", function(e){
+    var tab = e.target.closest(".tab"); if (!tab) return; e.preventDefault();
+    var t = findTab(tab.dataset.key);
+    showMenu(e.clientX, e.clientY, [
+      {label: "Close", key: "Ctrl+W", action: function(){ closeTab(t.key); }},
+      {label: "Close Others", action: function(){ closeMany(S.tabs.filter(function(x){ return x !== t; })); }},
+      {label: "Close to the Right", action: function(){ var i = S.tabs.indexOf(t); closeMany(S.tabs.slice(i + 1)); }},
+      {label: "Close Saved", action: function(){ closeMany(S.tabs.filter(function(x){ return !x.dirty; })); }},
+      {label: "Close All", action: function(){ closeMany(S.tabs.slice()); }},
+      {sep: true},
+      {label: "Copy Path", disabled: !t.path, action: function(){ copyText(t.path); }},
+      {label: "Reveal in File Explorer", disabled: !t.path, action: function(){ rpc("editor_reveal", t.path); }}
+    ]);
+  });
+  el.addEventListener("dragstart", function(e){ var tab = e.target.closest(".tab"); if (!tab) return; dragKey = tab.dataset.key; e.dataTransfer.effectAllowed = "move"; try { e.dataTransfer.setData("text/plain", dragKey); } catch (x) {} });
+  el.addEventListener("dragover", function(e){
+    if (!dragKey) return; e.preventDefault();
+    el.querySelectorAll(".dragover").forEach(function(n){ n.classList.remove("dragover"); });
+    var tab = e.target.closest(".tab"); if (tab && tab.dataset.key !== dragKey) tab.classList.add("dragover");
+  });
+  el.addEventListener("drop", function(e){
+    if (!dragKey) return; e.preventDefault();
+    var tab = e.target.closest(".tab"), from = S.tabs.findIndex(function(t){ return t.key === dragKey; });
+    if (from >= 0){
+      var moved = S.tabs.splice(from, 1)[0];
+      var to = tab ? S.tabs.findIndex(function(t){ return t.key === tab.dataset.key; }) : S.tabs.length;
+      S.tabs.splice(to < 0 ? S.tabs.length : to, 0, moved);
+    }
+    dragKey = null; renderTabs(); persist();
+  });
+  el.addEventListener("dragend", function(){ dragKey = null; el.querySelectorAll(".dragover").forEach(function(n){ n.classList.remove("dragover"); }); });
+  el.addEventListener("wheel", function(e){ if (e.deltaY && !e.deltaX){ el.scrollLeft += e.deltaY; e.preventDefault(); } }, {passive: false});
+})();
+
+async function closeTab(key, force){
+  var i = S.tabs.findIndex(function(t){ return t.key === key; }); if (i < 0) return true;
+  var t = S.tabs[i];
+  if (t.dirty && !force){
+    var r = await modal({title: "Unsaved changes", message: "Do you want to save the changes you made to " + t.name + "?\nYour changes will be lost if you don't save them.",
+      buttons: [{label: "Don't Save", value: "discard"}, {label: "Cancel", value: null}, {label: "Save", value: "save", primary: true}]});
+    if (r === null) return false;
+    if (r === "save"){ var ok = await saveTab(t); if (!ok) return false; }
+  }
+  var was = S.active === key;
+  disposeTab(t);
+  S.tabs.splice(i, 1);
+  if (was){ var next = S.tabs[Math.min(i, S.tabs.length - 1)]; activate(next ? next.key : null, {focus: !!next}); }
+  else { renderTabs(); persist(); }
+  return true;
+}
+async function closeMany(list){ for (var i = 0; i < list.length; i++){ if (!(await closeTab(list[i].key))) return; } }
+
+/* ───────── saving / reloading / external changes ───────── */
+async function saveTab(tab){
+  if (!tab || !tab.model) return false;
+  if (tab.readOnly && tab.kind === "artifact") return saveAsCopy(tab);
+  var content = tab.model.getValue(), r, alt = tab.model.getAlternativeVersionId(), force = !!tab.forceSave;
+  try {
+    if (tab.kind === "artifact") r = await rpc("editor_save_artifact", tab.id, content, force ? null : tab.version);
+    else r = await rpc("editor_write_file", tab.path, content, tab.encoding, tab.bom, force ? null : tab.mtime);
+  } catch (e){ toast("Save failed: " + e.message, "err"); return false; }
+  if (r.conflict){
+    tab.conflict = {msg: tab.kind === "artifact" ? "Midum changed this artifact (now v" + r.version + ") while you were editing." : "This file changed on disk since you opened it.",
+                    latest: tab.kind === "artifact" ? {version: r.version} : {mtime: r.mtime}};
+    if (tab.key === S.active) renderBanner();
+    toast("Save blocked: the content changed elsewhere. Choose Reload or Keep my version.", "err");
+    return false;
+  }
+  if (!r.ok){ toast("Save failed: " + r.error, "err"); return false; }
+  tab.forceSave = false; tab.conflict = null; tab.deleted = false;
+  if (tab.kind === "artifact"){ tab.version = r.version; } else { tab.mtime = r.mtime; tab.size = r.size; if (r.encoding) tab.encoding = r.encoding; }
+  tab.savedAlt = alt; tab.dirty = tab.model.getAlternativeVersionId() !== alt; tab.preview = false;
+  if (tab.key === S.active && ED) ED.updateOptions({readOnly: !!tab.readOnly});
+  renderTabs(); renderBanner(); renderStatus();
+  if (tab.kind === "file" && S.workspace && isUnder(tab.path, S.workspace)) refreshTree();
+  return true;
+}
+function saveActive(){ var t = activeTab(); if (t) return saveTab(t); }
+async function saveAll(){ for (var i = 0; i < S.tabs.length; i++){ if (S.tabs[i].dirty) await saveTab(S.tabs[i]); } }
+async function saveAsCopy(tab){
+  var suggested = tab.name.replace(/(\.[^.]*)?$/, function(m){ return "-copy" + (m || ""); });
+  var name = await promptDlg("Save as a new artifact", suggested, "Creates an editable copy in this chat's artifacts.");
+  if (!name || !name.trim()) return false;
+  var r = await rpc("editor_save_artifact_copy", name.trim(), tab.model.getValue());
+  if (!r.ok){ toast(r.error || "Could not save copy", "err"); return false; }
+  toast("Saved as " + r.name); await refreshArtifacts(); openArtifact(r.id); return true;
+}
+function applyContent(tab, text){
+  tab.model.pushStackElement();
+  tab.model.pushEditOperations([], [{range: tab.model.getFullModelRange(), text: text}], function(){ return null; });
+  tab.model.pushStackElement();
+  tab.savedAlt = tab.model.getAlternativeVersionId(); tab.dirty = false;
+}
+async function reloadTab(tab){
+  try {
+    if (tab.kind === "artifact"){
+      var r = await rpc("editor_open_artifact", tab.id);
+      if (!r.ok) return toast(r.error, "err");
+      applyContent(tab, r.content); tab.version = r.version; tab.readOnly = !r.editable;
+    } else {
+      var f = await rpc("editor_read_file", tab.path);
+      if (!f.ok || f.binary || f.too_large) return toast(f.error || "Cannot reload this file", "err");
+      applyContent(tab, f.content); tab.mtime = f.mtime; tab.size = f.size;
+    }
+    tab.conflict = null; tab.forceSave = false; tab.deleted = false;
+    renderTabs(); renderBanner(); renderStatus();
+  } catch (e){ toast("Reload failed: " + e.message, "err"); }
+}
+async function externalChange(tab, freshText, label, latest){
+  if (tab.model.getValue() === freshText) return true;          // same text: only the stamp moved
+  if (!tab.dirty){ applyContent(tab, freshText); toast(tab.name + " " + label); renderTabs(); renderStatus(); return true; }
+  tab.conflict = {msg: tab.kind === "artifact" ? "Midum changed this artifact while you have unsaved edits." : "This file changed on disk while you have unsaved edits.", latest: latest};
+  if (tab.key === S.active) renderBanner();
+  return false;
+}
+var polling = false;
+async function pollOnce(){
+  if (polling || !booted || window.innerWidth < 60) return;
+  polling = true;
+  try {
+    var files = S.tabs.filter(function(t){ return t.kind === "file" && !t.binary && !t.tooLarge && t.model; });
+    if (files.length){
+      var r = await rpc("editor_stat", files.map(function(t){ return t.path; }));
+      if (r.ok) for (var i = 0; i < files.length; i++){
+        var t = files[i], st = r.stats[t.path]; if (!st) continue;
+        if (!st.exists){ if (!t.deleted){ t.deleted = true; if (t.key === S.active){ ED.updateOptions({readOnly: true}); renderBanner(); } renderTabs(); } continue; }
+        if (t.deleted){ t.deleted = false; if (t.key === S.active){ ED.updateOptions({readOnly: !!t.readOnly}); renderBanner(); } renderTabs(); }
+        if (t.conflict) continue;
+        if (st.mtime !== t.mtime || st.size !== t.size){
+          var f = await rpc("editor_read_file", t.path);
+          if (f.ok && !f.binary && !f.too_large){
+            var synced = await externalChange(t, f.content, "was reloaded (changed on disk)", {mtime: f.mtime, size: f.size});
+            if (synced){ t.mtime = f.mtime; t.size = f.size; }
+          }
+        }
+      }
+    }
+    var arts = S.tabs.filter(function(t){ return t.kind === "artifact" && t.model; });
+    if (arts.length){
+      var a = await rpc("editor_artifact_stat", arts.map(function(t){ return t.id; }));
+      if (a.ok) for (var j = 0; j < arts.length; j++){
+        var at = arts[j], as = a.stats[at.id]; if (!as) continue;
+        if (!as.exists){ if (!at.deleted){ at.deleted = true; renderTabs(); } continue; }
+        if (at.conflict) continue;
+        if (as.version !== at.version && !at.readOnly){
+          var o = await rpc("editor_open_artifact", at.id);
+          if (o.ok){
+            var ok2 = await externalChange(at, o.content, "was updated by Midum (v" + o.version + ")", {version: o.version});
+            if (ok2){ at.version = o.version; renderTabs(); renderStatus(); }
+          }
+        }
+      }
+    }
+    await refreshArtifacts();
+    await refreshTree();
+  } catch (e) { /* transient (e.g. mid-save); the next tick retries */ }
+  polling = false;
+}
+setInterval(pollOnce, 2500);
+
+/* ───────── explorer: workspace tree ───────── */
+async function loadDir(path){
+  var r;
+  try { r = await rpc("editor_list_dir", path); } catch (e) { r = {ok: false, error: e.message}; }
+  if (!r.ok){ var had = T.dirs.get(path); T.dirs.set(path, {entries: [], sig: "err", error: r.error}); return !had || had.sig !== "err"; }
+  var sig = r.entries.map(function(e){ return e.name + (e.is_dir ? "/" : "") + e.mtime + ":" + e.size; }).join("|") + (r.truncated ? "+" : "");
+  var prev = T.dirs.get(path);
+  if (prev && prev.sig === sig) return false;
+  T.dirs.set(path, {entries: r.entries, sig: sig, truncated: r.truncated});
+  return true;
+}
+async function refreshTree(force){
+  if (!S.workspace || T.editing) return;
+  var changed = false, paths = [S.workspace].concat(Array.from(S.expanded).filter(function(p){ return isUnder(p, S.workspace); }));
+  for (var i = 0; i < paths.length; i++){ if (await loadDir(paths[i])) changed = true; }
+  if (changed || force) renderTree();
+}
+function rowHtml(e, depth){
+  var open = e.is_dir && S.expanded.has(e.path);
+  var t = activeTab(), act = t && t.kind === "file" && pkey(t.path) === pkey(e.path);
+  var cls = "row" + (T.sel === e.path ? " sel" : "") + (act ? " act" : "");
+  var pad = 6 + depth * 12;
+  return '<div class="' + cls + '" data-path="' + esc(e.path) + '" data-dir="' + (e.is_dir ? 1 : 0) + '" style="padding-left:' + pad + 'px">' +
+    (e.is_dir ? CHEV.replace("chev#", "chev" + (open ? " open" : "")) + FOLDER : '<span class="gap"></span>' + fileIcon(e.name)) +
+    '<span class="r-name">' + esc(e.name) + "</span></div>";
+}
+function editRowHtml(depth, value){
+  return '<div class="row editing" style="padding-left:' + (6 + depth * 12) + 'px"><span class="gap"></span><input id="inline-input" value="' + esc(value) + '" spellcheck="false"></div>';
+}
+function treeHtml(path, depth){
+  var d = T.dirs.get(path), h = "";
+  if (!d) return "";
+  if (d.error) return '<div class="empty-note" style="padding-left:' + (6 + depth * 12) + 'px">' + esc(d.error) + "</div>";
+  var ed = T.editing;
+  if (ed && ed.mode === "new" && ed.parent === path) h += editRowHtml(depth, "");
+  d.entries.forEach(function(e){
+    if (ed && ed.mode === "rename" && ed.path === e.path){ h += editRowHtml(depth, e.name); }
+    else h += rowHtml(e, depth);
+    if (e.is_dir && S.expanded.has(e.path)) h += treeHtml(e.path, depth + 1);
+  });
+  if (d.truncated) h += '<div class="empty-note">Folder truncated (too many entries).</div>';
+  return h;
+}
+function renderTree(){
+  var el = $("#tree"), scroll = el.scrollTop;
+  $("#ws-name").textContent = S.workspace ? baseName(S.workspace) : "No folder open";
+  $("#ws-name").title = S.workspace || "";
+  if (!S.workspace){
+    el.innerHTML = '<div class="empty-note">You have not opened a folder.<button class="btn primary" data-act="open-folder">Open Folder</button></div>';
+    return;
+  }
+  var h = treeHtml(S.workspace, 0);
+  if (!h && !T.editing) h = '<div class="empty-note">This folder is empty.</div>';
+  el.innerHTML = h;
+  el.scrollTop = scroll;
+  var inp = $("#inline-input");
+  if (inp){
+    inp.focus();
+    if (T.editing && T.editing.mode === "rename"){ var dot = inp.value.lastIndexOf("."); inp.setSelectionRange(0, dot > 0 && !T.editing.isDir ? dot : inp.value.length); }
+    var finished = false;
+    inp.addEventListener("keydown", function(e){
+      e.stopPropagation();
+      if (e.key === "Enter"){ finished = true; commitEdit(inp.value.trim()); }
+      else if (e.key === "Escape"){ finished = true; T.editing = null; renderTree(); }
+    });
+    inp.addEventListener("blur", function(){ if (!finished){ T.editing = null; renderTree(); } });
+  }
+}
+async function commitEdit(name){
+  var ed = T.editing; T.editing = null;
+  if (!ed || !name){ renderTree(); return; }
+  if (/[<>:"|?*\x00-\x1f]/.test(name)){ toast("That name contains characters that are not allowed.", "err"); renderTree(); return; }
+  if (ed.mode === "new"){
+    var target = joinP(ed.parent, name.replace(/\\/g, "/").split("/").join(sepOf(ed.parent)));
+    var r = await rpc("editor_create", target, !!ed.isDir);
+    if (!r.ok){ toast(r.error, "err"); renderTree(); return; }
+    var rel = target.slice(ed.parent.length).replace(/^[\\\/]+/, "").split(/[\\\/]/), cur = ed.parent;
+    for (var i = 0; i < rel.length - (ed.isDir ? 0 : 1); i++){ cur = joinP(cur, rel[i]); S.expanded.add(cur); }
+    await refreshTreeAll();
+    T.sel = target; renderTree();
+    if (!ed.isDir) openFile(target, {preview: false});
+  } else {
+    var np = joinP(dirName(ed.path), name);
+    if (np === ed.path){ renderTree(); return; }
+    var rr = await rpc("editor_rename", ed.path, np);
+    if (!rr.ok){ toast(rr.error, "err"); renderTree(); return; }
+    rebindPaths(ed.path, np);
+    await refreshTreeAll(); T.sel = np; renderTree();
+  }
+  persist();
+}
+async function refreshTreeAll(){
+  var paths = [S.workspace].concat(Array.from(S.expanded));
+  for (var i = 0; i < paths.length; i++) await loadDir(paths[i]);
+}
+function rebindPaths(oldP, newP){
+  var nexp = new Set();
+  S.expanded.forEach(function(p){ nexp.add(isUnder(p, oldP) ? newP + p.slice(oldP.length) : p); });
+  S.expanded = nexp;
+  var activeWas = S.active;
+  S.tabs.forEach(function(t){
+    if (t.kind !== "file" || !isUnder(t.path, oldP)) return;
+    var oldKey = t.key, np = newP + t.path.slice(oldP.length), content = t.model ? t.model.getValue() : null, wasDirty = t.dirty;
+    t.path = np; t.name = baseName(np); t.key = "file:" + pkey(np); t.lang = langFor(t.name);
+    if (activeWas === oldKey) S.active = t.key;
+    if (t.model){ t.model.dispose(); newModel(t, content); if (wasDirty){ t.savedAlt = -1; t.dirty = true; } }
+  });
+  var cur = activeTab(); if (cur && cur.model && ED) ED.setModel(cur.model);
+  renderTabs(); renderCrumbs(); renderStatus(); persist();
+}
+async function deleteItem(path, isDir){
+  var ok = await confirmDlg("Delete " + (isDir ? "folder" : "file") + "?", "Are you sure you want to delete '" + baseName(path) + "'" + (isDir ? " and its contents" : "") + "?\nIt is moved to the Recycle Bin when possible.", "Delete");
+  if (!ok) return;
+  var r = await rpc("editor_delete", path);
+  if (!r.ok){ toast(r.error, "err"); return; }
+  var closedActive = false;
+  S.tabs.filter(function(t){ return t.kind === "file" && isUnder(t.path, path); }).forEach(function(t){
+    if (t.dirty){ t.deleted = true; } else { var i = S.tabs.indexOf(t); disposeTab(t); S.tabs.splice(i, 1); if (S.active === t.key){ S.active = null; closedActive = true; } }
+  });
+  if (closedActive){ var n = S.tabs[S.tabs.length - 1]; activate(n ? n.key : null, {focus: false}); } else renderTabs();
+  await refreshTreeAll(); renderTree();
+}
+async function startCreate(parent, isDir){
+  if (!parent) return;
+  S.expanded.add(parent); await loadDir(parent);
+  T.editing = {mode: "new", parent: parent, isDir: isDir}; renderTree();
+}
+function startRename(path, isDir){ T.editing = {mode: "rename", path: path, isDir: isDir}; renderTree(); }
+function selectedDir(){
+  if (!T.sel) return S.workspace;
+  var row = $('#tree .row[data-path="' + (window.CSS && CSS.escape ? CSS.escape(T.sel) : T.sel) + '"]');
+  if (row && row.dataset.dir === "1") return T.sel;
+  return dirName(T.sel);
+}
+async function toggleDir(path){
+  if (S.expanded.has(path)) S.expanded.delete(path);
+  else { S.expanded.add(path); await loadDir(path); }
+  renderTree(); persist();
+}
+function treeMenu(e, path, isDir){
+  var items = isDir ? [
+    {label: "New File...", action: function(){ startCreate(path, false); }},
+    {label: "New Folder...", action: function(){ startCreate(path, true); }},
+    {sep: true}
+  ] : [{label: "Open", action: function(){ openFile(path, {preview: false}); }}, {sep: true}];
+  items = items.concat([
+    {label: "Rename...", key: "F2", action: function(){ startRename(path, isDir); }},
+    {label: "Delete", key: "Del", action: function(){ deleteItem(path, isDir); }},
+    {sep: true},
+    {label: "Copy Path", action: function(){ copyText(path); }},
+    {label: "Copy Relative Path", disabled: !S.workspace, action: function(){ copyText(path.slice(S.workspace.length).replace(/^[\\\/]+/, "")); }},
+    {label: "Reveal in File Explorer", action: function(){ rpc("editor_reveal", path); }},
+    {sep: true},
+    {label: "Open in Terminal \u2014 WSL2", action: function(){ termOpenAt("wsl", path); }},
+    {label: "Open in Terminal \u2014 PowerShell", action: function(){ termOpenAt("powershell", path); }}
+  ]);
+  if (isDir) items.push({sep: true}, {label: "Set as Workspace Folder", disabled: path === S.workspace, action: function(){ setWorkspace(path); }}, {label: "Refresh", action: function(){ refreshTreeAll().then(renderTree); }});
+  showMenu(e.clientX, e.clientY, items);
+}
+(function(){
+  var tree = $("#tree");
+  tree.addEventListener("click", function(e){
+    var b = e.target.closest("[data-act='open-folder']"); if (b){ pickFolder(); return; }
+    var row = e.target.closest(".row[data-path]"); if (!row) return;
+    var p = row.dataset.path; T.sel = p;
+    if (row.dataset.dir === "1"){ if (e.detail > 1) return; toggleDir(p); }   // 2nd click of a double-click must not undo the 1st
+    else { openFile(p, {preview: true}); renderTree(); }
+  });
+  tree.addEventListener("dblclick", function(e){
+    var row = e.target.closest(".row[data-path]"); if (!row || row.dataset.dir === "1") return;
+    openFile(row.dataset.path, {preview: false});
+  });
+  tree.addEventListener("contextmenu", function(e){
+    e.preventDefault();
+    var row = e.target.closest(".row[data-path]");
+    if (!row){ if (S.workspace) showMenu(e.clientX, e.clientY, [{label: "New File...", action: function(){ startCreate(S.workspace, false); }}, {label: "New Folder...", action: function(){ startCreate(S.workspace, true); }}, {sep: true}, {label: "Refresh", action: function(){ refreshTreeAll().then(renderTree); }}]); return; }
+    T.sel = row.dataset.path; renderTree();
+    treeMenu(e, row.dataset.path, row.dataset.dir === "1");
+  });
+  tree.addEventListener("keydown", function(e){
+    var rows = Array.prototype.slice.call(tree.querySelectorAll(".row[data-path]")), i = rows.findIndex(function(r){ return r.dataset.path === T.sel; });
+    var row = rows[i];
+    if (e.key === "ArrowDown"){ e.preventDefault(); var n = rows[Math.min(rows.length - 1, i + 1)]; if (n){ T.sel = n.dataset.path; renderTree(); } }
+    else if (e.key === "ArrowUp"){ e.preventDefault(); var p = rows[Math.max(0, i - 1)]; if (p){ T.sel = p.dataset.path; renderTree(); } }
+    else if (e.key === "ArrowRight" && row && row.dataset.dir === "1" && !S.expanded.has(T.sel)){ e.preventDefault(); toggleDir(T.sel); }
+    else if (e.key === "ArrowLeft" && row && row.dataset.dir === "1" && S.expanded.has(T.sel)){ e.preventDefault(); toggleDir(T.sel); }
+    else if (e.key === "Enter" && row){ e.preventDefault(); if (row.dataset.dir === "1") toggleDir(T.sel); else openFile(T.sel, {preview: false}); }
+    else if (e.key === "F2" && row){ e.preventDefault(); startRename(T.sel, row.dataset.dir === "1"); }
+    else if (e.key === "Delete" && row){ e.preventDefault(); deleteItem(T.sel, row.dataset.dir === "1"); }
+  });
+  $("#ws-hdr").addEventListener("click", function(e){
+    var act = e.target.closest("[data-act]");
+    if (act){
+      e.stopPropagation();
+      var a = act.dataset.act;
+      if (a === "new-file") startCreate(selectedDir(), false);
+      else if (a === "new-dir") startCreate(selectedDir(), true);
+      else if (a === "refresh") refreshTreeAll().then(renderTree);
+      else if (a === "collapse"){ S.expanded.clear(); renderTree(); persist(); }
+      return;
+    }
+    S.collapsed.workspace = !S.collapsed.workspace; applySections(); persist();
+  });
+  $("#ws-hdr").addEventListener("contextmenu", function(e){
+    e.preventDefault();
+    var items = S.recent.filter(function(p){ return p !== S.workspace; }).slice(0, 8).map(function(p){ return {label: baseName(p) + "  \u2014  " + p, action: function(){ setWorkspace(p); }}; });
+    items.unshift({label: "Open Folder...", action: pickFolder});
+    if (items.length > 1) items.splice(1, 0, {sep: true});
+    showMenu(e.clientX, e.clientY, items);
+  });
+})();
+
+/* ───────── workspace / opening things ───────── */
+function addRecent(p){
+  if (!p) return;
+  S.recent = [p].concat(S.recent.filter(function(x){ return pkey(x) !== pkey(p); })).slice(0, 10);
+}
+async function setWorkspace(path, noForce){
+  var r = await rpc("editor_list_dir", path);
+  if (!r.ok){ toast("Cannot open folder: " + r.error, "err"); return; }
+  S.workspace = r.path || path; S.expanded = new Set(); T.dirs = new Map(); T.sel = null;
+  addRecent(S.workspace);
+  await loadDir(S.workspace);
+  renderTree(); renderStatus(); renderWelcome(); renderCrumbs(); persist();
+  termSyncWorkspace(!noForce);
+}
+async function pickFolder(){
+  var r = await rpc("editor_pick_folder");
+  if (r.ok && r.path) setWorkspace(r.path); else if (!r.ok) toast(r.error, "err");
+}
+async function pickFile(){
+  var r = await rpc("editor_pick_file");
+  if (!r.ok){ toast(r.error, "err"); return; }
+  for (var i = 0; i < r.paths.length; i++) await openFile(r.paths[i], {preview: false});
+}
+$("#btn-openfolder").onclick = pickFolder; $("#btn-openfile").onclick = pickFile;
+$("#w-folder").onclick = pickFolder; $("#w-file").onclick = pickFile;
+$("#w-recent").addEventListener("click", function(e){ var a = e.target.closest("[data-folder]"); if (a) setWorkspace(a.dataset.folder); });
+$("#b-reveal").onclick = function(){ var t = activeTab(); if (t && t.path) rpc("editor_reveal", t.path); };
+
+/* ───────── artifacts section ───────── */
+var artSig = "";
+async function refreshArtifacts(){
+  var r; try { r = await rpc("editor_list_artifacts"); } catch (e) { return; }
+  if (!r.ok) return;
+  var sig = JSON.stringify(r.artifacts.map(function(a){ return [a.id, a.name, a.version]; }));
+  if (sig === artSig) return;
+  artSig = sig; S.artifacts = r.artifacts; renderArtifacts();
+}
+function renderArtifacts(){
+  $("#art-cnt").textContent = S.artifacts.length;
+  var t = activeTab();
+  var h = S.artifacts.length ? S.artifacts.map(function(a){
+    var act = t && t.kind === "artifact" && t.id === a.id;
+    return '<div class="row' + (act ? " act" : "") + '" data-aid="' + esc(a.id) + '" style="padding-left:12px" title="' + esc(a.editable ? "Created by Midum" : "Attached file (read-only)") + '">' +
+      fileIcon(a.name) + '<span class="r-name">' + esc(a.name) + '</span><span class="r-badge">' + (a.editable ? "v" + a.version : "ro") + "</span></div>";
+  }).join("") : '<div class="empty-note">Files Midum creates or you attach in this chat appear here.</div>';
+  $("#art-list").innerHTML = h;
+}
+$("#art-list").addEventListener("click", function(e){ var r = e.target.closest("[data-aid]"); if (r) openArtifact(r.dataset.aid, {preview: true}); });
+$("#art-list").addEventListener("dblclick", function(e){ var r = e.target.closest("[data-aid]"); if (r) openArtifact(r.dataset.aid, {preview: false}); });
+$("#art-hdr").addEventListener("click", function(){ S.collapsed.artifacts = !S.collapsed.artifacts; applySections(); persist(); });
+function applySections(){
+  $("#sec-art").classList.toggle("closed", !!S.collapsed.artifacts);
+  $("#sec-ws").classList.toggle("closed", !!S.collapsed.workspace);
+}
+
+/* ───────── quick open / pickers / toggles ───────── */
+function openQuickOpen(){
+  quickPick({placeholder: "Search files by name (Ctrl+P)", source: async function(q){
+    var out = [], lq = q.toLowerCase();
+    S.tabs.forEach(function(t){ if (!q || t.name.toLowerCase().indexOf(lq) >= 0) out.push({icon: fileIcon(t.name), label: t.name, detail: t.kind === "artifact" ? "open \u00b7 artifact" : "open \u00b7 " + (S.workspace && isUnder(t.path, S.workspace) ? t.path.slice(S.workspace.length).replace(/^[\\\/]+/, "") : t.path), tab: t.key}); });
+    S.artifacts.forEach(function(a){ if (q && a.name.toLowerCase().indexOf(lq) >= 0 && !out.some(function(o){ return o.tab === "artifact:" + a.id; })) out.push({icon: fileIcon(a.name), label: a.name, detail: "artifact", artifact: a.id}); });
+    if (S.workspace){
+      var r = await rpc("editor_search_files", S.workspace, q, 50);
+      if (r.ok) r.results.forEach(function(f){ if (!out.some(function(o){ return o.tab && o.tab === "file:" + pkey(f.path); })) out.push({icon: fileIcon(f.name), label: f.name, detail: f.rel, path: f.path}); });
+    }
+    return out.slice(0, 80);
+  }, onPick: function(it){ if (it.tab) activate(it.tab); else if (it.artifact) openArtifact(it.artifact, {preview: false}); else if (it.path) openFile(it.path, {preview: false}); }});
+}
+function pickLanguage(){
+  var t = activeTab(); if (!t || !t.model) return;
+  var all = monaco.languages.getLanguages().map(function(l){ return {label: (l.aliases && l.aliases[0]) || l.id, detail: l.id, id: l.id}; }).sort(function(a, b){ return a.label.localeCompare(b.label); });
+  quickPick({placeholder: "Select language mode", source: function(q){ q = q.toLowerCase(); return all.filter(function(l){ return !q || l.label.toLowerCase().indexOf(q) >= 0 || l.id.indexOf(q) >= 0; }).slice(0, 80); },
+    onPick: function(it){ monaco.editor.setModelLanguage(t.model, it.id); t.lang = it.id; renderStatus(); }});
+}
+function toggleWrap(){ S.wordWrap = !S.wordWrap; if (ED) ED.updateOptions({wordWrap: S.wordWrap ? "on" : "off"}); renderStatus(); persist(); }
+function toggleSide(){ S.sideHidden = !S.sideHidden; applySide(); }
+function applySide(){ $("#side").classList.toggle("hidden", S.sideHidden); $("#resizer").style.display = S.sideHidden ? "none" : ""; }
+$("#st-lang").onclick = pickLanguage;
+$("#st-wrap").onclick = toggleWrap;
+$("#st-auto").onclick = function(){ S.autoSave = !S.autoSave; renderStatus(); persist(); if (S.autoSave) S.tabs.forEach(function(t){ if (t.dirty) scheduleAutoSave(t); }); };
+$("#st-eol").onclick = function(){ var t = activeTab(); if (!t || !t.model) return; t.model.setEOL(t.model.getEOL() === "\n" ? monaco.editor.EndOfLineSequence.CRLF : monaco.editor.EndOfLineSequence.LF); renderStatus(); };
+$("#btn-toggle-side").onclick = toggleSide;
+
+/* sidebar resizer */
+(function(){
+  var rz = $("#resizer"), drag = false;
+  rz.addEventListener("mousedown", function(e){ drag = true; rz.classList.add("drag"); e.preventDefault(); });
+  window.addEventListener("mousemove", function(e){ if (!drag) return; S.sideWidth = Math.max(160, Math.min(e.clientX, Math.floor(innerWidth * 0.7))); $("#side").style.width = S.sideWidth + "px"; });
+  window.addEventListener("mouseup", function(){ if (drag){ drag = false; rz.classList.remove("drag"); persist(); } });
+})();
+
+/* global shortcuts (focus outside Monaco; Monaco handles + cancels its own) */
+document.addEventListener("keydown", function(e){
+  if (e.defaultPrevented) return;
+  var mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
+  if (mod && !e.shiftKey && k === "s"){ e.preventDefault(); saveActive(); }
+  else if (mod && e.shiftKey && k === "s"){ e.preventDefault(); saveAll(); }
+  else if (mod && k === "p" && !e.shiftKey){ e.preventDefault(); openQuickOpen(); }
+  else if (mod && k === "w"){ e.preventDefault(); if (S.active) closeTab(S.active); }
+  else if (mod && k === "b"){ e.preventDefault(); toggleSide(); }
+  else if (e.ctrlKey && k === "tab"){
+    e.preventDefault(); if (S.tabs.length < 2) return;
+    var i = S.tabs.findIndex(function(t){ return t.key === S.active; });
+    activate(S.tabs[(i + (e.shiftKey ? -1 : 1) + S.tabs.length) % S.tabs.length].key);
+  }
+  else if (e.key === "F5"){ e.preventDefault(); runActive(); }
+  else if (e.ctrlKey && (e.code === "Backquote" || e.key === "`")){ e.preventDefault(); termToggle(); }
+  else if (e.altKey && k === "z"){ e.preventDefault(); toggleWrap(); }
+});
+
+/* ───────── terminal panel: the SAME persistent shells as Midum's Shell tab ─────────
+   Every line either side (the model via execute_wsl_command / execute_terminal_command, or the
+   user typing here or in the Shell tab) streams in as an "editor_shell_line" event; history is
+   replayed on boot. Lines carry a per-shell seq number so replay + live never duplicate. */
+var TERM = {shell: "wsl", lines: {wsl: [], powershell: []}, seen: {wsl: 0, powershell: 0}, ready: {wsl: false, powershell: false},
+            buf: {wsl: [], powershell: []}, cwd: {wsl: "~", powershell: "~"}, info: [], cmds: {wsl: [], powershell: []}, idx: -1};
+var TERM_CAP = 1000;
+function termLine(l){
+  var ps = l.shell === "powershell";
+  if (l.stream === "cmd"){
+    var who = l.origin === "model" ? "[model] " : (l.origin === "editor" ? "[editor] " : "");
+    return '<div class="tl c">' + (who ? '<span class="tw">' + who + '</span>' : "") + '<span class="tp">' + (ps ? "PS " : "") + esc(l.cwd || "") + '</span> <span class="ts">' + (ps ? "&gt;" : "$") + '</span> ' + esc(l.text) + '</div>';
+  }
+  if (l.stream === "meta") return '<div class="tl m">' + esc(l.text) + '</div>';
+  return '<div class="tl">' + esc(l.text) + '</div>';
+}
+function termScroll(){ var b = $("#term-body"); b.scrollTop = b.scrollHeight; }
+function termPrompt(){
+  var ps = TERM.shell === "powershell";
+  $("#term-pl").textContent = (ps ? "PS " : "") + TERM.cwd[TERM.shell];
+  $("#term-sym").textContent = ps ? ">" : "$";
+}
+function termRenderAll(){
+  $("#term-out").innerHTML = TERM.lines[TERM.shell].map(termLine).join("");
+  termPrompt(); termScroll();
+}
+function termRenderTabs(){
+  var list = TERM.info.length ? TERM.info : [{kind: "wsl", label: "WSL2", available: true}, {kind: "powershell", label: "PowerShell", available: true}];
+  $("#term-tabs").innerHTML = list.map(function(s){
+    return '<button class="tt' + (s.kind === TERM.shell ? " on" : "") + '" data-k="' + s.kind + '"' + (s.available ? "" : " disabled title=\"not available on this machine\"") + '>' + esc(s.label) + '</button>';
+  }).join("");
+}
+function termAdd(l){
+  var k = l.shell || "wsl";
+  if (typeof l.seq === "number"){ if (l.seq <= TERM.seen[k]) return; TERM.seen[k] = l.seq; }
+  var arr = TERM.lines[k]; arr.push(l); if (arr.length > TERM_CAP) arr.shift();
+  if (l.stream === "meta" && l.cwd) TERM.cwd[k] = l.cwd;
+  if (!S.termOpen || k !== TERM.shell) return;
+  var out = $("#term-out");
+  out.insertAdjacentHTML("beforeend", termLine(l));
+  while (out.childNodes.length > TERM_CAP) out.removeChild(out.firstChild);
+  if (l.stream === "meta") termPrompt();
+  termScroll();
+}
+function termOnLine(p){
+  var k = p.shell || "wsl";
+  if (!TERM.ready[k]){ TERM.buf[k].push(p); return; }   // history replay still loading
+  termAdd(p);
+}
+function termSyncWorkspace(force){
+  if (S.termSync && S.workspace) rpc("editor_term_link", S.workspace, !!force).catch(function(){});
+}
+function applyTerm(){
+  $("#term").classList.toggle("open", !!S.termOpen);
+  $("#st-term").classList.toggle("on", !!S.termOpen);
+  $("#term-sync").checked = !!S.termSync;
+  termRenderTabs();
+  if (S.termOpen) termRenderAll();
+  requestAnimationFrame(function(){ if (ED) ED.layout(); });
+}
+/* ---- Run button: .py / .java run in the terminal panel's active shell; .html opens in the system browser ---- */
+var RUN_EXT = {py: "Python", pyw: "Python", java: "Java", html: "HTML", htm: "HTML"};
+function runKind(t){
+  if (!t || t.kind !== "file" || t.binary || t.tooLarge) return null;
+  var m = /\.([A-Za-z0-9]+)$/.exec(t.name || "");
+  return m && RUN_EXT[m[1].toLowerCase()] ? RUN_EXT[m[1].toLowerCase()] : null;
+}
+function renderRun(){
+  var b = $("#btn-run"), t = activeTab(), k = runKind(t);
+  b.disabled = !k;
+  b.title = k ? (k === "HTML" ? "Open in browser (F5)" : "Run " + k + " file in the terminal (F5)") : "Run (F5) - open a .py, .java or .html file";
+}
+async function runActive(){
+  var t = activeTab(), k = runKind(t);
+  if (!k){ toast("Run supports .py, .java and .html files", "err"); return; }
+  if (t.dirty && !(await saveTab(t))) return;       // run what is on screen
+  if (k !== "HTML"){ S.termOpen = true; applyTerm(); persist(); }   // watch the output stream in
+  var r;
+  try { r = await rpc("editor_run_file", t.path, TERM.shell); } catch (e){ toast("Run failed: " + e.message, "err"); return; }
+  if (!r || !r.ok){ toast((r && r.error) || "Run failed", "err"); return; }
+  if (k === "HTML") toast("Opened " + t.name + " in your browser");
+}
+function termToggle(force){
+  S.termOpen = typeof force === "boolean" ? force : !S.termOpen;
+  applyTerm(); persist();
+  if (S.termOpen) setTimeout(function(){ $("#term-in").focus(); }, 0);
+  else if (ED) ED.focus();
+}
+function termSetShell(k){
+  if (k === TERM.shell) return;
+  TERM.shell = k; S.termShell = k; TERM.idx = -1;
+  termRenderTabs(); termRenderAll(); persist(); $("#term-in").focus();
+}
+function termOpenAt(kind, path){
+  TERM.shell = kind; S.termShell = kind; S.termOpen = true;
+  applyTerm(); persist();
+  rpc("editor_term_cd", kind, path).catch(function(){});
+  setTimeout(function(){ $("#term-in").focus(); }, 0);
+}
+async function termBoot(){
+  TERM.shell = S.termShell === "powershell" ? "powershell" : "wsl";
+  $("#term").style.height = S.termHeight + "px";
+  try {
+    var i = await rpc("editor_term_info");
+    if (i && i.ok){ TERM.info = i.shells; i.shells.forEach(function(s){ if (s.cwd && s.cwd !== "~") TERM.cwd[s.kind] = s.cwd; }); }
+  } catch (e) {}
+  var kinds = ["wsl", "powershell"];
+  for (var n = 0; n < kinds.length; n++){
+    var k = kinds[n];
+    try { var r = await rpc("editor_term_history", k, 0); if (r && r.ok) r.lines.forEach(termAdd); } catch (e) {}
+    TERM.ready[k] = true;
+    TERM.buf[k].splice(0).forEach(termAdd);
+  }
+  applyTerm();
+  termSyncWorkspace(false);   // remember the workspace for (re)starts; don't move running shells at boot
+}
+(function(){
+  $("#st-term").onclick = function(){ termToggle(); };
+  $("#btn-run").onclick = function(){ runActive(); };
+  $("#term-close").onclick = function(){ termToggle(false); };
+  $("#term-tabs").addEventListener("click", function(e){ var b = e.target.closest(".tt"); if (b && !b.disabled) termSetShell(b.dataset.k); });
+  $("#term-sync").onchange = function(){ S.termSync = this.checked; persist(); if (S.termSync) termSyncWorkspace(true); };
+  $("#term-clear").onclick = function(){ TERM.lines[TERM.shell] = []; termRenderAll(); $("#term-in").focus(); };
+  $("#term-restart").onclick = function(){ rpc("editor_term_restart", TERM.shell).catch(function(){}); $("#term-in").focus(); };
+  $("#term-ws").onclick = async function(){
+    var r = await rpc("editor_term_cwd", TERM.shell);
+    if (r && r.ok && r.path) setWorkspace(r.path, true); else toast((r && r.error) || "Could not read the terminal folder", "err");
+  };
+  $("#term-body").addEventListener("click", function(e){
+    if (e.target.id === "term-in") return;
+    if (window.getSelection && String(window.getSelection())) return;   // let a text selection happen
+    $("#term-in").focus();
+  });
+  $("#term-in").addEventListener("keydown", function(e){
+    var inp = e.target, h = TERM.cmds[TERM.shell];
+    if (e.key === "Enter"){
+      var v = inp.value; if (!v.trim()) return;
+      h.push(v); if (h.length > 200) h.shift();
+      TERM.idx = -1; inp.value = "";
+      rpc("editor_term_run", TERM.shell, v).catch(function(x){ toast(String((x && x.message) || x), "err"); });
+    } else if (e.key === "ArrowUp"){
+      if (h.length){ TERM.idx = TERM.idx < 0 ? h.length - 1 : Math.max(0, TERM.idx - 1); inp.value = h[TERM.idx]; }
+      e.preventDefault();
+    } else if (e.key === "ArrowDown"){
+      if (TERM.idx >= 0){ TERM.idx++; if (TERM.idx >= h.length){ TERM.idx = -1; inp.value = ""; } else { inp.value = h[TERM.idx]; } }
+      e.preventDefault();
+    }
+  });
+  var rz = $("#term-rz"), drag = false;
+  rz.addEventListener("mousedown", function(e){ drag = true; rz.classList.add("drag"); e.preventDefault(); });
+  window.addEventListener("mousemove", function(e){
+    if (!drag) return;
+    S.termHeight = Math.max(90, Math.min(innerHeight - 22 - e.clientY, Math.floor(innerHeight * 0.8)));
+    $("#term").style.height = S.termHeight + "px"; if (ED) ED.layout();
+  });
+  window.addEventListener("mouseup", function(){ if (drag){ drag = false; rz.classList.remove("drag"); persist(); } });
+})();
+
+/* ───────── events pushed from Midum ───────── */
+function handleEvent(kind, p){
+  p = p || {};
+  if (kind === "editor_open_artifact" && p.id){ refreshArtifacts().then(function(){ openArtifact(p.id, {preview: false}); }); }
+  else if (kind === "editor_open_file" && p.path){ openFile(p.path, {preview: false, line: p.line, col: p.col}); }
+  else if (kind === "editor_artifact_changed"){ pollOnce(); }
+  else if (kind === "editor_shell_line" && p.text !== undefined){ termOnLine(p); }
+  else if (kind === "editor_shell_lines" && p.lines){ p.lines.forEach(termOnLine); }
+  else if (kind === "editor_open_folder" && p.path){ setWorkspace(p.path); }
+  else if (kind === "editor_ai_request" && p.id){ aiHandle(p); }
+}
+
+/* Chat model <-> Editor (see editor_link.py). Python sends {id, op, args}; we act on the LIVE Monaco models and
+   answer with editor_ai_reply. Ops: state, snapshot, edit, open_file, open_folder. */
+var aiFlash = null;
+function aiTabInfo(t){
+  return {key: t.key, kind: t.kind, name: t.name, path: t.path || "", id: t.id || "", dirty: !!t.dirty,
+          readOnly: !!(t.readOnly || t.deleted), active: t.key === S.active};
+}
+function aiState(){ return {ok: true, workspace: S.workspace, active: S.active, tabs: S.tabs.map(aiTabInfo)}; }
+function aiFindTab(path){
+  var q = pkey(path), hit = findTab("file:" + q);
+  if (hit) return hit;
+  var m = S.tabs.filter(function(x){ return x.path && (pkey(x.path) === q || pkey(x.path).slice(-(q.length + 1)) === "/" + q); });
+  if (m.length === 1) return m[0];
+  m = S.tabs.filter(function(x){ return (x.name || "").toLowerCase() === q.toLowerCase(); });
+  return m.length === 1 ? m[0] : null;
+}
+function aiSnapshot(a){
+  var out = aiState(); out.file = null;
+  var tab = (a && a.path) ? aiFindTab(a.path) : activeTab();
+  if (!tab) return out;
+  var f = {key: tab.key, kind: tab.kind, name: tab.name, path: tab.path || "", id: tab.id || "", lang: tab.lang || ""};
+  if (!tab.model){
+    f.noText = true; f.reason = tab.binary ? "a binary file" : tab.tooLarge ? "too large to open in the editor" : "not a text tab";
+    out.file = f; return out;
+  }
+  var m = tab.model, LF = monaco.editor.EndOfLinePreference.LF;
+  f.dirty = !!tab.dirty; f.readOnly = !!(tab.readOnly || tab.deleted); f.deleted = !!tab.deleted; f.conflict = !!tab.conflict;
+  f.version = m.getVersionId(); f.eol = m.getEOL() === "\r\n" ? "CRLF" : "LF"; f.lineCount = m.getLineCount();
+  f.content = m.getValue(LF);
+  if (ED && ED.getModel() === m){
+    var p = ED.getPosition(); if (p) f.cursor = {line: p.lineNumber, col: p.column};
+    var s = ED.getSelection();
+    if (s && !s.isEmpty()) f.selection = {startLine: s.startLineNumber, startCol: s.startColumn, endLine: s.endLineNumber, endCol: s.endColumn, text: m.getValueInRange(s, LF)};
+    var vr = ED.getVisibleRanges();
+    if (vr.length) f.visible = {start: vr[0].startLineNumber, end: vr[vr.length - 1].endLineNumber};
+  }
+  try {
+    f.problems = monaco.editor.getModelMarkers({resource: m.uri}).filter(function(k){ return k.severity >= 4; }).slice(0, 40)
+      .map(function(k){ return {line: k.startLineNumber, col: k.startColumn, sev: k.severity >= 8 ? "error" : "warning", msg: String(k.message).slice(0, 200)}; });
+  } catch (e) { f.problems = []; }
+  out.file = f; return out;
+}
+function aiFlashLines(ranges){
+  if (!ED || !ED.getModel() || !ranges || !ranges.length) return;
+  var n = ED.getModel().getLineCount();
+  var decs = ranges.map(function(r){
+    var s = Math.max(1, Math.min(n, r.start)), e = Math.max(s, Math.min(n, r.end));
+    return {range: new monaco.Range(s, 1, e, 1), options: {isWholeLine: true, className: "ai-edit-flash"}};
+  });
+  if (aiFlash){ try { aiFlash.clear(); } catch (e) {} }
+  var mine = aiFlash = ED.createDecorationsCollection(decs);
+  ED.revealLineInCenterIfOutsideViewport(decs[0].range.startLineNumber);
+  setTimeout(function(){ try { mine.clear(); } catch (e) {} }, 2500);
+}
+async function aiEdit(a){
+  var tab = activeTab();
+  if (!tab || !tab.model) return {ok: false, error: "no editable text tab is active"};
+  if (a.key && a.key !== tab.key) return {ok: false, stale: true, error: "the active tab changed"};
+  if (tab.readOnly || tab.deleted) return {ok: false, error: tab.deleted ? "the file was deleted on disk" : "this tab is read-only"};
+  var m = tab.model;
+  if (a.version !== undefined && a.version !== null && m.getVersionId() !== a.version) return {ok: false, stale: true, error: "the buffer changed since it was read"};
+  var eol = m.getEOL();
+  var ops = (a.edits || []).map(function(e){
+    return {range: new monaco.Range(e.sl, e.sc, e.el, e.ec), text: String(e.text).replace(/\r\n|\r|\n/g, eol), forceMoveMarkers: true};
+  });
+  try {
+    m.pushStackElement();                    // one undo step for the whole model edit, like applyContent()
+    m.pushEditOperations(ED && ED.getModel() === m ? ED.getSelections() : [], ops, function(){ return null; });
+    m.pushStackElement();
+  } catch (e) { return {ok: false, error: "could not apply the edit: " + ((e && e.message) || e)}; }
+  aiFlashLines(a.flash);
+  var saved = false;
+  if (a.save) saved = await saveTab(tab);
+  return {ok: true, version: m.getVersionId(), dirty: !!tab.dirty, saved: !!saved, lineCount: m.getLineCount()};
+}
+async function aiOpenFile(a){
+  var tab = await openFile(a.path, {preview: false, line: a.line, col: a.col});
+  if (!tab) return {ok: false, error: "it could not be opened (see the message in the Editor)"};
+  var r = {ok: true, key: tab.key, dirty: !!tab.dirty, lineCount: tab.model ? tab.model.getLineCount() : 0};
+  if (!tab.model){ r.noText = true; r.reason = tab.binary ? "a binary file" : tab.tooLarge ? "too large to open in the editor" : "not a text file"; }
+  return r;
+}
+async function aiOpenFolder(a){
+  await setWorkspace(a.path);
+  return pkey(S.workspace) === pkey(a.path) ? {ok: true, workspace: S.workspace} : {ok: false, error: "the folder could not be opened"};
+}
+/* Approval dialog for model edits: a diff + Approve / Reject (with an optional note for the model). Reject is focused
+   by default and plain Enter does nothing, so a keystroke meant for the editor can never approve an edit. */
+function aiApproveDlg(a){
+  return new Promise(function(resolve){
+    var bg = $("#modal-bg"), box = $("#modal"), finished = false, timer = null;
+    var rows = (a.diff || []).map(function(l){
+      var c = l.charAt(0) === "+" ? "add" : l.charAt(0) === "-" ? "del" : l.indexOf("@@") === 0 ? "hunk" : "";
+      return '<div class="' + c + '">' + esc(l || " ") + "</div>";
+    }).join("");
+    var info = (a.changes || 0) + " change(s): +" + (a.added || 0) + " / -" + (a.removed || 0) + " lines. " +
+      (a.save ? "It will also be saved to disk." : "It stays unsaved in the editor (Ctrl+Z undoes it).") + (a.path ? "\n" + a.path : "");
+    box.classList.add("wide");
+    box.innerHTML = "<h2>Midum wants to edit " + esc(a.name || "this file") + "</h2><p>" + esc(info) + "</p>" +
+      '<div class="aidiff">' + (rows || "<div>(no visible difference)</div>") + "</div>" +
+      '<input id="ai-note" placeholder="Optional note for Midum (sent if you reject)" spellcheck="false">' +
+      '<div class="bt"><button class="btn" data-v="always">Approve &amp; don\'t ask again</button>' +
+      '<button class="btn" data-v="no">Reject</button><button class="btn primary" data-v="yes">Approve</button></div>';
+    bg.classList.add("show");
+    function done(v, extra){
+      if (finished) return; finished = true; clearTimeout(timer);
+      var note = ($("#ai-note") || {}).value || "";
+      bg.classList.remove("show"); box.classList.remove("wide"); document.removeEventListener("keydown", onKey, true);
+      resolve(Object.assign({approved: v === "yes" || v === "always", always: v === "always", note: note}, extra || {}));
+    }
+    function onKey(e){
+      if (e.key === "Escape"){ e.preventDefault(); e.stopPropagation(); done("no"); }
+      else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)){ e.preventDefault(); e.stopPropagation(); done("yes"); }
+      else if (e.key === "Enter" && e.target && e.target.id === "ai-note"){ e.stopPropagation(); }
+    }
+    document.addEventListener("keydown", onKey, true);
+    box.onclick = function(e){ var b = e.target.closest("button[data-v]"); if (b) done(b.dataset.v); };
+    if (a.timeoutMs) timer = setTimeout(function(){ done("no", {timedOut: true}); }, a.timeoutMs);
+    var rej = box.querySelector('button[data-v="no"]'); if (rej) rej.focus();
+  });
+}
+async function aiApprove(a){
+  var r = await aiApproveDlg(a);
+  if (r.always){ S.aiApprove = false; persist(); toast("AI edits no longer need approval (F1 > Midum: Toggle Approval for AI Edits turns it back on)"); }
+  return {ok: true, approved: !!r.approved, always: !!r.always, note: r.note || "", timedOut: !!r.timedOut};
+}
+function aiLinkInit(){
+  if (!ED || aiLinkInit.done) return; aiLinkInit.done = true;
+  ED.addAction({id: "midum.toggleAiEditApproval", label: "Midum: Toggle Approval for AI Edits", run: function(){
+    S.aiApprove = !S.aiApprove; persist();
+    toast("AI edits " + (S.aiApprove ? "now need your approval" : "no longer need approval"));
+  }});
+}
+async function aiHandle(p){
+  var res, a = p.args || {};
+  try {
+    if (p.op === "state") res = aiState();
+    else if (p.op === "snapshot") res = aiSnapshot(a);
+    else if (p.op === "edit") res = await aiEdit(a);
+    else if (p.op === "open_file") res = await aiOpenFile(a);
+    else if (p.op === "open_folder") res = await aiOpenFolder(a);
+    else if (p.op === "approve_edit") res = await aiApprove(a);
+    else res = {ok: false, error: "unknown op: " + p.op};
+  } catch (e) { res = {ok: false, error: String((e && e.message) || e)}; }
+  try { await rpc("editor_ai_reply", p.id, res); } catch (e) {}
+}
+
+/* ───────── boot ───────── */
+async function boot(){
+  $("#fatal").classList.remove("show");
+  var st;
+  try { st = await rpc("editor_get_state"); } catch (e) { st = {ok: false, error: e.message}; }
+  var s = (st && st.ok && st.state) || {};
+  S.workspace = s.workspace || ""; S.recent = s.recent || []; S.expanded = new Set(s.expanded || []);
+  S.collapsed = Object.assign({artifacts: false, workspace: false}, s.collapsed || {});
+  if (s.sideWidth) S.sideWidth = s.sideWidth;
+  if (s.fontSize) S.fontSize = s.fontSize;
+  if (typeof s.wordWrap === "boolean") S.wordWrap = s.wordWrap;
+  if (typeof s.minimap === "boolean") S.minimap = s.minimap;
+  if (typeof s.autoSave === "boolean") S.autoSave = s.autoSave;
+  if (typeof s.termOpen === "boolean") S.termOpen = s.termOpen;
+  if (typeof s.inlineAI === "boolean") S.inlineAI = s.inlineAI;
+  if (typeof s.termSync === "boolean") S.termSync = s.termSync;
+  if (s.termHeight) S.termHeight = s.termHeight;
+  if (s.termShell) S.termShell = s.termShell;
+  if (typeof s.aiApprove === "boolean") S.aiApprove = s.aiApprove;
+  $("#side").style.width = S.sideWidth + "px"; applySections(); applySide();
+  try { await loadMonaco(); }
+  catch (e){
+    $("#fatal-msg").textContent = "Monaco could not be loaded. It is downloaded once (needs internet on first run).";
+    $("#fatal-code").textContent = String(e && e.message || e);
+    $("#fatal").classList.add("show"); return;
+  }
+  if (!ED) createEditor();
+  aiLinkInit();
+  renderTree(); renderStatus(); renderPanels();
+  if (S.workspace){ await loadDir(S.workspace); for (var ex of Array.from(S.expanded)) await loadDir(ex); renderTree(); }
+  await refreshArtifacts();
+  var want = s.active;
+  for (var i = 0; i < (s.tabs || []).length; i++){
+    var t = s.tabs[i];
+    try { if (t.kind === "file" && t.path) await openFile(t.path, {preview: !!t.preview}); else if (t.kind === "artifact" && t.id) await openArtifact(t.id, {preview: !!t.preview}); } catch (e) {}
+  }
+  if (want && findTab(want)) activate(want, {focus: false}); else if (S.tabs.length) activate(S.tabs[0].key, {focus: false}); else renderPanels();
+  booted = true;
+  termBoot(); aiProbe();
+  rpc("editor_ai_hello").catch(function(){});
+  eventQueue.splice(0).forEach(function(d){ handleEvent(d.kind, d.payload); });
+}
+/* AI inline suggestions: ghost text from Gemini via the editor's local /api/inline endpoint.
+   Key hopping across the configured Gemini keys happens server-side (gui/inline_suggest.py). */
+var INLINE_TOKEN = '__INLINE_TOKEN__';
+var AI_DELAY = 200, AI_PREFIX = 5000, AI_SUFFIX = 1500;
+var AI_SKIP = /^(\.env(\..*)?|.*\.(pem|key|pfx|p12|kdbx|ppk)|id_(rsa|dsa|ecdsa|ed25519)|.*secrets?.*)$/i;   // never sent anywhere
+var AI = {state: 'idle', seq: 0, pausedUntil: 0, info: '', registered: false, warnedNoKeys: false, prop: null, propKey: null, pendingAccept: null, applying: false};
+function aiPost(body, signal){
+  return fetch(location.origin + '/api/inline', {method: 'POST', cache: 'no-store', signal: signal,
+    headers: {'Content-Type': 'application/json', 'X-Midum-Token': INLINE_TOKEN}, body: JSON.stringify(body)})
+    .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
+}
+function aiSet(state, info){ AI.state = state; if (info !== undefined) AI.info = info; renderAiStatus(); }
+function renderAiStatus(){
+  var el = $('#st-ai'); if (!el) return;
+  var txt = 'AI: off', cls = 'it btn2', tip = 'AI inline suggestions are off (click to turn on)';
+  if (S.inlineAI){
+    tip = 'AI inline suggestions (Gemini, gemini-3.1-flash-lite). Tab accepts, Alt + backslash triggers. Click to turn off.';
+    if (AI.state === 'busy'){ txt = 'AI ...'; cls += ' on'; }
+    else if (AI.state === 'cooling'){ txt = 'AI: cooling'; cls += ' warn'; }
+    else if (AI.state === 'nokeys'){ txt = 'AI: no keys'; cls += ' err'; }
+    else if (AI.state === 'error'){ txt = 'AI: error'; cls += ' err'; }
+    else { txt = 'AI: on'; cls += ' on'; }
+    if (AI.info) tip += ' - ' + AI.info;
+  }
+  el.className = cls; el.textContent = txt; el.title = tip;
+}
+function aiContext(model, pos){
+  var NL = String.fromCharCode(10), off = model.getOffsetAt(pos), a = Math.max(0, off - AI_PREFIX), p0 = model.getPositionAt(a);
+  var prefix = model.getValueInRange(new monaco.Range(p0.lineNumber, p0.column, pos.lineNumber, pos.column));
+  var p1 = model.getPositionAt(off + AI_SUFFIX);
+  var suffix = model.getValueInRange(new monaco.Range(pos.lineNumber, pos.column, p1.lineNumber, p1.column));
+  if (a > 0){ var nl = prefix.indexOf(NL); if (nl >= 0) prefix = prefix.slice(nl + 1); }   // do not start mid-line
+  return {prefix: prefix, suffix: suffix};
+}
+function aiProvide(model, position, context, token){
+  var empty = {items: []}, t = activeTab();
+  if (!S.inlineAI || !t || t.model !== model || t.readOnly || t.deleted) return Promise.resolve(empty);
+  if (AI_SKIP.test(t.name) || (t.path && AI_SKIP.test(baseName(t.path)))) return Promise.resolve(empty);
+  if (context.selectedSuggestionInfo || Date.now() < AI.pausedUntil || AI.prop) return Promise.resolve(empty);
+  var ictx = aiInstrContext(model, position);
+  if (ictx && ictx.onComment && context.triggerKind !== monaco.languages.InlineCompletionTriggerKind.Explicit) return Promise.resolve(empty);   // still typing the comment: wait for Enter, or Alt + backslash
+  if (!ictx && /^[A-Za-z0-9_$]/.test(model.getLineContent(position.lineNumber).slice(position.column - 1))) return Promise.resolve(empty);   // mid-identifier
+  var my = ++AI.seq, ver = model.getVersionId();
+  if (AI.state === 'busy') aiSet('idle');
+  return new Promise(function(r){ setTimeout(r, (ictx || context.triggerKind === monaco.languages.InlineCompletionTriggerKind.Explicit) ? 0 : AI_DELAY); }).then(function(){
+    if (token.isCancellationRequested || my !== AI.seq) return empty;
+    var c = aiContext(model, position), ctrl = new AbortController();
+    token.onCancellationRequested(function(){ ctrl.abort(); });
+    aiSet('busy');
+    var body = {op: 'suggest', prefix: c.prefix, suffix: c.suffix, lang: model.getLanguageId(), name: t.name};
+    if (ictx) body.instr = {comment: ictx.comment, cursor: ictx.onComment ? 'end_of_comment_line' : 'blank_line_below_comment'};
+    body.cursor = {line: position.lineNumber, col: position.column};
+    var ew = aiEditWindow(model, position, ictx);   // the only lines a replace / delete may touch
+    if (ew) body.edit = ew;
+    return aiPost(body, ctrl.signal).then(function(r){
+      if (my !== AI.seq) return empty;
+      if (r.ok){
+        aiSet('idle', r.key ? 'last request: key ' + r.key + ' of ' + r.keys + (r.cached ? ' (cached)' : ', ' + r.ms + ' ms') : AI.info);
+        var action = r.action || 'insert';
+        if (action !== 'insert'){
+          if (r.start && r.end) aiShowEdit(model, (ictx && r.is_instruction) ? ictx : null, r, ver, position);
+          return empty;
+        }
+        AI.pendingAccept = (ictx && r.is_instruction && r.text) ? {model: model, text: r.text, c: ictx} : null;
+        if (!r.text) return empty;
+        return {items: [{insertText: r.text, range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column)}]};
+      }
+      if (r.error === 'no_keys'){
+        aiSet('nokeys', 'No Gemini API keys found in the secrets file.'); AI.pausedUntil = Date.now() + 30000;
+        if (!AI.warnedNoKeys){ AI.warnedNoKeys = true; toast('AI suggestions: add GEMINI_API_KEY (and _2 to _5) to your secrets file.', 'err'); }
+      } else if (r.cooling){
+        var wait = Math.min(Math.max(r.retry_after || 20, 5), 60);
+        AI.pausedUntil = Date.now() + wait * 1000;
+        aiSet('cooling', 'All ' + r.total + ' keys are rate-limited; retrying in about ' + Math.round(wait) + ' s.');
+      } else if (r.busy){ aiSet('idle'); }
+      else aiSet('error', r.error || 'request failed');
+      return empty;
+    });
+  }).catch(function(e){
+    if (my === AI.seq){ if (e && e.name === 'AbortError') aiSet('idle'); else aiSet('error', String((e && e.message) || e)); }
+    return empty;
+  });
+}
+// ---- instruction comments: the comment, plus the code block directly below it (the edit target) ----
+function aiIsComment(s, lang){
+  var t = s.trim();
+  if (!t || lang === 'markdown' || lang === 'plaintext') return false;
+  if (t.indexOf('//') === 0 || t.indexOf('/*') === 0 || t.indexOf('--') === 0 || t.indexOf('<!--') === 0) return true;
+  var c = t.charAt(0);
+  if (c === '*' || c === '%' || c === ';') return true;
+  return c === '#' && !/^#(include|define|if|ifdef|ifndef|elif|else|endif|pragma|import|region|endregion|!)/.test(t);
+}
+function aiIndent(l){ var i = 0, tab = String.fromCharCode(9); while (i < l.length && (l.charAt(i) === ' ' || l.charAt(i) === tab)) i++; return i; }
+function aiCloser(l){ var c = l.trim().charAt(0); return c === ')' || c === ']' || c === '}'; }
+function aiTargetBlock(model, start){
+  // first line below the comment, plus the rest of its statement/block (deeper-indented lines, a closing bracket)
+  var n = model.getLineCount();
+  if (start > n || !model.getLineContent(start).trim()) return null;
+  var base = aiIndent(model.getLineContent(start)), end = start, i, j, l, ind, t;
+  for (i = start + 1; i <= n && i - start < 80; i++){
+    l = model.getLineContent(i);
+    if (!l.trim()){
+      j = i + 1; while (j <= n && !model.getLineContent(j).trim()) j++;
+      if (j <= n && j - start < 80 && aiIndent(model.getLineContent(j)) > base){ i = j - 1; continue; }
+      break;
+    }
+    ind = aiIndent(l);
+    if (ind > base){ end = i; continue; }
+    if (ind === base && aiCloser(l)){
+      end = i; t = l.trim();
+      if ('{:('.indexOf(t.charAt(t.length - 1)) >= 0) continue;   // a line like  } else {  opens the next part
+    }
+    break;
+  }
+  return {start: start, end: end};
+}
+function aiInstrContext(model, pos){
+  var lang = model.getLanguageId(), ln = pos.lineNumber, cur = model.getLineContent(ln), onComment = false, cEnd = 0, k, i;
+  if (aiIsComment(cur, lang)){
+    if (cur.slice(pos.column - 1).trim() !== '') return null;   // cursor must be at the end of the comment line
+    cEnd = ln; onComment = true;
+  } else if (!cur.trim()){
+    k = ln - 1; while (k >= 1 && k >= ln - 3 && !model.getLineContent(k).trim()) k--;
+    if (k >= 1 && aiIsComment(model.getLineContent(k), lang)) cEnd = k; else return null;
+  } else return null;
+  var cStart = cEnd, NL = String.fromCharCode(10), lines = [], tl = [];
+  while (cStart > 1 && cEnd - cStart < 12 && aiIsComment(model.getLineContent(cStart - 1), lang)) cStart--;
+  for (i = cStart; i <= cEnd; i++) lines.push(model.getLineContent(i).trim());
+  var tb = aiTargetBlock(model, ln + 1);
+  if (tb) for (i = tb.start; i <= tb.end; i++) tl.push(model.getLineContent(i));
+  return {cStart: cStart, cEnd: cEnd, comment: lines.join(NL), target: tl.join(NL), tStart: tb ? tb.start : 0, tEnd: tb ? tb.end : 0, onComment: onComment};
+}
+
+// ---- edit proposals (replace / delete): red = removed, green = new text; Tab applies, Esc dismisses ----
+function aiDeleteRange(model, s, e){
+  var n = model.getLineCount();
+  if (e < n) return new monaco.Range(s, 1, e + 1, 1);
+  if (s > 1) return new monaco.Range(s - 1, model.getLineMaxColumn(s - 1), e, model.getLineMaxColumn(e));
+  return new monaco.Range(s, 1, e, model.getLineMaxColumn(e));
+}
+function aiClearProp(){
+  var P = AI.prop; if (!P) return;
+  AI.prop = null;
+  if (AI.propKey) AI.propKey.set(false);
+  try { if (P.coll) P.coll.clear(); } catch (e) {}
+  try { if (P.zoneIds && P.zoneIds.length) ED.changeViewZones(function(acc){ P.zoneIds.forEach(function(id){ acc.removeZone(id); }); }); } catch (e) {}
+}
+function aiEditWindow(model, pos, ictx){
+  // the only lines a replace / delete may touch: the code block under an instruction comment, else a few lines around the cursor
+  var s, e, i, l, lines = [];
+  if (ictx){ if (!ictx.target) return null; s = ictx.tStart; e = ictx.tEnd; }
+  else { s = Math.max(1, pos.lineNumber - 2); e = Math.min(model.getLineCount(), pos.lineNumber + 4); }
+  for (i = s; i <= e; i++){ l = model.getLineContent(i); if (l.length > 400) return null; lines.push(l); }
+  return {start: s, lines: lines};
+}
+function aiDiffHunks(oldL, newL){
+  // line diff (LCS): changed chunks as {o0,o1} old index range + {n0,n1} new index range; unchanged lines are left alone
+  var n = oldL.length, m = newL.length, i, j, T = [], hunks = [], h = null;
+  if (n * m > 40000) return [{o0: 0, o1: n, n0: 0, n1: m}];
+  for (i = 0; i <= n; i++){ T.push([]); for (j = 0; j <= m; j++) T[i].push(0); }
+  for (i = n - 1; i >= 0; i--) for (j = m - 1; j >= 0; j--)
+    T[i][j] = oldL[i] === newL[j] ? T[i + 1][j + 1] + 1 : Math.max(T[i + 1][j], T[i][j + 1]);
+  i = 0; j = 0;
+  while (i < n || j < m){
+    if (i < n && j < m && oldL[i] === newL[j]){ if (h){ hunks.push(h); h = null; } i++; j++; continue; }
+    if (!h) h = {o0: i, o1: i, n0: j, n1: j};
+    if (j < m && (i >= n || T[i][j + 1] >= T[i + 1][j])){ j++; h.n1 = j; } else { i++; h.o1 = i; }
+  }
+  if (h) hunks.push(h);
+  return hunks;
+}
+function aiZoneNode(lines, color, fi, lh){
+  var li = ED.getLayoutInfo(), node = document.createElement('div'), bar = document.createElement('div');
+  node.className = 'ai-zone';
+  node.style.paddingLeft = li.contentLeft + 'px';
+  node.style.fontFamily = fi.fontFamily; node.style.fontSize = fi.fontSize + 'px';
+  bar.className = 'ai-zbar'; bar.style.left = (li.glyphMarginLeft + 7) + 'px'; bar.style.background = color;   // gutter marker, left of the line numbers
+  node.appendChild(bar);
+  lines.forEach(function(l){
+    var d = document.createElement('div');
+    d.style.height = lh + 'px'; d.style.lineHeight = lh + 'px'; d.textContent = l;
+    node.appendChild(d);
+  });
+  return node;
+}
+function aiShowProp(P){
+  // Draws the proposal as a diff. Marker in the gutter, left of the line numbers: green = added lines, red = deleted lines, yellow = edited lines.
+  aiClearProp();
+  var fi = ED.getOption(monaco.editor.EditorOption.fontInfo), lh = fi.lineHeight, M = P.model, decs = [], zones = [];
+  var hunks = aiDiffHunks(P.oldLines, P.newLines);
+  if (!hunks.length) return;
+  hunks.forEach(function(h){
+    var hasOld = h.o1 > h.o0, hasNew = h.n1 > h.n0, edit = hasOld && hasNew;
+    if (hasOld) decs.push({range: new monaco.Range(P.start + h.o0, 1, P.start + h.o1 - 1, M.getLineMaxColumn(P.start + h.o1 - 1)),
+      options: {isWholeLine: true, className: edit ? 'ai-edit-line' : 'ai-del-line', inlineClassName: 'ai-del-text', glyphMarginClassName: edit ? 'ai-gm-edit' : 'ai-gm-del'}});
+    if (hasNew) zones.push({after: hasOld ? P.start + h.o1 - 1 : P.start + h.o0 - 1, lines: P.newLines.slice(h.n0, h.n1), color: edit ? '#eab308' : '#10b981'});
+  });
+  P.coll = ED.createDecorationsCollection(decs);
+  ED.changeViewZones(function(acc){
+    P.zoneIds = zones.map(function(z){ return acc.addZone({afterLineNumber: z.after, heightInPx: z.lines.length * lh, domNode: aiZoneNode(z.lines, z.color, fi, lh), suppressMouseDown: true}); });
+  });
+  AI.prop = P; AI.propKey.set(true);
+}
+function aiShowEdit(model, ictx, r, ver, pos){
+  var t = activeTab(), p = ED.getPosition();
+  if (!t || t.model !== model || model.getVersionId() !== ver || !p || p.lineNumber !== pos.lineNumber || p.column !== pos.column) return;   // stale
+  var s = r.start, e = r.end, del = r.action === 'delete', NL = String.fromCharCode(10), old = [], nw = del ? [] : String(r.text || '').split(NL), i;
+  if (!(s >= 1 && e >= s && e <= model.getLineCount())) return;
+  for (i = s; i <= e; i++) old.push(model.getLineContent(i));
+  aiShowProp({model: model, ver: ver, start: s, oldLines: old, newLines: nw,
+    edits: [{range: del ? aiDeleteRange(model, s, e) : new monaco.Range(s, 1, e, model.getLineMaxColumn(e)), text: del ? '' : nw.join(NL)}],
+    endCursor: del ? null : {line: s + nw.length - 1, col: nw[nw.length - 1].length + 1},
+    after: ictx ? function(){ aiOfferCommentDelete(model, ictx); } : null});   // an instruction was carried out: offer to delete its comment
+}
+function aiOfferCommentDelete(model, c){
+  var t = activeTab();
+  if (!t || t.model !== model || !c || c.cStart < 1 || c.cEnd > model.getLineCount()) return;
+  var NL = String.fromCharCode(10), cur = [], raw = [], i;
+  for (i = c.cStart; i <= c.cEnd; i++){ raw.push(model.getLineContent(i)); cur.push(model.getLineContent(i).trim()); }
+  if (cur.join(NL) !== c.comment) return;   // the comment moved or changed: do not guess
+  aiShowProp({model: model, ver: model.getVersionId(), start: c.cStart, oldLines: raw, newLines: [],
+    edits: [{range: aiDeleteRange(model, c.cStart, c.cEnd), text: ''}]});
+}
+function aiApplyProp(){
+  var P = AI.prop; if (!P) return;
+  var ok = ED.getModel() === P.model && P.model.getVersionId() === P.ver;
+  aiClearProp();
+  if (!ok) return;
+  AI.applying = true;
+  try {
+    ED.pushUndoStop();
+    ED.executeEdits('midum-ai', P.edits.map(function(e){ return {range: e.range, text: e.text, forceMoveMarkers: true}; }));
+    if (P.endCursor) ED.setPosition({lineNumber: P.endCursor.line, column: P.endCursor.col});   // keep typing right after the new code
+    ED.pushUndoStop();
+  } finally { AI.applying = false; }
+  if (P.after) setTimeout(P.after, 80);
+}
+function aiOnContent(e){
+  if (AI.applying) return;
+  aiClearProp();   // any edit invalidates a shown proposal
+  var pa = AI.pendingAccept; if (!pa || !e.changes.length) return;
+  var CR = String.fromCharCode(13);
+  if (e.changes.some(function(c){ return c.text.split(CR).join('') === pa.text; })){   // the whole suggestion was accepted
+    AI.pendingAccept = null;
+    setTimeout(function(){ aiOfferCommentDelete(pa.model, pa.c); }, 80);
+  }
+}
+function aiSetupEdits(){
+  AI.propKey = ED.createContextKey('midumAiProposal', false);
+  ED.addCommand(monaco.KeyCode.Tab, function(){ aiApplyProp(); }, 'midumAiProposal');
+  ED.addCommand(monaco.KeyCode.Escape, function(){ aiClearProp(); }, 'midumAiProposal');
+  ED.onDidChangeModelContent(aiOnContent);
+  ED.onDidChangeCursorPosition(function(){ if (AI.prop && !AI.applying) aiClearProp(); });
+  ED.onDidChangeModel(function(){ aiClearProp(); AI.pendingAccept = null; });
+}
+function aiInit(){
+  if (!AI.registered){
+    AI.registered = true;
+    monaco.languages.registerInlineCompletionsProvider('*', {
+      provideInlineCompletions: aiProvide,
+      freeInlineCompletions: function(){}, disposeInlineCompletions: function(){}
+    });
+  }
+  ED.addAction({id: 'midum.toggleAiInline', label: 'Midum: Toggle AI Inline Suggestions', run: function(){ aiToggle(); }});
+  aiSetupEdits();
+}
+function aiToggle(force){
+  S.inlineAI = typeof force === 'boolean' ? force : !S.inlineAI;
+  if (!S.inlineAI){ AI.seq++; aiClearProp(); }
+  else { AI.pausedUntil = 0; AI.state = 'idle'; }
+  if (ED) ED.updateOptions({inlineSuggest: {enabled: S.inlineAI, mode: 'subwordSmart', showToolbar: 'never'}});
+  renderAiStatus(); persist(); toast('AI inline suggestions ' + (S.inlineAI ? 'on' : 'off'));
+}
+function aiProbe(){
+  aiPost({op: 'status'}).then(function(r){
+    if (!r || !r.ok) return;
+    if (!r.total) aiSet('nokeys', 'No Gemini API keys found in the secrets file.');
+    else aiSet(AI.state === 'nokeys' ? 'idle' : AI.state, r.total + ' Gemini key' + (r.total > 1 ? 's' : '') + ' loaded (' + r.model + '), used round-robin with automatic hopping.');
+  }).catch(function(){ aiSet('error', 'The suggestion service is not reachable.'); });
+}
+$('#st-ai').onclick = function(){ aiToggle(); };
+
+$("#fatal-retry").onclick = boot;
+window.__mzEditor = {S: S, T: T, openFile: openFile, openArtifact: openArtifact, activate: activate, saveActive: saveActive, closeTab: closeTab, setWorkspace: setWorkspace, pollOnce: pollOnce, get editor(){ return ED; }};
+postParent({__ed: "ready"});
+boot();
+})();
+</script>
+</body>
+</html>

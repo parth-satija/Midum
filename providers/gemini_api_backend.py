@@ -103,9 +103,20 @@ def _sanitize_messages_for_gemini_api(messages: list) -> list:
     sanitized    = []
     pending_calls = []  # list of (call_id, function_name), FIFO
     counter      = 0
-    for m in messages:
+    # Artifact attachments: inline images for the most recent attachment-bearing
+    # user message(s); everything else is reachable through the artifact tools.
+    try:
+        import artifacts as _art
+        _inline_idx = _art.inline_eligible_indices(messages)
+    except Exception as _art_err:
+        print(f"   [Gemini API] artifact inlining unavailable: {_art_err}")
+        _art, _inline_idx = None, set()
+    for _idx, m in enumerate(messages):
         m = dict(m)
         role = m.get("role")
+        # Ollama-style raw-base64 `images` (screenshots, view_artifact) are not valid on
+        # Google's endpoint -- lift them out and re-send as a following user message.
+        imgs = m.pop("images", None)
 
         if role == "assistant" and m.get("tool_calls"):
             new_calls = []
@@ -159,8 +170,32 @@ def _sanitize_messages_for_gemini_api(messages: list) -> list:
             m["name"] = name
             sanitized.append(m)
 
+        elif role == "user" and _art is not None and _idx in _inline_idx and isinstance(m.get("content"), str):
+            try:
+                parts = _art.build_user_parts(m["content"])
+            except Exception as _part_err:
+                print(f"   [Gemini API] could not inline attachments: {_part_err}")
+                parts = None
+            if parts:
+                m["content"] = parts
+            sanitized.append(m)
+
         else:
             sanitized.append(m)
+
+        if imgs:
+            img_parts = [{"type": "text", "text": "[Image result from the previous tool call]"}]
+            for b64 in imgs:
+                if not isinstance(b64, str) or not b64:
+                    continue
+                if b64.startswith("data:"):
+                    url = b64
+                else:
+                    mime = "image/jpeg" if b64.startswith("/9j/") else "image/webp" if b64.startswith("UklGR") else "image/png"
+                    url = f"data:{mime};base64,{b64}"
+                img_parts.append({"type": "image_url", "image_url": {"url": url}})
+            if len(img_parts) > 1:
+                sanitized.append({"role": "user", "content": img_parts})
 
     return sanitized
 
@@ -283,6 +318,155 @@ def _gemini_api_chat(messages: list, model: str = None, tools_schema: list = Non
             "tool_calls": normalised_calls,
         }
     }
+
+
+# =============================================================================
+# GEMINI FILES API (native, NOT the OpenAI-compat layer)
+# =============================================================================
+# Google's OpenAI-compatible endpoint cannot reference uploaded files, so the
+# artifact system uploads attachments to the native Files API (kept ~48h) and
+# the `analyze_artifact` tool calls native generateContent with the file URI.
+# NOTE: uploaded files are scoped to the API key's project, so we remember which
+# key (index in the fallback chain) did the upload and reuse that key for reads.
+
+class GeminiFilesError(RuntimeError):
+    def __init__(self, msg, status=None):
+        super().__init__(msg)
+        self.status = status
+
+
+def _gemini_native_root() -> str:
+    base = GEMINI_API_BASE.rstrip("/")
+    if base.endswith("/openai"):
+        base = base[: -len("/openai")]
+    return base                                  # e.g. https://generativelanguage.googleapis.com/v1beta
+
+
+def _gemini_upload_root() -> str:
+    return _gemini_native_root().replace("/v1beta", "/upload/v1beta", 1)
+
+
+def _gemini_key_at(index=None):
+    """(index, key) for an explicit chain index, else the currently active key."""
+    if index is not None and 0 <= index < len(_GEMINI_API_KEYS):
+        return index, _GEMINI_API_KEYS[index]
+    return _GEMINI_API_KEY_INDEX, _GEMINI_API_KEY
+
+
+def _files_error(resp) -> GeminiFilesError:
+    msg = None
+    try:
+        j = resp.json()
+        j = j[0] if isinstance(j, list) and j else j
+        msg = (j.get("error") or {}).get("message")
+    except Exception:
+        pass
+    return GeminiFilesError(f"Gemini API error ({resp.status_code}): {msg or resp.text[:200]}", resp.status_code)
+
+
+def gemini_files_upload(path: str, mime_type: str, display_name: str = None, timeout: int = 900) -> dict:
+    """Upload a local file to the Gemini Files API (resumable protocol). Returns the file
+    resource dict plus ``key_index``. Rotates to the next key on 429 like the chat path."""
+    if not _GEMINI_API_AVAILABLE or not _GEMINI_API_KEY:
+        raise GeminiFilesError("No Gemini API key configured (GEMINI_API_KEY in the secrets file).")
+    size = os.path.getsize(path)
+    while True:
+        idx, key = _gemini_key_at(None)
+        start = requests.post(
+            f"{_gemini_upload_root()}/files",
+            headers={
+                "x-goog-api-key": key,
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": str(size),
+                "X-Goog-Upload-Header-Content-Type": mime_type,
+                "Content-Type": "application/json",
+            },
+            json={"file": {"display_name": (display_name or os.path.basename(path))[:128]}},
+            timeout=60,
+        )
+        if start.status_code == 429 and _advance_gemini_api_key():
+            continue
+        if start.status_code != 200:
+            raise _files_error(start)
+        upload_url = start.headers.get("x-goog-upload-url")
+        if not upload_url:
+            raise GeminiFilesError("Gemini Files API did not return an upload URL.")
+        with open(path, "rb") as fh:
+            up = requests.post(
+                upload_url,
+                headers={"Content-Length": str(size), "X-Goog-Upload-Offset": "0",
+                         "X-Goog-Upload-Command": "upload, finalize"},
+                data=fh, timeout=timeout,
+            )
+        if up.status_code != 200:
+            raise _files_error(up)
+        info = up.json().get("file") or {}
+        break
+    # Video/large files are PROCESSING for a bit before they can be referenced.
+    deadline = time.time() + 180
+    while info.get("state") == "PROCESSING" and time.time() < deadline:
+        time.sleep(2)
+        r = requests.get(f"{_gemini_native_root()}/{info['name']}", headers={"x-goog-api-key": key}, timeout=30)
+        if r.status_code == 200:
+            info = r.json()
+    if info.get("state") in ("FAILED", "PROCESSING"):
+        raise GeminiFilesError(f"Gemini could not process the file (state={info.get('state')}).")
+    info["key_index"] = idx
+    return info
+
+
+def gemini_files_delete(name: str, key_index=None) -> bool:
+    if not name or not _GEMINI_API_AVAILABLE:
+        return False
+    _, key = _gemini_key_at(key_index)
+    try:
+        r = requests.delete(f"{_gemini_native_root()}/{name}", headers={"x-goog-api-key": key}, timeout=30)
+        return r.status_code in (200, 204, 404)
+    except Exception:
+        return False
+
+
+def gemini_generate_with_files(prompt: str, files: list = None, inline: list = None, model: str = None,
+                               system: str = None, key_index=None, timeout: int = 300) -> str:
+    """Native generateContent call. ``files`` = [{"uri", "mime"}] (Files API),
+    ``inline`` = [{"mime", "data"(base64)}]. Returns the model's text."""
+    if not _GEMINI_API_AVAILABLE or not _GEMINI_API_KEY:
+        raise GeminiFilesError("No Gemini API key configured.")
+    model_id = (model or config.GEMINI_API_MODEL or "").split("/")[-1]
+    parts = []
+    for f in files or []:
+        parts.append({"file_data": {"mime_type": f["mime"], "file_uri": f["uri"]}})
+    for f in inline or []:
+        parts.append({"inline_data": {"mime_type": f["mime"], "data": f["data"]}})
+    parts.append({"text": prompt})
+    body = {"contents": [{"role": "user", "parts": parts}]}
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+    last = None
+    for attempt in range(3):
+        _, key = _gemini_key_at(key_index)
+        resp = requests.post(f"{_gemini_native_root()}/models/{model_id}:generateContent",
+                             headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                             json=body, timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            cands = data.get("candidates") or []
+            if not cands:
+                raise GeminiFilesError(f"Gemini returned no answer (blocked?): {data.get('promptFeedback')}")
+            out = "".join(p.get("text", "") for p in (cands[0].get("content") or {}).get("parts", [])
+                          if not p.get("thought"))
+            if not out.strip():
+                raise GeminiFilesError(f"Gemini returned an empty answer (finishReason={cands[0].get('finishReason')}).")
+            return out.strip()
+        last = _files_error(resp)
+        if resp.status_code == 429 and key_index is None and _advance_gemini_api_key():
+            continue
+        if resp.status_code in (429, 500, 503) and attempt < 2:
+            time.sleep(2 * (attempt + 1))
+            continue
+        break
+    raise last or GeminiFilesError("Gemini request failed.")
 
 
 def consult_gemini_api(prompt: str, context: str = "", model: str = None) -> str:

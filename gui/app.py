@@ -79,6 +79,9 @@ from gui.ambient_surface import AmbientSurfaceManager
 import config
 import main as midum
 import permissions
+import artifacts
+import midumdocs
+from gui.editor_backend import EditorMixin
 import midum_mcp.filesystem_policy as fs_policy
 
 CHATS_DIR = os.path.join(midum.STORAGE_DIR, "chats")
@@ -576,7 +579,7 @@ def _install_win_snap_hook(window):
 # JS <-> Python bridge — every method here is callable from the frontend as
 # `pywebview.api.<method>(...)` and returns JSON-serialisable data.
 # =============================================================================
-class Api:
+class Api(EditorMixin):
     def __init__(self):
         self.window = None
         self._closing       = False   # set once real teardown has started -- see _push_event / _on_closing
@@ -758,6 +761,12 @@ class Api:
         # `midum`, or write_render_code/edit_render_code/close_render_surface
         # would silently keep calling a stale None hook forever.
         _render_surface_tools._gui_render_hook = self._handle_render
+        # MidumDocs (LaTeX editor pane): artifacts of type 'latex' open/refresh through this hook.
+        midumdocs._gui_hook = self._handle_midumdocs
+        # Editor tab (gui/editor_backend.py): lets the model open artifacts in it and lets artifact
+        # commits (model edits) refresh an open editor tab live. Set on `artifacts` itself for the same
+        # rebinding reason as the hooks above.
+        artifacts._gui_editor_hook = self._handle_editor
 
         # ── Ambient Surfaces ──────────────────────────────────────────────
         # Floating over-the-screen widgets (see tools/ambient_surface_tools.py
@@ -788,8 +797,11 @@ class Api:
         # execute_wsl_command or typed by the user directly into the tab,
         # streams here as a "shell_line" event so both sides watch (and
         # can drive) the exact same live terminal.
-        from shell_session import get_shell_session
-        get_shell_session().set_event_hook(self._push_event)
+        from shell_session import set_shell_event_hook, set_workspace_resolver
+        set_shell_event_hook(self._push_event)
+        # Both shells start in the editor's active workspace folder.
+        from gui.editor_backend import active_workspace
+        set_workspace_resolver(active_workspace)
 
         # Notified the moment a sub-agent's Action Loop stops (task done,
         # crashed, or cut off) -- see multi_agent.set_agent_done_hook and
@@ -993,7 +1005,7 @@ class Api:
             self._display_log.append(("toolcall", toolcall_payload))
 
     # ── Shell tab (persistent WSL2 terminal, shared with the model) ────────
-    def shell_run_user_command(self, command: str):
+    def shell_run_user_command(self, command: str, shell: str = "wsl"):
         """Runs a command the USER typed directly into the Shell tab, in the
         exact same persistent WSL2 session the model's execute_wsl_command
         tool drives -- so cwd/env/background jobs stay consistent no matter
@@ -1006,27 +1018,76 @@ class Api:
         if not command:
             return {"ok": False, "error": "empty command"}
         from shell_session import get_shell_session
+        sess = get_shell_session(shell)
         def _run():
-            get_shell_session().run(command, origin="user", timeout=120)
+            # `edit <path> [line]` opens the file/folder in the Editor tab
+            # instead of running in the shell (see _shell_try_edit).
+            if self._shell_try_edit(sess, command):
+                return
+            sess.run(command, origin="user", timeout=120)
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True}
 
-    def shell_restart(self):
+    def _shell_try_edit(self, sess, command):
+        """Handles `edit <path> [line]` typed by the user into either shell:
+        the path is resolved against the shell's own cwd (WSL paths are
+        mapped to Windows paths) and opened in the Editor tab."""
+        import re as _re, shlex
+        m = _re.match(r"^\s*edit\s+(\S.*?)\s*$", command)
+        if not m:
+            return False
+        ps = sess.kind == "powershell"
+        try:
+            parts = shlex.split(m.group(1), posix=not ps)
+        except ValueError:
+            return False
+        if ps:
+            parts = [p.strip("'\"") for p in parts]
+        if not parts:
+            return False
+        line = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        with sess._lock:
+            sess._emit("user", "cmd", command, cwd=sess.get_cwd())
+            host = sess.to_host_path(parts[0])
+            if not host:
+                msg = "edit: could not resolve that path"
+            elif os.path.isdir(host):
+                self._push_event("editor_open_folder", {"path": host})
+                msg = f"opened folder in Editor: {host}"
+            elif os.path.isfile(host):
+                self._handle_editor("open_file", {"path": host, "line": line})
+                msg = f"opened in Editor: {host}"
+            else:
+                msg = f"edit: no such file: {host}"
+            sess._emit("system", "meta", msg, cwd=sess.get_cwd())
+        return True
+
+    def shell_restart(self, shell: str = "wsl"):
         """Kills the current WSL2 shell process so the next command (from
         either the model or the user) starts a fresh session -- exposed as
         a "Restart" button in the Shell tab for when a command hangs or the
         environment needs a clean slate."""
         from shell_session import get_shell_session
-        get_shell_session().restart()
+        get_shell_session(shell).restart()
         return {"ok": True}
 
-    def get_shell_cwd(self):
+    def get_shell_info(self):
+        """Which shells exist on this machine (for the Shell tab switcher)."""
+        from shell_session import available_shells
+        return available_shells()
+
+    def get_shell_history(self, shell: str = "wsl", since: int = 0):
+        """Replay of a shell's recent lines (used by the Editor terminal panel)."""
+        from shell_session import get_shell_session
+        return get_shell_session(shell).get_history(int(since or 0))
+
+    def get_shell_cwd(self, shell: str = "wsl"):
         """Current working directory of the persistent shell, for the
         Shell tab's terminal-style prompt label ("<cwd> $"). Cheap
         in-process lookup -- shell_session.py keeps this in sync with the
         shell's real $PWD after every command (see ShellSession.run)."""
         from shell_session import get_shell_session
-        return get_shell_session().get_cwd()
+        return get_shell_session(shell).get_cwd()
 
     # ── Bootstrap ─────────────────────────────────────────────────────────
     def startup(self):
@@ -1737,6 +1798,24 @@ class Api:
             },
         },
     }
+    # Main chat window text size in CSS px (SETTINGS -> Chat Text Size). It only
+    # drives the chat pane, through the --chat-fs variable in the frontend.
+    _CHAT_FONT_SIZE_DEFAULT = 15.0
+    _CHAT_FONT_SIZE_MIN = 10.0
+    _CHAT_FONT_SIZE_MAX = 32.0
+
+    @classmethod
+    def _clamp_chat_font_size(cls, value):
+        if isinstance(value, bool):
+            return cls._CHAT_FONT_SIZE_DEFAULT
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return cls._CHAT_FONT_SIZE_DEFAULT
+        if v != v:  # NaN
+            return cls._CHAT_FONT_SIZE_DEFAULT
+        return round(max(cls._CHAT_FONT_SIZE_MIN, min(cls._CHAT_FONT_SIZE_MAX, v)), 2)
+
     _DEFAULT_BG_IMAGE = {
         "enabled": False, "path": "",
         "brightness": 100, "blur": 0, "opacity": 100,
@@ -1766,6 +1845,7 @@ class Api:
             "liquid_glass_enabled": False,
             "liquid_glass_opacity": 55,
             "liquid_glass_sheen_enabled": True,
+            "chat_font_size": self._CHAT_FONT_SIZE_DEFAULT,
             # Ambient Surfaces are excluded from screenshots/OCR/screen-share
             # by default (the user still sees them). Turn off to let the
             # model's own screenshots include the floating widgets.
@@ -1823,6 +1903,8 @@ class Api:
                     defaults["liquid_glass_opacity"] = max(35, min(75, int(saved["liquid_glass_opacity"])))
                 if isinstance(saved.get("liquid_glass_sheen_enabled"), bool):
                     defaults["liquid_glass_sheen_enabled"] = saved["liquid_glass_sheen_enabled"]
+                if isinstance(saved.get("chat_font_size"), (int, float)) and not isinstance(saved.get("chat_font_size"), bool):
+                    defaults["chat_font_size"] = self._clamp_chat_font_size(saved["chat_font_size"])
                 if isinstance(saved.get("ambient_hide_from_capture"), bool):
                     defaults["ambient_hide_from_capture"] = saved["ambient_hide_from_capture"]
                 if isinstance(saved.get("bg_image"), dict):
@@ -1927,6 +2009,8 @@ class Api:
                 current["liquid_glass_opacity"] = max(35, min(75, int(settings["liquid_glass_opacity"])))
             if isinstance(settings.get("liquid_glass_sheen_enabled"), bool):
                 current["liquid_glass_sheen_enabled"] = settings["liquid_glass_sheen_enabled"]
+            if isinstance(settings.get("chat_font_size"), (int, float)) and not isinstance(settings.get("chat_font_size"), bool):
+                current["chat_font_size"] = self._clamp_chat_font_size(settings["chat_font_size"])
             if isinstance(settings.get("ambient_hide_from_capture"), bool):
                 current["ambient_hide_from_capture"] = settings["ambient_hide_from_capture"]
             if isinstance(settings.get("bg_image"), dict):
@@ -1953,6 +2037,38 @@ class Api:
 
             self._push_event("log", {"text": "💾 [Settings saved — will be restored on next launch]\n"})
             return {"ok": True, "settings": current}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def set_chat_font_size(self, px):
+        """Persist ONLY the chat text size (SETTINGS -> Chat Text Size slider).
+
+        The slider repaints instantly in the page and calls this (debounced) so
+        the value survives a restart without needing the Save button. It is
+        deliberately not routed through save_settings(): that also re-applies
+        the saved provider/model, which would clobber a model picked for the
+        current session just by nudging a text-size slider.
+        """
+        try:
+            size = self._clamp_chat_font_size(px)
+            path = self._settings_path()
+            data = {}
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                except Exception as e:
+                    # Never overwrite a settings file we couldn't read.
+                    return {"ok": False, "error": f"settings file unreadable: {e}"}
+                if isinstance(loaded, dict):
+                    data = loaded
+            data["chat_font_size"] = size
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, path)
+            return {"ok": True, "chat_font_size": size}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -2378,6 +2494,7 @@ class Api:
         self._render_surface_title = saved_render.get("title") if saved_render else None
         self._render_surface_open  = False
         self._push_event("render_surface_close", {})
+        artifacts.set_active_chat(self._current_chat_id)   # MidumDocs follows the chat too (closes a doc from the old chat)
         if active_id:
             self._tab_gui_state[active_id] = self._snapshot_gui_state()
         self._persist_open_tabs()
@@ -2433,6 +2550,7 @@ class Api:
             self._render_surface_title = saved_render.get("title") if saved_render else None
             self._render_surface_open  = False
             self._push_event("render_surface_close", {})
+            artifacts.set_active_chat(self._current_chat_id)
 
             # NOW register the new tab, wrapping the reopened chat's own
             # (freshly copied, not shared with any other tab) history list.
@@ -2531,6 +2649,7 @@ class Api:
         self._render_surface_title = None
         self._render_surface_open  = False
         self._push_event("render_surface_close", {})
+        artifacts.set_active_chat(self._current_chat_id)
 
     # =========================================================================
     # CONVERSATION TABS -- GUI layer over conversation_tabs.py
@@ -2637,6 +2756,7 @@ class Api:
         # panel is on screen (it belonged to the tab being left).
         self._render_surface_open = False
         self._push_event('render_surface_close', {})
+        artifacts.set_active_chat(self._current_chat_id)
 
     def _agent_tab_display(self, tab_id: str) -> list:
         """Builds a replay-ready 'display' list (the same (tag, text) tuple
@@ -3128,11 +3248,87 @@ class Api:
     _KB_ONLY_MARKER = "[MIDUM KB-ONLY MODE]"
     _EXPLAIN_MODE_MARKER = "[MIDUM EXPLAIN MODE]"
 
-    def send_message(self, user_input: str, kb_only: bool = False, kb_sources: list = None, explain_mode: bool = False, explain_mode_type: str = "part"):
+    # ── File attachments (artifact system) ────────────────────────────────────────────────
+    # Files are ingested into storage/artifacts (see artifacts.py), scoped to this
+    # chat, then uploaded to the Gemini Files API in the background. The composer
+    # polls attach_status() for progress and passes the ids to send_message().
+    def attach_limits(self):
+        return {"max_bytes": artifacts.MAX_UPLOAD_BYTES, "chunk": 786432}
+
+    def attach_pick_files(self):
+        """Native multi-select dialog; files are ingested by path (nothing goes through the JS bridge)."""
+        try:
+            result = self.window.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=True)
+        except Exception as e:
+            return {"ok": False, "error": str(e), "files": [], "errors": []}
+        if not result:
+            return {"ok": True, "files": [], "errors": [], "cancelled": True}
+        return self.attach_paths(list(result))
+
+    def attach_paths(self, paths: list):
+        files, errors = [], []
+        for p in paths or []:
+            try:
+                rec = artifacts.add_file(src_path=p, chat_id=self._current_chat_id)
+                files.append(artifacts.public_view(rec))
+            except Exception as e:
+                errors.append({"name": os.path.basename(str(p)), "error": str(e)})
+        return {"ok": True, "files": files, "errors": errors}
+
+    def attach_chunk(self, upload_id: str, name: str, mime: str, index: int, total: int, b64: str):
+        """Chunked upload for pasted / dropped files that have no real path."""
+        try:
+            # Bind the upload to the chat it STARTED in, so switching tabs while a big file is still
+            # streaming in can't land it in the wrong tab's composer.
+            bound = self.__dict__.setdefault("_upload_chat", {})
+            if int(index) == 0 or upload_id not in bound:
+                bound[upload_id] = self._current_chat_id
+            res = artifacts.receive_chunk(upload_id, name, mime, int(index), int(total), b64,
+                                          chat_id=bound[upload_id])
+            if int(index) + 1 >= int(total):
+                bound.pop(upload_id, None)
+            return res
+        except Exception as e:
+            self.__dict__.get("_upload_chat", {}).pop(upload_id, None)
+            artifacts.abort_upload(upload_id)
+            return {"ok": False, "error": str(e)}
+
+    def attach_abort(self, upload_id: str):
+        self.__dict__.get("_upload_chat", {}).pop(upload_id, None)
+        artifacts.abort_upload(upload_id)
+        return {"ok": True}
+
+    def attach_pending(self):
+        """The prompt box is a per-tab draft: unsent attachments of the ACTIVE tab's chat.
+        The frontend calls this whenever the visible chat changes (tab switch, new/closed tab,
+        restore on startup) to rebuild its chips -- the files themselves are already stored."""
+        try:
+            recs = artifacts.pending_records(self._current_chat_id)
+            return {"ok": True, "chat_id": self._current_chat_id,
+                    "files": [artifacts.public_view(r) for r in recs]}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "files": []}
+
+    def attach_status(self, ids: list):
+        out = []
+        for i in ids or []:
+            rec = artifacts.get(i)
+            if rec:
+                out.append(artifacts.public_view(rec))
+        return {"files": out}
+
+    def attach_remove(self, art_id: str):
+        # Only never-sent uploads are deleted; a file already attached to a sent message stays.
+        return {"ok": True, "deleted": bool(artifacts.remove(art_id, only_unsent=True))}
+
+    def attach_thumbnail(self, art_id: str):
+        return artifacts.make_thumbnail(art_id)
+
+    def send_message(self, user_input: str, kb_only: bool = False, kb_sources: list = None, explain_mode: bool = False, explain_mode_type: str = "part", attachment_ids: list = None):
         if self._thinking:
             return {"ok": False, "error": "busy"}
         user_input = (user_input or "").strip()
-        if not user_input:
+        if not user_input and not attachment_ids:
             return {"ok": False, "error": "empty"}
 
         # Mark where THIS turn starts in both logs, before appending
@@ -3145,9 +3341,22 @@ class Api:
         self._last_turn_display_start = len(self._display_log)
         self._last_turn_display_end = None
 
-        self._display_log.append(("user", user_input))
+        # Attachments: re-tag to THIS chat (they may have been added in another
+        # tab before sending) and record them on the display row for chip rendering.
+        artifacts.set_active_chat(self._current_chat_id)
+        _att_recs = []
+        if attachment_ids:
+            try:
+                _att_recs = artifacts.adopt(list(attachment_ids), self._current_chat_id)
+            except Exception as _att_err:
+                print(f"⚠️ [attachments: {_att_err}]")
+        _att_public = [artifacts.public_view(r) for r in _att_recs]
+        if _att_public:
+            self._display_log.append(("user", user_input, _att_public))
+        else:
+            self._display_log.append(("user", user_input))
         if not self._chat_title:
-            self._set_chat_title_from_first_message(user_input)
+            self._set_chat_title_from_first_message(user_input or (_att_public[0]["name"] if _att_public else ""))
         self._persist_current_chat()
 
         approval_kw = ["yes", "grant", "approve", "run it", "go ahead", "y"]
@@ -3162,6 +3371,9 @@ class Api:
                 "If it requires interacting with an app window, call click_ui_element "
                 "(UI Automation) — do not use screen/OCR tools unless explicitly asked."
             )
+
+        if _att_recs:
+            payload = artifacts.attachment_block(_att_recs, user_text_empty=not user_input) + "\n\n" + payload
 
         self._session.append({"role": "user", "content": payload})
         self._thinking = True
@@ -3522,6 +3734,7 @@ class Api:
         # that's no longer really "the last thing in the chat".
         try:
             midum._abort_event.clear()
+            artifacts.set_active_chat(self._current_chat_id)
             permissions.set_kb_only_mode(kb_only)
             if kb_only and kb_context_msg:
                 # Insert right before the newest (user) message so it's the
@@ -3755,9 +3968,12 @@ class Api:
             start_d = self._last_turn_display_start
 
             prompt_text = None
+            prompt_atts = []
             with self._persist_lock:
                 if start_d < len(self._display_log) and self._display_log[start_d][0] == "user":
                     prompt_text = self._display_log[start_d][1]
+                    if len(self._display_log[start_d]) > 2:
+                        prompt_atts = list(self._display_log[start_d][2] or [])
                 if put_back_prompt:
                     del self._display_log[start_d:]
                 else:
@@ -3774,7 +3990,7 @@ class Api:
                 self._last_turn_display_start = None
                 self._last_turn_display_end = None
                 self._persist_current_chat()
-                return {"ok": True, "text": prompt_text or ""}
+                return {"ok": True, "text": prompt_text or "", "attachments": prompt_atts}
 
             # Regenerate: the user message is still sitting at the end of
             # history/display_log exactly as send_message would have left
@@ -4121,6 +4337,65 @@ class Api:
             rendered = str(data)
         wrapped = f"[Render Surface input]\n{rendered}"
         return self.send_message(wrapped)
+
+    # ── MidumDocs (LaTeX documents) ────────────────────────────────────────────
+    # The editor itself lives in an iframe (gui/midumdocs_assets/editor.html, served by
+    # midumdocs.py); it can only talk to its parent page, which relays to these methods.
+    def _handle_midumdocs(self, kind, payload):
+        if kind == "open":
+            self._render_surface_open = False      # the pane takes over from the Render Surface
+        if kind in ("open", "changed", "close"):
+            self._push_event("midumdocs_" + kind, payload)
+            return "ok"
+        return f"unknown midumdocs hook kind: {kind}"
+
+    def midumdocs_server_info(self):
+        return midumdocs.server_info()
+
+    def midumdocs_state(self, state):
+        return midumdocs.update_live(state)
+
+    def midumdocs_save(self, art_id, content, base_version=None, mode="auto"):
+        return midumdocs.user_save(art_id, content, base_version, mode)
+
+    def midumdocs_prompt(self, text, ctx=None):
+        """The editor's small prompt box: becomes an ordinary user turn that carries the cursor/selection."""
+        text = (text or "").strip()
+        if not text:
+            return {"ok": False, "error": "empty"}
+        snap = midumdocs.begin_request(ctx)
+        return self.send_message(midumdocs.wrap_request(text, snap))
+
+    def midumdocs_revert_last(self, art_id):
+        return midumdocs.revert_last(art_id)
+
+    def midumdocs_make_copy(self, art_id):
+        return midumdocs.make_copy(art_id)
+
+    def midumdocs_manual_close(self):
+        midumdocs.on_closed()
+        return {"ok": True}
+
+    def midumdocs_reopen_ui(self):
+        return midumdocs.reopen_ui()
+
+    def midumdocs_export(self, kind, name, data):
+        """Save the compiled PDF (base64) or the .tex source through a native save dialog."""
+        import base64 as _b64
+        try:
+            res = self.window.create_file_dialog(webview.SAVE_DIALOG, save_filename=str(name or "document"))
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if not res:
+            return {"ok": False, "cancelled": True}
+        path = res[0] if isinstance(res, (list, tuple)) else res
+        try:
+            raw = _b64.b64decode(data) if kind == "pdf" else str(data).encode("utf-8")
+            with open(path, "wb") as fh:
+                fh.write(raw)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "path": path}
 
     def pick_file(self, must_exist: bool = True):
         try:
@@ -5446,6 +5721,19 @@ _HTML = r"""<!DOCTYPE html>
   --glass-edge: color-mix(in srgb, white calc(var(--glass-pct) * 0.6), transparent);
   --glass-edge-dim: color-mix(in srgb, white calc(var(--glass-pct) * 0.22), transparent);
   --glass-glow: 0 6px 18px -10px rgba(0,0,0,.45);
+  /* Main chat window text size (SETTINGS -> Chat Text Size slider, driven by
+     applyChatFontSize()). Only chat-pane rules read these, so the sidebar,
+     tool panes, settings and titlebar are unaffected. The smaller tiers are
+     fixed ratios of --chat-fs so the whole text hierarchy scales together,
+     with a floor so small text never drops below a legible size. */
+  --chat-fs:15px;
+  --cfs-xs:max(10px, calc(var(--chat-fs) * .8));
+  --cfs-sm:max(10.5px, calc(var(--chat-fs) * .875));
+  --cfs-md:max(11px, calc(var(--chat-fs) * .93));
+  --cfs-lg:max(11.5px, calc(var(--chat-fs) * .95));
+  /* Secondary chat text (labels, timestamps, previews): brighter than
+     --subtext, derived from the theme's own text/bg so it tracks light/dark. */
+  --chat-sub:color-mix(in srgb, var(--text) 80%, var(--bg));
 }
 /* Frosted-highlight toggle (SETTINGS → checkbox next to Glass Opacity).
    This only kills the diagonal sheen gradient -- the thing that makes each
@@ -5728,6 +6016,7 @@ input[type="checkbox"]:focus-visible{
 #tabbar .tab-btn:nth-of-type(10) .ic{color:#86efac;}
 #tabbar .tab-btn:nth-of-type(11) .ic{color:#fda4af;}
 #tabbar .tab-btn:nth-of-type(12) .ic{color:#93c5fd;}
+#tabbar .tab-btn:nth-of-type(13) .ic{color:#a5b4fc;}
 
 #right-cluster{flex:0 0 auto;}
 #abort-btn{
@@ -6173,6 +6462,12 @@ html.liquid-glass-on #sidebar-settings-overlay{
 /* Tool pane */
 #tool-pane-wrap{left:0;width:0;}
 #tool-content{flex:1;padding:14px;overflow-y:auto;}
+/* Editor tab: persistent iframe host (see MZED in the script below). Parked inside the tool pane,
+   shown only while the Editor tab is active, never rebuilt (so open files survive tab switches). */
+#mz-ed-host{position:absolute;inset:0;display:none;background:var(--bg);}
+#mz-ed-host iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:var(--bg);}
+.mz-ed-err{padding:30px;color:var(--subtext);text-align:center;font-size:13px;line-height:1.8;}
+.tab-btn.has-dirty::after{content:"";position:absolute;top:6px;right:9px;width:6px;height:6px;border-radius:50%;background:var(--accent);}
 
 /* Chat pane (always present) */
 #chat-pane-wrap{left:0;width:100%;}
@@ -6197,6 +6492,42 @@ html.liquid-glass-on #sidebar-settings-overlay{
 }
 #send-btn:hover{background:var(--accent-dim);}
 #send-hint{text-align:center;font-size:9px;color:var(--muted);padding-bottom:6px;}
+
+/* ── Prompt-box file attachments (artifact system) ───────────────────── */
+#input-box{flex-wrap:wrap;}
+#attach-btn{flex:0 0 auto;}
+#attach-btn svg{width:17px;height:17px;}
+#attach-btn.has-files{background:var(--accent);color:#fff;}
+#attach-tray{flex:0 0 100%;order:-1;display:none;gap:8px;overflow-x:auto;padding:2px 2px 6px 0;margin-left:-4px;scrollbar-width:thin;}
+#attach-tray.show{display:flex;}
+.att-chip,.att-chip-ro{position:relative;display:flex;align-items:center;gap:8px;flex:0 0 auto;min-width:120px;max-width:240px;padding:6px 8px 6px 6px;border-radius:12px;box-sizing:border-box;}
+.att-chip{padding-right:30px;background:var(--surface2);border:1px solid var(--border2);color:var(--text);animation:attIn .18s var(--ease,ease-out);}
+.att-chip.err{border-color:var(--red);}
+.att-chip-ro{background:color-mix(in srgb,currentColor 12%,transparent);color:inherit;}
+@keyframes attIn{from{opacity:0;transform:translateY(4px) scale(.97);}to{opacity:1;transform:none;}}
+.att-thumb,.att-ico{width:34px;height:34px;border-radius:8px;flex:0 0 auto;object-fit:cover;}
+.att-ico{display:flex;align-items:center;justify-content:center;background:color-mix(in srgb,var(--accent) 22%,transparent);color:var(--accent);}
+.att-chip-ro .att-ico{color:inherit;background:color-mix(in srgb,currentColor 14%,transparent);}
+.att-chip.err .att-ico{background:color-mix(in srgb,var(--red) 22%,transparent);color:var(--red);}
+.att-ico svg{width:17px;height:17px;}
+.att-meta{min-width:0;flex:1;display:flex;flex-direction:column;gap:1px;}
+.att-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;font-weight:600;line-height:1.25;}
+.att-sub{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px;opacity:.7;line-height:1.25;}
+.att-chip.err .att-sub{color:var(--red);opacity:1;}
+.att-x{position:absolute;top:50%;right:5px;transform:translateY(-50%);width:22px;height:22px;border:none;border-radius:50%;background:transparent;color:var(--subtext);display:flex;align-items:center;justify-content:center;padding:0;}
+.att-x:hover{background:var(--border2);color:var(--text);}
+.att-x svg{width:13px;height:13px;}
+.att-prog{height:3px;border-radius:2px;background:var(--border);overflow:hidden;margin-top:3px;}
+.att-prog>i{display:block;height:100%;width:0;background:var(--accent);transition:width .15s;}
+.att-prog.indet>i{width:40%;animation:attSlide 1.1s ease-in-out infinite;}
+@keyframes attSlide{0%{transform:translateX(-100%);}100%{transform:translateX(260%);}}
+/* margin-left:-6px cancels the read-only chip's 6px left padding so the file icon/thumbnail lines up exactly with the start of the message text */
+.bubble.user .att-row{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;margin-left:-6px;}
+.bubble.user .att-row:last-child{margin-bottom:0;}
+#drop-overlay{position:absolute;inset:8px;z-index:60;display:none;align-items:center;justify-content:center;flex-direction:column;gap:6px;border:2px dashed var(--accent);border-radius:22px;background:color-mix(in srgb,var(--surface) 80%,transparent);backdrop-filter:blur(3px);color:var(--text);font-size:15px;font-weight:600;pointer-events:none;}
+#drop-overlay small{font-size:11px;font-weight:400;opacity:.7;}
+#drop-overlay svg{width:30px;height:30px;color:var(--accent);}
+#drop-overlay.show{display:flex;}
 
 /* KB Only dropdown (prompt-box knowledge-base restriction toggle) */
 #kb-toggle-btn{flex:0 0 auto;font-size:11px;}
@@ -6349,9 +6680,28 @@ select, .btn, .ghost-btn{
    navigation. The sidebar toggle itself (☰) is deliberately left OUT of
    this rule so the sidebar stays reachable. */
 body.render-surface-active #tabbar .tab-btn,
+body.midumdocs-active #tabbar .tab-btn,
+body.midumdocs-active #settings-panel-toggle .ghost-btn,
 body.render-surface-active #settings-panel-toggle .ghost-btn{
   opacity:.35;pointer-events:none;
 }
+
+/* MidumDocs -- LaTeX documents. A real .pane-wrap like the Render Surface, but wider (62%), with one slim header;
+   everything else (source editor, compiled pages, AI prompt box) lives in the iframe (gui/midumdocs_assets/editor.html). */
+#midumdocs-pane-wrap .pane{padding:0;overflow:hidden;}
+#midumdocs-header{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border2);background:var(--surface);}
+#midumdocs-title{font-size:12px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:30%;}
+.md-status{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);white-space:nowrap;margin-right:auto;}
+.md-status i{width:7px;height:7px;border-radius:50%;background:var(--muted);display:inline-block;}
+.md-status.ok i{background:var(--green);}
+.md-status.compiling i{background:var(--yellow);animation:mdpulse 1s ease-in-out infinite;}
+.md-status.error i{background:var(--red);}
+@keyframes mdpulse{50%{opacity:.35;}}
+.md-seg{display:flex;padding:2px;border-radius:14px;background:var(--surface2);border:1px solid var(--border2);}
+.md-seg button{border:0;background:transparent;color:var(--subtext);font-size:11px;padding:3px 11px;border-radius:12px;cursor:pointer;}
+.md-seg button.active{background:var(--accent);color:#04121f;}
+#midumdocs-frame{flex:1;width:100%;height:100%;border:none;background:transparent;}
+body.midumdocs-active #sidebar-toggle{opacity:1;}
 
 /* Chat bubbles */
 .row{display:flex;flex-direction:column;padding:6px 0;position:relative;}
@@ -6766,6 +7116,53 @@ table.md-table tr:nth-child(even) td{background:color-mix(in srgb, var(--surface
   height:32px;padding:0 12px;color:var(--text);margin-bottom:6px;}
 .ask-opt-btn:hover{background:var(--border2);}
 
+/* ── Chat text size + readability ─────────────────────────────────────────
+   Scoped to the MAIN CHAT WINDOW (messages, tool-call pills, code, tables,
+   ask cards, prompt box). Reads --chat-fs (see :root). This block sits after
+   the original chat rules on purpose: it supersedes their old hardcoded
+   9-12px sizes with the scaled tiers and brightens the dim secondary text. */
+.bubble{font-size:var(--chat-fs);line-height:1.55;}
+.row-label{font-size:var(--cfs-xs);letter-spacing:.015em;}
+.row:not(.midum) .row-label{color:var(--chat-sub);}
+.row.system .bubble,.row.error .bubble,.row.interjection .bubble{font-size:var(--cfs-md);}
+.row.system .bubble{color:var(--chat-sub);}
+code.inline-code{font-size:.92em;}
+pre.code-block{font-size:var(--cfs-md);line-height:1.6;}
+table.md-table{font-size:var(--cfs-lg);}
+.tool-line{font-size:var(--cfs-sm);color:var(--chat-sub);}
+.tool-line .chevron{font-size:var(--cfs-xs);opacity:.85;}
+.tool-detail .tool-detail-label{font-size:var(--cfs-xs);font-weight:700;color:var(--chat-sub);}
+.tool-detail pre{font-size:var(--cfs-sm);line-height:1.5;}
+.agent-tool-line{opacity:.72;}
+.tg-pill{height:auto;min-height:calc(var(--chat-fs) * 2.4);font-size:var(--cfs-md);color:var(--chat-sub);}
+.tg-extra{font-size:var(--cfs-sm);font-weight:500;color:var(--chat-sub);}
+.tc-pill{height:auto;min-height:calc(var(--chat-fs) * 2);font-size:var(--cfs-md);color:var(--chat-sub);}
+.tc::before{top:var(--chat-fs);}
+.tc-name{font-size:var(--cfs-sm);}
+.tc-preview{font-size:var(--cfs-sm);opacity:1;color:var(--chat-sub);}
+.tc-time{font-size:var(--cfs-xs);opacity:.9;color:var(--chat-sub);}
+.tc-agent{font-size:var(--cfs-xs);}
+.tc-block-head{font-size:var(--cfs-xs);color:var(--chat-sub);}
+.tc-copy{font-size:var(--cfs-sm);}
+.tc-panel pre{font-size:var(--cfs-sm);line-height:1.55;}
+.ask-hdr{font-size:var(--cfs-md);}
+.ask-card input[type=text]{font-size:var(--cfs-md);height:auto;min-height:calc(var(--chat-fs) * 2.4);padding-top:4px;padding-bottom:4px;}
+.ask-opt-btn{font-size:var(--cfs-md);height:auto;min-height:calc(var(--chat-fs) * 2.3);padding-top:5px;padding-bottom:5px;line-height:1.35;}
+.ask-card .ghost-btn,.ask-card .btn{font-size:var(--cfs-md);height:auto;min-height:calc(var(--chat-fs) * 2.3);}
+#msg-input{font-size:var(--chat-fs);line-height:1.45;min-height:calc(var(--chat-fs) * 1.45 + 14px);max-height:calc(var(--chat-fs) * 14.5 + 14px);}
+#msg-input::placeholder{color:var(--chat-sub);opacity:.7;}
+#send-hint{font-size:var(--cfs-xs);color:var(--chat-sub);opacity:.8;}
+#kb-toggle-btn{font-size:var(--cfs-xs);}
+/* SETTINGS -> Chat Text Size controls */
+.chat-fs-row{display:flex;align-items:center;gap:8px;}
+.chat-fs-row input[type=range]{flex:1;min-width:0;}
+.chat-fs-row input[type=number]{
+  width:76px;height:28px;border-radius:14px;border:1px solid var(--border2);background:var(--surface);
+  color:var(--text);padding:0 8px;outline:none;font-size:12px;text-align:right;font-variant-numeric:tabular-nums;
+}
+.chat-fs-row input[type=number]:focus{border-color:var(--accent);}
+.chat-fs-unit{font-size:11px;color:var(--subtext);}
+
 /* Tool pane inner widgets */
 .field-label{font-size:9px;font-weight:700;color:var(--subtext);margin:8px 0 4px;}
 textarea.code-area{
@@ -7074,11 +7471,14 @@ textarea.code-area{
     </div>
 
     <div class="pane-wrap" id="chat-pane-wrap">
+      <div id="drop-overlay"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>Drop files to attach<small>PDF, Office docs, images, audio, video, code, text…</small></div>
       <div class="pane">
         <button class="icon-btn" id="copy-chat-btn" title="Copy full conversation"
           style="position:absolute;top:10px;right:10px;z-index:5;"><svg class="ic ic-copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
         <button class="icon-btn" id="reopen-render-surface-btn" title="Reopen last Render Surface"
           style="position:absolute;top:52px;right:10px;z-index:5;"><svg class="ic ic-image" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></button>
+        <button class="icon-btn" id="reopen-midumdocs-btn" title="Open MidumDocs (LaTeX editor)"
+          style="position:absolute;top:94px;right:10px;z-index:5;"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg></button>
         <div id="chat-scroll"><div id="chat-col"></div></div>
         <div id="input-row">
           <div style="width:100%;max-width:760px;position:relative;">
@@ -7111,6 +7511,8 @@ textarea.code-area{
             </div>
             <div id="input-box">
               <button class="icon-btn" id="kb-toggle-btn" title="Knowledge Base options"><svg class="ic ic-chevron-down" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
+              <div id="attach-tray"></div>
+              <button class="icon-btn" id="attach-btn" title="Attach files (or drag & drop / paste)"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
               <textarea id="msg-input" placeholder="Message Midum..." rows="1"></textarea>
               <button id="send-btn"><svg class="ic ic-arrow-up" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
             </div>
@@ -7134,6 +7536,21 @@ textarea.code-area{
         <iframe id="render-surface-frame" sandbox="allow-scripts allow-forms allow-popups allow-modals" referrerpolicy="strict-origin-when-cross-origin"></iframe>
       </div>
     </div>
+
+    <div class="pane-wrap pane-hidden" id="midumdocs-pane-wrap">
+      <div class="pane" id="midumdocs-pane">
+        <div id="midumdocs-header">
+          <span id="midumdocs-title">MidumDoc</span>
+          <span class="md-status" id="midumdocs-status"><i></i><span id="midumdocs-status-text"></span></span>
+          <div class="md-seg" id="midumdocs-modes"><button data-mode="source">Source</button><button data-mode="split" class="active">Split</button><button data-mode="page">Page</button></div>
+          <button class="icon-btn" id="midumdocs-recompile" title="Recompile (Shift = clean rebuild)"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg></button>
+          <button class="icon-btn" id="midumdocs-pdf" title="Save as PDF"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></button>
+          <button class="icon-btn" id="midumdocs-tex" title="Save .tex source"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg></button>
+          <button class="icon-btn" id="midumdocs-close" title="Close"><svg class="ic ic-x" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+        </div>
+        <iframe id="midumdocs-frame" sandbox="allow-scripts allow-same-origin allow-forms allow-modals" referrerpolicy="no-referrer"></iframe>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -7146,7 +7563,7 @@ textarea.code-area{
 // longer eat into the horizontal tab bar's space.
 const TABS = [
   ["Chat","message"], ["Voice","mic"], ["Model","cpu"],
-  ["System Core","sparkles"], ["Knowledge","book-open"], ["Skills","layers"], ["Tools","wrench"], ["Shell","terminal"], ["Flows","link"], ["Agents","bot"], ["MCP","plug"], ["Permissions","lock"]
+  ["System Core","sparkles"], ["Knowledge","book-open"], ["Skills","layers"], ["Tools","wrench"], ["Shell","terminal"], ["Flows","link"], ["Agents","bot"], ["MCP","plug"], ["Permissions","lock"], ["Editor","code"]
   // "Surfaces" used to live here as a top tab, but it's a sidebar quick-
   // access button now (see #sidebar-surfaces-btn in buildSidebar) -- it's
   // a "jump to my saved surfaces" shortcut, not a work area someone tabs
@@ -7158,6 +7575,7 @@ let state = {
   activeTab: "Chat",
   sidebarOpen: false,
   renderSurfaceOpen: false,
+  midumDocOpen: false,
   thinking: false,
   kbOnly: false,
   kbSources: [],
@@ -7175,7 +7593,10 @@ let voiceState = { running: false, connecting: false };
 // Scrollback for the Shell tab -- kept here (not just in the DOM) so
 // switching away to another tab and back doesn't lose history, since
 // showToolPane() tears down and rebuilds #tool-content on every switch.
-let shellHistory = [];
+const shellHistories = {wsl: [], powershell: []};
+let shellActive = "wsl";
+let shellInfo = [];
+let shellHistory = shellHistories.wsl;
 const SHELL_HISTORY_CAP = 1000;
 
 // Tracks the chat row currently receiving say()/reply text for the
@@ -7263,7 +7684,8 @@ const _ICONS = {
   "moon": '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>',
   "sun": '<circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>',
   "megaphone": '<path d="M3 11l18-5v12L3 14v-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/>',
-  "dot": '<circle cx="12" cy="12" r="6"/>'
+  "dot": '<circle cx="12" cy="12" r="6"/>',
+  "code": '<path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/>'
 };
 const _ICON_FILLED = new Set(["dot", "play", "star-fill", "stop"]);
 function icon(name, extraClass){
@@ -7913,13 +8335,14 @@ function targetGeo(){
   // The Flows tab is a node-graph editor that needs real canvas space to
   // be usable, so it's the one tab given a pane larger than the chat
   // panel -- every other tab keeps the normal (smaller-than-chat) split.
-  const isFlows = state.activeTab === "Flows";
+  const isFlows = state.activeTab === "Flows" || state.activeTab === "Editor";   // both want a wide pane
   // Render Surface takes the right half of the window as a real pane in
   // this same split, same as any other pane -- chat keeps the left half
   // so the conversation (and the ability to send the model input) stays
   // visible and usable while it's open. Tool/sidebar panes collapse to 0
   // width while it's active (they're also dimmed via body.render-
   // surface-active, see CSS) so nothing fights the surface for space.
+  if (state.midumDocOpen)        return {tool:[0,0], chat:[0,38], side:[100,0], render:[100,0], docs:[38,62]};
   if (showRender)                return {tool:[0,0], chat:[0,50], side:[100,0], render:[50,50]};
   if (showTool && showSide)      return isFlows ? {tool:[0,55], chat:[55,25], side:[80,20], render:[100,0]} : {tool:[0,30], chat:[30,50], side:[80,20], render:[100,0]};
   if (showTool && !showSide)     return isFlows ? {tool:[0,70], chat:[70,30], side:[100,0], render:[100,0]} : {tool:[0,40], chat:[40,60], side:[100,0], render:[100,0]};
@@ -7942,6 +8365,8 @@ function applyLayout(){
   toolWrap.classList.toggle("pane-hidden", g.tool[1] === 0);
   sideWrap.classList.toggle("pane-hidden", g.side[1] === 0);
   if (renderWrap) renderWrap.classList.toggle("pane-hidden", g.render[1] === 0);
+  const docsWrap = document.getElementById("midumdocs-pane-wrap");
+  if (docsWrap){ const gd = g.docs || [100,0]; docsWrap.style.left = gd[0]+"%"; docsWrap.style.width = gd[1]+"%"; docsWrap.classList.toggle("pane-hidden", gd[1] === 0); }
 }
 
 function switchTab(name){
@@ -8030,7 +8455,62 @@ const MIDUM_BRIDGE_SCRIPT = `<scr` + `ipt>
 })();
 <\/scr` + `ipt>`;
 
+// ── MidumDocs ----------------------------------------------------------------------
+// LaTeX documents. The editor runs in an iframe served from a localhost server (see midumdocs.py) because the
+// SwiftLaTeX engine needs a real http origin; it talks only to this page via postMessage, and this page relays to
+// Python (Api.midumdocs_*). The iframe is kept loaded after closing so reopening is instant and the engine stays warm.
+let _mdReady = false, _mdPendingInit = null, _mdMode = "split", _mdDoc = null, _mdThemeTimer = null;
+const _MD_THEME_VARS = ["--bg","--panel","--surface","--surface2","--border2","--accent","--accent-faint","--text","--subtext","--muted","--red","--green","--yellow"];
+function _mdTheme(){ const cs = getComputedStyle(document.documentElement), v = {}; _MD_THEME_VARS.forEach(k=>{ const x = cs.getPropertyValue(k).trim(); if (x) v[k] = x; }); return v; }
+function _mdPost(msg){ const f = document.getElementById("midumdocs-frame"); if (f && f.contentWindow) f.contentWindow.postMessage(msg, "*"); }
+function _mdBusy(v){ _mdPost({md:"busy", value:!!v}); }
+function _mdStatus(m){
+  const el = document.getElementById("midumdocs-status"); if (!el) return;
+  el.className = "md-status " + (m.kind === "ok" ? "ok" : m.kind === "error" ? "error" : "compiling");
+  document.getElementById("midumdocs-status-text").textContent = m.text || "";
+}
+function _mdSendInit(){ if (!_mdPendingInit) return; _mdPost({md:"init", doc:_mdPendingInit, theme:_mdTheme(), mode:_mdMode}); _mdPendingInit = null; }
+async function openMidumDoc(doc){
+  if (state.renderSurfaceOpen) closeRenderSurfaceUI();
+  _mdDoc = doc; _mdPendingInit = doc;
+  document.getElementById("midumdocs-title").textContent = doc.title || doc.name || "MidumDoc";
+  const frame = document.getElementById("midumdocs-frame");
+  if (!frame.getAttribute("src")){
+    const info = await api("midumdocs_server_info");
+    if (!info || !info.ok){ await showConfirm((info && info.error) || "Could not start MidumDocs.", "MidumDocs"); return; }
+    _mdReady = false; frame.setAttribute("src", info.url);
+  }
+  state.midumDocOpen = true;
+  document.body.classList.add("midumdocs-active");
+  applyLayout();
+  if (_mdReady) _mdSendInit();
+}
+function updateMidumDoc(payload){ if (state.midumDocOpen && _mdDoc && payload && payload.id === _mdDoc.id) _mdPost(Object.assign({md:"doc_changed"}, payload)); }
+function closeMidumDocUI(){
+  if (!state.midumDocOpen) return;
+  state.midumDocOpen = false;
+  document.body.classList.remove("midumdocs-active");
+  applyLayout();
+}
+window.addEventListener("message", (e)=>{
+  const f = document.getElementById("midumdocs-frame");
+  if (!f || e.source !== f.contentWindow) return;
+  const m = e.data; if (!m || typeof m.md !== "string") return;
+  if (m.md === "ready"){ _mdReady = true; _mdSendInit(); }
+  else if (m.md === "state"){ api("midumdocs_state", m.state); }
+  else if (m.md === "save"){ api("midumdocs_save", m.id, m.content, m.base_version, m.mode || "auto").then(r=>_mdPost({md:"rpc_result", rid:m.rid, result:r})); }
+  else if (m.md === "prompt"){ api("midumdocs_prompt", m.text, m.ctx).then(r=>{ if (r && r.ok === false) _mdBusy(false); }); }
+  else if (m.md === "abort"){ api("abort"); }
+  else if (m.md === "undo"){ api("midumdocs_revert_last", m.id); }
+  else if (m.md === "make_copy"){ api("midumdocs_make_copy", m.id); }
+  else if (m.md === "export"){ api("midumdocs_export", m.kind, m.name, m.kind === "pdf" ? m.b64 : m.text); }
+  else if (m.md === "status"){ _mdStatus(m); }
+});
+new MutationObserver(()=>{ clearTimeout(_mdThemeTimer); _mdThemeTimer = setTimeout(()=>{ if (state.midumDocOpen) _mdPost({md:"theme", vars:_mdTheme()}); }, 250); })
+  .observe(document.documentElement, {attributes:true, attributeFilter:["class","style","data-theme"]});
+
 function openRenderSurface(code, title){
+  if (state.midumDocOpen) closeMidumDocUI();
   const frame   = document.getElementById("render-surface-frame");
   const titleEl = document.getElementById("render-surface-title");
   titleEl.textContent = title && title.trim() ? title : "Render Surface";
@@ -8596,7 +9076,7 @@ function renderFlowchartSVG(data){
     });
 
     svg += `</svg>`;
-    return `<div class="flowchart-wrap"><div style="font-size:11px;color:var(--subtext);margin-bottom:6px;">${icon("chart")} ${escapeHtml(data.title || "Flowchart")}</div>${svg}</div>`;
+    return `<div class="flowchart-wrap"><div style="font-size:var(--cfs-sm);color:var(--chat-sub);margin-bottom:6px;">${icon("chart")} ${escapeHtml(data.title || "Flowchart")}</div>${svg}</div>`;
   } catch (e) {
     return null;
   }
@@ -8811,7 +9291,7 @@ function renderMidumContent(text){
           </div>`;
         }).join('');
         renderedBlock = `<div class="flowchart-wrap">
-                           <div style="font-size:11px;color:var(--subtext);margin-bottom:6px;">${icon("image")} ${escapeHtml(title)}</div>
+                           <div style="font-size:var(--cfs-sm);color:var(--chat-sub);margin-bottom:6px;">${icon("image")} ${escapeHtml(title)}</div>
                            ${imagesHtml}
                          </div>`;
       }
@@ -8855,12 +9335,12 @@ let _histActive   = false; // true once a loaded chat's history is being windowe
 function groupDisplayIntoTurns(display){
   const turns = [];
   let cur = null;
-  (display || []).forEach(([tag, text])=>{
+  (display || []).forEach(([tag, text, extra])=>{
     if (tag === "user" || !cur){
       cur = [];
       turns.push(cur);
     }
-    cur.push([tag, text]);
+    cur.push([tag, text, extra]);
   });
   return turns;
 }
@@ -8872,12 +9352,13 @@ function groupDisplayIntoTurns(display){
 // reply was streamed as several say() chunks is shown here as several
 // stacked "Midum" bubbles instead of one merged bubble (a small cosmetic
 // difference from the live view -- no content is lost).
-function buildStaticRow(tag, text){
+function buildStaticRow(tag, text, extra){
   const row = document.createElement("div");
   if (tag === "user"){
     row.className = "row user";
-    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">${icon("copy")}</button></div><div class="bubble user">${renderUserContent(text)}</div>`;
+    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">${icon("copy")}</button></div><div class="bubble user">${attBubbleChips(extra)}${text ? renderUserContent(text) : ""}</div>`;
     wireRowCopyBtn(row);
+    attHydrate(row);
   } else if (tag === "midum"){
     row.className = "row midum";
     row.innerHTML = `<div class="row-label-row"><button class="row-copy-btn" title="Copy response">${icon("copy")}</button></div><div class="bubble midum">${renderMidumContent(text)}</div>`;
@@ -8929,7 +9410,7 @@ function buildTurnBlock(turnIndex){
   // group (same grouping the live view does) -- any other row (say/reply,
   // system, error, ...) closes it, so the next tool call starts a new group.
   let group = null;
-  _histTurns[turnIndex].forEach(([tag, text])=>{
+  _histTurns[turnIndex].forEach(([tag, text, extra])=>{
     if (tag === "toolcall"){
       let data;
       try { data = JSON.parse(text); } catch(e){ data = {name: "", args: {}, result: text}; }
@@ -8940,7 +9421,7 @@ function buildTurnBlock(turnIndex){
       _tgAdd(group, tc);
     } else {
       group = null;
-      wrap.appendChild(buildStaticRow(tag, text));
+      wrap.appendChild(buildStaticRow(tag, text, extra));
     }
   });
   return wrap;
@@ -9289,15 +9770,16 @@ function animateWords(container){
   });
 }
 
-function appendRow(tag, text){
+function appendRow(tag, text, extra){
   const col = chatCol();
   const row = document.createElement("div");
   if (tag === "user"){
     closeToolGroup();          // a new user turn always starts fresh tool group(s) too
     _currentMidumRow = null;   // a new user turn always starts a fresh Midum bubble
     row.className = "row user";
-    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">${icon("copy")}</button></div><div class="bubble user">${renderUserContent(text)}</div>`;
+    row.innerHTML = `<div class="row-label-row"><div class="row-label">You</div><button class="row-copy-btn" title="Copy message">${icon("copy")}</button></div><div class="bubble user">${attBubbleChips(extra)}${text ? renderUserContent(text) : ""}</div>`;
     wireRowCopyBtn(row);
+    attHydrate(row);
     _currentUserRow = row;
   } else if (tag === "midum"){
     setActiveToolDot(null);
@@ -9562,6 +10044,7 @@ async function editLastPrompt(turnId, btn){
   _pendingTurnId = null;
   const input = document.getElementById("msg-input");
   input.value = res.text || "";
+  (res.attachments || []).forEach(a=>attAddRecord(a, true));   // put the files back in the composer too
   autosizeMsgInput();
   input.focus();
   state.thinking = false;
@@ -9632,6 +10115,8 @@ function clearChat(){
   _histTurns    = [];
   _histWinStart = 0;
   _histActive   = false;
+  // The prompt box's attachment chips belong to the chat being shown -- reload them for it.
+  try { attRestoreForTab().catch(()=>{}); } catch (e) {}
 }
 
 // ── Ask cards --------------------------------------------------------------
@@ -9650,7 +10135,7 @@ function appendAsk(id, kind, payload){
 
   if (kind === "text"){
     card.innerHTML = `<div class="ask-hdr">${icon("help")} ${escapeHtml(payload.title||"Midum needs input")}</div>
-      <div style="font-size:13px;margin-bottom:10px;">${escapeHtml(payload.prompt||"")}</div>
+      <div style="font-size:var(--cfs-lg);margin-bottom:10px;">${escapeHtml(payload.prompt||"")}</div>
       <input type="text" placeholder="Type your answer..." />
       <div class="ask-actions">
         <button class="ghost-btn" data-act="cancel">Cancel</button>
@@ -9664,8 +10149,8 @@ function appendAsk(id, kind, payload){
     setTimeout(()=>input.focus(), 30);
   } else if (kind === "approval"){
     card.innerHTML = `<div class="ask-hdr">${icon("alert")} Midum requests approval</div>
-      <div style="font-weight:700;font-size:13px;">${escapeHtml(payload.message||"")}</div>
-      <div style="font-size:12px;color:var(--subtext);margin:6px 0 10px;">${escapeHtml(payload.details||"")}</div>
+      <div style="font-weight:700;font-size:var(--cfs-lg);">${escapeHtml(payload.message||"")}</div>
+      <div style="font-size:var(--cfs-md);color:var(--chat-sub);margin:6px 0 10px;">${escapeHtml(payload.details||"")}</div>
       <div class="ask-actions">
         <button class="ghost-btn" data-act="decline" style="color:var(--red);border-color:#3f0f0f;">${icon("x-circle")} Decline</button>
         <button class="btn" data-act="approve" style="background:var(--green);color:#fff;">${icon("check-circle")} Approve</button>
@@ -9675,7 +10160,7 @@ function appendAsk(id, kind, payload){
   } else if (kind === "choice"){
     const opts = (payload.options||[]).map(o=>`<button class="ask-opt-btn" data-v="${escapeHtml(o)}">${escapeHtml(o)}</button>`).join("");
     card.innerHTML = `<div class="ask-hdr">${icon("help")} Midum has a question</div>
-      <div style="font-weight:700;font-size:13px;margin-bottom:10px;">${escapeHtml(payload.question||"")}</div>
+      <div style="font-weight:700;font-size:var(--cfs-lg);margin-bottom:10px;">${escapeHtml(payload.question||"")}</div>
       ${opts}
       ${payload.allow_custom !== false ? '<div style="display:flex;gap:6px;margin-top:6px;"><input type="text" placeholder="Something else..." style="flex:1;"/><button class="btn" data-act="custom">Other...</button></div>' : ""}`;
     card.querySelectorAll(".ask-opt-btn").forEach(b=>{
@@ -9688,7 +10173,7 @@ function appendAsk(id, kind, payload){
     }
   } else if (kind === "file"){
     card.innerHTML = `<div class="ask-hdr">${icon("folder")} Midum needs a file</div>
-      <div style="font-size:13px;margin-bottom:10px;">${escapeHtml(payload.prompt||"Select a file")}</div>
+      <div style="font-size:var(--cfs-lg);margin-bottom:10px;">${escapeHtml(payload.prompt||"Select a file")}</div>
       <div class="ask-actions">
         <button class="ghost-btn" data-act="cancel">Cancel</button>
         <button class="btn" data-act="browse" style="background:var(--accent);color:#fff;">Browse...</button>
@@ -9710,21 +10195,288 @@ function autosizeMsgInput(){
   const el = document.getElementById("msg-input");
   if (!el) return;
   el.style.height = "auto";
-  const maxHeight = 216; // ~10 lines
+  // ~10 lines + vertical padding, derived from the live font size so it still
+  // fits when the chat text size slider changes the line height.
+  const cs = getComputedStyle(el);
+  const lh = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) * 1.45);
+  const maxHeight = Math.round(lh * 10 + 14);
   const newHeight = Math.min(el.scrollHeight, maxHeight);
   el.style.height = newHeight + "px";
   el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden";
 }
 
+// ── File attachments (prompt box) ────────────────────────────────────────────────────────
+// Files become ARTIFACTS server-side (artifacts.py): stored per chat, text-indexed,
+// and uploaded to the Gemini Files API. A chip is: transferring (browser -> app,
+// only for pasted/dropped blobs) -> ready (with background indexing/Gemini state
+// polled via attach_status) or error. Sending never waits on the Gemini upload.
+const ATT = { items: [], max: 100*1024*1024, chunk: 786432, poll: null, seq: 0, limitsLoaded: false, chatId: null, restoreSeq: 0 };
+const _ATT_THUMBS = {};
+const _ATT_SVG = {
+  file:'<path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/>',
+  image:'<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>',
+  music:'<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
+  video:'<rect x="2" y="5" width="14" height="14" rx="2"/><path d="M22 7l-6 4 6 4z"/>',
+  table:'<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18"/>',
+  code:'<path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/>',
+  x:'<path d="M18 6 6 18M6 6l12 12"/>',
+  alert:'<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>'
+};
+function attSvg(n){ return '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (_ATT_SVG[n] || _ATT_SVG.file) + '</svg>'; }
+function attEsc(s){ return String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
+function attFmtSize(n){ n = Number(n) || 0; if (n < 1024) return n + " B"; if (n < 1048576) return (n/1024).toFixed(0) + " KB"; if (n < 1073741824) return (n/1048576).toFixed(1) + " MB"; return (n/1073741824).toFixed(2) + " GB"; }
+function attIconFor(kind){ return ({image:"image", audio:"music", video:"video", sheet:"table", code:"code"})[kind] || "file"; }
+function attStatusText(c){
+  if (c.status === "transferring") return "Reading… " + Math.round((c.progress || 0) * 100) + "%";
+  if (c.status === "error") return c.error || "Failed";
+  const r = c.rec || {};
+  if (r.text_state === "pending") return "Reading file…";
+  if (r.gemini_state === "uploading") return "Uploading to Gemini…";
+  if (r.gemini_state === "active") return attFmtSize(c.size) + " · in Gemini";
+  return attFmtSize(c.size);
+}
+function attChipTip(c){
+  if (c.status === "error") return c.error || "Failed";
+  if (c.rec && c.rec.gemini_state === "error") return "Gemini upload failed (still readable locally): " + (c.rec.gemini_error || "");
+  return c.name;
+}
+function attChipHtml(c){
+  const busy = c.status === "transferring" || (c.rec && c.rec.busy);
+  const lead = c.thumb ? `<img class="att-thumb" src="${attEsc(c.thumb)}" alt="">`
+                       : `<div class="att-ico">${attSvg(c.status === "error" ? "alert" : attIconFor(c.kind))}</div>`;
+  const prog = c.status === "transferring" ? `<div class="att-prog"><i style="width:${Math.round((c.progress || 0) * 100)}%"></i></div>`
+             : (busy ? '<div class="att-prog indet"><i></i></div>' : "");
+  const tip = attChipTip(c);
+  return `<div class="att-chip${c.status === "error" ? " err" : ""}" data-key="${c.key}" title="${attEsc(tip)}">${lead}<div class="att-meta"><div class="att-name">${attEsc(c.name)}</div><div class="att-sub">${attEsc(attStatusText(c))}</div>${prog}</div><button class="att-x" data-key="${c.key}" title="Remove">${attSvg("x")}</button></div>`;
+}
+// Everything about a chip that needs its inner markup rebuilt. Progress % and the status
+// text are deliberately NOT part of it -- they are patched in place so a running progress
+// bar / indeterminate slider is never torn down and restarted.
+function attChipSig(c){
+  const busy = c.status === "transferring" || !!(c.rec && c.rec.busy);
+  return [c.status, c.thumb || "", c.kind, c.name, busy ? (c.status === "transferring" ? "t" : "i") : "-", attChipTip(c)].join("\u0001");
+}
+function attBuildChip(c){
+  const t = document.createElement("div");
+  t.innerHTML = attChipHtml(c);
+  return t.firstElementChild;
+}
+function attRender(){
+  const tray = document.getElementById("attach-tray");
+  if (!tray) return;
+  // Reconcile the chips in place (keyed by c.key) instead of rebuilding tray.innerHTML.
+  // Rebuilding on every upload chunk / 1.2s status poll re-created every chip, which replayed
+  // the .att-chip entry animation (the shrink-and-grow flash) and restarted the indeterminate slider.
+  const live = new Map();
+  Array.from(tray.children).forEach(el=>live.set(el.dataset.key, el));
+  let prev = null;
+  ATT.items.forEach(c=>{
+    const sig = attChipSig(c);
+    let el = live.get(c.key);
+    if (el) live.delete(c.key);
+    if (!el){
+      el = attBuildChip(c);
+      el._attSig = sig;
+    } else if (el._attSig !== sig){
+      const fresh = attBuildChip(c);
+      el.className = fresh.className;
+      el.title = fresh.title;
+      el.innerHTML = fresh.innerHTML;
+      el._attSig = sig;
+    }
+    const sub = el.querySelector(".att-sub"), txt = attStatusText(c);
+    if (sub && sub.textContent !== txt) sub.textContent = txt;
+    const bar = el.querySelector(".att-prog:not(.indet) > i");
+    if (bar) bar.style.width = Math.round((c.progress || 0) * 100) + "%";
+    if (el.parentNode !== tray || el.previousElementSibling !== prev) tray.insertBefore(el, prev ? prev.nextSibling : tray.firstChild);
+    prev = el;
+  });
+  live.forEach(el=>el.remove());
+  tray.classList.toggle("show", ATT.items.length > 0);
+  const btn = document.getElementById("attach-btn");
+  if (btn) btn.classList.toggle("has-files", ATT.items.length > 0);
+}
+function attClear(){   // composer only -- the files themselves stay stored (they're sent with the message)
+  ATT.items.forEach(c=>{ if (c.thumb && String(c.thumb).startsWith("blob:")) URL.revokeObjectURL(c.thumb); });
+  ATT.items = [];
+  attRender();
+}
+// The prompt box is a per-tab draft. Whenever the visible chat changes (see clearChat) the
+// server is asked which unsent attachments belong to the now-active chat and the chips are
+// rebuilt from that -- so a file attached in tab A stays in tab A (and survives a restart),
+// instead of one global chip list following you around and being sent from whichever tab.
+async function attRestoreForTab(){
+  const seq = ++ATT.restoreSeq;
+  const before = new Set(ATT.items.map(c=>c.key));   // chips that belong to the tab we're leaving
+  let r = null;
+  try { r = await api("attach_pending"); } catch (e){ return; }
+  if (seq !== ATT.restoreSeq || !r || !r.ok) return;  // a newer switch superseded this one
+  if (r.chat_id === ATT.chatId) return;               // same chat (e.g. re-clicking the active tab): already right
+  ATT.chatId = r.chat_id;
+  ATT.items.forEach(c=>{ if (before.has(c.key) && c.thumb && String(c.thumb).startsWith("blob:")) URL.revokeObjectURL(c.thumb); });
+  ATT.items = ATT.items.filter(c=>!before.has(c.key));
+  (r.files || []).forEach(f=>attAddRecord(f));
+  attRender();
+}
+function attAddRecord(rec, refresh){
+  if (!rec || ATT.items.some(c=>c.id === rec.id)) return;
+  const c = {key: "a" + (++ATT.seq), id: rec.id, name: rec.name, size: rec.size, mime: rec.mime, kind: rec.kind,
+             status: "ready", rec: refresh ? Object.assign({}, rec, {busy: true}) : rec, thumb: null};
+  ATT.items.push(c);
+  if (rec.kind === "image"){
+    api("attach_thumbnail", rec.id).then(u=>{ if (u){ c.thumb = u; attRender(); } }).catch(()=>{});
+  }
+  attRender();
+  attPollStart();
+}
+function attHandleResult(r){
+  if (!r) return;
+  (r.files || []).forEach(f=>attAddRecord(f));
+  if ((r.errors || []).length) showAlert(r.errors.map(e=>e.name + ": " + e.error).join("\n"), "Attachment");
+  else if (r.ok === false && r.error) showAlert(String(r.error), "Attachment");
+}
+async function attPickFiles(){
+  let r = null;
+  try { r = await api("attach_pick_files"); } catch (e){ r = {ok: false, error: String(e)}; }
+  attHandleResult(r);
+}
+async function attLimits(){
+  if (ATT.limitsLoaded) return;
+  ATT.limitsLoaded = true;
+  try { const l = await api("attach_limits"); if (l){ ATT.max = l.max_bytes || ATT.max; ATT.chunk = l.chunk || ATT.chunk; } } catch (e){}
+}
+function attBlobToB64(blob){
+  return new Promise((res, rej)=>{
+    const fr = new FileReader();
+    fr.onload = ()=>{ const s = String(fr.result); res(s.slice(s.indexOf(",") + 1)); };
+    fr.onerror = ()=>rej(fr.error || new Error("read failed"));
+    fr.readAsDataURL(blob);
+  });
+}
+async function attUploadBlob(file){
+  await attLimits();
+  if (!file.size){ showAlert(`"${file.name || "This item"}" is empty or is a folder -- folders can't be attached.`, "Attachment"); return; }
+  if (file.size > ATT.max){ showAlert(`"${file.name}" is ${attFmtSize(file.size)}; the limit is ${attFmtSize(ATT.max)}.`, "Attachment"); return; }
+  const ext = ((file.type || "").split("/")[1] || "bin").split("+")[0];
+  const name = (file.name && file.name !== "image.png") ? file.name : ("pasted-" + Date.now().toString(36) + "." + ext);
+  const chip = {key: "a" + (++ATT.seq), id: null, name: name, size: file.size, mime: file.type || "", kind: (file.type || "").startsWith("image/") ? "image" : "file",
+                status: "transferring", progress: 0, rec: null, thumb: (file.type || "").startsWith("image/") ? URL.createObjectURL(file) : null};
+  ATT.items.push(chip);
+  attRender();
+  const uid = "up" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const total = Math.max(1, Math.ceil(file.size / ATT.chunk));
+  try {
+    for (let i = 0; i < total; i++){
+      if (chip.cancelled){ await api("attach_abort", uid); return; }
+      const b64 = await attBlobToB64(file.slice(i * ATT.chunk, Math.min(file.size, (i + 1) * ATT.chunk)));
+      const r = await api("attach_chunk", uid, name, file.type || "", i, total, b64);
+      if (!r || !r.ok) throw new Error((r && r.error) || "upload failed");
+      chip.progress = (i + 1) / total;
+      if (r.done && r.file){
+        Object.assign(chip, {id: r.file.id, rec: r.file, kind: r.file.kind, mime: r.file.mime, size: r.file.size, status: "ready"});
+      }
+      if (!chip.cancelled) attRender();
+    }
+    if (!chip.id && !chip.cancelled) throw new Error("upload did not finish");
+  } catch (e){
+    chip.status = "error"; chip.error = String((e && e.message) || e);
+  }
+  attRender();
+  attPollStart();
+}
+async function attAddBrowserFiles(list){
+  const files = Array.from(list || []);
+  if (!files.length) return;
+  const paths = files.map(f=>f.pywebviewFullPath).filter(Boolean);
+  const blobs = files.filter(f=>!f.pywebviewFullPath);
+  if (paths.length){ try { attHandleResult(await api("attach_paths", paths)); } catch (e){ showAlert(String(e), "Attachment"); } }
+  for (const f of blobs) await attUploadBlob(f);
+}
+function attPollStart(){ if (!ATT.poll) ATT.poll = setInterval(attPoll, 1200); }
+async function attPoll(){
+  const ids = ATT.items.filter(c=>c.id && c.rec && c.rec.busy).map(c=>c.id);
+  if (!ids.length){ clearInterval(ATT.poll); ATT.poll = null; return; }
+  let r = null;
+  try { r = await api("attach_status", ids); } catch (e){ return; }
+  const seen = new Set();
+  ((r && r.files) || []).forEach(rec=>{ seen.add(rec.id); const c = ATT.items.find(x=>x.id === rec.id); if (c) c.rec = rec; });
+  ATT.items.forEach(c=>{ if (c.id && ids.includes(c.id) && !seen.has(c.id)){ c.status = "error"; c.error = "File no longer available"; } });
+  attRender();
+}
+// Chips shown inside a sent user bubble (live + replayed history)
+function attBubbleChips(list){
+  if (!list || !list.length) return "";
+  return '<div class="att-row">' + list.map(a=>{
+    const lead = a.kind === "image" ? `<img class="att-thumb" alt="" data-thumb="${attEsc(a.id)}">` : `<div class="att-ico">${attSvg(attIconFor(a.kind))}</div>`;
+    return `<div class="att-chip-ro" title="${attEsc(a.name)}">${lead}<div class="att-meta"><div class="att-name">${attEsc(a.name)}</div><div class="att-sub">${attEsc(attFmtSize(a.size))}</div></div></div>`;
+  }).join("") + '</div>';
+}
+function attHydrate(root){
+  root.querySelectorAll("img[data-thumb]").forEach(img=>{
+    const id = img.dataset.thumb;
+    if (_ATT_THUMBS[id]){ img.src = _ATT_THUMBS[id]; return; }
+    api("attach_thumbnail", id).then(u=>{ if (u){ _ATT_THUMBS[id] = u; img.src = u; } else { img.style.visibility = "hidden"; } }).catch(()=>{ img.style.visibility = "hidden"; });
+  });
+}
+function initAttachments(){
+  const tray = document.getElementById("attach-tray");
+  const input = document.getElementById("msg-input");
+  const overlay = document.getElementById("drop-overlay");
+  if (!tray || !input) return;
+  document.getElementById("attach-btn").onclick = attPickFiles;
+  tray.addEventListener("click", e=>{
+    const b = e.target.closest(".att-x");
+    if (!b) return;
+    const i = ATT.items.findIndex(c=>c.key === b.dataset.key);
+    if (i < 0) return;
+    const c = ATT.items.splice(i, 1)[0];
+    if (c.status === "transferring") c.cancelled = true;
+    else if (c.id) api("attach_remove", c.id).catch(()=>{});
+    if (c.thumb && String(c.thumb).startsWith("blob:")) URL.revokeObjectURL(c.thumb);
+    attRender();
+  });
+  // Paste: files/images from the clipboard become attachments; plain text paste is untouched.
+  input.addEventListener("paste", e=>{
+    const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
+    if (!files.length) return;
+    e.preventDefault();
+    attAddBrowserFiles(files);
+  });
+  // Drag & drop anywhere in the window (also stops the webview from navigating to a dropped file).
+  let depth = 0;
+  const hasFiles = e=>!!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files"));
+  window.addEventListener("dragenter", e=>{ if (!hasFiles(e)) return; e.preventDefault(); depth++; overlay.classList.add("show"); });
+  window.addEventListener("dragover", e=>{ if (!hasFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = "copy"; });
+  window.addEventListener("dragleave", e=>{ if (!hasFiles(e)) return; depth = Math.max(0, depth - 1); if (!depth) overlay.classList.remove("show"); });
+  window.addEventListener("drop", e=>{
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    depth = 0; overlay.classList.remove("show");
+    attAddBrowserFiles(e.dataTransfer.files);
+  });
+}
+if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", initAttachments);
+else initAttachments();
+
 async function sendMessage(){
   const input = document.getElementById("msg-input");
   const text = input.value.trim();
-  if (!text) return;
+  const pendingAtt = ATT.items.filter(c=>c.status === "ready" && c.id);
+  if (!text && !pendingAtt.length) return;
+  if (ATT.items.some(c=>c.status === "transferring")){
+    showAlert("Your files are still being read -- one moment, then send again.", "Attachments");
+    return;
+  }
   if (state.viewingAgentTab){
     showAlert(`You're viewing "${state.viewingAgentTab}"'s conversation, which is read-only. Switch to one of your own tabs to send a message.`, "Read-only");
     return;
   }
   if (state.thinking){
+    if (pendingAtt.length){
+      showAlert("Midum is still working. Send your files once the current turn finishes.", "Attachments");
+      return;
+    }
+    if (!text) return;
     // Midum is still "Executing turns..." on a previous message -- this
     // doesn't start a new turn, it steers the one already running. Shown
     // as a wide interjection pill (not a normal user bubble) and queued
@@ -9740,13 +10492,16 @@ async function sendMessage(){
   input.value = "";
   autosizeMsgInput();
   clearOldTurnButtons();   // this message supersedes whatever turn had them
-  appendRow("user", text);
+  const attIds = pendingAtt.map(c=>c.id);
+  const attPublic = pendingAtt.map(c=>({id: c.id, name: c.name, mime: c.mime, size: c.size, kind: c.kind}));
+  attClear();
+  appendRow("user", text, attPublic);
   setActiveToolDot(null);
   setStatus("Executing turns...", "busy");
   state.thinking = true;
   const kbOnlyActive = !!(state.kbOnly && state.kbSources.length);
   const explainActive = !!(kbOnlyActive && state.explainMode);
-  const res = await api("send_message", text, kbOnlyActive, kbOnlyActive ? state.kbSources : [], explainActive, state.explainModeType);
+  const res = await api("send_message", text, kbOnlyActive, kbOnlyActive ? state.kbSources : [], explainActive, state.explainModeType, attIds);
   if (res && res.ok && typeof res.turn_id !== "undefined"){
     _pendingTurnId = res.turn_id;
     // Edit Prompt can attach right away -- it doesn't need the response to
@@ -9976,6 +10731,7 @@ window.__midumEvent = function(evt){
   else if (kind === "error_line"){ appendRow("error", payload.text); }
   else if (kind === "tool_line"){ appendRow("tool", payload.text); }
   else if (kind === "shell_line"){ appendShellLine(payload); }
+  else if (kind === "shell_lines"){ appendShellLines(payload.lines || []); }
   else if (kind === "tool_call"){ attachToolCallDetail(payload.name, payload.args, payload.result); }
   else if (kind === "tool_start"){ attachToolCallArgs(payload.name, payload.args); }
   else if (kind === "agent_tool_call"){ appendAgentToolRow(payload.agent, payload.name, payload.args, payload.result); }
@@ -9990,7 +10746,7 @@ window.__midumEvent = function(evt){
     if (_currentUserRow) attachEditButton(_currentUserRow, payload.turn_id);
     if (_currentMidumRow) attachRegenButton(_currentMidumRow, payload.turn_id);
   }
-  else if (kind === "done"){ state.thinking = false; setActiveToolDot(null); closeToolGroup(); settleStaleToolPills(); _currentMidumRow = null; refreshTitlebarInfo(); buildConversationTabs(); }
+  else if (kind === "done"){ state.thinking = false; _mdBusy(false); setActiveToolDot(null); closeToolGroup(); settleStaleToolPills(); _currentMidumRow = null; refreshTitlebarInfo(); buildConversationTabs(); }
   else if (kind === "projects"){ populateProjects(payload.projects, payload.active); }
   else if (kind === "ask"){ appendAsk(payload.id, payload.kind, payload.payload); }
   else if (kind === "mcp_changed"){ if (state.activeTab === "MCP") refreshMcpList(); }
@@ -10020,9 +10776,13 @@ window.__midumEvent = function(evt){
   else if (kind === "ptt_captured"){ handlePttCaptured(payload); }
   else if (kind === "voice_ptt_state"){ handlePttState(payload); }
   else if (kind === "pdf_cache_warmed"){ if (typeof onPdfCacheWarmed === "function") onPdfCacheWarmed(); }
+  else if (typeof kind === "string" && kind.indexOf("editor_") === 0){ mzEdEvent(kind, payload); }
   else if (kind === "render_surface_open"){ openRenderSurface(payload.code, payload.title); }
   else if (kind === "render_surface_update"){ updateRenderSurfaceCode(payload.code); }
   else if (kind === "render_surface_close"){ closeRenderSurfaceUI(); }
+  else if (kind === "midumdocs_open"){ openMidumDoc(payload); }
+  else if (kind === "midumdocs_changed"){ updateMidumDoc(payload); }
+  else if (kind === "midumdocs_close"){ closeMidumDocUI(); }
   else if (kind === "chat_title_updated"){
     // A background model call (see Api._apply_generated_title in
     // gui/app.py) finished naming this chat after the truncated fallback
@@ -10425,6 +11185,18 @@ function buildSidebar(){
       <div style="font-size:9px;color:var(--subtext);margin:-4px 0 2px;">
         When on, floating widgets are invisible to Midum's own screenshots, OCR and screen-share (you still see them). Windows 10 2004+.
       </div>
+      <div class="hdr-row" style="margin-top:4px;">
+        <div class="field-label" style="margin:0;">CHAT TEXT SIZE</div>
+        <button class="ghost-btn" id="settings-chat-fs-reset" style="flex:0 0 auto;height:22px;font-size:10px;padding:0 8px;" title="Reset chat text size to default">Reset</button>
+      </div>
+      <div class="chat-fs-row">
+        <input type="range" id="settings-chat-fs" min="10" max="32" step="0.05" value="15" aria-label="Chat text size"/>
+        <input type="number" id="settings-chat-fs-num" min="10" max="32" step="0.05" value="15.00" aria-label="Chat text size in pixels"/>
+        <span class="chat-fs-unit">px</span>
+      </div>
+      <div style="font-size:9px;color:var(--subtext);margin:-2px 0 2px;">
+        Main chat window only (messages, tool calls, code, prompt box). Drag, type an exact value, or use the arrow keys: 0.05 px per step, Shift = 1 px.
+      </div>
       <div class="field-label">DEFAULT PROVIDER</div>
       <select id="settings-provider"></select>
       <div class="field-label">DEFAULT MODEL</div>
@@ -10572,6 +11344,44 @@ function buildSidebar(){
   document.getElementById("settings-glass-opacity").oninput = (e)=>{
     applyGlassOpacity(e.target.value);
   };
+  {
+    // Chat Text Size: slider + exact number box + Reset. Repaints live, and
+    // persists on its own (debounced) so it doesn't depend on the Save button.
+    const fsSlider = document.getElementById("settings-chat-fs");
+    const fsNum = document.getElementById("settings-chat-fs-num");
+    const fsReset = document.getElementById("settings-chat-fs-reset");
+    let fsSaveTimer = null;
+    const live = (v)=>{
+      applyChatFontSize(v);
+      clearTimeout(fsSaveTimer);
+      fsSaveTimer = setTimeout(()=>{ api("set_chat_font_size", _chatFontSize); }, 350);
+    };
+    const nudge = (e)=>{
+      // Shift+Arrow = 1 px jumps; plain arrows keep the native 0.05 px step.
+      if (!e.shiftKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown" && e.key !== "ArrowLeft" && e.key !== "ArrowRight")) return;
+      e.preventDefault();
+      const dir = (e.key === "ArrowUp" || e.key === "ArrowRight") ? 1 : -1;
+      live(_chatFontSize + dir);
+      if (fsNum) fsNum.value = _chatFontSize.toFixed(2);
+    };
+    if (fsSlider){
+      fsSlider.value = _chatFontSize;
+      fsSlider.oninput = (e)=> live(e.target.value);
+      fsSlider.onkeydown = nudge;
+    }
+    if (fsNum){
+      fsNum.value = _chatFontSize.toFixed(2);
+      fsNum.oninput = (e)=>{
+        const n = Number(e.target.value);
+        if (e.target.value !== "" && isFinite(n) && n >= CHAT_FS_MIN && n <= CHAT_FS_MAX) live(n);
+      };
+      fsNum.onchange = (e)=>{ live(e.target.value); e.target.value = _chatFontSize.toFixed(2); };
+      fsNum.onkeydown = nudge;
+    }
+    if (fsReset){
+      fsReset.onclick = ()=>{ live(CHAT_FS_DEFAULT); if (fsNum) fsNum.value = _chatFontSize.toFixed(2); };
+    }
+  }
   document.getElementById("settings-glass-sheen-enabled").onchange = (e)=>{
     applyGlassSheen(e.target.checked);
   };
@@ -10868,6 +11678,27 @@ function applyGlassOpacity(pct){
   if (el) el.value = _glassOpacity;
 }
 
+// Main chat window text size (SETTINGS → Chat Text Size). Writes one custom
+// property, --chat-fs, that only chat-pane CSS reads (see the "Chat text size
+// + readability" block), so nothing outside the chat window changes size.
+// Precision is 0.01 px; the slider/number box use 0.05 px steps.
+const CHAT_FS_DEFAULT = 15, CHAT_FS_MIN = 10, CHAT_FS_MAX = 32;
+let _chatFontSize = CHAT_FS_DEFAULT;
+function clampChatFontSize(v){
+  const n = Number(v);
+  if (!isFinite(n)) return CHAT_FS_DEFAULT;
+  return Math.min(CHAT_FS_MAX, Math.max(CHAT_FS_MIN, Math.round(n * 100) / 100));
+}
+function applyChatFontSize(px){
+  _chatFontSize = clampChatFontSize(px);
+  document.documentElement.style.setProperty("--chat-fs", _chatFontSize + "px");
+  const sl = document.getElementById("settings-chat-fs");
+  if (sl) sl.value = _chatFontSize;
+  const num = document.getElementById("settings-chat-fs-num");
+  if (num && document.activeElement !== num) num.value = _chatFontSize.toFixed(2);
+  try { autosizeMsgInput(); } catch (e) {}
+}
+
 // The frosted-highlight toggle (SETTINGS → "Frosted highlight" checkbox).
 // Just flips the html.glass-no-sheen class -- see that CSS rule for what
 // it zeroes out. On by default, independent of the opacity slider.
@@ -11015,6 +11846,7 @@ async function loadSettingsPanel(){
   applyLiquidGlass(s.liquid_glass_enabled === true);
   applyGlassOpacity(s.liquid_glass_opacity != null ? s.liquid_glass_opacity : 55);
   applyGlassSheen(s.liquid_glass_sheen_enabled !== false);
+  applyChatFontSize(s.chat_font_size);
   applyAmbientHideCapture(s.ambient_hide_from_capture !== false);
   const blobsIndiv = s.blobs_individual || {};
   ["center","a","b","cursor"].forEach(key=>{
@@ -11063,6 +11895,7 @@ async function saveSettingsPanel(){
     liquid_glass_enabled: _glassEnabled,
     liquid_glass_opacity: _glassOpacity,
     liquid_glass_sheen_enabled: _glassSheenEnabled,
+    chat_font_size: _chatFontSize,
     ambient_hide_from_capture: _ambientHideCapture,
     bg_image,
   });
@@ -11078,6 +11911,7 @@ async function saveSettingsPanel(){
     applyLiquidGlass(r.settings.liquid_glass_enabled === true);
     applyGlassOpacity(r.settings.liquid_glass_opacity != null ? r.settings.liquid_glass_opacity : 55);
     applyGlassSheen(r.settings.liquid_glass_sheen_enabled !== false);
+    applyChatFontSize(r.settings.chat_font_size);
     applyAmbientHideCapture(r.settings.ambient_hide_from_capture !== false);
     if (status) status.textContent = "Saved — will be remembered next launch.";
   } else if (status) {
@@ -11174,6 +12008,97 @@ async function refreshHistory(){
 }
 
 // ── Tool pane content builders -------------------------------------------
+// ── Editor tab (Monaco) ────────────────────────────────────────────────────────────────
+// A full code editor (explorer + file tabs + Monaco) that edits ANY file on disk, plus the chat's
+// artifacts. It lives in its own page (gui/editor_assets/editor.html, served by a localhost server
+// started in gui/editor_backend.py) and is shown in a PERSISTENT iframe. It cannot be built into
+// #tool-content like the other panes: showToolPane() wipes that element on every tab switch, which
+// would destroy the editor and every open file with it. The iframe is parked beside #tool-content and
+// is only shown/hidden. Isolation also keeps Monaco's AMD loader and CSS away from this page.
+// Page <-> app traffic is postMessage only: the iframe asks for editor_* Api methods (whitelisted by
+// name below) and Python pushes editor_* events down the same pipe (see mzEdEvent).
+var MZED = {frame:null, host:null, ready:false, queue:[], origin:"", booting:null, themeTimer:null};
+const MZED_VARS = ["bg","panel","surface","surface2","border","border2","accent","accent-dim","accent-faint","text","subtext","muted","green","red","yellow"];
+function mzEdThemeVars(){
+  const cs = getComputedStyle(document.documentElement), out = {};
+  MZED_VARS.forEach(k=>{ const v = cs.getPropertyValue("--" + k).trim(); if (v) out["--" + k] = v; });
+  return out;
+}
+function mzEdPost(msg){
+  if (!MZED.frame || !MZED.ready){ MZED.queue.push(msg); return; }
+  try { MZED.frame.contentWindow.postMessage(msg, MZED.origin); } catch (e) {}
+}
+function mzEdShow(show){ if (typeof MZED !== "undefined" && MZED && MZED.host) MZED.host.style.display = show ? "block" : "none"; }
+function mzEdEnsureFrame(){
+  if (MZED.booting) return MZED.booting;
+  MZED.booting = (async ()=>{
+    const pane = document.querySelector("#tool-pane-wrap .pane");
+    let host = MZED.host;
+    if (!host){ host = document.createElement("div"); host.id = "mz-ed-host"; pane.appendChild(host); MZED.host = host; }
+    let info;
+    try { info = await api("editor_server_info"); } catch (e) { info = {ok:false, error:String(e)}; }
+    if (!info || !info.ok){
+      host.innerHTML = `<div class="mz-ed-err">The code editor could not start.<br><small>${escapeHtml((info && info.error) || "unknown error")}</small><br><button class="ghost-btn" id="mz-ed-retry">Retry</button></div>`;
+      const rb = document.getElementById("mz-ed-retry");
+      if (rb) rb.onclick = ()=>{ host.innerHTML = ""; MZED.booting = null; mzEdEnsureFrame(); };
+      MZED.booting = null;
+      return;
+    }
+    const fr = document.createElement("iframe");
+    MZED.origin = new URL(info.url).origin;
+    fr.src = info.url;
+    host.appendChild(fr);
+    MZED.frame = fr;
+  })();
+  return MZED.booting;
+}
+function buildEditorPane(box){
+  box.style.display = "none";          // the persistent host takes this pane's place
+  mzEdShow(true);
+  mzEdEnsureFrame().then(()=>mzEdShow(true));
+}
+// Python -> editor. editor_open_* also brings the Editor tab to the front (closing the Render Surface
+// first, since while it is open the layout reserves the whole right half for it).
+function mzEdEvent(kind, payload){
+  // editor_ai_request = the chat model reading/editing through the Editor (editor_link.py). Its open_file /
+  // open_folder ops show the Editor like the plain open events; state/snapshot/edit ops must NOT steal the
+  // tab, but they still need the iframe alive, so boot it in the background if it never started.
+  const aiOp = (kind === "editor_ai_request" && payload) ? payload.op : "";
+  const aiOpen = (aiOp === "open_file" || aiOp === "open_folder" || aiOp === "approve_edit");   // approve_edit: the dialog must be seen
+  if (kind === "editor_open_artifact" || kind === "editor_open_file" || kind === "editor_open_folder" || aiOpen){
+    if (state.renderSurfaceOpen){ closeRenderSurfaceUI(); api("render_surface_manual_close"); }
+    switchTab("Editor");
+  } else if (kind === "editor_ai_request" && !MZED.frame){
+    mzEdEnsureFrame();
+  }
+  mzEdPost({__ed:"event", kind, payload});
+}
+window.addEventListener("message", (e)=>{
+  if (!MZED.frame || e.source !== MZED.frame.contentWindow) return;
+  const d = e.data;
+  if (!d || typeof d !== "object" || !d.__ed) return;
+  const reply = (o)=>{ try { MZED.frame.contentWindow.postMessage(o, MZED.origin); } catch (x) {} };
+  if (d.__ed === "ready"){
+    MZED.ready = true;
+    mzEdPost({__ed:"theme", vars: mzEdThemeVars()});
+    MZED.queue.splice(0).forEach(m=>mzEdPost(m));
+  } else if (d.__ed === "rpc"){
+    const m = String(d.method || "");
+    if (!/^editor_[a-z_]+$/.test(m)){ reply({__ed:"rpc_result", id:d.id, error:"method not allowed: " + m}); return; }
+    Promise.resolve().then(()=>api(m, ...(Array.isArray(d.args) ? d.args : [])))
+      .then(r=>reply({__ed:"rpc_result", id:d.id, result:r}))
+      .catch(err=>reply({__ed:"rpc_result", id:d.id, error:String((err && err.message) || err)}));
+  } else if (d.__ed === "dirty"){
+    const b = document.querySelector('.tab-btn[data-name="Editor"]');
+    if (b) b.classList.toggle("has-dirty", d.count > 0);
+  }
+});
+// Keep Monaco's colors in step with the app theme (applyTheme/applyColors set CSS vars on <html>).
+new MutationObserver(()=>{
+  clearTimeout(MZED.themeTimer);
+  MZED.themeTimer = setTimeout(()=>{ if (MZED.ready) mzEdPost({__ed:"theme", vars: mzEdThemeVars()}); }, 120);
+}).observe(document.documentElement, {attributes:true, attributeFilter:["style","class"]});
+
 function showToolPane(name){
   const box = document.getElementById("tool-content");
   const builders = {
@@ -11183,8 +12108,10 @@ function showToolPane(name){
     "Agents": buildAgentsPane,
     "Permissions": buildPermissionsPane,
     "Surfaces": buildSurfacesPane,
+    "Editor": buildEditorPane,
   };
   box.innerHTML = "";
+  mzEdShow(false);   // the Editor's persistent iframe host is hidden for every tab; buildEditorPane re-shows it
   box.style.display = "flex"; box.style.flexDirection = "column"; box.style.height = "100%";
   box.style.padding = "";  // reset any pane-specific override (e.g. Flows sets 0) before rebuilding
   (builders[name] || (()=>{}))(box);
@@ -11216,9 +12143,13 @@ function shellLineHtml(line){
     // into an actual shell -- the origin (user vs model) is conveyed by a
     // small leading marker instead of a "[who]" bracket, so the line reads
     // like a genuine terminal transcript rather than a chat log.
-    const originMark = line.origin === "model" ? '<span style="color:var(--subtext);">' + icon("bot") + ' </span>' : "";
+    const originMark = line.origin === "model" ? '<span style="color:var(--subtext);">' + icon("bot") + ' </span>'
+      : (line.origin === "editor" ? '<span style="color:var(--subtext);">[editor] </span>' : "");
     const cwd = line.cwd || "";
-    return `<div style="font-weight:600;white-space:pre-wrap;word-break:break-word;">${originMark}<span style="color:var(--subtext);">${escapeHtml(cwd)}</span> <span style="color:${color};">$</span> <span style="color:${color};">${escapeHtml(line.text)}</span></div>`;
+    const isPs = line.shell === "powershell";
+    const pfx = isPs ? "PS " : "";
+    const sym = isPs ? "&gt;" : "$";
+    return `<div style="font-weight:600;white-space:pre-wrap;word-break:break-word;">${originMark}<span style="color:var(--subtext);">${pfx}${escapeHtml(cwd)}</span> <span style="color:${color};">${sym}</span> <span style="color:${color};">${escapeHtml(line.text)}</span></div>`;
   }
   if (line.stream === "meta"){
     return `<div style="color:${color};font-style:italic;white-space:pre-wrap;word-break:break-word;">${escapeHtml(line.text)}</div>`;
@@ -11231,15 +12162,45 @@ function shellLineHtml(line){
 // real $PWD (see shell_session.py) by re-fetching it after every command
 // finishes (a "meta" shell_line event -- see appendShellLine below).
 let shellCwd = "~";
+const shellCmdHist = {wsl: [], powershell: []};
+let shellHistIdx = -1;
+
+async function shellLoadInfo(){
+  try { shellInfo = (await api("get_shell_info")) || []; } catch (e) { /* keep defaults */ }
+}
+
+function shellRenderSwitch(){
+  const box = document.getElementById("shell-switch");
+  if (!box) return;
+  const list = shellInfo.length ? shellInfo
+    : [{kind:"wsl", label:"WSL2", available:true}, {kind:"powershell", label:"PowerShell", available:true}];
+  box.innerHTML = list.map(s =>
+    `<button class="ghost-btn" data-k="${s.kind}" ${s.available ? "" : "disabled title='not available on this machine'"}
+      style="height:22px;font-size:10px;${s.kind === shellActive ? "background:var(--accent);color:#fff;" : ""}">${escapeHtml(s.label)}</button>`
+  ).join("");
+  box.querySelectorAll("button").forEach(b => { b.onclick = () => shellSwitchTo(b.dataset.k); });
+}
+
+function shellSwitchTo(kind){
+  if (kind === shellActive) return;
+  shellActive = kind;
+  shellHistory = shellHistories[kind] || (shellHistories[kind] = []);
+  shellHistIdx = -1;
+  const box = document.getElementById("shell-terminal");
+  const host = box ? box.parentElement : null;
+  if (host) buildShellPane(host);
+}
 
 function updateShellPromptLabel(){
   const el = document.getElementById("shell-cwd-label");
-  if (el) el.textContent = shellCwd;
+  if (el) el.textContent = (shellActive === "powershell" ? "PS " : "") + shellCwd;
+  const sym = document.getElementById("shell-sym");
+  if (sym) sym.textContent = shellActive === "powershell" ? ">" : "$";
 }
 
 async function refreshShellCwd(){
   try {
-    shellCwd = (await api("get_shell_cwd")) || shellCwd;
+    shellCwd = (await api("get_shell_cwd", shellActive)) || shellCwd;
   } catch (e) { /* leave shellCwd as-is */ }
   updateShellPromptLabel();
 }
@@ -11247,10 +12208,12 @@ async function refreshShellCwd(){
 function buildShellPane(box){
   box.innerHTML = `
     <div class="hdr-row">
-      <div class="section-label">SHELL — WSL2 (live, shared with model)</div>
+      <div class="section-label">SHELL</div>
+      <div id="shell-switch" style="display:flex;gap:4px;margin-left:8px;"></div>
+      <span style="flex:1;"></span>
       <button class="ghost-btn" id="shell-restart" style="height:22px;font-size:10px;">Restart</button>
     </div>
-    <div style="font-size:10px;color:var(--muted);margin:2px 0 6px;line-height:1.5;">
+    <div id="shell-desc" style="font-size:10px;color:var(--muted);margin:2px 0 6px;line-height:1.5;">
       This is a real, persistent Linux terminal the model treats as its own
       computer (cwd/env/background jobs persist between commands) -- the
       user's Windows files are reachable at /mnt/&lt;drive&gt; (e.g. C:\\Users
@@ -11262,8 +12225,8 @@ function buildShellPane(box){
       font-size:12px;line-height:1.5;cursor:text;">
       <div id="shell-output"></div>
       <div id="shell-prompt-line" style="display:flex;align-items:center;font-weight:600;">
-        <span id="shell-cwd-label" style="color:var(--subtext);white-space:pre;">${escapeHtml(shellCwd)}</span>
-        <span style="color:var(--tool-text);margin:0 4px;">$</span>
+        <span id="shell-cwd-label" style="color:var(--subtext);white-space:pre;">${shellActive === "powershell" ? "PS " : ""}${escapeHtml(shellCwd)}</span>
+        <span id="shell-sym" style="color:var(--tool-text);margin:0 4px;">${shellActive === "powershell" ? ">" : "$"}</span>
         <input id="shell-input" autocomplete="off" spellcheck="false"
           style="flex:1;min-width:0;background:transparent;border:none;outline:none;color:var(--tool-text);
           font-family:var(--mono-font,monospace);font-size:12px;padding:0;"/>
@@ -11273,7 +12236,7 @@ function buildShellPane(box){
   const term = document.getElementById("shell-terminal");
   const out = document.getElementById("shell-output");
   const input = document.getElementById("shell-input");
-  out.innerHTML = shellHistory.map(shellLineHtml).join("");
+  out.innerHTML = (shellHistories[shellActive] || []).map(shellLineHtml).join("");
 
   // Clicking anywhere in the terminal (scrollback or the empty area below
   // the prompt line) focuses the live input, same as clicking into a real
@@ -11290,15 +12253,37 @@ function buildShellPane(box){
     const cmd = input.value;
     if (!cmd || !cmd.trim()) return;
     input.value = "";
-    await api("shell_run_user_command", cmd);
+    await api("shell_run_user_command", cmd, shellActive);
   };
-  input.addEventListener("keydown", (e)=>{ if (e.key === "Enter") sendCmd(); });
+  input.addEventListener("keydown", (e)=>{
+    const h = shellCmdHist[shellActive] || (shellCmdHist[shellActive] = []);
+    if (e.key === "Enter"){
+      if (input.value.trim()){ h.push(input.value); if (h.length > 200) h.shift(); }
+      shellHistIdx = -1;
+      sendCmd();
+    } else if (e.key === "ArrowUp"){
+      if (h.length){ shellHistIdx = shellHistIdx < 0 ? h.length - 1 : Math.max(0, shellHistIdx - 1); input.value = h[shellHistIdx]; }
+      e.preventDefault();
+    } else if (e.key === "ArrowDown"){
+      if (shellHistIdx >= 0){
+        shellHistIdx++;
+        if (shellHistIdx >= h.length){ shellHistIdx = -1; input.value = ""; } else { input.value = h[shellHistIdx]; }
+      }
+      e.preventDefault();
+    }
+  });
 
   document.getElementById("shell-restart").onclick = async ()=>{
-    await api("shell_restart");
+    await api("shell_restart", shellActive);
   };
 
   input.focus();
+  const desc = document.getElementById("shell-desc");
+  if (desc) desc.innerHTML = shellActive === "powershell"
+    ? "A real, persistent PowerShell session. The model drives it with execute_terminal_command and you type into the same session, so the working directory and variables persist. Type <b>edit &lt;file&gt;</b> to open a file in the Editor."
+    : "A real, persistent Linux (WSL2) terminal the model treats as its own computer; Windows files are at /mnt/&lt;drive&gt;. What you type lands in this exact same session. Type <b>edit &lt;file&gt;</b> to open a file in the Editor.";
+  shellRenderSwitch();
+  shellLoadInfo().then(shellRenderSwitch);
   refreshShellCwd();
   term.scrollTop = term.scrollHeight;
 }
@@ -11312,8 +12297,14 @@ function buildShellPane(box){
 // the bottom, exactly like a real terminal scrolling up under a fixed
 // cursor line.
 function appendShellLine(payload){
-  shellHistory.push(payload);
-  if (shellHistory.length > SHELL_HISTORY_CAP) shellHistory.shift();
+  const sk = payload.shell || "wsl";
+  const hist = shellHistories[sk] || (shellHistories[sk] = []);
+  hist.push(payload);
+  if (hist.length > SHELL_HISTORY_CAP) hist.shift();
+  // Mirror to the Editor's terminal panel -- only if the editor is already up
+  // (otherwise mzEdPost would queue forever; the panel replays history on open).
+  if (MZED.frame && MZED.ready) mzEdPost({__ed:"event", kind:"editor_shell_line", payload});
+  if (sk !== shellActive) return;
   const out = document.getElementById("shell-output");
   const term = document.getElementById("shell-terminal");
   if (!out || !term) return;
@@ -11323,6 +12314,31 @@ function appendShellLine(payload){
   // the shell's $PWD may have changed (e.g. `cd`), so refresh the prompt
   // label to match. Cheap no-op most of the time (cwd usually unchanged).
   if (payload.stream === "meta") refreshShellCwd();
+}
+
+// Batched variant: the backend coalesces output into ONE push per ~30 ms burst (instead of one
+// blocking evaluate_js round trip per line, which made big outputs crawl). Same effect as calling
+// appendShellLine per line, but one DOM write and one forwarded editor message per batch.
+function appendShellLines(lines){
+  const fwd = [];
+  let html = "", metaSeen = false;
+  for (const payload of lines){
+    const sk = payload.shell || "wsl";
+    const hist = shellHistories[sk] || (shellHistories[sk] = []);
+    hist.push(payload);
+    if (hist.length > SHELL_HISTORY_CAP) hist.shift();
+    fwd.push(payload);
+    if (sk === shellActive){ html += shellLineHtml(payload); if (payload.stream === "meta") metaSeen = true; }
+  }
+  if (MZED.frame && MZED.ready && fwd.length) mzEdPost({__ed:"event", kind:"editor_shell_lines", payload:{lines:fwd}});
+  const out = document.getElementById("shell-output");
+  const term = document.getElementById("shell-terminal");
+  if (out && term && html){
+    out.insertAdjacentHTML("beforeend", html);
+    while (out.childNodes.length > SHELL_HISTORY_CAP) out.removeChild(out.firstChild);
+    term.scrollTop = term.scrollHeight;
+  }
+  if (metaSeen) refreshShellCwd();
 }
 
 function buildVoicePane(box){
@@ -14070,6 +15086,19 @@ window.addEventListener("pywebviewready", async ()=>{
   document.getElementById("msg-input").addEventListener("input", ()=>{ autosizeMsgInput(); checkPathPickerTrigger(); checkCapabilityPickerTrigger(); });
   document.getElementById("abort-btn").onclick = ()=>api("abort");
   document.getElementById("copy-chat-btn").onclick = copyFullConversation;
+  document.getElementById("reopen-midumdocs-btn").onclick = async ()=>{
+    const r = await api("midumdocs_reopen_ui");
+    if (r && r.ok === false) await showConfirm(r.error || "Could not open MidumDocs.", "MidumDocs");
+  };
+  document.getElementById("midumdocs-close").onclick = ()=>{ closeMidumDocUI(); api("midumdocs_manual_close"); };
+  document.getElementById("midumdocs-recompile").onclick = (e)=>_mdPost({md:"cmd", cmd:"recompile", clean:!!e.shiftKey});
+  document.getElementById("midumdocs-pdf").onclick = ()=>_mdPost({md:"cmd", cmd:"download_pdf"});
+  document.getElementById("midumdocs-tex").onclick = ()=>_mdPost({md:"cmd", cmd:"download_tex"});
+  document.querySelectorAll("#midumdocs-modes button").forEach(b=>{ b.onclick = ()=>{
+    _mdMode = b.dataset.mode;
+    document.querySelectorAll("#midumdocs-modes button").forEach(x=>x.classList.toggle("active", x === b));
+    _mdPost({md:"cmd", cmd:"mode", value:_mdMode});
+  }; });
   document.getElementById("reopen-render-surface-btn").onclick = async ()=>{
     const r = await api("render_surface_reopen_ui");
     if (!r.ok) await showConfirm(r.message || "Nothing to reopen.", "Reopen Render Surface");
@@ -14096,6 +15125,7 @@ window.addEventListener("pywebviewready", async ()=>{
     applyLiquidGlass(s.liquid_glass_enabled === true);
     applyGlassOpacity(s.liquid_glass_opacity != null ? s.liquid_glass_opacity : 55);
     applyGlassSheen(s.liquid_glass_sheen_enabled !== false);
+    applyChatFontSize(s.chat_font_size);
     applyAmbientHideCapture(s.ambient_hide_from_capture !== false);
     const blobsIndiv = s.blobs_individual || {};
     ["center","a","b","cursor"].forEach(key=>{

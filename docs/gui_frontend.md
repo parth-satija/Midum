@@ -29,6 +29,12 @@ The graphical user interface of `midum_pkg` is built primarily with PyQt/PySide 
 - **Log pane** is a scrollable `div` (not a `textarea`) so it can hold icons.
 - **Add an icon**: add its `<path>` markup to `_ICONS` (and, if it should replace an emoji, to `_EMOJI_ICON`).
 
+## 3d. Chat text size (chat pane only)
+- **Setting**: SETTINGS → **Chat Text Size** — a 10–32 px slider (0.05 px steps) plus an exact-value number box and a Reset button. Shift+Arrow nudges by 1 px. Stored as `chat_font_size` in `storage/gui_settings.json` (default 15).
+- **Scope**: one CSS custom property, `--chat-fs`, set by `applyChatFontSize()`. Only chat-pane rules read it (bubbles, tool-call pills, code/tables, ask cards, prompt box); the sidebar, tool panes, settings and titlebar are untouched. The smaller text tiers (`--cfs-xs/sm/md/lg`) are fixed ratios of `--chat-fs` with legibility floors, and `--chat-sub` is the brighter secondary-text colour used for labels, timestamps and previews. All of it lives in the `Chat text size + readability` CSS block in `gui/app.py` (placed after the original chat rules so it supersedes their old hardcoded sizes).
+- **Persistence**: the slider repaints live and calls `Api.set_chat_font_size` (debounced) which writes only that key — it intentionally does not go through `save_settings()`, which would also re-apply the saved provider/model. `save_settings()` also accepts the value.
+- **Sizing**: pills, ask-card buttons and the prompt box use `min-height`/`calc()` rather than fixed pixel heights so nothing clips at large sizes; `autosizeMsgInput()` derives its ~10-line cap from the live line height.
+
 ## 4. `gui/voice_overlay.py`
 - **Purpose**: Floating HUD or overlay for voice mode sessions, displaying speech status, transcripts, and active visualizers.
 - **Icons**: the mic / gear / speaker states are drawn with PIL (`draw_icon`) in the same stroke style as the chat UI icons, rather than rendering emoji from a system font.

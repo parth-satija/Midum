@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MidumDocs</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="/vendor/codemirror/codemirror.css">
+<style>
+:root{
+  --bg:#05070c; --panel:#0b0f19; --surface:#0d1220; --surface2:#121a2c; --border2:#1f2937;
+  --accent:#60a5fa; --accent-faint:#0f1e33; --text:#f3f4f6; --subtext:#9ca3af; --muted:#4b5563;
+  --red:#ef4444; --green:#10b981; --yellow:#f59e0b;
+  --canvas:color-mix(in srgb, var(--bg) 78%, #000);
+  --ease:cubic-bezier(.2,.8,.2,1);
+}
+*{box-sizing:border-box;}
+html,body{margin:0;height:100%;background:transparent;color:var(--text);
+  font:13px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden;}
+button{font:inherit;color:inherit;cursor:pointer;}
+
+#app{position:absolute;inset:0;display:flex;}
+#src-wrap,#page-wrap{position:relative;min-width:0;height:100%;}
+#src-wrap{flex:0 0 var(--split,46%);background:var(--panel);transition:flex-basis .25s var(--ease), opacity .2s;}
+#page-wrap{flex:1 1 0;background:var(--canvas);}
+#splitter{flex:0 0 5px;margin:0 -2px;z-index:6;cursor:col-resize;background:transparent;position:relative;}
+#splitter::after{content:"";position:absolute;left:2px;top:0;bottom:0;width:1px;background:var(--border2);}
+#splitter:hover::after,#splitter.drag::after{background:var(--accent);width:2px;left:1.5px;}
+.mode-source #page-wrap,.mode-source #splitter{display:none;}
+.mode-source #src-wrap{flex:1 1 0;}
+.mode-page #src-wrap,.mode-page #splitter{display:none;}
+
+/* source pane */
+.CodeMirror{height:100%;background:transparent;color:var(--text);
+  font:13px/1.62 ui-monospace,"Cascadia Code",Consolas,Menlo,monospace;}
+.CodeMirror-gutters{background:transparent;border-right:1px solid color-mix(in srgb,var(--border2) 60%,transparent);}
+.CodeMirror-linenumber{color:var(--muted);padding:0 8px 0 4px;}
+.CodeMirror-cursor{border-left:2px solid var(--accent);}
+.CodeMirror-selected{background:color-mix(in srgb,var(--accent) 28%,transparent)!important;}
+.CodeMirror-focused .CodeMirror-selected{background:color-mix(in srgb,var(--accent) 38%,transparent)!important;}
+.CodeMirror-activeline-background{background:color-mix(in srgb,var(--accent) 7%,transparent)!important;}
+.CodeMirror-matchingbracket{color:var(--text)!important;background:color-mix(in srgb,var(--accent) 30%,transparent);}
+.CodeMirror-lines{padding:14px 0 90px;}
+.cm-s-default .cm-tag{color:var(--accent);} .cm-s-default .cm-builtin{color:color-mix(in srgb,var(--accent) 70%,#fff);}
+.cm-s-default .cm-comment{color:var(--muted);font-style:italic;} .cm-s-default .cm-string{color:var(--green);}
+.cm-s-default .cm-atom{color:var(--yellow);} .cm-s-default .cm-number{color:var(--yellow);}
+.cm-s-default .cm-bracket{color:var(--subtext);} .cm-s-default .cm-variable-2{color:var(--green);}
+.cm-s-default .cm-error{color:var(--red);}
+.CodeMirror-linebackground.err-line{background:color-mix(in srgb,var(--red) 14%,transparent);}
+.CodeMirror-linebackground.flash{animation:flash 1.8s var(--ease) forwards;}
+@keyframes flash{0%{background:color-mix(in srgb,var(--accent) 38%,transparent);}100%{background:transparent;}}
+.err-dot{width:8px;height:8px;border-radius:50%;background:var(--red);margin:6px 0 0 3px;}
+
+/* page pane */
+#pages{position:absolute;inset:0;overflow:auto;padding:22px 24px 120px;scroll-behavior:auto;}
+.page{position:relative;margin:0 auto 18px;background:#fff;border-radius:2px;
+  box-shadow:0 1px 2px rgba(0,0,0,.3),0 10px 30px -12px rgba(0,0,0,.55);}
+.page canvas{display:block;}
+#pages.stale .page{filter:saturate(.6) brightness(.82);transition:filter .2s;}
+.textLayer{position:absolute;inset:0;overflow:hidden;line-height:1;}
+.textLayer span,.textLayer br{position:absolute;color:transparent;white-space:pre;cursor:text;transform-origin:0 0;}
+.textLayer ::selection{background:rgba(59,130,246,.38);}
+#empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:10px;color:var(--subtext);text-align:center;padding:0 40px;pointer-events:none;}
+#empty .big{font-size:14px;color:var(--text);}
+#empty .small{font-size:12px;max-width:340px;}
+#empty button{pointer-events:auto;margin-top:4px;padding:5px 14px;border-radius:14px;border:1px solid var(--border2);background:var(--surface2);}
+.spin{width:18px;height:18px;border-radius:50%;border:2px solid var(--border2);border-top-color:var(--accent);animation:spin .8s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+/* floating bits */
+.float{position:absolute;z-index:8;}
+#errpill{left:14px;bottom:14px;max-width:min(520px,70%);display:none;align-items:center;gap:8px;padding:6px 12px;border-radius:16px;
+  background:color-mix(in srgb,var(--red) 18%,var(--surface));border:1px solid color-mix(in srgb,var(--red) 55%,transparent);
+  color:var(--text);font-size:12px;box-shadow:0 8px 24px -10px rgba(0,0,0,.6);}
+#errpill.show{display:flex;}
+#errpill span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#zoom{right:14px;bottom:14px;display:flex;align-items:center;gap:2px;padding:3px;border-radius:16px;background:var(--surface);
+  border:1px solid var(--border2);opacity:.0;transition:opacity .2s;}
+#page-wrap:hover #zoom{opacity:1;}
+#zoom button{width:24px;height:24px;border-radius:12px;border:0;background:transparent;}
+#zoom button:hover{background:var(--surface2);} #zoom span{min-width:38px;text-align:center;font-size:11px;color:var(--subtext);}
+#banner{left:50%;top:10px;transform:translateX(-50%);display:none;gap:10px;align-items:center;padding:6px 8px 6px 14px;border-radius:16px;
+  background:var(--surface);border:1px solid var(--border2);box-shadow:0 8px 24px -10px rgba(0,0,0,.6);font-size:12px;}
+#banner.show{display:flex;}
+#banner button,.chip{border:1px solid var(--border2);background:var(--surface2);border-radius:12px;padding:2px 10px;font-size:11.5px;}
+#banner button:hover,.chip:hover{border-color:var(--accent);}
+#toast{left:50%;bottom:84px;transform:translateX(-50%);padding:6px 14px;border-radius:14px;background:var(--surface);
+  border:1px solid var(--border2);font-size:12px;opacity:0;pointer-events:none;transition:opacity .2s;display:flex;gap:10px;align-items:center;}
+#toast.show{opacity:1;pointer-events:auto;} #toast.err{border-color:var(--red);}
+
+#savebtn{right:14px;top:10px;display:flex;align-items:center;gap:6px;height:26px;padding:0 12px;border-radius:13px;border:1px solid var(--border2);
+  background:var(--surface);color:var(--subtext);font-size:12px;box-shadow:0 6px 18px -8px rgba(0,0,0,.6);}
+#savebtn.draft{border-color:var(--accent);color:var(--accent);background:var(--accent-faint);}
+#savebtn.draft:hover{background:color-mix(in srgb,var(--accent) 22%,var(--surface));}
+#savebtn.saved{cursor:default;}
+#savebtn kbd{font:10px ui-monospace,monospace;opacity:.7;}
+
+/* ask box */
+#ask{left:50%;bottom:16px;transform:translateX(-50%);width:auto;max-width:calc(100% - 28px);z-index:9;}
+#ask-pill{display:flex;align-items:center;gap:8px;height:34px;padding:0 14px;border-radius:17px;background:var(--surface);
+  border:1px solid var(--border2);color:var(--subtext);box-shadow:0 8px 26px -10px rgba(0,0,0,.65);transition:border-color .15s,color .15s;}
+#ask-pill:hover{border-color:var(--accent);color:var(--text);}
+#ask-pill kbd{font:10.5px ui-monospace,monospace;padding:1px 5px;border-radius:5px;border:1px solid var(--border2);color:var(--muted);}
+#ask-box{display:none;width:min(580px,calc(100vw - 28px));padding:8px 10px 8px 12px;border-radius:18px;background:var(--surface);
+  border:1px solid color-mix(in srgb,var(--accent) 55%,var(--border2));box-shadow:0 14px 40px -12px rgba(0,0,0,.75);}
+#ask.open #ask-box{display:block;} #ask.open #ask-pill{display:none;}
+#ask-ctx{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:6px;font-size:11px;color:var(--subtext);}
+#ask-ctx .tag{padding:1px 8px;border-radius:10px;background:var(--accent-faint);color:var(--accent);}
+#ask-row{display:flex;align-items:flex-end;gap:8px;}
+#ask-in{flex:1;resize:none;border:0;outline:0;background:transparent;color:var(--text);font:inherit;font-size:13.5px;max-height:110px;padding:4px 0;}
+#ask-in::placeholder{color:var(--muted);}
+#ask-go{width:28px;height:28px;border-radius:14px;border:0;background:var(--accent);color:#04121f;font-weight:700;flex:0 0 auto;}
+#ask-go:disabled{opacity:.35;cursor:default;}
+#ask-busy{display:none;align-items:center;gap:8px;font-size:12.5px;color:var(--text);padding:4px 0;}
+#ask.busy #ask-row,#ask.busy #ask-ctx{display:none;} #ask.busy #ask-busy{display:flex;}
+#ask-busy .grow{flex:1;} #ask-busy button{border:1px solid var(--border2);background:var(--surface2);border-radius:12px;padding:2px 10px;font-size:11.5px;}
+#ask-sugg{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;}
+</style>
+</head>
+<body>
+<div id="app" class="mode-split">
+  <section id="src-wrap"><textarea id="src"></textarea></section>
+  <div id="splitter" title="Drag to resize"></div>
+  <section id="page-wrap">
+    <div id="pages"></div>
+    <div id="empty"><div class="spin"></div><div class="big" id="empty-big">Looking for your LaTeX installation…</div>
+      <div class="small" id="empty-small">MidumDocs compiles offline with the TeX distribution installed on this PC.</div></div>
+    <div id="errpill" class="float"><span id="errtext"></span><button id="errlog" class="chip">Log</button></div>
+    <div id="zoom" class="float"><button id="zout" title="Zoom out">−</button><span id="zval">100%</span><button id="zin" title="Zoom in">+</button></div>
+  </section>
+  <div id="banner" class="float"><span id="banner-text"></span><span id="banner-btns"></span></div>
+  <button id="savebtn" class="float draft" title="Save this document (Ctrl/⌘ S). After the first save it autosaves."><span id="savetxt">Save</span><kbd>Ctrl S</kbd></button>
+  <div id="toast" class="float"><span id="toast-text"></span><button id="toast-btn" class="chip" style="display:none"></button></div>
+  <div id="ask" class="float">
+    <button id="ask-pill" title="Ask Midum to change this document (Ctrl/⌘ K)"><span>✦ Ask Midum</span><kbd>Ctrl K</kbd></button>
+    <div id="ask-box">
+      <div id="ask-ctx"></div>
+      <div id="ask-row"><textarea id="ask-in" rows="1" placeholder="What should change?"></textarea><button id="ask-go" title="Send (Enter)">↑</button></div>
+      <div id="ask-busy"><div class="spin"></div><span class="grow">Midum is working on your document…</span><button id="ask-stop">Stop</button></div>
+      <div id="ask-sugg"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/vendor/codemirror/codemirror.js"></script>
+<script src="/vendor/codemirror/stex.js"></script>
+<script src="/vendor/codemirror/matchbrackets.js"></script>
+<script src="/vendor/codemirror/closebrackets.js"></script>
+<script src="/vendor/codemirror/active-line.js"></script>
+<script src="/vendor/pdfjs/pdf.min.js"></script>
+<script src="/pageedit.js"></script>
+<script>
+"use strict";
+/* MidumDocs editor page. Runs in an iframe served from 127.0.0.1 (see midumdocs.py). It talks ONLY to its parent window
+   (the Midum UI) via postMessage; the parent relays to Python. Protocol: see the md:* messages below. */
+(function(){
+const $ = (id)=>document.getElementById(id);
+const appEl=$("app"), pagesEl=$("pages"), emptyEl=$("empty");
+const PE=window.MidumPageEdit||{defer:()=>false,setPages(){},isEditing:()=>false,enabled:()=>false,init(){}};
+
+// ── parent messaging ─────────────────────────────────────────────────────────────────────
+let _rid=0; const _pending=new Map();
+function post(md, data){ try{ parent.postMessage(Object.assign({md}, data||{}), "*"); }catch(e){} }
+function rpc(md, data){ return new Promise((res)=>{ const rid=++_rid; _pending.set(rid,res); post(md, Object.assign({rid}, data||{}));
+  setTimeout(()=>{ if(_pending.has(rid)){ _pending.delete(rid); res({ok:false,error:"timed out"}); } }, 20000); }); }
+
+// ── theme ────────────────────────────────────────────────────────────────────────────────
+function applyTheme(vars){ if(!vars) return; for(const k in vars){ if(/^--[a-z0-9-]+$/i.test(k) && typeof vars[k]==="string") document.documentElement.style.setProperty(k, vars[k]); } }
+
+// ── editor ───────────────────────────────────────────────────────────────────────────────
+const cm = CodeMirror.fromTextArea($("src"), {
+  mode:"stex", lineNumbers:true, lineWrapping:true, matchBrackets:true, autoCloseBrackets:true, styleActiveLine:true,
+  indentUnit:2, tabSize:2, indentWithTabs:false, gutters:["errors","CodeMirror-linenumbers"], viewportMargin:40,
+  extraKeys:{ "Ctrl-K":()=>openAsk(), "Cmd-K":()=>openAsk(), "Ctrl-S":()=>{saveNow(true,"manual");compileSoon(0);}, "Cmd-S":()=>{saveNow(true,"manual");compileSoon(0);},
+              "Ctrl-Enter":()=>compileSoon(0), "Cmd-Enter":()=>compileSoon(0), "Tab":(c)=>c.somethingSelected()?c.indentSelection("add"):c.replaceSelection("  ","end") }
+});
+let doc = {id:null,name:"",readonly:false,reason:""}, baseVersion=0, dirty=false, zoom=1, docSaved=false;
+
+function selInfo(){
+  const s=cm.listSelections()[0]; if(!s) return null;
+  const a=cm.indexFromPos(s.anchor), h=cm.indexFromPos(s.head), from=Math.min(a,h), to=Math.max(a,h);
+  if(to<=from) return null;
+  const f=cm.posFromIndex(from), t=cm.posFromIndex(to);
+  return {from,to,text:cm.getRange(f,t),fromLine:f.line+1,toLine:t.line+1};
+}
+function cursorInfo(){ const p=cm.getCursor("head"); return {offset:cm.indexFromPos(p), line:p.line+1, col:p.ch+1}; }
+
+let compileInfo=null, stateTimer=null;
+function postState(){
+  clearTimeout(stateTimer);
+  post("state",{ state:{ id:doc.id, version:baseVersion, dirty, length:cm.getValue().length, cursor:cursorInfo(), selection:selInfo(), compile:compileInfo } });
+}
+function postStateSoon(){ clearTimeout(stateTimer); stateTimer=setTimeout(postState,120); }
+
+cm.on("cursorActivity", ()=>{ postStateSoon(); if($("ask").classList.contains("open")) refreshAskCtx(); });
+cm.on("change", (inst,ch)=>{
+  if(ch.origin==="+external"||ch.origin==="setValue") return;
+  if(doc.readonly) return;
+  dirty=true; if(docSaved) scheduleSave(); updateSaveUI(); compileSoon(900); postStateSoon();
+});
+
+// ── save (autosave to the artifact) ──────────────────────────────────────────────────────
+let saveTimer=null, saving=false;
+function scheduleSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(()=>saveNow(false),1200); }
+// Saving is manual until the first Save; after that the document autosaves.
+//  mode "manual" = Save button / Ctrl+S (also switches autosave on), "auto" = autosave, "sync" = push text for the model without saving.
+const autoMode=()=>docSaved?"auto":"sync";
+function updateSaveUI(){
+  const b=$("savebtn"), t=$("savetxt"); if(!b) return;
+  b.style.display=(doc.readonly||!doc.id)?"none":"";
+  b.classList.toggle("draft",!docSaved); b.classList.toggle("saved",docSaved);
+  b.querySelector("kbd").style.display=docSaved?"none":"";
+  t.textContent=!docSaved?(dirty?"Save changes":"Save"):((saving||dirty)?"Saving…":"Saved ✓");
+  b.title=docSaved?"Autosave is on for this document":"Not saved yet. Click to save (Ctrl/⌘ S); after the first save it autosaves.";
+}
+$("savebtn").onclick=()=>{ if(!docSaved){ saveNow(true,"manual"); compileSoon(0); } };
+document.addEventListener("keydown",(e)=>{ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="s"){ e.preventDefault(); saveNow(true,"manual"); compileSoon(0); } });
+async function saveNow(force,mode){
+  clearTimeout(saveTimer); mode=mode||autoMode();
+  if(doc.readonly||!doc.id||(!dirty&&!force)) return;
+  if(saving){ if(docSaved) scheduleSave(); return; }
+  const value=cm.getValue(); saving=true; updateSaveUI();
+  const res=await rpc("save",{id:doc.id, content:value, base_version:baseVersion, mode});
+  saving=false;
+  if(res && res.ok){
+    if(res.skipped){ docSaved=false; updateSaveUI(); postState(); return; }
+    baseVersion=res.version;
+    if(res.saved!==undefined){ const was=docSaved; docSaved=!!res.saved; if(mode==="manual"&&!was&&docSaved) toast("Saved. This document now autosaves.","ok",null,2500); else if(mode==="manual") toast("Saved","ok",null,1200); }
+    if(cm.getValue()===value) dirty=false; else if(docSaved) scheduleSave();
+    if(compileInfo && lastCompiledSrc===value && !compileInfo.running) compileInfo.version=baseVersion;
+    updateSaveUI(); postState();
+  }else if(res && res.conflict){
+    showConflict(res.version,res.content);
+  }else{
+    toast((res&&res.error)||"Could not save","err");
+  }
+}
+
+// ── external (model) changes ─────────────────────────────────────────────────────────────
+function applyExternal(newText){
+  const cur=cm.getValue(); if(cur===newText) return null;
+  let a=0; const max=Math.min(cur.length,newText.length);
+  while(a<max && cur.charCodeAt(a)===newText.charCodeAt(a)) a++;
+  let ce=cur.length, ne=newText.length;
+  while(ce>a && ne>a && cur.charCodeAt(ce-1)===newText.charCodeAt(ne-1)){ ce--; ne--; }
+  const hi=(c)=>c>=0xD800&&c<=0xDBFF, lo=(c)=>c>=0xDC00&&c<=0xDFFF;
+  if(a>0 && hi(cur.charCodeAt(a-1))) a--;
+  if(ce<cur.length && lo(cur.charCodeAt(ce))){ ce++; ne++; }
+  cm.replaceRange(newText.slice(a,ne), cm.posFromIndex(a), cm.posFromIndex(ce), "+external");
+  return {from:a,to:ne};
+}
+function flashLines(fromIdx,toIdx){
+  const f=cm.posFromIndex(fromIdx).line, t=cm.posFromIndex(Math.max(fromIdx,toIdx)).line, hs=[];
+  cm.operation(()=>{ for(let l=f;l<=t;l++) hs.push(cm.addLineClass(l,"background","flash")); });
+  setTimeout(()=>{ cm.operation(()=>{ hs.forEach((l)=>{ try{cm.removeLineClass(l,"background","flash");}catch(e){} }); }); },1900);
+}
+let pendingExternal=null;
+function onDocChanged(m){
+  if(m.id!==doc.id) return;
+  if(dirty && !doc.readonly){ pendingExternal={version:m.version,content:m.content}; showConflict(m.version,m.content,true); return; }
+  const rng=applyExternal(m.content);
+  baseVersion=m.version; dirty=false;
+  if(Array.isArray(m.select) && m.select.length===2){
+    cm.setSelection(cm.posFromIndex(m.select[0]), cm.posFromIndex(m.select[1]));
+    cm.scrollIntoView({from:cm.posFromIndex(m.select[0]),to:cm.posFromIndex(m.select[1])},120);
+    flashLines(m.select[0],m.select[1]);
+  }else if(rng){ flashLines(rng.from,rng.to); }
+  if(rng && m.source==="model") toast("Midum edited the document","ok",{label:"Undo",fn:()=>{ post("undo",{id:doc.id}); hideToast(); }},9000);
+  postState(); compileSoon(150);
+}
+function showConflict(version,content,fromModel){
+  $("banner-text").textContent = fromModel ? "Midum changed this document while you were typing." : "This document changed elsewhere.";
+  const b=$("banner-btns"); b.innerHTML="";
+  const mk=(t,fn)=>{ const x=document.createElement("button"); x.textContent=t; x.onclick=()=>{ $("banner").classList.remove("show"); fn(); }; b.appendChild(x); };
+  mk("Use Midum's version",()=>{ applyExternal(content); baseVersion=version; dirty=false; postState(); compileSoon(150); });
+  mk("Keep mine",()=>{ baseVersion=version; dirty=true; saveNow(true); });
+  $("banner").classList.add("show");
+}
+
+// ── toast ────────────────────────────────────────────────────────────────────────────────
+let toastTimer=null;
+function hideToast(){ $("toast").classList.remove("show"); }
+function toast(text,kind,action,ms){
+  const t=$("toast"); $("toast-text").textContent=text; t.classList.toggle("err",kind==="err");
+  const b=$("toast-btn"); if(action){ b.style.display=""; b.textContent=action.label; b.onclick=action.fn; } else { b.style.display="none"; b.onclick=null; }
+  t.classList.add("show"); clearTimeout(toastTimer); toastTimer=setTimeout(hideToast, ms||3500);
+}
+
+// ── SwiftLaTeX engine + compile loop ─────────────────────────────────────────────────────
+let engine=null, engineState="loading", compiling=false, compileAgain=false, compileTimer=null, lastCompiledSrc=null, lastPdf=null, lastGood=false;
+function loadScript(src){ return new Promise((res,rej)=>{ const s=document.createElement("script"); s.src=src; s.onload=res; s.onerror=()=>rej(new Error("failed to load "+src)); document.head.appendChild(s); }); }
+function setEmpty(big,small,spin,retry){
+  $("empty-big").textContent=big; $("empty-small").textContent=small||"";
+  emptyEl.querySelector(".spin").style.display=spin?"":"none";
+  const old=emptyEl.querySelector("button"); if(old) old.remove();
+  if(retry){ const b=document.createElement("button"); b.textContent="Retry"; b.onclick=()=>{ initEngine(); }; emptyEl.appendChild(b); }
+  emptyEl.style.display="flex";
+}
+async function initEngine(){
+  engineState="loading"; engine=null;
+  setEmpty("Looking for your LaTeX installation…","MidumDocs compiles offline with the TeX distribution installed on this PC.",true,false);
+  post("status",{kind:"engine",text:"Checking LaTeX…"});
+  try{
+    const r=await (await fetch("/engine-status",{cache:"no-store"})).json();
+    if(!r||!r.ready) throw new Error((r&&r.error)||"No local LaTeX compiler found.");
+    engine={name:r.engine||"latex"}; engineState="ready";
+    if(!lastGood) setEmpty("Compiling…","Compiling with "+engine.name+". The very first build can take a little longer while TeX builds its font cache.",true,false);
+    compileSoon(0);
+  }catch(e){
+    engineState="error";
+    setEmpty("No LaTeX compiler found",(e&&e.message)||"Install TeX Live or MiKTeX, then press Retry.",false,true);
+    post("status",{kind:"error",text:"LaTeX not installed"});
+  }
+}
+function compileSoon(ms){ clearTimeout(compileTimer); compileTimer=setTimeout(compileNow, ms); }
+
+function parseLog(log){
+  const lines=String(log||"").split(/\r?\n/), errs=[];
+  for(let i=0;i<lines.length;i++){
+    if(lines[i].charAt(0)!=="!") continue;
+    const msg=lines[i].slice(1).trim(); let ln=null;
+    for(let j=i+1;j<Math.min(i+14,lines.length);j++){ const m=lines[j].match(/^l\.(\d+)/); if(m){ ln=+m[1]; break; } }
+    if(/Fatal error occurred|Emergency stop/i.test(msg)) continue;
+    errs.push({msg:msg||"Error",line:ln});
+  }
+  if(!errs.length && /Fatal error occurred|Emergency stop/i.test(log||"")) errs.push({msg:"Compilation stopped (see the log)",line:null});
+  return errs;
+}
+let currentErrors=[], errCursor=0, lastLog="";
+function toggleLog(){ let v=$("logview"); if(v){ v.remove(); return; } v=document.createElement("pre"); v.id="logview";
+  v.style.cssText="position:absolute;inset:10px 10px 56px;z-index:12;margin:0;padding:12px;overflow:auto;background:var(--surface);border:1px solid var(--border2);border-radius:10px;font:11px/1.45 ui-monospace,Consolas,monospace;white-space:pre-wrap;color:var(--text)";
+  v.textContent=(lastLog||"(no log yet)").slice(-12000); v.onclick=()=>v.remove(); $("page-wrap").appendChild(v); }
+function showErrors(errs){
+  currentErrors=errs; errCursor=0;
+  cm.operation(()=>{
+    cm.clearGutter("errors");
+    for(let l=0;l<cm.lineCount();l++) cm.removeLineClass(l,"background","err-line");
+    errs.forEach((e)=>{ if(e.line && e.line<=cm.lineCount()){ const d=document.createElement("div"); d.className="err-dot"; d.title=e.msg;
+      cm.setGutterMarker(e.line-1,"errors",d); cm.addLineClass(e.line-1,"background","err-line"); } });
+  });
+  const pill=$("errpill");
+  if(!errs.length){ pill.classList.remove("show"); return; }
+  const e=errs[0]; const missing=/File `([^']+)' not found/.exec(e.msg);
+  $("errtext").textContent=(errs.length>1?errs.length+" errors · ":"")+e.msg+(e.line?" (line "+e.line+")":"")+(missing?" — package not installed in your TeX distribution":"");
+  pill.classList.add("show");
+}
+$("errpill").addEventListener("click",(ev)=>{
+  if(ev.target.id==="errlog"){ toggleLog(); return; }
+  if(!currentErrors.length) return; const e=currentErrors[errCursor%currentErrors.length]; errCursor++;
+  if(e.line){ if(appEl.classList.contains("mode-page")) setMode("split"); cm.setCursor({line:e.line-1,ch:0}); cm.scrollIntoView({line:e.line-1,ch:0},140); cm.focus(); }
+  const n=currentErrors[errCursor%currentErrors.length]; $("errtext").textContent=(currentErrors.length>1?currentErrors.length+" errors · ":"")+n.msg+(n.line?" (line "+n.line+")":"");
+});
+
+async function compileNow(){
+  if(!doc.id) return;
+  if(engineState!=="ready"){ if(engineState==="error") return; compileAgain=true; return; }
+  if(compiling){ compileAgain=true; return; }
+  compiling=true; compileAgain=false;
+  const src=cm.getValue(), ver=baseVersion;
+  compileInfo={version:ver,running:true,ok:false,pages:0,errors:[],error:""}; postState();
+  post("status",{kind:"compiling",text:"Compiling…"});
+  try{
+    const resp=await fetch("/compile",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({source:src})});
+    if(!resp.ok) throw new Error("Compile server error (HTTP "+resp.status+")");
+    const j=await resp.json();
+    const r={status:j.status,log:j.log,pdf:j.pdf?b64ToBytes(j.pdf):null};
+    lastCompiledSrc=src;
+    if(r.status===0 && r.pdf){
+      const pages=await showPdf(r.pdf);
+      lastPdf=r.pdf; lastGood=true;
+      compileInfo={version:ver,running:false,ok:true,pages,errors:[],error:""};
+      showErrors([]); pagesEl.classList.remove("stale"); emptyEl.style.display="none";
+      post("status",{kind:"ok",text:pages+(pages===1?" page":" pages")});
+    }else{
+      const errs=parseLog(r.log);
+      lastLog="[engine status "+r.status+"]\n"+String(r.log||"");
+      if(!errs.length){
+        const tail=String(r.log||"").split(/\r?\n/).map((s)=>s.trim()).filter(Boolean);
+        errs.push({msg:r.status<0 ? (tail[0]||"The LaTeX compiler could not run.") : "Compiler failed (status "+r.status+"). "+tail.slice(-2).join(" | "),line:null});
+      }
+      compileInfo={version:ver,running:false,ok:false,pages:0,errors:errs.map((e)=>e.msg+(e.line?" (line "+e.line+")":"")),error:errs.length?"":"Compilation failed"};
+      showErrors(errs);
+      if(lastGood) pagesEl.classList.add("stale"); else setEmpty("This document does not compile yet", errs.length?errs[0].msg:"See the log.",false,false);
+      post("status",{kind:"error",text:errs.length+(errs.length===1?" error":" errors")});
+    }
+  }catch(e){
+    compileInfo={version:ver,running:false,ok:false,pages:0,errors:[],error:String((e&&e.message)||e||"engine crashed")};
+    post("status",{kind:"error",text:"Compiler error"});
+    toast("Could not reach the LaTeX compiler","err");
+  }
+  compiling=false; postState();
+  if(compileAgain || cm.getValue()!==src) compileSoon(120);
+}
+
+// ── PDF pages (pdf.js) ───────────────────────────────────────────────────────────────────
+pdfjsLib.GlobalWorkerOptions.workerSrc="/vendor/pdfjs/pdf.worker.min.js";
+let pdfDoc=null, renderToken=0;
+function fitWidth(pageW){ const avail=Math.max(200,pagesEl.clientWidth-48); return Math.max(220,Math.min(avail,880)*zoom); }
+async function renderPages(){
+  if(!pdfDoc) return 0;
+  if(PE.defer()) return -1;                 // the user is typing on a page: render after they finish
+  const token=++renderToken, dpr=window.devicePixelRatio||1, frag=document.createDocumentFragment(), store={};
+  for(let n=1;n<=pdfDoc.numPages;n++){
+    const page=await pdfDoc.getPage(n); if(token!==renderToken) return -1;
+    const v0=page.getViewport({scale:1}), scale=fitWidth(v0.width)/v0.width, vp=page.getViewport({scale});
+    const wrap=document.createElement("div"); wrap.className="page"; wrap.dataset.n=String(n);
+    wrap.style.width=vp.width+"px"; wrap.style.height=vp.height+"px";
+    const cv=document.createElement("canvas"); cv.width=Math.floor(vp.width*dpr); cv.height=Math.floor(vp.height*dpr);
+    cv.style.width=vp.width+"px"; cv.style.height=vp.height+"px"; wrap.appendChild(cv);
+    await page.render({canvasContext:cv.getContext("2d"),viewport:vp,transform:[dpr,0,0,dpr,0,0]}).promise; if(token!==renderToken) return -1;
+    const tl=document.createElement("div"); tl.className="textLayer"; tl.style.setProperty("--scale-factor",String(vp.scale)); wrap.appendChild(tl);
+    try{ const tc=await page.getTextContent(); store[n]={items:tc.items,vp}; await pdfjsLib.renderTextLayer({textContentSource:tc,container:tl,viewport:vp,textDivs:[]}).promise; }catch(_){}
+    frag.appendChild(wrap);
+  }
+  if(token!==renderToken) return -1;
+  PE.setPages(store);
+  const top=pagesEl.scrollTop, left=pagesEl.scrollLeft;
+  pagesEl.replaceChildren(frag); pagesEl.scrollTop=top; pagesEl.scrollLeft=left;
+  return pdfDoc.numPages;
+}
+async function showPdf(bytes){
+  const old=pdfDoc;
+  pdfDoc=await pdfjsLib.getDocument({data:bytes.slice()}).promise;
+  const n=await renderPages();
+  if(old && old!==pdfDoc){ try{ old.destroy(); }catch(_){} }
+  return n<0 ? pdfDoc.numPages : n;
+}
+let rsTimer=null;
+new ResizeObserver(()=>{ clearTimeout(rsTimer); rsTimer=setTimeout(()=>{ cm.refresh(); renderPages(); },220); }).observe($("page-wrap"));
+function setZoom(z){ zoom=Math.max(.5,Math.min(2.5,z)); $("zval").textContent=Math.round(zoom*100)+"%"; renderPages(); }
+$("zin").onclick=()=>setZoom(zoom+.1); $("zout").onclick=()=>setZoom(zoom-.1);
+pagesEl.addEventListener("wheel",(e)=>{ if(e.ctrlKey){ e.preventDefault(); setZoom(zoom+(e.deltaY<0?.1:-.1)); } },{passive:false});
+
+// ── page -> source (approximate: typeset text is matched back to the source) ─────────────
+function locate(text, frac){
+  const t=String(text||"").replace(/\s+/g," ").trim(); if(t.length<3) return null;
+  const src=cm.getValue(), words=t.split(" ");
+  const needles=[t, t.slice(0,40), words.slice(0,4).join(" "), words.slice(0,2).join(" ")].filter((n,i,a)=>n.length>=3 && a.indexOf(n)===i);
+  for(const n of needles){
+    const hits=[]; let i=-1; while((i=src.indexOf(n,i+1))>=0 && hits.length<400) hits.push(i);
+    if(!hits.length) continue;
+    const want=frac*src.length; let best=hits[0]; for(const h of hits) if(Math.abs(h-want)<Math.abs(best-want)) best=h;
+    return {from:best,to:best+(n===t?t.length:n.length),exact:n===t};
+  }
+  return null;
+}
+pagesEl.addEventListener("mouseup",(mev)=>{
+  setTimeout(()=>{
+    const sel=window.getSelection(), txt=sel?String(sel):""; if(!pdfDoc||PE.isEditing()) return;
+    let anchor=sel&&sel.anchorNode&&(sel.anchorNode.nodeType===3?sel.anchorNode.parentElement:sel.anchorNode); const pg=anchor&&anchor.closest&&anchor.closest(".page");
+    const n=pg?+pg.dataset.n:1, frac=((n-1)+0.5)/Math.max(1,pdfDoc.numPages);
+    if(sel && !sel.isCollapsed && txt.trim().length>=3){
+      const hit=locate(txt,frac); if(hit){ cm.setSelection(cm.posFromIndex(hit.from),cm.posFromIndex(hit.to)); cm.scrollIntoView({from:cm.posFromIndex(hit.from),to:cm.posFromIndex(hit.to)},120); }
+    }else if(sel && sel.anchorNode && (!PE.enabled() || mev.altKey)){
+      const w=(sel.anchorNode.textContent||"").trim(); const hit=locate(w,frac);
+      if(hit){ if(appEl.classList.contains("mode-page")) setMode("split"); cm.setCursor(cm.posFromIndex(hit.from)); cm.scrollIntoView(cm.posFromIndex(hit.from),160); }
+    }
+  },0);
+});
+
+// ── layout / modes ───────────────────────────────────────────────────────────────────────
+function setMode(m){ if(!/^(source|split|page)$/.test(m)) return; appEl.className="mode-"+m; setTimeout(()=>{ cm.refresh(); renderPages(); },260); }
+(function(){ const sp=$("splitter"); let drag=false;
+  sp.addEventListener("mousedown",(e)=>{ drag=true; sp.classList.add("drag"); e.preventDefault(); });
+  window.addEventListener("mousemove",(e)=>{ if(!drag) return; const r=appEl.getBoundingClientRect(); const p=Math.max(22,Math.min(78,((e.clientX-r.left)/r.width)*100));
+    document.documentElement.style.setProperty("--split",p+"%"); cm.refresh(); });
+  window.addEventListener("mouseup",()=>{ if(drag){ drag=false; sp.classList.remove("drag"); renderPages(); } });
+})();
+
+// ── ask box ──────────────────────────────────────────────────────────────────────────────
+const askEl=$("ask"), askIn=$("ask-in");
+function refreshAskCtx(){
+  const box=$("ask-ctx"), sg=$("ask-sugg"); box.innerHTML=""; sg.innerHTML="";
+  const sel=selInfo(), cur=cursorInfo(), tag=(t)=>{ const s=document.createElement("span"); s.className="tag"; s.textContent=t; box.appendChild(s); };
+  if(sel){ tag("Selection · "+(sel.fromLine===sel.toLine?"line "+sel.fromLine:"lines "+sel.fromLine+"–"+sel.toLine)+" · "+sel.text.length+" chars"); }
+  else tag("Cursor · line "+cur.line);
+  const hint=document.createElement("span"); hint.textContent=sel?"Midum will change the selection":"Midum sees where you are"; box.appendChild(hint);
+  const add=(label,text)=>{ const b=document.createElement("button"); b.className="chip"; b.textContent=label; b.onclick=()=>submitAsk(text); sg.appendChild(b); };
+  if(compileInfo && !compileInfo.ok && !compileInfo.running && (compileInfo.errors.length||compileInfo.error)) add("Fix the errors","Fix the LaTeX compile errors in this document.");
+  if(sel){ add("Improve writing","Improve the writing of the selected text without changing its meaning."); add("Shorten","Make the selected text shorter."); add("Make a table","Turn the selected text into a LaTeX table."); }
+  else { add("Continue writing","Continue writing from the cursor."); add("Add a section here","Add a new section here that fits the document."); }
+}
+function openAsk(){ if(doc.readonly){ toast("This document is read-only","err"); return; } askEl.classList.add("open"); refreshAskCtx(); askIn.focus(); autoGrow(); }
+function closeAsk(){ askEl.classList.remove("open"); cm.focus(); }
+function autoGrow(){ askIn.style.height="auto"; askIn.style.height=Math.min(110,askIn.scrollHeight)+"px"; }
+let askBusyTimer=null;
+function setBusy(b){ askEl.classList.toggle("busy",!!b); if(b){ askEl.classList.add("open"); clearTimeout(askBusyTimer); askBusyTimer=setTimeout(()=>setBusy(false),5*60*1000); } else { clearTimeout(askBusyTimer); } }
+async function submitAsk(text){
+  const t=String(text!==undefined?text:askIn.value).trim(); if(!t||askEl.classList.contains("busy")) return;
+  const ctxNow={cursor:cursorInfo(), selection:selInfo()};
+  askIn.value=""; autoGrow(); setBusy(true);
+  await saveNow(true);                       // the model reads the artifact: push what is on screen first (no autosave switch-on)
+  post("prompt",{text:t, ctx:{version:baseVersion, cursor:ctxNow.cursor, selection:ctxNow.selection}});
+}
+$("ask-pill").onclick=openAsk;
+$("ask-go").onclick=()=>submitAsk();
+$("ask-stop").onclick=()=>{ post("abort"); setBusy(false); };
+askIn.addEventListener("input",autoGrow);
+askIn.addEventListener("keydown",(e)=>{
+  if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); submitAsk(); }
+  else if(e.key==="Escape"){ e.preventDefault(); closeAsk(); }
+});
+document.addEventListener("keydown",(e)=>{ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="k"){ e.preventDefault(); openAsk(); } });
+
+// ── exports ──────────────────────────────────────────────────────────────────────────────
+function baseName(){ return (doc.name||"document").replace(/\.tex$/i,""); }
+function b64ToBytes(b64){ const s=atob(b64), u=new Uint8Array(s.length); for(let i=0;i<s.length;i++) u[i]=s.charCodeAt(i); return u; }
+function toB64(u8){ let s=""; const CH=0x8000; for(let i=0;i<u8.length;i+=CH) s+=String.fromCharCode.apply(null,u8.subarray(i,i+CH)); return btoa(s); }
+
+// ── messages from the Midum UI ───────────────────────────────────────────────────────────
+function loadDoc(d){
+  doc={id:d.id,name:d.name,readonly:!!d.readonly,reason:d.reason||""}; baseVersion=d.version; dirty=false; pendingExternal=null; docSaved=!!d.saved;
+  cm.setOption("readOnly",doc.readonly?true:false); cm.setValue(d.content||""); cm.clearHistory();
+  compileInfo=null; lastCompiledSrc=null; showErrors([]); $("banner").classList.remove("show");
+  $("ask").style.display=doc.readonly?"none":"";
+  if(doc.readonly){ $("banner-text").textContent="Read-only ("+(doc.reason||"view")+")"; const b=$("banner-btns"); b.innerHTML="";
+    if(doc.reason==="attached file"){ const x=document.createElement("button"); x.textContent="Make editable copy"; x.onclick=()=>post("make_copy",{id:doc.id}); b.appendChild(x); }
+    $("banner").classList.add("show"); }
+  cm.setCursor({line:0,ch:0}); postState(); updateSaveUI(); compileSoon(0);
+}
+window.addEventListener("message",(e)=>{
+  if(e.source!==parent) return; const m=e.data; if(!m||typeof m.md!=="string") return;
+  switch(m.md){
+    case "init": applyTheme(m.theme); if(m.mode) setMode(m.mode); loadDoc(m.doc); break;
+    case "theme": applyTheme(m.vars); break;
+    case "doc_changed": onDocChanged(m); break;
+    case "busy": setBusy(!!m.value); if(!m.value) refreshAskCtx(); break;
+    case "rpc_result": { const r=_pending.get(m.rid); if(r){ _pending.delete(m.rid); r(m.result); } break; }
+    case "cmd":
+      if(m.cmd==="mode") setMode(m.value);
+      else if(m.cmd==="recompile"){ if(engineState==="error") initEngine(); else compileSoon(0); }
+      else if(m.cmd==="download_pdf"){ if(lastPdf) post("export",{kind:"pdf",name:baseName()+".pdf",b64:toB64(lastPdf)}); else toast("Nothing compiled yet","err"); }
+      else if(m.cmd==="download_tex"){ post("export",{kind:"tex",name:baseName()+".tex",text:cm.getValue()}); }
+      else if(m.cmd==="ask") openAsk();
+      break;
+  }
+});
+
+setEmpty("Looking for your LaTeX installation…","MidumDocs compiles offline with the TeX distribution installed on this PC.",true,false);
+initEngine();
+PE.init({cm, pagesEl, isReadonly:()=>doc.readonly, pageCount:()=>pdfDoc?pdfDoc.numPages:1, toast, hideToast, flashLines,
+  rerender:()=>renderPages(), askMidum:(t)=>{ openAsk(); askIn.value=t; autoGrow(); }});
+post("ready");
+})();
+</script>
+</body>
+</html>

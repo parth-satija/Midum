@@ -1,5 +1,6 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
 import config
+import artifacts as _artifacts
 import providers.openrouter_backend as providers_openrouter_backend
 from config import COMMANDS_FILE, MODEL_CANVAS_H, MODEL_CANVAS_W, OPENROUTER_CONSULT_MODE, SCALE_X, SCALE_Y, STARTUP_DIR, _is_legacy_toolcall_model
 from knowledge_base import add_instruction, add_path, add_pdf_source, create_domain_knowledge, create_domain_skill, format_pdf_source_page_for_prompt, format_pdf_source_part_for_prompt, list_domain_knowledge, list_domain_skills, list_pdf_source_parts, list_pdf_sources, read_domain_knowledge, read_instructions, read_paths, set_pdf_source_headings, set_pdf_source_part_levels
@@ -19,13 +20,18 @@ from screen_capture import capture_screen_to_ram, fallback_click_grid, fallback_
 from skills import list_skills, load_skill
 from state import _abort_event, _action_loop_event, _action_loop_lock, _action_loop_state, drain_interjections, run_abortable
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
-from tools.render_surface_tools import write_render_code, edit_render_code, close_render_surface, save_render_surface, list_saved_render_surfaces, load_render_surface, delete_saved_render_surface
+from tools.render_surface_tools import write_render_code, edit_render_code, close_render_surface, save_render_surface, list_saved_render_surfaces, load_render_surface, delete_saved_render_surface, webapi_fetch, stream_asset, search_assets, search_web_assets, stream_web_asset
 from tools.ambient_surface_tools import show_ambient_surface, edit_ambient_surface, move_ambient_surface, close_ambient_surface, list_ambient_surfaces, save_ambient_surface, list_saved_ambient_surfaces, load_ambient_surface, delete_saved_ambient_surface
 from permissions import enforce_tool_permission, filter_tools_schema, mcp_permission_key
-from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, execute_wsl_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
+from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, execute_terminal_command_live, execute_wsl_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
 from multi_agent import start_agent, send_agent_task, get_agent_report, list_agents, stop_agent, resume_agent, forget_agent, delegate_agent_task_to_supervisor, tell_supervisor_to_inform_user, get_current_agent_name, attach_agent_knowledge, list_agent_knowledge, attach_agent_skills, list_agent_skills
 from providers.discord_voice import call_discord, discord_upload_file, end_discord_call, get_discord_call_status, get_discord_call_transcript, get_discord_chat_history, list_discord_calls, list_discord_servers, list_discord_sessions, message_discord, start_discord_bot
 from tools_schema import tools
+_artifacts.register_tools(tools)   # list/read/search/view/analyze/add_from_path + create/update/rewrite/open/revert artifact + list_artifact_versions
+import midumdocs as _midumdocs
+_midumdocs.register_tools(tools)   # create_midumdoc + midumdoc_state / replace_selection / insert_at_cursor
+import editor_link as _editor_link
+_editor_link.register_tools(tools)   # open_file_in_editor / open_folder_in_editor + editor_workspace_tree / read_active_file / edit_active_file
 from ui_automation import ui_navigator
 from ui_automation.windows_uia import _UIA_AVAILABLE
 from utils.path_resolver import resolve_file_path
@@ -48,6 +54,28 @@ _TRIVIAL_PATTERNS = {
     "exit","quit","new session","stop","cancel","abort","go ahead","run it",
     "grant","approve","continue","done","next","skip","hello","hi","hey",
 }
+
+# stream_asset / stream_web_asset return base64 data URIs (up to ~15MB). Inside a Render
+# Surface that is exactly what's wanted -- `midum.call` routes through gui/dispatch.py and hands
+# the full string straight to the surface's JS, never through here. But a multi-megabyte data
+# URI landing in the MODEL's context (and the GUI tool log) is useless to it and wrecks the
+# turn, so on the model-direct path anything too big to reasonably paste by hand is replaced
+# with a short explanation. Small assets (icons, thumbnails) still come back intact.
+_ASSET_INLINE_MAX_CHARS = 60_000
+
+def _asset_result_for_model(tool_name: str, output) -> str:
+    out = output if isinstance(output, str) else str(output)
+    if len(out) <= _ASSET_INLINE_MAX_CHARS or not out.startswith("data:"):
+        return out   # small enough, or an error/status message -- pass through untouched
+    head = out[:120]
+    mime = out[5:head.index(";")] if ";" in head else "unknown type"
+    return (
+        f"[{tool_name}] Loaded OK ({mime}, {len(out):,} chars as a base64 data URI) -- too large "
+        f"to paste into the conversation, so it is not shown here. Data URIs are only useful "
+        f"inside a Render Surface: have the surface's own JS fetch it at runtime with "
+        f"`await midum.call(\"{tool_name}\", {{...same args...}})` instead of embedding it "
+        f"in the HTML you write."
+    )
 
 def _is_trivial_input(text: str) -> bool:
     """Return True if the input is short/simple enough to skip Gemini pre-reasoning."""
@@ -1200,6 +1228,22 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
         non_sys  = [m for m in conversation_history if m.get("role") != "system"]
         trimmed  = sys_msgs + _trim_history_preserving_tool_pairs(non_sys, HISTORY_WINDOW)
 
+        # ── Live artifact list ───────────────────────────────────────────────
+        # Rebuilt EVERY step (so files created/attached mid-turn show up at once)
+        # and appended to a COPY of the system message -- never persisted.
+        try:
+            trimmed = _artifacts.inject_into_system(trimmed, _artifacts.prompt_block())
+        except Exception as _art_block_err:
+            print(f"⚠️ [artifacts prompt block failed: {_art_block_err}]")
+        try:
+            trimmed = _artifacts.inject_into_system(trimmed, _midumdocs.prompt_block())
+        except Exception as _md_block_err:
+            print(f"⚠️ [midumdocs prompt block failed: {_md_block_err}]")
+        try:
+            trimmed = _artifacts.inject_into_system(trimmed, _editor_link.prompt_block())
+        except Exception as _ed_block_err:
+            print(f"⚠️ [editor link prompt block failed: {_ed_block_err}]")
+
         # ── Run the primary model on a thread so Ctrl+Q can interrupt the wait ─
         result_q = _queue.Queue()
         t = threading.Thread(
@@ -1405,6 +1449,19 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 )
             _perm_decision, _perm_blocked_msg = enforce_tool_permission(_perm_key, func_name, arguments)
 
+            # ── Editor guard ───────────────────────────────────────────────────
+            # Generic file-writing tools (write_local_file / append_local_file / Filesystem MCP write_file, edit_file,
+            # move_file) must not touch a file that is open in the user's Editor: that bypasses the edit-approval
+            # dialog and can clobber unsaved text. The model is told to use editor_edit_active_file /
+            # edit_file_in_editor instead (editor_link.py).
+            if _perm_decision != "blocked":
+                try:
+                    _ed_guard_msg = _editor_link.guard_external_write(func_name, arguments)
+                except Exception:
+                    _ed_guard_msg = None
+                if _ed_guard_msg:
+                    _perm_decision, _perm_blocked_msg = "blocked", _ed_guard_msg
+
             # ── Tool dispatch ──────────────────────────────────────────────────
             if _perm_decision == "blocked":
                 tool_output = _perm_blocked_msg
@@ -1475,6 +1532,19 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             elif func_name == "get_path":
                 tool_output = get_path(int(arguments.get("index", 0)))
                 _paths_consulted = True
+
+            elif func_name in _artifacts.TOOL_NAMES:
+                if func_name == "analyze_artifact":
+                    # Network call to Gemini -- run abortable so Ctrl+Q / Stop still works.
+                    tool_output = run_abortable(_artifacts.analyze_tool, arguments, timeout=330)
+                else:
+                    tool_output, tool_images = _artifacts.dispatch(func_name, arguments)
+
+            elif func_name in _midumdocs.TOOL_NAMES:
+                tool_output, tool_images = _midumdocs.dispatch(func_name, arguments)
+
+            elif func_name in _editor_link.TOOL_NAMES:
+                tool_output, tool_images = _editor_link.dispatch(func_name, arguments)
 
             elif func_name == "list_domain_knowledge_indexed":
                 tool_output = list_domain_knowledge_indexed()
@@ -1595,7 +1665,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                             unknown_cmd  = cmd
                             print(f"   [ℹ️  '{cmd.split()[0]}' not in commands.md]")
                         tool_output = run_abortable(
-                            execute_terminal_command,
+                            execute_terminal_command_live,
                             cmd,
                             working_directory=arguments.get("working_directory"),
                             is_long_running=arguments.get("is_long_running", False),
@@ -2143,6 +2213,41 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             elif func_name == "delete_saved_render_surface":
                 tool_output = delete_saved_render_surface(arguments.get("name", ""))
 
+            elif func_name == "webapi_fetch":
+                _wa_headers = arguments.get("headers")
+                if isinstance(_wa_headers, str):   # some providers hand objects back as a JSON string
+                    try:
+                        _wa_headers = json.loads(_wa_headers) if _wa_headers.strip() else None
+                    except Exception:
+                        _wa_headers = None
+                tool_output = webapi_fetch(
+                    arguments.get("url", ""),
+                    arguments.get("method", "GET"),
+                    _wa_headers,
+                    arguments.get("body"),
+                    arguments.get("timeout", 20)
+                )
+
+            elif func_name == "stream_asset":
+                tool_output = _asset_result_for_model(
+                    "stream_asset", stream_asset(arguments.get("path", ""))
+                )
+
+            elif func_name == "search_assets":
+                tool_output = search_assets(arguments.get("query", ""))
+
+            elif func_name == "search_web_assets":
+                tool_output = search_web_assets(
+                    arguments.get("query", ""),
+                    arguments.get("count", 8)
+                )
+
+            elif func_name == "stream_web_asset":
+                tool_output = _asset_result_for_model(
+                    "stream_web_asset",
+                    stream_web_asset(arguments.get("url", ""), arguments.get("timeout", 20))
+                )
+
             elif func_name == "show_ambient_surface":
                 tool_output = show_ambient_surface(
                     arguments.get("code", ""),
@@ -2442,7 +2547,9 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     if len(_pre_mcp_matches) == 1:
                         _mcp_server, _mcp_tool = _pre_mcp_matches[0]
                         print(f"   [MCP resolver] '{func_name}' -> call_mcp_tool(server='{_mcp_server}', tool_name='{_mcp_tool}')")
-                        tool_output = call_mcp_tool(_mcp_server, _mcp_tool, arguments)
+                        _ed_guard_msg = _editor_link.guard_external_write(
+                            "call_mcp_tool", {"server": _mcp_server, "tool_name": _mcp_tool, "arguments": arguments})
+                        tool_output = _ed_guard_msg or call_mcp_tool(_mcp_server, _mcp_tool, arguments)
                     else:
                         options = "; ".join(f"server='{s}' tool_name='{t}'" for s, t in _pre_mcp_matches)
                         tool_output = (
