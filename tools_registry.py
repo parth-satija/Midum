@@ -1473,6 +1473,15 @@ def execute_python_code(code: str, timeout: int = 15) -> str:
         timeout = 15
 
     python_exe = sys.executable or "python"
+    if getattr(sys, "frozen", False):
+        # Installed (PyInstaller) build: sys.executable is Midum.exe itself, and
+        # running it would open another Midum window instead of executing code.
+        # Use a real system Python from PATH instead.
+        import shutil as _shutil
+        python_exe = _shutil.which("python") or _shutil.which("python3") or _shutil.which("py")
+        if not python_exe:
+            return ("Error: running Python code requires Python to be installed and on PATH "
+                    "(this installed build of Midum doesn't bundle a standalone interpreter).")
     print(f"   [Python sandbox] Running {len(code)} chars (timeout={timeout}s)")
     try:
         result = subprocess.run(

@@ -35,6 +35,11 @@ The graphical user interface of `midum_pkg` is built primarily with PyQt/PySide 
 - **Persistence**: the slider repaints live and calls `Api.set_chat_font_size` (debounced) which writes only that key — it intentionally does not go through `save_settings()`, which would also re-apply the saved provider/model. `save_settings()` also accepts the value.
 - **Sizing**: pills, ask-card buttons and the prompt box use `min-height`/`calc()` rather than fixed pixel heights so nothing clips at large sizes; `autosizeMsgInput()` derives its ~10-line cap from the live line height.
 
+## 3e. Glass Surfaces in the iframe panes and upload cards
+- **Iframe panes** (MidumDocs, Editor): they are separate documents, so they can't see `html.liquid-glass-on`. `_glassThemeVars()` (in `gui/app.py`) adds `--mz-glass-on` / `--mz-glass-pct` / `--mz-glass-sheen` to the theme payload that `_mdTheme()` and `mzEdThemeVars()` already push on every `class`/`style` change of `<html>`, so toggling Glass Surfaces, moving the opacity slider or flipping the frosted highlight updates both panes live. The `--mz-*` keys are control values only; the pages never apply them as CSS.
+- **Hosts**: `#mz-ed-host`, its iframe and `#midumdocs-frame` are forced `transparent` under `html.liquid-glass-on`, and `#midumdocs-header` / `.md-seg` get the shared glass recipe.
+- **Upload cards**: `.att-chip` (prompt-box tray) and `.att-chip-ro` (inside sent prompt bubbles), plus their icon, remove button, progress track and the drag-drop overlay, use the shared `--glass-*` tokens.
+
 ## 4. `gui/voice_overlay.py`
 - **Purpose**: Floating HUD or overlay for voice mode sessions, displaying speech status, transcripts, and active visualizers.
 - **Icons**: the mic / gear / speaker states are drawn with PIL (`draw_icon`) in the same stroke style as the chat UI icons, rather than rendering emoji from a system font.

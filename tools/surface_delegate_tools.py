@@ -39,6 +39,7 @@ import tools.render_surface_tools as _render
 VOICE_BLOCKED_TOOLS = frozenset({
     "write_render_code", "edit_render_code",
     "show_ambient_surface", "edit_ambient_surface",
+    "create_dynamic_background", "edit_dynamic_background",
 })
 
 _ERR = "[SURFACE DELEGATE ERROR]"

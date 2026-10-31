@@ -402,7 +402,41 @@ def _is_legacy_toolcall_model(model_name: str) -> bool:
 # of platform, so the app's data travels with the package instead of living
 # in some external, hardcoded location.
 _PKG_DIR        = os.path.dirname(os.path.abspath(__file__))
-STORAGE_DIR     = os.path.join(_PKG_DIR, "storage")
+
+# ── Installed (PyInstaller) builds: keep user data OUT of the install folder ──
+# In a frozen build _PKG_DIR points inside the read-only/ephemeral bundle, so
+# chats, memory, settings and the webview profile must live in a per-user
+# data directory instead (survives upgrades and uninstalls-with-keep-data).
+# Overrides: MIDUM_HOME (root of all user data) or MIDUM_STORAGE_DIR (storage only).
+import sys as _sys
+_FROZEN = bool(getattr(_sys, "frozen", False))
+
+
+def _user_data_root() -> str:
+    override = os.environ.get("MIDUM_HOME")
+    if override:
+        return override
+    if _IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+        return os.path.join(base, "Midum")
+    if _IS_MAC:
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Midum")
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "Midum")
+
+
+if os.environ.get("MIDUM_STORAGE_DIR"):
+    STORAGE_DIR = os.environ["MIDUM_STORAGE_DIR"]
+elif _FROZEN:
+    STORAGE_DIR = os.path.join(_user_data_root(), "storage")
+else:
+    STORAGE_DIR = os.path.join(_PKG_DIR, "storage")
+
+if _FROZEN or os.environ.get("MIDUM_STORAGE_DIR"):
+    try:
+        os.makedirs(STORAGE_DIR, exist_ok=True)
+    except OSError:
+        pass
 
 if _IS_LINUX:
     _HOME           = os.path.expanduser("~")
@@ -555,6 +589,14 @@ FLOW_SCHEDULES_FILE = os.path.join(STORAGE_DIR, "flow_schedules.json")
 # history. Set from the Model tab; None/absent means fall back to the
 # built-in per-model table there.
 CONTEXT_TOKENS_FILE = os.path.join(STORAGE_DIR, "context_tokens.json")
+if _FROZEN:
+    # Installed build: never touch a hardcoded D:\Jarvis (or ~/Jarvis) location.
+    TARGET_DIR   = _user_data_root()
+    SKILLS_INDEX = os.path.join(TARGET_DIR, "jarvis_project", "skills.md")
+    try:
+        os.makedirs(TARGET_DIR, exist_ok=True)
+    except OSError:
+        pass
 LOG_FILE            = os.path.join(TARGET_DIR, "chat_log.md")
 
 GOAL_SECTION_HEADER = "## Current Goal"

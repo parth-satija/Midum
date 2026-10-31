@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Midum Workbench</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="midum-token" content="__MIDUM_TOKEN__">
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg,#1e1e1e);color:var(--text,#ccc);font:13px system-ui,Segoe UI,sans-serif}
+  #workbench{position:absolute;inset:0}
+  #boot{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;z-index:99999;background:var(--bg,#1e1e1e)}
+  #boot.hide{display:none}
+  #boot .t{font-size:15px;font-weight:600}
+  #boot .s{color:var(--subtext,#999);max-width:640px;text-align:center;white-space:pre-wrap}
+  #boot .e{color:#f87171;max-width:760px;font:12px ui-monospace,Consolas,monospace;white-space:pre-wrap;text-align:left;display:none}
+  #boot button{background:var(--accent,#3b82f6);color:#fff;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;display:none;margin:0 4px}
+  #boot .e{user-select:text;max-height:46vh;overflow:auto}
+  .spin{width:22px;height:22px;border:3px solid var(--border,#444);border-top-color:var(--accent,#3b82f6);border-radius:50%;animation:r 1s linear infinite}
+  @keyframes r{to{transform:rotate(360deg)}}
+  /* Glass Surfaces: same recipe as Midum's own panes (translucent fills + sheen + edges, no backdrop-filter). The colors
+     themselves come from theme.ts (workbench.colorCustomizations); this adds the sheen and clears the page background so
+     the app's blobs / background image show through the transparent iframe. */
+  :root{--glass-pct:55%;
+    --glass-sheen:color-mix(in srgb, white calc(var(--glass-pct) * 0.55), transparent);
+    --glass-sheen-soft:color-mix(in srgb, white calc(var(--glass-pct) * 0.2), transparent);
+    --glass-edge:color-mix(in srgb, white calc(var(--glass-pct) * 0.6), transparent);
+    --glass-edge-dim:color-mix(in srgb, white calc(var(--glass-pct) * 0.22), transparent)}
+  html.glass-no-sheen{--glass-sheen:transparent;--glass-sheen-soft:transparent}
+  html.glass-on,html.glass-on body,html.glass-on #workbench,html.glass-on .monaco-workbench{background:transparent !important}
+  html.glass-on .monaco-workbench .monaco-grid-view,html.glass-on .monaco-workbench .monaco-grid-branch-node,html.glass-on .monaco-workbench .part.editor,
+  html.glass-on .monaco-workbench .part.editor > .content,html.glass-on .monaco-workbench .editor-group-container,html.glass-on .monaco-workbench .editor-container{background:transparent !important}
+  html.glass-on .monaco-workbench .part.sidebar,html.glass-on .monaco-workbench .part.activitybar,html.glass-on .monaco-workbench .part.panel,
+  html.glass-on .monaco-workbench .part.statusbar,html.glass-on .monaco-workbench .part.titlebar,html.glass-on .monaco-workbench .part.auxiliarybar,
+  html.glass-on .monaco-workbench .part.editor > .content .editor-group-container > .title{
+    background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%)}
+  html.glass-on .monaco-workbench .part.editor > .content .editor-group-container > .tabs-and-actions-container .tab.active{
+    box-shadow:inset 0 1px 0 var(--glass-edge)}
+  html.glass-on .quick-input-widget,html.glass-on .monaco-menu-container .monaco-menu,html.glass-on .monaco-hover,html.glass-on .suggest-widget,
+  html.glass-on .monaco-editor .monaco-editor-hover,html.glass-on .notifications-toasts .notification-toast{
+    background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
+    border-color:var(--glass-edge) !important;box-shadow:inset 0 1px 0 var(--glass-edge), 0 10px 30px rgba(0,0,0,.4) !important}
+  /* Fully clear inner surfaces: anything VS Code paints with its own opaque background (views, lists, trees, terminal, editor
+     chrome, welcome / settings pages, empty editor area) lets the app's blobs / background image through. The translucent
+     fills + sheen above stay on the bars, panels and popups, exactly like Midum's own panes. */
+  :root{color-scheme:normal}
+  html.glass-on .monaco-workbench .part > .content,html.glass-on .monaco-workbench .pane-body,html.glass-on .monaco-workbench .monaco-pane-view,
+  html.glass-on .monaco-workbench .split-view-view,html.glass-on .monaco-workbench .monaco-split-view2,html.glass-on .monaco-workbench .pane,
+  html.glass-on .monaco-workbench .monaco-list,html.glass-on .monaco-workbench .monaco-list-rows,html.glass-on .monaco-workbench .monaco-tl-contents,
+  html.glass-on .monaco-workbench .monaco-scrollable-element,html.glass-on .monaco-workbench .tree-explorer-viewlet-tree-view,
+  html.glass-on .monaco-workbench .explorer-folders-view,html.glass-on .monaco-workbench .explorer-viewlet,html.glass-on .monaco-workbench .search-view,
+  html.glass-on .monaco-workbench .extensions-viewlet,html.glass-on .monaco-workbench .welcomeView,html.glass-on .monaco-workbench .part.sidebar > .content,
+  html.glass-on .monaco-workbench .part.auxiliarybar > .content,
+  html.glass-on .monaco-workbench .editor-group-container > .editor-container,html.glass-on .monaco-workbench .editor-instance,
+  html.glass-on .monaco-workbench .editor-group-container.empty,html.glass-on .monaco-workbench .editor-group-watermark,
+  html.glass-on .monaco-workbench .settings-editor,html.glass-on .monaco-workbench .settings-editor > .settings-body,
+  html.glass-on .monaco-workbench .gettingStartedContainer,
+  html.glass-on .monaco-workbench .part.panel .pane-body,html.glass-on .monaco-workbench .terminal-outer-container,
+  html.glass-on .monaco-workbench .terminal-wrapper,html.glass-on .monaco-workbench .xterm,html.glass-on .monaco-workbench .xterm-viewport,
+  html.glass-on .monaco-workbench .xterm-screen,html.glass-on .monaco-workbench .xterm-rows,html.glass-on .monaco-workbench .xterm-decoration-container,
+  html.glass-on .monaco-workbench .panel-switcher-container,html.glass-on .monaco-workbench .output-view,html.glass-on .monaco-workbench .repl,
+  html.glass-on .monaco-workbench .markers-panel,html.glass-on .monaco-workbench .problems-panel,
+  html.glass-on .monaco-editor,html.glass-on .monaco-editor .monaco-editor-background,html.glass-on .monaco-editor .margin,
+  html.glass-on .monaco-editor .margin-view-overlays,html.glass-on .monaco-editor .minimap,html.glass-on .monaco-editor .minimap canvas,
+  html.glass-on .monaco-editor .decorationsOverviewRuler,html.glass-on .monaco-editor .overflow-guard,html.glass-on .monaco-editor .lines-content,
+  html.glass-on .monaco-editor .view-lines,html.glass-on .monaco-diff-editor,
+  html.glass-on .monaco-diff-editor .diffViewport,html.glass-on .monaco-diff-editor .editor.original,html.glass-on .monaco-diff-editor .editor.modified,
+  html.glass-on .interactive-session,html.glass-on .monaco-editor .inputarea{
+    background-color:transparent !important}
+  /* Section headers inside views and panels get the same translucent fill + sheen as Midum's glass pane headers */
+  html.glass-on .monaco-workbench .pane-header,html.glass-on .monaco-workbench .monaco-pane-view .pane > .pane-header{
+    background-color:color-mix(in srgb, var(--panel, #1e1e1e) var(--glass-pct), transparent) !important;
+    background-image:linear-gradient(150deg, var(--glass-sheen-soft) 0%, transparent 60%) !important}
+  /* VS Code's own scrollbar tracks and shadows are opaque in some themes */
+  html.glass-on .monaco-workbench .monaco-scrollable-element > .shadow,html.glass-on .monaco-workbench .monaco-scrollable-element > .scrollbar{background:transparent !important;box-shadow:none !important}
+  /* webviews (Markdown preview, extension pages) inherit the editor colour, which is clear */
+  html.glass-on .monaco-workbench .webview,html.glass-on .monaco-workbench iframe.webview{background:transparent !important}
+  /* Sidebars (primary left + secondary right): completely clear, no fill, no sheen. Everything that opens FROM them (context
+     menus, view-title menus, dropdowns, hovers, quick pick, suggestions, find widget) is a translucent, blurred glass pane. */
+  html.glass-on .monaco-workbench .part.sidebar,html.glass-on .monaco-workbench .part.auxiliarybar,
+  html.glass-on .monaco-workbench .part.sidebar .pane-header,html.glass-on .monaco-workbench .part.auxiliarybar .pane-header,
+  html.glass-on .monaco-workbench .part.sidebar .composite.title,html.glass-on .monaco-workbench .part.auxiliarybar .composite.title,
+  html.glass-on .monaco-workbench .part.sidebar .monaco-pane-view .pane > .pane-header,
+  html.glass-on .monaco-workbench .part.auxiliarybar .monaco-pane-view .pane > .pane-header,
+  html.glass-on .monaco-workbench .part.titlebar,html.glass-on .monaco-workbench .part.titlebar > .titlebar-container,
+  html.glass-on .monaco-workbench .part.titlebar .titlebar-left,html.glass-on .monaco-workbench .part.titlebar .titlebar-center,
+  html.glass-on .monaco-workbench .part.titlebar .titlebar-right,html.glass-on .monaco-workbench .part.editor > .content .editor-group-container > .title,
+  html.glass-on .monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-and-actions-container,
+  html.glass-on .monaco-workbench .part.editor > .content .editor-group-container > .title .tabs-container,
+  html.glass-on .monaco-workbench .part.editor > .content .editor-group-container > .title .tab,
+  html.glass-on .monaco-workbench .part.editor > .content .editor-group-container > .title .editor-actions{
+    background-color:transparent !important;background-image:none !important}
+  html.glass-on .monaco-dropdown .dropdown-menu,
+  html.glass-on .monaco-hover,html.glass-on .monaco-editor .monaco-editor-hover,html.glass-on .quick-input-widget,html.glass-on .suggest-widget,
+  html.glass-on .monaco-editor .suggest-widget,html.glass-on .action-widget,html.glass-on .monaco-select-box-dropdown-container,
+  html.glass-on .monaco-editor .find-widget,html.glass-on .notifications-toasts .notification-toast,html.glass-on .notifications-center{
+    -webkit-backdrop-filter:blur(18px) saturate(1.25);backdrop-filter:blur(18px) saturate(1.25)}
+  /* Menus: blur on a pseudo-element, NOT on .monaco-menu itself. A backdrop-filter on the menu would become the containing
+     block of its position:fixed sub menus, so they would be mis-placed / clipped and never appear. */
+  html.glass-on .monaco-menu{position:relative;isolation:isolate}
+  html.glass-on .monaco-menu::before{content:"";position:absolute;inset:0;z-index:-1;border-radius:inherit;pointer-events:none;
+    -webkit-backdrop-filter:blur(18px) saturate(1.25);backdrop-filter:blur(18px) saturate(1.25)}
+  html.glass-on .monaco-submenu,html.glass-on .monaco-submenu .monaco-menu{overflow:visible}
+  /* Caret safety net: nothing above may hide it. Keep the cursor layer painted, on top, and never transparent. */
+  .monaco-editor .cursors-layer{opacity:1 !important;z-index:5}
+  .monaco-editor .cursors-layer > .cursor{background-color:var(--text,#ccc) !important;border-color:var(--text,#ccc);min-width:2px}
+  /* Title-bar app icon: VS Code's blue logo is replaced by the Midum bolt, painted in the theme's accent colour (a mask, so it
+     follows the theme, light or dark, with or without Glass Surfaces). */
+  .monaco-workbench .part.titlebar .window-appicon{
+    background-image:none !important;background-color:var(--accent,#7c6cf0) !important;
+    -webkit-mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M13 2 3 14h9l-1 8 10-12h-9l1-8z'/></svg>") center / 16px 16px no-repeat;
+    mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M13 2 3 14h9l-1 8 10-12h-9l1-8z'/></svg>") center / 16px 16px no-repeat}
+</style>
+</head>
+<body>
+<div id="workbench"></div>
+<div id="boot"><div class="spin"></div><div class="t">Starting VS Code workbench…</div><div class="s" id="boot-s">Loading services</div><pre class="e" id="boot-e"></pre><button id="boot-c">Copy details</button><button id="boot-b">Back to simple editor</button></div>
+<script type="module" src="/main.ts"></script>
+</body>
+</html>

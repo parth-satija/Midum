@@ -41,7 +41,8 @@ import artifacts
 import config
 
 # ── constants ────────────────────────────────────────────────────────────────────────────
-TOOL_NAMES = ("create_midumdoc", "midumdoc_state", "midumdoc_replace_selection", "midumdoc_insert_at_cursor")
+TOOL_NAMES = ("create_midumdoc", "midumdoc_state", "midumdoc_replace_selection", "midumdoc_insert_at_cursor",
+              "list_midumdocs", "open_midumdoc")
 
 USER_NOTE = "edited in MidumDocs"
 COALESCE_SECS = 90                  # user autosaves within this window overwrite the same version
@@ -50,6 +51,7 @@ WAIT_SYNC_SECS = 4.0
 WAIT_COMPILE_SECS = 75.0
 SELECTION_PROMPT_CHARS = 2500
 CONTEXT_LINES = 5
+LIST_MAX = 40                       # most MidumDocs list_midumdocs returns in one call
 
 # Local LaTeX compiler (offline). Optional config.py overrides:
 #   MIDUMDOCS_LATEX_PATH   full path to the compiler exe, or to the folder that contains it
@@ -595,7 +597,7 @@ def show(rec, version=None):
         text = _text(rec, int(version) if older else None)
     except Exception as e:
         return f"(Could not open the document: {e})"
-    readonly = older or rec.get("origin") != "generated"
+    readonly = older or not artifacts.is_editable(rec)
     payload = {"id": rec["id"], "name": rec["name"], "title": rec.get("title") or rec["name"],
                "version": int(version) if older else cur, "content": text, "readonly": readonly,
                "reason": "older version" if older else ("attached file" if readonly else ""),
@@ -633,7 +635,7 @@ def last_doc_for_chat(chat_id=None):
     except Exception:
         return None
     for rec in recs:
-        if (rec.get("chat_id") or "") != chat_id or rec.get("origin") != "generated" or not is_latex(rec):
+        if (rec.get("chat_id") or "") != chat_id or not artifacts.is_editable(rec) or not is_latex(rec):
             continue
         t = float(rec.get("md_opened") or 0)
         if t >= best_t:
@@ -718,8 +720,8 @@ def user_save(art_id, content, base_version=None, mode="auto"):
     rec = _rec(art_id)
     if not rec:
         return {"ok": False, "error": "Document not found (its chat may have been deleted)."}
-    if rec.get("origin") != "generated":
-        return {"ok": False, "error": "This is a file you attached, so it is read-only. Use 'Make editable copy'."}
+    if not artifacts.is_editable(rec):
+        return {"ok": False, "error": "This file cannot be edited as text, so it is read-only. Use 'Make editable copy'."}
     cur = int(rec.get("version") or 0)
     if mode == "auto" and not rec.get("md_saved"):
         return {"ok": True, "skipped": True, "saved": False, "version": cur}
@@ -748,7 +750,7 @@ def user_save(art_id, content, base_version=None, mode="auto"):
 def revert_last(art_id):
     """Undo the model's last change (non-destructive: saved as a new version)."""
     rec = _rec(art_id)
-    if not rec or rec.get("origin") != "generated":
+    if not rec or not artifacts.is_editable(rec):
         return {"ok": False, "error": "Nothing to undo."}
     vs = rec.get("versions") or []
     if len(vs) < 2:
@@ -867,7 +869,12 @@ def prompt_block():
     if not _live["open"] or not _rec(_live["id"]):
         rec = last_doc_for_chat()
         if rec is None:
-            return ""
+            n = len(_all_docs())
+            if not n:
+                return ""
+            return ("━━━ MIDUMDOCS (saved) ━━━\n"
+                    f"{n} MidumDoc(s) saved in other chats. If the user refers to an earlier document, list_midumdocs shows them "
+                    "and open_midumdoc(artifact) opens one in the editor (never create it again).")
         return ("━━━ MIDUMDOC (closed) ━━━\n"
                 f"This chat has a LaTeX MidumDoc, \"{rec.get('name')}\" (v{int(rec.get('version') or 0)}), that the user has closed. "
                 "If they want to continue it, read it with read_artifact and edit it with update_artifact / rewrite_artifact "
@@ -886,7 +893,7 @@ def _resolve_target(kind):
     if not _live["open"]:
         return None, "No MidumDoc is open. Use update_artifact / rewrite_artifact on the artifact instead."
     rec = _rec(_live["id"])
-    if not rec or rec.get("origin") != "generated":
+    if not rec or not artifacts.is_editable(rec):
         return None, "The open document is read-only."
     cur_v = int(rec.get("version") or 0)
     if not _wait(lambda: _live["version"] == cur_v and not _live["dirty"], WAIT_SYNC_SECS):
@@ -981,6 +988,92 @@ def create_tool(args):
     return artifacts.create_tool(args)
 
 
+# ── saved documents from ANY chat ────────────────────────────────────────────────────────
+def _doc_stamp(rec):
+    return max(float(rec.get("md_opened") or 0), float(rec.get("created") or 0))
+
+
+def _all_docs(query=""):
+    """Every model-created MidumDoc (type latex) in the artifact store, whatever chat it belongs to, newest first."""
+    try:
+        recs = list(artifacts._load().values())
+    except Exception:
+        return []
+    q = str(query or "").strip().lower()
+    out = [r for r in recs if artifacts.is_editable(r) and is_latex(r)
+           and (not q or q in str(r.get("name") or "").lower() or q in str(r.get("title") or "").lower()
+                or q in str(r.get("id") or "").lower())]
+    out.sort(key=_doc_stamp, reverse=True)
+    return out
+
+
+def _resolve_doc(ref):
+    """(rec, None) for the MidumDoc named by ``ref`` (id, id prefix, file name or part of it), else (None, error).
+    An empty ref means the most recently used document. Documents of the current chat win ties."""
+    docs = _all_docs()
+    ref = str(ref or "").strip()
+    if not docs:
+        return None, "Error: there are no saved MidumDocs in any chat yet. Create one with create_midumdoc."
+    if not ref:
+        return docs[0], None
+    low = ref.lower()
+    cand = [r for r in docs if str(r["id"]).lower() == low or str(r["name"]).lower() == low]
+    if not cand and len(low) >= 6:
+        cand = [r for r in docs if str(r["id"]).lower().startswith(low)]
+    if not cand:
+        cand = [r for r in docs if low in str(r["name"]).lower() or low in str(r.get("title") or "").lower()]
+    if not cand:
+        return None, f"Error: no saved MidumDoc matches '{ref}'. Call list_midumdocs to see them."
+    here = artifacts.get_active_chat() or ""
+    pool = [r for r in cand if (r.get("chat_id") or "") == here] or cand
+    if len(pool) > 1:
+        names = "; ".join(f"{r['id']} ({r['name']})" for r in pool[:8])
+        return None, f"Error: '{ref}' matches several MidumDocs: {names}. Call open_midumdoc again with the exact id."
+    return pool[0], None
+
+
+def list_docs_tool(args):
+    query = str((args or {}).get("query") or "").strip()
+    docs = _all_docs(query)
+    if not docs:
+        return (f"No saved MidumDoc matches '{query}'." if query
+                else "No saved MidumDocs in any chat yet. Create one with create_midumdoc.")
+    here = artifacts.get_active_chat() or ""
+    lines = []
+    for r in docs[:LIST_MAX]:
+        where = "this chat" if (r.get("chat_id") or "") == here else "another chat"
+        try:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(_doc_stamp(r)))
+        except (OverflowError, OSError, ValueError):
+            when = "?"
+        now_open = " · open now" if _live["open"] and _live["id"] == r["id"] else ""
+        lines.append(f"{r['id']}  {r['name']}  [v{int(r.get('version') or 1)} · {where} · last used {when}{now_open}]")
+    if len(docs) > LIST_MAX:
+        lines.append(f"({len(docs) - LIST_MAX} older MidumDocs not shown - narrow it with query)")
+    lines.append("Open one with open_midumdoc(artifact=<id or name>).")
+    return "\n".join(lines)
+
+
+def open_doc_tool(args):
+    args = args or {}
+    rec, err = _resolve_doc(args.get("artifact"))
+    if err:
+        return err
+    version = None
+    if args.get("version") not in (None, ""):
+        try:
+            version = int(args["version"])
+        except (TypeError, ValueError):
+            return "Error: 'version' must be a whole number (see list_artifact_versions)."
+        if not os.path.exists(artifacts._vpath(rec, version)):
+            return f"Error: {rec['name']} has no version {version}. Call list_artifact_versions."
+    msg = f"{rec['name']} ({rec['id']}): {show(rec, version)}"
+    if (rec.get("chat_id") or "") != (artifacts.get_active_chat() or ""):
+        msg += (" It was saved in another chat; read_artifact / update_artifact / rewrite_artifact work on it by id as usual. "
+                "It closes when the user switches chats; open_midumdoc brings it back.")
+    return msg
+
+
 def dispatch(func_name, arguments):
     """Returns (output_text, images_or_None)."""
     arguments = arguments or {}
@@ -993,6 +1086,10 @@ def dispatch(func_name, arguments):
             return replace_selection_tool(arguments), None
         if func_name == "midumdoc_insert_at_cursor":
             return insert_at_cursor_tool(arguments), None
+        if func_name == "list_midumdocs":
+            return list_docs_tool(arguments), None
+        if func_name == "open_midumdoc":
+            return open_doc_tool(arguments), None
     except Exception as e:
         return f"Error in {func_name}: {e}", None
     return f"Error: unknown MidumDocs tool '{func_name}'", None
@@ -1027,6 +1124,18 @@ TOOL_SCHEMAS = [
         "Insert `text` at the user's cursor in the open MidumDoc (where it was when they sent their request). Use for 'add a ... here'. "
         "If something is selected use midumdoc_replace_selection instead.",
         {"text": {"type": "string", "description": "LaTeX source to insert."}}, ["text"]),
+    artifacts._fn(
+        "list_midumdocs",
+        "List the MidumDocs (LaTeX documents) saved in ANY chat, newest first, with id, name, version and whether each belongs to "
+        "this chat. Use it when the user mentions a document from an earlier chat, or asks what documents they have.",
+        {"query": {"type": "string", "description": "Optional text to match against document names, titles or ids."}}),
+    artifacts._fn(
+        "open_midumdoc",
+        "Open a MidumDoc saved earlier -- in this chat OR any other chat -- in the MidumDocs editor so the user sees it and you can "
+        "continue it. Afterwards edit it with update_artifact / rewrite_artifact by its id (never create it again). Omit `artifact` "
+        "to open the most recently used one. Use `version` to view an older version read-only.",
+        {"artifact": {"type": "string", "description": "MidumDoc id (art_xxxxxxxx), file name, or part of the name (see list_midumdocs)."},
+         "version": {"type": "integer", "description": "Optional older version to view (read-only)."}}),
 ]
 
 

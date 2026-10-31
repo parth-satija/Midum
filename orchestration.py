@@ -22,6 +22,7 @@ from state import _abort_event, _action_loop_event, _action_loop_lock, _action_l
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
 from tools.render_surface_tools import write_render_code, edit_render_code, close_render_surface, save_render_surface, list_saved_render_surfaces, load_render_surface, delete_saved_render_surface, webapi_fetch, stream_asset, search_assets, search_web_assets, stream_web_asset
 from tools.ambient_surface_tools import show_ambient_surface, edit_ambient_surface, move_ambient_surface, close_ambient_surface, list_ambient_surfaces, save_ambient_surface, list_saved_ambient_surfaces, load_ambient_surface, delete_saved_ambient_surface
+from tools.dynamic_background_tools import create_dynamic_background, save_dynamic_background, edit_dynamic_background
 from permissions import enforce_tool_permission, filter_tools_schema, mcp_permission_key
 from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, execute_terminal_command_live, execute_wsl_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
 from multi_agent import start_agent, send_agent_task, get_agent_report, list_agents, stop_agent, resume_agent, forget_agent, delegate_agent_task_to_supervisor, tell_supervisor_to_inform_user, get_current_agent_name, attach_agent_knowledge, list_agent_knowledge, attach_agent_skills, list_agent_skills
@@ -32,6 +33,8 @@ import midumdocs as _midumdocs
 _midumdocs.register_tools(tools)   # create_midumdoc + midumdoc_state / replace_selection / insert_at_cursor
 import editor_link as _editor_link
 _editor_link.register_tools(tools)   # open_file_in_editor / open_folder_in_editor + editor_workspace_tree / read_active_file / edit_active_file
+import voiceover as _voiceover
+_voiceover.register_tools(tools)   # record_voiceover / revise_voiceover / play_voiceover / save_voiceover ... (in-memory voiceover clips)
 from ui_automation import ui_navigator
 from ui_automation.windows_uia import _UIA_AVAILABLE
 from utils.path_resolver import resolve_file_path
@@ -1546,6 +1549,13 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             elif func_name in _editor_link.TOOL_NAMES:
                 tool_output, tool_images = _editor_link.dispatch(func_name, arguments)
 
+            elif func_name in _voiceover.TOOL_NAMES:
+                # Recording is a network call to the Live voice model; keep it abortable (Ctrl+Q / Stop).
+                if func_name in ("record_voiceover", "revise_voiceover"):
+                    tool_output = run_abortable(lambda: _voiceover.dispatch(func_name, arguments)[0], timeout=600)
+                else:
+                    tool_output, tool_images = _voiceover.dispatch(func_name, arguments)
+
             elif func_name == "list_domain_knowledge_indexed":
                 tool_output = list_domain_knowledge_indexed()
 
@@ -2311,6 +2321,21 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
 
             elif func_name == "delete_saved_ambient_surface":
                 tool_output = delete_saved_ambient_surface(arguments.get("name", ""))
+
+            elif func_name == "create_dynamic_background":
+                tool_output = create_dynamic_background(
+                    arguments.get("code", ""),
+                    title=arguments.get("title", "")
+                )
+
+            elif func_name == "edit_dynamic_background":
+                tool_output = edit_dynamic_background(
+                    arguments.get("edits", []),
+                    title=arguments.get("title", "")
+                )
+
+            elif func_name == "save_dynamic_background":
+                tool_output = save_dynamic_background(arguments.get("name", ""))
 
             elif func_name == "call_discord":
                 tool_output = call_discord(

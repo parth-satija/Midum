@@ -43,6 +43,14 @@ except ImportError:
     except ImportError:
         inline_suggest = None
 
+try:                                    # VS Code workbench (CodinGame monaco-vscode-api); optional
+    from gui import workbench_backend
+except ImportError:
+    try:
+        import workbench_backend
+    except ImportError:
+        workbench_backend = None
+
 MONACO_VERSION = "0.52.2"
 CDN_BASE = f"https://cdn.jsdelivr.net/npm/monaco-editor@{MONACO_VERSION}/min/vs"
 
@@ -176,9 +184,13 @@ class _Handler(BaseHTTPRequestHandler):
     do_HEAD = lambda self: self.do_GET()     # noqa: E731
 
     def do_POST(self):
-        """Only /api/inline (AI inline suggestions). Same-origin, token-protected, size-capped."""
+        """/api/inline (AI inline suggestions) and /api/fs/* (VS Code workbench file system). Same-origin,
+        token-protected, size-capped."""
         try:
-            if urlparse(self.path).path != "/api/inline" or inline_suggest is None:
+            req_path = urlparse(self.path).path
+            if req_path.startswith("/api/fs/") and workbench_backend is not None:
+                return workbench_backend.handle_fs(self, req_path[len("/api/fs/"):])
+            if req_path != "/api/inline" or inline_suggest is None:
                 return self._send(404, b"not found")
             port = self.server.server_address[1]
             hosts = (f"127.0.0.1:{port}", f"localhost:{port}")
@@ -219,6 +231,8 @@ class _Handler(BaseHTTPRequestHandler):
                 with open(full, "rb") as fh:
                     data = fh.read()
                 return self._send(200, data, ctype, "public, max-age=86400")
+            if workbench_backend is not None and workbench_backend.handle_static(self, path):
+                return
             return self._send(404, b"not found")
         except Exception as e:
             try:
@@ -231,16 +245,99 @@ _server = None
 _server_lock = threading.Lock()
 
 
+class _Server(ThreadingHTTPServer):
+    allow_reuse_address = False            # on Windows SO_REUSEADDR would let us bind a port another program already listens on
+
+
+_PORT_PATH = os.path.join(config.STORAGE_DIR, "editor_port.txt")
+
+
+def _remembered_port():
+    try:
+        with open(_PORT_PATH, "r", encoding="utf-8") as fh:
+            p = int(fh.read().strip())
+        return p if 1024 <= p <= 65535 else 0
+    except (OSError, ValueError):
+        return 0
+
+
+def _remember_port(port):
+    try:
+        os.makedirs(os.path.dirname(_PORT_PATH), exist_ok=True)
+        with open(_PORT_PATH, "w", encoding="utf-8") as fh:
+            fh.write(str(int(port)))
+    except OSError:
+        pass
+
+
 def ensure_server():
     """Start (once) and return the port of the localhost asset server."""
     global _server
     with _server_lock:
         if _server is None:
-            httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+            # Prefer the port used last time: the VS Code workbench keeps its UI state (layout, recent files) in the
+            # browser's per-origin storage, and the origin includes the port. Fall back to any free port.
+            httpd = None
+            for port in [p for p in (_remembered_port(),) if p] + [0]:
+                try:
+                    httpd = _Server(("127.0.0.1", port), _Handler)
+                    break
+                except OSError:
+                    continue
+            if httpd is None:
+                raise OSError("could not start the editor's local server")
+            _remember_port(httpd.server_address[1])
             httpd.daemon_threads = True
             threading.Thread(target=httpd.serve_forever, name="midum-editor-http", daemon=True).start()
             _server = httpd
         return _server.server_address[1]
+
+
+# ── shell page server ────────────────────────────────────────────────────────────────────
+# The main window used to be created with html=..., which gives the page an opaque origin. The IDE iframe
+# (http://localhost:<port>) is then a third-party context and Chromium denies it IndexedDB ("The user denied permission
+# to access the database"), and it is not a secure context either. Serving the shell from a SECOND localhost port makes
+# it same-site with the IDE (site ignores the port) yet still cross-origin, so the IDE cannot reach the app's bridge.
+_shell_server = None
+_shell_html = {"body": b""}
+
+
+class _ShellHandler(BaseHTTPRequestHandler):
+    server_version = "MidumShell/1.0"
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        try:
+            path = urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                body = _shell_html["body"]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except Exception:
+            pass
+
+
+def serve_shell(html):
+    """Serve the main UI page on http://localhost:<port>/ and return that URL (the port differs from ensure_server's)."""
+    global _shell_server
+    with _server_lock:
+        _shell_html["body"] = html.encode("utf-8")
+        if _shell_server is None:
+            httpd = _Server(("127.0.0.1", 0), _ShellHandler)
+            httpd.daemon_threads = True
+            threading.Thread(target=httpd.serve_forever, name="midum-shell-http", daemon=True).start()
+            _shell_server = httpd
+        return f"http://localhost:{_shell_server.server_address[1]}/"
 
 
 # ── persisted UI state ───────────────────────────────────────────────────────────────────
@@ -251,7 +348,17 @@ def _default_workspace():
     return os.path.dirname(_HERE)            # the midum_pkg folder
 
 
-_RUN_KINDS = {".py": "python", ".pyw": "python", ".java": "java", ".html": "html", ".htm": "html"}
+if workbench_backend is not None:
+    workbench_backend.init(token_fn=lambda: inline_suggest.TOKEN if inline_suggest else None,
+                           default_workspace_fn=_default_workspace)
+
+
+_RUN_KINDS = {".py": "python", ".pyw": "python", ".java": "java", ".html": "html", ".htm": "html",
+              ".js": "node", ".mjs": "node", ".cjs": "node", ".ts": "ts", ".go": "go", ".php": "php", ".rb": "ruby",
+              ".lua": "lua", ".c": "c", ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".rs": "rust", ".sh": "sh",
+              ".ps1": "ps1", ".bat": "bat", ".cmd": "bat"}
+_SIMPLE_RUN = {"node": "node", "ts": "npx --yes tsx", "go": "go run", "php": "php", "ruby": "ruby", "lua": "lua", "sh": "bash"}
+_COMPILE_RUN = {"c": "gcc", "cpp": "g++ -std=c++17", "rust": "rustc"}
 
 
 def _java_main_class(host_path):
@@ -284,6 +391,23 @@ def _run_command(kind, target, host_path, shell_kind):
             return ("if (Get-Command python -ErrorAction SilentlyContinue) { python -u " + q(target) + " } "
                     "else { py -3 -u " + q(target) + " }")
         return "python3 -u " + q(target)
+    if kind in _SIMPLE_RUN:
+        return _SIMPLE_RUN[kind] + " " + q(target)
+    if kind in _COMPILE_RUN:      # compile to a temp dir, run, clean up (no binaries left in the workspace)
+        cc = _COMPILE_RUN[kind]
+        if ps:
+            return ("$__o = Join-Path ([IO.Path]::GetTempPath()) 'midum_native_run'; "
+                    "Remove-Item -Recurse -Force $__o -ErrorAction SilentlyContinue; "
+                    "New-Item -ItemType Directory -Force $__o | Out-Null; "
+                    + cc + " " + q(target) + " -o \"$__o\\a.exe\"; "
+                    "if ($LASTEXITCODE -eq 0) { & \"$__o\\a.exe\" }; "
+                    "Remove-Item -Recurse -Force $__o -ErrorAction SilentlyContinue")
+        return ("__o=$(mktemp -d) && " + cc + " " + q(target) + " -o \"$__o/a.out\" && \"$__o/a.out\"; "
+                "__rc=$?; rm -rf \"$__o\"; (exit $__rc)")
+    if kind == "ps1":
+        return ("& " + q(target)) if ps else ("pwsh -File " + q(target))
+    if kind == "bat":
+        return ("cmd /c " + q(target)) if ps else ("cmd.exe /c \"$(wslpath -w " + q(target) + ")\"")
     cls = _java_main_class(host_path)     # java: compile to a temp dir, run, clean up (no .class litter)
     if ps:
         return ("$__o = Join-Path ([IO.Path]::GetTempPath()) 'midum_java_run'; "
@@ -344,7 +468,7 @@ def _clean_state(st):
     for k, lo, hi in (("sideWidth", 160, 700), ("fontSize", 8, 40)):
         if isinstance(st.get(k), (int, float)):
             out[k] = max(lo, min(hi, int(st[k])))
-    for k in ("wordWrap", "minimap", "autoSave", "termOpen", "termSync", "inlineAI", "aiApprove"):
+    for k in ("wordWrap", "minimap", "autoSave", "termOpen", "termSync", "inlineAI", "aiApprove", "syncTheme"):
         if isinstance(st.get(k), bool):
             out[k] = st[k]
     if isinstance(st.get("termHeight"), (int, float)):
@@ -452,11 +576,38 @@ class EditorMixin:
     """``editor_*`` methods exposed to the page through pywebview (see ``Api``)."""
 
     # -- server / state ---------------------------------------------------------------
-    def editor_server_info(self):
+    def editor_server_info(self, kind="simple"):
+        """URL of an editor page. kind="simple" is the Editor tab's editor; kind="ide" is the full VS Code workbench
+        (CodinGame monaco-vscode-api) shown full-window. Both are served by the same localhost server and share files,
+        workspace and editor_state.json."""
         try:
             port = ensure_server()
+            if kind == "ide":
+                if workbench_backend is None or not workbench_backend.is_built():
+                    return {"ok": False, "error": "The IDE has not been built yet.", "needs_build": True}
+                # `localhost`, not 127.0.0.1: the workbench's extension-host iframe CSP only allows http://localhost:*
+                return {"ok": True, "url": f"http://localhost:{port}/workbench.html", "kind": "ide"}
             ensure_monaco_async()
-            return {"ok": True, "url": f"http://127.0.0.1:{port}/editor.html", "monaco_local": monaco_local()}
+            return {"ok": True, "url": f"http://127.0.0.1:{port}/editor.html", "monaco_local": monaco_local(), "kind": "simple"}
+        except Exception as e:
+            return _err(e)
+
+    # -- VS Code workbench (CodinGame monaco-vscode-api) ---------------------------------
+    def editor_workbench_status(self):
+        """Build/availability status of the IDE: {state: none|building|ready|error, built, stale, node, step, log, ...}."""
+        try:
+            if workbench_backend is None:
+                return {"ok": True, "state": "unavailable", "built": False, "node": False}
+            return {"ok": True, **workbench_backend.status()}
+        except Exception as e:
+            return _err(e)
+
+    def editor_workbench_build(self, force=False):
+        """Start (or rebuild) the workbench bundle in the background. Needs Node.js 18+ and internet."""
+        try:
+            if workbench_backend is None:
+                return {"ok": False, "error": "workbench_backend.py is missing"}
+            return {"ok": True, **workbench_backend.build_async(bool(force))}
         except Exception as e:
             return _err(e)
 
@@ -472,10 +623,28 @@ class EditorMixin:
         except Exception as e:
             return _err(e)
 
+    def editor_set_ide_open(self, is_open):
+        """Remember whether the full IDE was on screen, so the next launch reopens straight into it."""
+        try:
+            with _state_lock:
+                st = _load_state()
+                if bool(is_open):
+                    st["ideOpen"] = True
+                else:
+                    st.pop("ideOpen", None)
+                _write_state(st)
+            return {"ok": True}
+        except Exception as e:
+            return _err(e)
+
     def editor_set_state(self, state):
         try:
             clean = _clean_state(state if isinstance(state, dict) else {})
             with _state_lock:
+                old = _load_state()
+                for k in ("syncTheme", "ideOpen"):                # owned by the IDE page / the app shell; the editors never send them
+                    if k not in clean and k in old:
+                        clean[k] = old[k]
                 _write_state(clean)
             return {"ok": True}
         except Exception as e:
@@ -709,7 +878,7 @@ class EditorMixin:
                 return {"ok": False, "error": "File not found - save it first"}
             kind = _RUN_KINDS.get(os.path.splitext(p)[1].lower())
             if not kind:
-                return {"ok": False, "error": "Run supports .py, .java and .html files"}
+                return {"ok": False, "error": "Run supports: " + ", ".join(sorted(_RUN_KINDS)) }
             if kind == "html":
                 import webbrowser, pathlib
                 webbrowser.open(pathlib.Path(p).as_uri(), new=2)

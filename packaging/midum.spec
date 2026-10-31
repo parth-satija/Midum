@@ -1,0 +1,195 @@
+# -*- mode: python ; coding: utf-8 -*-
+"""PyInstaller spec for Midum (one-folder build).
+
+Build from the repo root:
+    pyinstaller packaging/midum.spec --noconfirm --clean
+
+Output: dist/Midum/Midum.exe (+ _internal/). One-folder is deliberate:
+  * starts instantly (a one-file exe re-extracts hundreds of MB on every launch)
+  * far fewer antivirus false positives
+  * it zips cleanly for the web installer
+"""
+import os
+
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
+
+SPEC_DIR = os.path.abspath(SPECPATH)            # noqa: F821  (provided by PyInstaller)
+ROOT = os.path.dirname(SPEC_DIR)                # repo root == the midum_pkg folder
+
+# --------------------------------------------------------------------------
+# 1. Midum's own modules.
+#    Midum imports many of its modules dynamically (tool registry, provider
+#    backends, flows), which static analysis can miss -- so list every .py
+#    file in the project explicitly. Done by walking the filesystem (no
+#    imports, so nothing heavy executes at build time).
+# --------------------------------------------------------------------------
+SKIP_DIRS = {
+    "build", "dist", "docs", "demo_assets", "storage", "packaging", "node_modules",
+    "__pycache__", ".git", ".github", ".vscode", ".VSCodeCounter", ".ruff_cache", ".midum",
+}
+SKIP_FILES = {"launcher.py"}        # the old source-install launcher is not part of the app
+
+
+def project_modules():
+    mods = []
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        rel = os.path.relpath(dirpath, ROOT)
+        pkg = "" if rel == "." else rel.replace(os.sep, ".")
+        for fn in filenames:
+            if not fn.endswith(".py") or fn in SKIP_FILES or fn.startswith("_removed"):
+                continue
+            name = fn[:-3]
+            if name == "__init__":
+                if pkg:
+                    mods.append(pkg)
+            else:
+                mods.append(f"{pkg}.{name}" if pkg else name)
+    return mods
+
+
+# --------------------------------------------------------------------------
+# 2. Third-party packages with data files / native libs / dynamic imports.
+#    collect_all() grabs code + data + binaries. Missing packages (e.g.
+#    platform-specific ones) are skipped instead of failing the build.
+# --------------------------------------------------------------------------
+datas, binaries, hiddenimports = [], [], []
+
+
+def add_all(pkg):
+    try:
+        d, b, h = collect_all(pkg)
+    except Exception as exc:  # pragma: no cover
+        print(f"[midum.spec] skipping {pkg}: {exc}")
+        return
+    datas.extend(d)
+    binaries.extend(b)
+    hiddenimports.extend(h)
+
+
+# PyQt5 + QtWebEngine: pywebview's Qt backend renders the whole UI through it.
+# (collect_all is the approach the project already used successfully.)
+for pkg in (
+    "PyQt5", "webview", "qtpy",
+    "uiautomation",            # ships native UIAutomation helper DLLs
+    "discord", "nacl",         # voice: opus + libsodium
+    "_sounddevice_data",       # PortAudio DLL for sounddevice
+    "docx",                    # python-docx default template
+    "speech_recognition",
+    "ddgs", "primp",
+    "gemini_webapi", "llm_cookie_bridge",
+    "pdfstructx", "edge_tts",
+):
+    add_all(pkg)
+
+# litellm: lots of provider modules + bundled JSON/tokenizer data. Skip its
+# proxy server (pulls in a large unrelated dependency tree).
+try:
+    hiddenimports += collect_submodules("litellm", filter=lambda n: not n.startswith("litellm.proxy"))
+    datas += collect_data_files("litellm")
+except Exception as exc:  # pragma: no cover
+    print(f"[midum.spec] skipping litellm: {exc}")
+
+for pkg in ("mcp", "pygments", "google.genai"):
+    try:
+        hiddenimports += collect_submodules(pkg)
+    except Exception as exc:  # pragma: no cover
+        print(f"[midum.spec] skipping {pkg}: {exc}")
+
+hiddenimports += [
+    "tiktoken_ext", "tiktoken_ext.openai_public",
+    "anyio._backends._asyncio",
+    "pynput.keyboard._win32", "pynput.mouse._win32",
+    "comtypes", "comtypes.client", "win32com.client", "win32timezone", "pythoncom", "pywintypes",
+    "PyQt5.QtWebEngineWidgets", "PyQt5.QtWebEngineCore", "PyQt5.QtWebChannel",
+    "PyQt5.QtNetwork", "PyQt5.QtPrintSupport", "PyQt5.sip",
+]
+hiddenimports += project_modules()
+
+# --------------------------------------------------------------------------
+# 3. Midum's own data files. Destination folders mirror the source layout
+#    because the app looks them up relative to sys._MEIPASS (see
+#    midumdocs._assets_dir / editor_backend._assets_dir).
+#    NOTE: storage/ is intentionally NOT bundled -- it holds personal data.
+# --------------------------------------------------------------------------
+def add_tree(src_rel, dest_rel):
+    src = os.path.join(ROOT, *src_rel.split("/"))
+    if os.path.isdir(src):
+        datas.append((src, dest_rel))
+    else:
+        print(f"[midum.spec] (optional) missing folder: {src_rel}")
+
+
+def add_file(src_rel, dest_rel="."):
+    src = os.path.join(ROOT, *src_rel.split("/"))
+    if os.path.isfile(src):
+        datas.append((src, dest_rel))
+    else:
+        print(f"[midum.spec] (optional) missing file: {src_rel}")
+
+
+add_tree("gui/assets", "gui/assets")
+add_tree("gui/editor_assets", "gui/editor_assets")
+add_tree("gui/midumdocs_assets", "gui/midumdocs_assets")
+add_tree("gui/workbench", "gui/workbench")
+add_file("gui/midum.png", "gui")
+add_file("flow_meta.json")
+add_file("Modelfile")
+add_file("LICENSE")
+add_file("TRADEMARK.md")
+
+ICON = os.path.join(ROOT, "gui", "assets", "icon.ico")
+if not os.path.isfile(ICON):
+    ICON = None
+
+# --------------------------------------------------------------------------
+# 4. Build
+# --------------------------------------------------------------------------
+a = Analysis(  # noqa: F821
+    [os.path.join(ROOT, "gui", "app.py")],
+    pathex=[ROOT],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[os.path.join(SPEC_DIR, "rthook_midum.py")],
+    # Only one Qt binding may be present or PyInstaller aborts; Midum falls
+    # back from PySide6 to PyQt5, so PyQt5 is the one we ship.
+    excludes=["PySide6", "PySide2", "PyQt6", "pytest", "IPython", "matplotlib",
+              # Heavy ML stacks that may be installed globally but aren't Midum dependencies;
+              # PyInstaller would otherwise try to import/analyze them (torch can hard-crash).
+              "torch", "torchvision", "torchaudio", "tensorflow", "keras", "triton",
+              "jax", "jaxlib", "onnxruntime", "cv2", "sklearn", "scipy", "pandas"],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)  # noqa: F821
+
+exe = EXE(  # noqa: F821
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="Midum",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,                 # UPX increases antivirus false positives and slows startup
+    console=False,             # GUI app: no console window (errors go to the log file via rthook)
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=ICON,
+)
+
+coll = COLLECT(  # noqa: F821
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="Midum",
+)

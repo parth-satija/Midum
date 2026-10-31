@@ -20,7 +20,12 @@ Artifacts the MODEL creates (``origin == "generated"``) are editable and version
 ``create_artifact`` -> ``update_artifact`` (exact-match edits) / ``rewrite_artifact`` ->
 ``list_artifact_versions`` / ``revert_artifact``. Every write is a new version (snapshots live in
 ``files/<id>/.versions``). html / markdown / svg / mermaid / react artifacts are shown live in the
-Render Surface panel via the GUI render hook; user-attached files are never edited in place.
+Render Surface panel via the GUI render hook.
+
+Uploaded text / code / csv files (``origin == "upload"``) are ALSO editable and versioned: on ingest they get an
+``editable`` working copy (v1 = the upload). Edits only ever change Midum's own copy under ``files/<id>/``; the original
+file on the user's computer (``source_path``) is never opened for writing. Uploaded PDF / Office / image / media files
+stay read-only (the model can read them and create_artifact a modified copy).
 
 Only ``config`` is imported at module level so this is safe to import from
 ``tools_schema`` / ``orchestration`` / the GUI without circular imports.
@@ -178,6 +183,7 @@ def _load():
             except Exception as e:
                 print(f"⚠️ [artifacts] could not read index ({e}); starting empty")
                 _index = {}
+            _upgrade_old_uploads(_index)
         return _index
 
 
@@ -189,6 +195,56 @@ def _save():
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(idx, fh, indent=1)
         os.replace(tmp, INDEX_FILE)
+
+
+EDITABLE_UPLOAD_MAX = 5 * 1024 * 1024      # larger uploads stay read-only (the editor/read tools page text anyway)
+
+
+def is_editable(rec):
+    """True for model-created artifacts and for uploaded text/code files that have an editable working copy."""
+    return bool(rec) and (rec.get("origin") == "generated" or bool(rec.get("editable")))
+
+
+def _make_editable(rec):
+    """Give an uploaded text/code/csv file a versioned, editable working copy (v1 = the upload as received).
+
+    Only Midum's stored copy is ever written; ``source_path`` (the original on the user's disk) is not touched.
+    Returns True when the record was changed."""
+    if rec.get("origin") != "upload" or rec.get("editable"):
+        return False
+    ext = os.path.splitext(rec.get("name") or "")[1].lower()
+    kind = rec.get("kind")
+    if not (kind in ("text", "code") or (kind == "sheet" and ext in (".csv", ".tsv"))):
+        return False
+    if int(rec.get("size") or 0) > EDITABLE_UPLOAD_MAX:
+        return False
+    blob = _blob_path(rec)
+    if not os.path.isfile(blob):
+        return False
+    os.makedirs(_vdir(rec), exist_ok=True)
+    if not os.path.exists(_vpath(rec, 1)):
+        shutil.copyfile(blob, _vpath(rec, 1))
+    rec["editable"] = True
+    rec["art_type"] = _infer_type(rec["name"])
+    rec.setdefault("title", "")
+    rec["version"] = 1
+    rec["versions"] = [{"n": 1, "ts": rec.get("created", time.time()), "size": int(rec.get("size") or 0), "note": "uploaded"}]
+    return True
+
+
+def _upgrade_old_uploads(idx):
+    """Once per run: files uploaded before editable uploads existed get their working copy too."""
+    changed = False
+    for rec in list(idx.values()):
+        try:
+            changed = _make_editable(rec) or changed
+        except Exception as e:
+            print(f"⚠️ [artifacts] could not make {rec.get('id')} editable ({e})")
+    if changed:
+        try:
+            _save()
+        except Exception:
+            pass
 
 
 def _blob_path(rec):
@@ -210,7 +266,7 @@ def public_view(rec):
         "pages": (rec.get("text") or {}).get("pages", 0),
         "text_state": text_state, "gemini_state": gem.get("state", "none"),
         "gemini_error": gem.get("error", ""), "busy": busy,
-        "art_type": art_type(rec) if rec.get("origin") == "generated" else "",
+        "art_type": art_type(rec) if is_editable(rec) else "", "editable": is_editable(rec),
         "version": rec.get("version", 0),
     }
 
@@ -245,6 +301,11 @@ def _finalize(tmp_path, name, mime, size, sha, chat_id, origin, source_path, mov
             "gemini": {"state": "none"},
             "sent": bool(sent),     # True = already referenced by a message / added by the model -> never a composer chip
         }
+        if origin == "upload":
+            try:
+                _make_editable(rec)
+            except Exception as e:
+                print(f"⚠️ [artifacts] could not make {art_id} editable ({e})")
         idx[art_id] = rec
         _save()
     threading.Thread(target=_process, args=(art_id, upload), daemon=True, name=f"artifact-{art_id}").start()
@@ -495,7 +556,7 @@ def _extract(rec):
             raw = fh.read(25 * 1024 * 1024)
         text = _decode(raw)
         # Model-created html must come back as raw SOURCE (it needs the exact text to edit it).
-        if ext in (".html", ".htm") and rec.get("origin") != "generated":
+        if ext in (".html", ".htm") and not is_editable(rec):
             text = re.sub(r"(?is)<(script|style).*?</\1>", "", text)
             text = re.sub(r"<[^>]+>", " ", text)
             text = re.sub(r"[ \t]+", " ", text)
@@ -657,6 +718,8 @@ def _describe(r):
         bits.append(t["note"])
     if r.get("origin") == "generated":
         bits.append(f"{art_type(r)} · created by you · v{r.get('version', 1)}")
+    elif is_editable(r):
+        bits.append(f"{art_type(r)} · attached, editable copy · v{r.get('version', 1)}")
     return f"{r['id']}  {r['name']}  [{' · '.join(bits)}]"
 
 
@@ -909,6 +972,13 @@ def _commit(rec, data, note=""):
     """Write ``data`` as the new current content of a generated artifact (= a new version). Returns the version number."""
     if len(data) > MAX_UPLOAD_BYTES:
         raise ValueError("content exceeds the size limit")
+    src = rec.get("source_path") or ""
+    if src:                                   # hard guard: an uploaded file's ORIGINAL on the user's disk is never written
+        try:
+            if os.path.normcase(os.path.realpath(src)) == os.path.normcase(os.path.realpath(_blob_path(rec))):
+                raise ValueError("refusing to overwrite the original file")
+        except OSError:
+            pass
     with _lock:
         n = int(rec.get("version") or 0) + 1
         os.makedirs(_vdir(rec), exist_ok=True)
@@ -958,10 +1028,10 @@ def _resolve_editable(ref):
     rec = get(ref)
     if not rec:
         return None, _not_found(ref)
-    if rec.get("origin") != "generated":
-        return None, (f"Error: {rec['name']} ({rec['id']}) is a file the user attached, so it cannot be edited in place. "
-                      f"To change it: read_artifact it, then create_artifact with the full modified content under a new "
-                      f"name (e.g. 'edited-{rec['name']}').")
+    if not is_editable(rec):
+        return None, (f"Error: {rec['name']} ({rec['id']}) is an attached file that cannot be edited as text (PDF, Office, image, "
+                      f"media or very large file). To change it: read_artifact it, then create_artifact with the full modified "
+                      f"content under a new name (e.g. 'edited-{rec['name']}').")
     ext = os.path.splitext(rec["name"])[1].lower()
     if rec["kind"] not in ("text", "code") and not (rec["kind"] == "sheet" and ext in (".csv", ".tsv")):
         return None, f"Error: {rec['name']} is not a text artifact and cannot be edited."
@@ -1162,7 +1232,7 @@ def editor_list():
     for r in list_records():
         if not _textual(r):
             continue
-        gen = r.get("origin") == "generated"
+        gen = is_editable(r)
         out.append({"id": r["id"], "name": r["name"], "kind": r["kind"], "origin": r.get("origin", "upload"),
                     "art_type": art_type(r) if gen else "", "version": int(r.get("version") or 0) if gen else 0,
                     "size": r.get("size", 0), "editable": gen, "created": r.get("created", 0)})
@@ -1182,7 +1252,7 @@ def editor_read(art_id):
         text = _read_raw(rec)
     except OSError as e:
         return {"ok": False, "error": f"Could not read {rec['name']}: {e}"}
-    gen = rec.get("origin") == "generated"
+    gen = is_editable(rec)
     return {"ok": True, "id": rec["id"], "name": rec["name"], "content": text, "editable": gen,
             "origin": rec.get("origin", "upload"), "version": int(rec.get("version") or 0) if gen else 0,
             "art_type": art_type(rec) if gen else "", "title": rec.get("title", "")}
@@ -1193,8 +1263,8 @@ def editor_save(art_id, content, expected_version=None):
     rec = _load().get(str(art_id))
     if not rec:
         return {"ok": False, "error": "Artifact not found."}
-    if rec.get("origin") != "generated":
-        return {"ok": False, "error": "This is a file you attached, so it is read-only. Use Save as copy."}
+    if not is_editable(rec):
+        return {"ok": False, "error": "This attached file cannot be edited as text, so it is read-only. Use Save as copy."}
     cur = int(rec.get("version") or 0)
     if expected_version is not None and cur != int(expected_version):
         return {"ok": False, "conflict": True, "version": cur}
@@ -1228,7 +1298,7 @@ def editor_stat_ids(ids):
     for i in list(ids or [])[:100]:
         r = idx.get(str(i))
         out[i] = {"exists": bool(r),
-                  "version": int(r.get("version") or 0) if r and r.get("origin") == "generated" else 0,
+                  "version": int(r.get("version") or 0) if r and is_editable(r) else 0,
                   "sha": (r or {}).get("sha256", "")}
     return out
 
@@ -1367,7 +1437,7 @@ def open_tool(arguments):
             version = int(arguments["version"])
         except (TypeError, ValueError):
             return "Error: 'version' must be a whole number (see list_artifact_versions)."
-        if rec.get("origin") != "generated" or not os.path.exists(_vpath(rec, version)):
+        if not is_editable(rec) or not os.path.exists(_vpath(rec, version)):
             return f"Error: {rec['name']} has no version {version}. Call list_artifact_versions."
     # Default: pages/diagrams/documents preview in the Render Surface; code & text open in the Editor tab.
     # Opening for editing (mode=edit) always uses the Editor tab. An old version can only be previewed.
@@ -1412,8 +1482,8 @@ def versions_tool(arguments):
     if not rec:
         return _not_found(arguments.get("artifact"))
     vs = rec.get("versions") or []
-    if rec.get("origin") != "generated" or not vs:
-        return f"{rec['name']} has no version history (only artifacts you created are versioned)."
+    if not is_editable(rec) or not vs:
+        return f"{rec['name']} has no version history (only artifacts you created and editable attached text files are versioned)."
     lines = [f"{rec['name']} ({rec['id']}): {len(vs)} version(s), current = v{rec.get('version')}"]
     for v in vs:
         ts = datetime.fromtimestamp(v.get("ts", 0)).strftime("%Y-%m-%d %H:%M")
@@ -1581,6 +1651,10 @@ def prompt_block(chat_id=None):
         lines.append("Files marked 'created by you' are yours to maintain: change them with update_artifact / "
                      "rewrite_artifact (each change is a new version; open_artifact re-shows one) - never re-create "
                      "them or paste their full content back into chat.")
+    if any(r.get("origin") != "generated" and r.get("editable") for r in recs):
+        lines.append("Attached text/code files marked 'attached, editable copy' can be edited in place with update_artifact / "
+                     "rewrite_artifact -- do NOT create a separate copy. Edits change Midum's stored copy only; the original file "
+                     "on the user's computer is never modified, so tell the user the original is unchanged if it matters.")
     shown = recs[-PROMPT_LIST_MAX:]
     if len(recs) > len(shown):
         lines.append(f"({len(recs) - len(shown)} older files not shown - call list_artifacts)")
@@ -1669,7 +1743,7 @@ TOOL_SCHEMAS = [
         "EXACTLY ONCE (including whitespace and line breaks) - add a neighbouring line to make it unique, or set replace_all=true to change "
         "every occurrence. To make several changes in one go send edits=[{old_str,new_str},...] (all-or-nothing). Prefer this over "
         "rewrite_artifact whenever you are changing part of a file. If you are not sure of the exact current text, read_artifact it first. "
-        "Each successful call saves a new version and refreshes the live preview. Files the user attached cannot be edited in place.",
+        "Each successful call saves a new version and refreshes the live preview. Attached text/code/csv files can be edited too (marked 'editable copy'): the edit changes Midum's stored copy, never the original file on the user's computer. Attached PDF/Office/image/media files cannot be edited.",
         {"artifact": _REF,
          "old_str": {"type": "string", "description": "Exact existing text to replace (must be unique unless replace_all)."},
          "new_str": {"type": "string", "description": "Replacement text (empty string deletes old_str)."},

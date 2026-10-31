@@ -3146,6 +3146,100 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "create_dynamic_background",
+            "description": (
+                "Create a Dynamic Background: an animated backdrop for the ENTIRE Midum app, "
+                "written as ONE self-contained HTML+CSS+JS document in `code`. It goes live "
+                "immediately (replacing the active dynamic background) at the very bottom of "
+                "the app's layers -- directly above the static background image, beneath the "
+                "ambient blobs and every pane/button/message. Decorative only: it never "
+                "receives clicks. Make the document fill the viewport (html,body{margin:0;"
+                "width:100%;height:100%;overflow:hidden}) and paint everything yourself "
+                "(canvas, CSS keyframes, inline SVG, WebGL). It is shown at the app window's "
+                "size and follows resizes, so size canvases from window.innerWidth/innerHeight "
+                "and handle 'resize'. It runs continuously behind the whole UI, so keep it "
+                "cheap (requestAnimationFrame/CSS animation, modest particle counts) and use "
+                "calm, low-contrast colours so the foreground stays readable. Inline everything "
+                "(no external resources); the iframe is sandboxed (scripts only, no midum.call "
+                "bridge). This only creates and previews it -- call save_dynamic_background to "
+                "keep it. There is no tool to switch to a saved one: the user chooses from "
+                "their saved Dynamic Backgrounds via the sidebar's 'Dynamic Backgrounds' button."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "A complete, self-contained HTML document (inline <style>/<script> allowed) that fills the viewport."},
+                    "title": {"type": "string", "description": "Optional short human-readable label shown in the picker."}
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_dynamic_background",
+            "description": (
+                "Edit the Dynamic Background that is CURRENTLY showing, in place, using exact-text "
+                "replacements -- much cheaper than resending the whole document with "
+                "create_dynamic_background for a tweak (a colour, speed, particle count, one extra "
+                "effect). The edited version goes live immediately. `edits` is a list of "
+                "{old, new, replace_all?}: `old` must match the live document EXACTLY (whitespace and "
+                "indentation included) and occur once unless replace_all is true; `new` replaces it "
+                "(empty string deletes). Edits apply in order, each seeing the previous result, and the "
+                "call is all-or-nothing -- if any edit fails nothing changes and the error names it. "
+                "Requires an active dynamic background. It never alters saved copies on disk: to keep "
+                "the change call save_dynamic_background again (same name overwrites). Use "
+                "create_dynamic_background instead for a rewrite or when you no longer have the "
+                "document's text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "description": "Replacements to apply in order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old": {"type": "string", "description": "Exact text to find in the live document (must be unique unless replace_all)."},
+                                "new": {"type": "string", "description": "Replacement text (empty string deletes)."},
+                                "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring a unique match. Default false."}
+                            },
+                            "required": ["old", "new"],
+                        },
+                    },
+                    "title": {"type": "string", "description": "Optional new short label for it (shown in the picker)."}
+                },
+                "required": ["edits"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_dynamic_background",
+            "description": (
+                "Save the Dynamic Background that is CURRENTLY showing (its HTML/CSS/JS and "
+                "title) to disk under `name`, so the user can pick it again later from the "
+                "sidebar's 'Dynamic Backgrounds' button, even after a restart. The live "
+                "background stays active; this only writes a copy. Saving under an existing "
+                "name OVERWRITES it. Requires an active dynamic background "
+                "(create_dynamic_background first). It only saves -- it never changes which "
+                "background is active, and there is no tool to apply a saved one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Name to save it under (letters, digits, spaces, _ or -)."}
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "call_discord",
             "description": (
                 "Join a Discord VOICE CHANNEL and hold a live, two-way SPOKEN conversation with "

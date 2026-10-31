@@ -10,6 +10,7 @@ from midum_mcp.tools import get_filesystem_mcp_policy, set_filesystem_mcp_allowe
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
 from tools.render_surface_tools import write_render_code, edit_render_code, close_render_surface, save_render_surface, list_saved_render_surfaces, load_render_surface, delete_saved_render_surface, webapi_fetch, stream_asset, search_assets, search_web_assets, stream_web_asset
 from tools.ambient_surface_tools import show_ambient_surface, edit_ambient_surface, move_ambient_surface, close_ambient_surface, list_ambient_surfaces, save_ambient_surface, list_saved_ambient_surfaces, load_ambient_surface, delete_saved_ambient_surface
+from tools.dynamic_background_tools import create_dynamic_background, save_dynamic_background, edit_dynamic_background
 from tools_schema import tools
 from ui_automation import ui_navigator
 
@@ -38,6 +39,7 @@ from providers.gemini_reasoning import consult_gemini
 from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _gemini_webapi_load_msg, _get_gemini_web_client, delegate_to_gemini_web, set_gemini_web_model
 from providers.openai_web_backend import _OPENAI_WEB_AVAILABLE, _openai_web_load_msg, _get_openai_web_bridge, delegate_to_openai_web
 from providers.gemini_live_backend import start_screen_share, stop_screen_share
+from voiceover import record_voiceover, revise_voiceover, undo_voiceover_change, play_voiceover, stop_voiceover, save_voiceover, list_voiceovers, discard_voiceover
 from providers.groq_backend import _groq_load_msg, consult_groq, delegate_to_groq, list_groq_models, set_groq_model, set_groq_model_by_index
 from providers.ollama_cloud_backend import consult_ollama_cloud, delegate_to_ollama_cloud, list_ollama_cloud_models, set_ollama_cloud_model
 from providers.openrouter_backend import _openrouter_load_msg, consult_openrouter, delegate_to_openrouter, list_openrouter_models, set_openrouter_model, set_openrouter_model_by_index

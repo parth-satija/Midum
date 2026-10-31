@@ -550,12 +550,44 @@ def get_shell_session(kind="wsl"):
     return _SESSIONS[canonical_kind(kind)]
 
 
+_autostart_done = False
+_AUTOSTART_DELAY = 1.5      # lets the GUI register the workspace resolver first, so shells open in the right folder
+
+
+def autostart_shells(delay=_AUTOSTART_DELAY):
+    """Start both persistent shells in the background (once per process) so they are already
+    running when the app, the Shell tab, the Editor's terminal panel, or the model first needs
+    them. Set MIDUM_SHELL_AUTOSTART=0 to disable. Never blocks and never raises."""
+    global _autostart_done
+    if _autostart_done or os.environ.get("MIDUM_SHELL_AUTOSTART", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    _autostart_done = True
+
+    def _boot(sess):
+        try:
+            if delay:
+                time.sleep(delay)
+            if not sess.available():
+                return
+            if sess.kind == "wsl" and _IS_WINDOWS and not shutil.which("wsl.exe") and not shutil.which("wsl"):
+                return                      # no WSL installed: do not print a start error at every launch
+            sess.ensure_ready()
+        except Exception:
+            pass
+
+    for s in _SESSIONS.values():
+        threading.Thread(target=_boot, args=(s,), name=f"midum-shell-autostart-{s.kind}", daemon=True).start()
+
+
 def set_shell_event_hook(fn):
-    """Register the GUI's event sink on every session at once."""
+    """Register the GUI's event sink on every session at once. The GUI calls this once at startup,
+    which is also the moment the shells are started in the background (see autostart_shells)."""
     global _module_hook
     _module_hook = fn
     for s in _SESSIONS.values():
         s.set_event_hook(fn)
+    if fn is not None:
+        autostart_shells()
 
 
 def available_shells():

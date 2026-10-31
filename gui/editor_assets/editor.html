@@ -116,6 +116,12 @@ button{font:inherit;color:inherit}
 .ai-gm-del,.ai-gm-edit{width:4px!important;margin-left:7px}
 .ai-gm-del{background:#ef4444}
 .ai-gm-edit{background:#eab308}
+/* ── Open full VS Code IDE: prominent button in the editor tab strip ── */
+#btn-ide{display:inline-flex;align-items:center;gap:7px;height:26px;margin:0 8px 0 4px;padding:0 14px 0 11px;border-radius:6px;border:1px solid var(--accent);background:linear-gradient(180deg,var(--accent) 0%,var(--accent-dim) 100%);color:#fff;font:600 12px/1 var(--ui);letter-spacing:.01em;cursor:pointer;white-space:nowrap;box-shadow:0 1px 0 rgba(255,255,255,.22) inset,0 4px 14px -4px var(--accent-dim);transition:filter .12s,transform .08s,box-shadow .12s}
+#btn-ide:hover{filter:brightness(1.12);box-shadow:0 1px 0 rgba(255,255,255,.28) inset,0 6px 18px -4px var(--accent)}
+#btn-ide:active{transform:translateY(1px);filter:brightness(.96)}
+#btn-ide:focus-visible{outline:2px solid var(--text);outline-offset:2px}
+#btn-ide svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;flex:0 0 auto}
 /* ── floating ui ── */
 #btn-run{color:#3fb950}
 #btn-run svg{fill:currentColor;stroke:none}
@@ -187,6 +193,46 @@ button{font:inherit;color:inherit}
 .aidiff .add{background:rgba(63,185,80,.16)}
 .aidiff .del{background:rgba(248,81,73,.16)}
 .aidiff .hunk{color:var(--subtext);opacity:.8}
+
+/* ── Glass Surfaces ───────────────────────────────────────────────────────────────────────
+   applyThemeVars() (JS) sets html.glass-on and swaps --bg/--panel/--surface/--surface2 for translucent versions
+   (--bg fully clear; the opaque originals live on as --bg-raw, --panel-raw, ...), so every surface above that
+   paints from those vars -- sidebar, tab strip, status bar, terminal, rows, buttons -- goes see-through with no
+   per-element rewrite. The host iframe is clear too, so the main window's ambient blobs / background image show
+   through the whole Editor. The rules below only add the glass look (sheen + edges) and keep popups readable.
+   Same token recipe as the main window (no backdrop-filter). */
+:root{
+  --glass-pct:55%;
+  --glass-sheen:color-mix(in srgb, white calc(var(--glass-pct) * 0.55), transparent);
+  --glass-sheen-soft:color-mix(in srgb, white calc(var(--glass-pct) * 0.2), transparent);
+  --glass-edge:color-mix(in srgb, white calc(var(--glass-pct) * 0.6), transparent);
+  --glass-edge-dim:color-mix(in srgb, white calc(var(--glass-pct) * 0.22), transparent);
+  --glass-glow:0 6px 18px -10px rgba(0,0,0,.45);
+  --glass-fill:color-mix(in srgb, var(--panel-raw, var(--panel)) var(--glass-pct), transparent);
+  --glass-fill-strong:color-mix(in srgb, var(--panel-raw, var(--panel)) calc(var(--glass-pct) + 10%), transparent);
+  --glass-pop:color-mix(in srgb, var(--panel-raw, var(--panel)) calc(var(--glass-pct) + 20%), transparent);
+}
+html.glass-no-sheen{--glass-sheen:transparent;--glass-sheen-soft:transparent;}
+html.glass-on #side,html.glass-on #tabs-wrap,html.glass-on #status,html.glass-on #term-hdr{
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%);
+  border-color:var(--glass-edge-dim);
+}
+html.glass-on #term{border-top-color:var(--glass-edge-dim);}
+html.glass-on .sec.art{border-top-color:var(--glass-edge-dim);}
+html.glass-on .tab.active{background-color:var(--glass-fill-strong);box-shadow:inset 0 2px 0 var(--accent), inset 0 1px 0 var(--glass-edge);}
+html.glass-on .btn,html.glass-on .row input,html.glass-on #modal input,html.glass-on .aidiff{
+  background-color:var(--glass-fill);border-color:var(--glass-edge-dim);
+}
+html.glass-on .row input{border-color:var(--accent);}
+html.glass-on .overlay-panel,html.glass-on #fatal{background-color:var(--glass-fill);}
+html.glass-on #menu,html.glass-on #modal,html.glass-on #quick,html.glass-on .toast{
+  background-color:var(--glass-pop);
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%);
+  border-color:var(--glass-edge);
+  box-shadow:inset 0 1px 0 var(--glass-edge), 0 10px 30px rgba(0,0,0,.4);
+}
+html.glass-on .toast{border-left-color:var(--accent);}
+html.glass-on #quick input{background-color:transparent;border-bottom-color:var(--glass-edge-dim);}
 </style>
 </head>
 <body>
@@ -214,7 +260,7 @@ button{font:inherit;color:inherit}
   <div id="resizer"></div>
   <div id="center">
     <div id="tabs-wrap"><div id="tabs"></div>
-      <div id="tabs-actions"><button class="ib" id="btn-run" title="Run file (F5)" disabled><svg viewBox="0 0 24 24"><path d="M7 4v16l13-8z"/></svg></button><button class="ib" id="btn-toggle-side" title="Toggle Explorer (Ctrl+B)"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg></button></div></div>
+      <div id="tabs-actions"><button id="btn-ide" title="Open the full VS Code IDE (workbench)"><svg viewBox="0 0 24 24"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span>Open VS Code IDE</span></button><button class="ib" id="btn-run" title="Run file (F5)" disabled><svg viewBox="0 0 24 24"><path d="M7 4v16l13-8z"/></svg></button><button class="ib" id="btn-toggle-side" title="Toggle Explorer (Ctrl+B)"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg></button></div></div>
     <div id="crumbs"></div>
     <div id="banner"></div>
     <div id="editor-wrap">
@@ -331,6 +377,10 @@ window.addEventListener("message", function(e){
     applyThemeVars(d.vars || {});
   } else if (d.__ed === "event"){
     if (booted) handleEvent(d.kind, d.payload); else eventQueue.push(d);
+  } else if (d.__ed === "handoff_out"){
+    handoffOut().then(function(data){ postParent({__ed: "handoff", id: d.id, data: data}); }).catch(function(){ postParent({__ed: "handoff", id: d.id, data: null}); });
+  } else if (d.__ed === "handoff_in"){
+    handoffIn(d.data || {}).then(function(){ postParent({__ed: "handoff_done", id: d.id}); }).catch(function(){ postParent({__ed: "handoff_done", id: d.id}); });
   }
 });
 function postParent(msg){ try { parent.postMessage(msg, "*"); } catch (e) {} }
@@ -345,29 +395,58 @@ function toHex(c){
   return m ? "#" + [m[1], m[2], m[3]].map(function(n){ return (+n).toString(16).padStart(2, "0"); }).join("") : "#000000";
 }
 function lum(h){ var r = parseInt(h.slice(1,3),16), g = parseInt(h.slice(3,5),16), b = parseInt(h.slice(5,7),16); return (0.299*r + 0.587*g + 0.114*b) / 255; }
-function cssVar(n){ return toHex(getComputedStyle(document.documentElement).getPropertyValue(n).trim() || "#000000"); }
+/* Theme values exactly as the Midum UI sent them (seeded from the stylesheet defaults). Glass Surfaces overrides the
+   live CSS surface vars with translucent versions, so anything that needs the real colours (Monaco) reads RAW. */
+var RAW = {}, GKEYS = ["--bg", "--panel", "--surface", "--surface2"];
+["--bg", "--panel", "--surface", "--surface2", "--border2", "--accent", "--text", "--subtext", "--muted"].forEach(function(k){
+  RAW[k] = getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+});
+function cssVar(n){ return toHex(RAW[n] || getComputedStyle(document.documentElement).getPropertyValue(n).trim() || "#000000"); }
+/* Glass Surfaces state, carried in the theme message as --mz-glass-on / --mz-glass-pct / --mz-glass-sheen (control
+   values only, never applied as CSS). */
+function glassState(){ var p = parseFloat(RAW["--mz-glass-pct"]); return {on: RAW["--mz-glass-on"] === "1", pct: Math.max(0, Math.min(100, isNaN(p) ? 55 : p))}; }
+function alphaHex(h, pct){ return h + ("0" + Math.round(Math.max(0, Math.min(100, pct)) / 100 * 255).toString(16)).slice(-2); }
+function paintTheme(){
+  var root = document.documentElement, st = root.style, g = glassState();
+  Object.keys(RAW).forEach(function(k){
+    if (k.indexOf("--mz-") === 0 || !RAW[k]) return;
+    st.setProperty(k, RAW[k]);
+    if (GKEYS.indexOf(k) >= 0) st.setProperty(k + "-raw", RAW[k]);
+  });
+  st.setProperty("--glass-pct", g.pct + "%");
+  root.classList.toggle("glass-on", g.on);
+  root.classList.toggle("glass-no-sheen", RAW["--mz-glass-sheen"] === "0");
+  if (g.on) GKEYS.forEach(function(k){
+    if (!RAW[k]) return;
+    st.setProperty(k, k === "--bg" ? "transparent" : "color-mix(in srgb, " + RAW[k] + " " + g.pct + "%, transparent)");
+  });
+}
 function applyThemeVars(vars){
-  Object.keys(vars).forEach(function(k){ if (vars[k]) document.documentElement.style.setProperty(k, vars[k]); });
+  Object.keys(vars).forEach(function(k){ if (vars[k]) RAW[k] = vars[k]; });
+  paintTheme();
   if (monacoReady) defineTheme();
 }
 function defineTheme(){
   var bg = cssVar("--bg"), panel = cssVar("--panel"), surf = cssVar("--surface"), surf2 = cssVar("--surface2"),
       b = cssVar("--border2"), acc = cssVar("--accent"), text = cssVar("--text"), sub = cssVar("--subtext"), mut = cssVar("--muted");
   var light = lum(bg) > 0.55;
+  /* Glass on: the editor surface, gutter and minimap are fully clear so the main window shows through; popups
+     (suggest / hover / find / quick input / sticky scroll) keep a denser glass fill so their text stays readable. */
+  var g = glassState(), edBg = g.on ? "#00000000" : bg, pop = g.on ? alphaHex(panel, Math.min(96, g.pct + 35)) : panel;
   monaco.editor.defineTheme("midum", {base: light ? "vs" : "vs-dark", inherit: true, rules: [], colors: {
-    "editor.background": bg, "editor.foreground": text, "editorGutter.background": bg,
+    "editor.background": edBg, "editor.foreground": text, "editorGutter.background": edBg,
     "editorLineNumber.foreground": mut, "editorLineNumber.activeForeground": sub,
     "editorCursor.foreground": acc, "editor.selectionBackground": acc + "44", "editor.inactiveSelectionBackground": acc + "22",
     "editor.lineHighlightBackground": surf + "aa", "editor.lineHighlightBorder": "#00000000",
     "editorIndentGuide.background1": b, "editorIndentGuide.activeBackground1": mut,
-    "editorWidget.background": panel, "editorWidget.border": b,
-    "editorSuggestWidget.background": panel, "editorSuggestWidget.border": b, "editorSuggestWidget.selectedBackground": surf2,
-    "editorHoverWidget.background": panel, "editorHoverWidget.border": b,
+    "editorWidget.background": pop, "editorWidget.border": b,
+    "editorSuggestWidget.background": pop, "editorSuggestWidget.border": b, "editorSuggestWidget.selectedBackground": surf2,
+    "editorHoverWidget.background": pop, "editorHoverWidget.border": b,
     "input.background": surf, "input.border": b, "focusBorder": acc + "88",
     "scrollbarSlider.background": mut + "55", "scrollbarSlider.hoverBackground": mut + "88", "scrollbarSlider.activeBackground": mut + "aa",
-    "minimap.background": bg, "editorBracketMatch.background": acc + "33", "editorBracketMatch.border": acc + "88",
+    "minimap.background": edBg, "editorBracketMatch.background": acc + "33", "editorBracketMatch.border": acc + "88",
     "list.hoverBackground": surf2, "list.activeSelectionBackground": surf2, "list.focusBackground": surf2,
-    "quickInput.background": panel, "editorStickyScroll.background": panel, "editorStickyScrollHover.background": surf2,
+    "quickInput.background": pop, "editorStickyScroll.background": pop, "editorStickyScrollHover.background": surf2,
     "editorOverviewRuler.border": "#00000000", "editorGroup.border": b
   }});
   monaco.editor.setTheme("midum");
@@ -1194,6 +1273,72 @@ function applySide(){ $("#side").classList.toggle("hidden", S.sideHidden); $("#r
 $("#st-lang").onclick = pickLanguage;
 $("#st-wrap").onclick = toggleWrap;
 $("#st-auto").onclick = function(){ S.autoSave = !S.autoSave; renderStatus(); persist(); if (S.autoSave) S.tabs.forEach(function(t){ if (t.dirty) scheduleAutoSave(t); }); };
+/* ───────── switch to the VS Code workbench (CodinGame monaco-vscode-api) ───────── */
+function ideOpen(){ postParent({__ed: "ide_open"}); }          // the Midum window shows the full IDE and runs the handoff
+$("#btn-ide").onclick = ideOpen;
+
+/* Handoff with the full IDE. Both editors read and write the same files and editor_state.json; what lives only in memory
+   (unsaved buffers, active tab, cursor, shared settings) travels in this message so the two always show one session. */
+async function handoffOut(){
+  var tabs = S.tabs.map(function(t){
+    var o = {key: t.key, kind: t.kind, path: t.path || "", id: t.id || "", name: t.name, dirty: !!t.dirty, readOnly: !!t.readOnly, preview: !!t.preview};
+    if (t.model){
+      if (t.dirty) o.content = t.model.getValue();
+      if (t.key === S.active && ED){ var p = ED.getPosition(); if (p){ o.line = p.lineNumber; o.col = p.column; } }
+    }
+    return o;
+  });
+  try {                                                   // the IDE boots from editor_state.json, so write it now, not after the debounce
+    await rpc("editor_set_state", {
+      workspace: S.workspace, recent: S.recent, active: S.active, expanded: Array.from(S.expanded), collapsed: S.collapsed,
+      sideWidth: S.sideWidth, fontSize: S.fontSize, wordWrap: S.wordWrap, minimap: S.minimap, autoSave: S.autoSave,
+      termOpen: S.termOpen, termSync: S.termSync, termHeight: S.termHeight, termShell: S.termShell, inlineAI: S.inlineAI, aiApprove: S.aiApprove,
+      tabs: S.tabs.map(function(t){ return {key: t.key, kind: t.kind, path: t.path, id: t.id, name: t.name, preview: !!t.preview}; })
+    });
+  } catch (e) {}
+  return {workspace: S.workspace, active: S.active, tabs: tabs,
+          settings: {fontSize: S.fontSize, wordWrap: S.wordWrap, minimap: S.minimap, autoSave: S.autoSave, inlineAI: S.inlineAI, aiApprove: S.aiApprove, termShell: S.termShell}};
+}
+async function handoffIn(d){
+  var t0 = Date.now();
+  while (!booted && Date.now() - t0 < 20000) await new Promise(function(r){ setTimeout(r, 100); });
+  var st = d.settings || {};
+  if (typeof st.fontSize === "number" && st.fontSize !== S.fontSize){ S.fontSize = st.fontSize; if (ED) ED.updateOptions({fontSize: S.fontSize}); }
+  if (typeof st.wordWrap === "boolean" && st.wordWrap !== S.wordWrap){ S.wordWrap = st.wordWrap; if (ED) ED.updateOptions({wordWrap: S.wordWrap ? "on" : "off"}); }
+  if (typeof st.minimap === "boolean" && st.minimap !== S.minimap){ S.minimap = st.minimap; if (ED) ED.updateOptions({minimap: {enabled: S.minimap}}); }
+  if (typeof st.autoSave === "boolean") S.autoSave = st.autoSave;
+  if (typeof st.aiApprove === "boolean") S.aiApprove = st.aiApprove;
+  if (typeof st.inlineAI === "boolean" && st.inlineAI !== S.inlineAI) aiToggle(st.inlineAI);
+  if (st.termShell === "wsl" || st.termShell === "powershell") S.termShell = st.termShell;
+  if (d.workspace && pkey(d.workspace) !== pkey(S.workspace || "")) await setWorkspace(d.workspace, true);
+  var keep = {}, i;
+  for (i = 0; i < (d.tabs || []).length; i++){
+    var t = d.tabs[i], tab = findTab(t.key); keep[t.key] = 1;
+    if (!tab){
+      try { tab = t.kind === "artifact" ? await openArtifact(t.id, {preview: !!t.preview}) : await openFile(t.path, {preview: !!t.preview}); } catch (e) { tab = null; }
+    }
+    if (!tab || !tab.model) continue;
+    if (t.dirty && typeof t.content === "string"){
+      if (tab.model.getValue().replace(/\r\n/g, "\n") !== t.content){
+        tab.model.pushStackElement();
+        tab.model.pushEditOperations([], [{range: tab.model.getFullModelRange(), text: t.content}], function(){ return null; });
+        tab.model.pushStackElement();
+      }
+      tab.dirty = tab.model.getAlternativeVersionId() !== tab.savedAlt; tab.conflict = null;
+    } else {
+      await reloadTab(tab);                                  // clean in the IDE: take the file as it is on disk now
+    }
+  }
+  var extra = S.tabs.filter(function(x){ return !keep[x.key]; });        // closed in the IDE: close here (its unsaved edits were discarded there)
+  for (i = 0; i < extra.length; i++) await closeTab(extra[i].key, true);
+  if (d.active && findTab(d.active)){
+    activate(d.active, {focus: false});
+    var at = (d.tabs || []).find(function(x){ return x.key === d.active; });
+    if (at && at.line) reveal(at.line, at.col);
+  } else if (S.tabs.length) activate(S.tabs[0].key, {focus: false});
+  renderTabs(); renderStatus(); renderPanels(); persist();
+  rpc("editor_ai_hello").catch(function(){});             // this is the editor the chat model talks to again
+}
 $("#st-eol").onclick = function(){ var t = activeTab(); if (!t || !t.model) return; t.model.setEOL(t.model.getEOL() === "\n" ? monaco.editor.EndOfLineSequence.CRLF : monaco.editor.EndOfLineSequence.LF); renderStatus(); };
 $("#btn-toggle-side").onclick = toggleSide;
 
@@ -1847,6 +1992,7 @@ function aiInit(){
     });
   }
   ED.addAction({id: 'midum.toggleAiInline', label: 'Midum: Toggle AI Inline Suggestions', run: function(){ aiToggle(); }});
+  ED.addAction({id: 'midum.openIde', label: 'Midum: Open Full IDE (VS Code workbench)', run: function(){ ideOpen(); }});
   aiSetupEdits();
 }
 function aiToggle(force){

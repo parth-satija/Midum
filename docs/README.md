@@ -55,6 +55,7 @@ For detailed subsystem specifications, consult the dedicated documentation files
 4. **[Tools & Execution Subsystems](tools_execution.md)**: Reference manual for native OS automation, Windows UI Automation (UIA), OCR fallbacks, Chrome DevTools Protocol (CDP), and MCP servers.
 5. **[Render Surface & IPC Architecture](render_surface.md)**: Engineering guide for the sandboxed iframe render panel, `midum.call` bidirectional IPC, asset streaming, and persistent storage.
 6. **[Ambient Surface Architecture](ambient_surface.md)**: Floating over-the-screen widgets (model-chosen position and size, rounded card with an outside-corner close button) built on the same sandbox and `midum.call` bridge.
+7. **[Dynamic Background Architecture](dynamic_background.md)**: App-wide animated backdrop written by the model (HTML+CSS+JS in a sandboxed iframe), layered directly above the static background image. Model tools are create + save only; the user picks saved ones from the sidebar.
 
 ---
 
@@ -70,7 +71,8 @@ midum_pkg/
 │   ├── llm_providers.md       # AI model providers & gateways
 │   ├── tools_execution.md     # Native tools, UIA, CDP & MCP
 │   ├── render_surface.md      # Sandboxed HTML/JS panel & IPC
-│   └── ambient_surface.md     # Floating on-screen widgets
+│   ├── ambient_surface.md     # Floating on-screen widgets
+│   └── dynamic_background.md  # App-wide animated backdrop
 │
 ├── storage/                   # Persistent runtime state & memory
 │   ├── master.md              # Global system instructions & state

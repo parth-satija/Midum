@@ -2,6 +2,18 @@
 import os
 import sys
 
+# Pick ONE Qt binding for the whole process, before pywebview/qtpy are imported.
+# Both PySide6 (Qt 6) and PyQt5 (Qt 5) are installed here. main() probes PySide6, but pywebview
+# chooses its binding through qtpy, which prefers PyQt5 when QT_API is unset. The result was two
+# incompatible Qt runtimes loaded into one process: random access-violation crashes, plus the old
+# Qt 5.15 Chromium 87 engine rendering the modern CSS wrongly (crammed top-left layout).
+if "QT_API" not in os.environ:
+    import importlib.util as _ilu
+    if _ilu.find_spec("PySide6") is not None:
+        os.environ["QT_API"] = "pyside6"
+    elif _ilu.find_spec("PyQt5") is not None:
+        os.environ["QT_API"] = "pyqt5"
+
 # Declare DPI awareness BEFORE any window/webview/Qt object is created.
 # Rationale: when run as `python gui/app.py`, python.exe ships a manifest
 # that already marks the process DPI-aware, so Windows lets it render at
@@ -12,15 +24,21 @@ import sys
 # shrunk/deformed and shoved into a corner on any monitor running above
 # 100% scaling. Setting this explicitly at startup opts the frozen exe
 # into the same per-monitor-DPI-aware behavior python.exe gets for free.
+
 if sys.platform == "win32":
-    try:
-        import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE_V2
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()  # Windows 7/8 fallback
-        except Exception:
-            pass
+    # Let Qt itself own DPI awareness and scaling instead of setting it behind Qt's back with ctypes.
+    # A process-wide awareness mode chosen here that differs from what the installed Qt expects
+    # (Qt 5.15 / PyQt5 only understands per-monitor V1; Qt 6 defaults to V2) leaves Qt with a wrong
+    # device-pixel-ratio: the window is created at physical-pixel size while the page is laid out
+    # at 1x, which shows up as a small window with everything crammed into the top-left corner.
+    # These env vars are read by Qt 5 and Qt 6 alike and also cover the frozen .exe case that the
+    # old ctypes call was added for, because Qt then declares the awareness itself at startup.
+    os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")          # Qt 5: enable high-DPI scaling
+    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")            # Qt 6
+    os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")  # 125%/150% stay exact
+    _qpa = os.environ.get("QT_QPA_PLATFORM", "")
+    if "dpiawareness" not in _qpa:
+        os.environ["QT_QPA_PLATFORM"] = (_qpa + "," if _qpa else "windows:") + "dpiawareness=2"
 
 # gui/app.py -> parent: midum_pkg (package root)
 _GUI_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +92,7 @@ import concurrent.futures
 import tools.user_prompt_tools as _user_prompt_tools
 import tools.render_surface_tools as _render_surface_tools
 import tools.ambient_surface_tools as _ambient_surface_tools
+import tools.dynamic_background_tools as _dynamic_background_tools
 from gui.ambient_surface import AmbientSurfaceManager
 
 import config
@@ -724,6 +743,18 @@ class Api(EditorMixin):
         self._render_surface_code = None
         self._render_surface_title = None
 
+        # Dynamic Background: an app-wide animated backdrop (model-written
+        # HTML+CSS+JS in a sandboxed iframe pinned just above #bg-image-layer;
+        # see tools/dynamic_background_tools.py and _handle_dynamic_background
+        # below). Unlike a Render Surface it is NOT per-chat state -- it
+        # belongs to the whole app, so chat switches/new chats never touch it.
+        # The active one is persisted (code included) to
+        # storage/dynamic_background_active.json so it survives restarts.
+        self._dyn_bg_code = None
+        self._dyn_bg_title = None
+        self._dyn_bg_name = None   # saved name it corresponds to, if any
+        self._dyn_bg_load_active()
+
         self._base_work_dir = r"D:\\"
         if not os.path.exists(self._base_work_dir):
             self._base_work_dir = os.path.expanduser("~/Documents")
@@ -761,12 +792,23 @@ class Api(EditorMixin):
         # `midum`, or write_render_code/edit_render_code/close_render_surface
         # would silently keep calling a stale None hook forever.
         _render_surface_tools._gui_render_hook = self._handle_render
+        # Dynamic Backgrounds (create/save only -- no model-facing "set"; the
+        # user picks saved ones from the sidebar). Same rebinding caveat: the
+        # hook must be set on the tools module itself.
+        _dynamic_background_tools._gui_dynamic_bg_hook = self._handle_dynamic_background
         # MidumDocs (LaTeX editor pane): artifacts of type 'latex' open/refresh through this hook.
         midumdocs._gui_hook = self._handle_midumdocs
         # Editor tab (gui/editor_backend.py): lets the model open artifacts in it and lets artifact
         # commits (model edits) refresh an open editor tab live. Set on `artifacts` itself for the same
         # rebinding reason as the hooks above.
         artifacts._gui_editor_hook = self._handle_editor
+        # Audio player above the prompt box: voiceover.py pushes its state (clip recorded/revised/saved,
+        # play/pause/finished) through this hook; the shell renders it (see the "voiceover_state" event).
+        try:
+            import voiceover as _voiceover_mod
+            _voiceover_mod.set_event_hook(lambda st: self._push_event("voiceover_state", st))
+        except Exception as _vo_hook_err:
+            print(f"⚠️ [voiceover player hook failed: {_vo_hook_err}]")
 
         # ── Ambient Surfaces ──────────────────────────────────────────────
         # Floating over-the-screen widgets (see tools/ambient_surface_tools.py
@@ -1142,6 +1184,16 @@ class Api(EditorMixin):
             import conversation_tabs
             self._restore_tabs_or_start_fresh(sys_prompt, memories)
 
+            # Always greet the user with a brand-new, blank tab (and its welcome
+            # screen) on launch. The previously open tabs are all still restored
+            # in the strip, just not the one on screen. If the restored active
+            # tab is already empty, reuse it instead of stacking up blank tabs.
+            try:
+                if self._display_log:
+                    self.new_conversation_tab()
+            except Exception as _e:
+                print(f"[startup] could not open a fresh tab: {_e}")
+
             # Everything above this point is exactly what's needed to know
             # which tabs were open last time and show them -- cheap, local,
             # no network/subprocess involved. Push it to the frontend RIGHT
@@ -1467,6 +1519,40 @@ class Api(EditorMixin):
             "model": config.GEMINI_LIVE_MODEL,
             "voice": config.GEMINI_LIVE_VOICE,
         }
+
+    # ── Audio player (voiceover clips; see voiceover.py) ────────────────────────────────
+    def voiceover_state(self):
+        import voiceover
+        return voiceover.get_state()
+
+    def voiceover_toggle(self):
+        import voiceover
+        return voiceover.player_toggle()
+
+    def voiceover_seek(self, fraction):
+        import voiceover
+        try:
+            return voiceover.player_seek(float(fraction))
+        except Exception:
+            return voiceover.get_state()
+
+    def voiceover_save(self):
+        """Save the latest voiceover version through a native save dialog."""
+        import voiceover
+        if not voiceover.get_state():
+            return {"ok": False, "error": "No voiceover to save."}
+        try:
+            res = self.window.create_file_dialog(
+                webview.SAVE_DIALOG, save_filename=voiceover.default_filename(),
+                file_types=("WAV audio (*.wav)",))
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if not res:
+            return {"ok": False, "cancelled": True}
+        path = res[0] if isinstance(res, (list, tuple)) else res
+        out = voiceover.save_latest_to(path)
+        out["state"] = voiceover.get_state()
+        return out
 
     def start_voice_session(self, model="", voice=""):
         return self._voice_session.start(model or "", voice or "")
@@ -4312,6 +4398,210 @@ class Api(EditorMixin):
         except Exception:
             pass
 
+    # ── Dynamic Background ────────────────────────────────────────────
+    # App-wide animated backdrop. The model can only CREATE (goes live as the
+    # active background) and SAVE (persist the active one under a name); there
+    # is intentionally no model-facing way to activate a saved one -- that is
+    # the user's choice, made from the sidebar's "Dynamic Backgrounds" picker
+    # (dynamic_background_load_ui / _clear_ui below). The active background
+    # (code included) is mirrored to storage/dynamic_background_active.json so
+    # it is restored on the next launch.
+    def _dyn_bg_active_path(self):
+        return os.path.join(config.STORAGE_DIR, "dynamic_background_active.json")
+
+    def _dyn_bg_load_active(self):
+        """Restore the last active Dynamic Background from disk (if any)."""
+        try:
+            path = self._dyn_bg_active_path()
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            code = data.get("code")
+            if isinstance(code, str) and code.strip():
+                self._dyn_bg_code = code
+                self._dyn_bg_title = data.get("title") or None
+                self._dyn_bg_name = data.get("name") or None
+        except Exception:
+            self._dyn_bg_code = self._dyn_bg_title = self._dyn_bg_name = None
+
+    def _dyn_bg_persist_active(self):
+        """Mirror the active background to disk, or remove the file if none."""
+        try:
+            path = self._dyn_bg_active_path()
+            if self._dyn_bg_code is None:
+                if os.path.exists(path):
+                    os.remove(path)
+                return
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "name": self._dyn_bg_name,
+                    "title": self._dyn_bg_title,
+                    "code": self._dyn_bg_code,
+                }, f, indent=2)
+        except Exception:
+            pass
+
+    def _dyn_bg_push(self):
+        """Tell the frontend what the active background is (or to drop it)."""
+        if self._dyn_bg_code is None:
+            self._push_event("dynamic_background_clear", {})
+        else:
+            self._push_event("dynamic_background_set", {
+                "code": self._dyn_bg_code,
+                "title": self._dyn_bg_title or "",
+                "name": self._dyn_bg_name or "",
+            })
+
+    # Called by tools/dynamic_background_tools.py (create_dynamic_background /
+    # save_dynamic_background) from the turn-execution thread.
+    def _handle_dynamic_background(self, kind: str, payload: dict) -> str:
+        if kind == "create":
+            code = payload.get("code", "") or ""
+            if not code.strip():
+                return "[DYNAMIC BACKGROUND ERROR] 'code' is required."
+            title = (payload.get("title") or "").strip() or "Dynamic Background"
+            self._dyn_bg_code = code
+            self._dyn_bg_title = title
+            self._dyn_bg_name = None   # a fresh creation isn't any saved one yet
+            self._dyn_bg_persist_active()
+            self._dyn_bg_push()
+            return (f"Dynamic Background created and now live ({len(code)} chars). "
+                    "Call save_dynamic_background(name) to keep it; the user picks "
+                    "saved ones from the sidebar.")
+
+        if kind == "edit":
+            if self._dyn_bg_code is None:
+                return ("[DYNAMIC BACKGROUND ERROR] No Dynamic Background is active -- "
+                        "call create_dynamic_background first.")
+            new_code, err = _dynamic_background_tools.apply_dynamic_bg_edits(
+                self._dyn_bg_code, payload.get("edits"))
+            if err:
+                return f"[DYNAMIC BACKGROUND ERROR] {err} Nothing was changed."
+            title = (payload.get("title") or "").strip()
+            prev_name = self._dyn_bg_name
+            self._dyn_bg_code = new_code
+            if title:
+                self._dyn_bg_title = title
+            # The live document no longer matches any saved copy, so it isn't "that saved one" anymore
+            # (keeps the picker's active highlight honest). Saved files are never touched here.
+            self._dyn_bg_name = None
+            self._dyn_bg_persist_active()
+            self._dyn_bg_push()
+            n = len(payload.get("edits") or [])
+            msg = f"Dynamic Background edited ({n} edit{'s' if n != 1 else ''} applied) and live ({len(new_code)} chars)."
+            if prev_name:
+                msg += (f" The saved copy '{prev_name}' is unchanged; call save_dynamic_background('{prev_name}') "
+                        "to overwrite it with this version.")
+            else:
+                msg += " Call save_dynamic_background(name) to keep it."
+            return msg
+
+        if kind == "save":
+            name = (payload.get("name") or "").strip()
+            if not name:
+                return "[DYNAMIC BACKGROUND ERROR] 'name' is required to save."
+            if self._dyn_bg_code is None:
+                return ("[DYNAMIC BACKGROUND ERROR] No Dynamic Background is active -- "
+                        "call create_dynamic_background first.")
+            try:
+                os.makedirs(_dynamic_background_tools.DYNAMIC_BACKGROUNDS_DIR, exist_ok=True)
+                path = _dynamic_background_tools._saved_dynamic_bg_path(name)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "name": name,
+                        "title": self._dyn_bg_title or name,
+                        "code": self._dyn_bg_code,
+                        "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    }, f, indent=2)
+            except Exception as e:
+                return f"[DYNAMIC BACKGROUND ERROR] Could not save '{name}': {e}"
+            # The live background IS this saved one now (keeps the picker's
+            # "active" highlight right) -- without re-rendering it.
+            self._dyn_bg_name = name
+            self._dyn_bg_persist_active()
+            self._push_event("log", {"text": f"\U0001f4be Dynamic Background saved as '{name}'.\n"})
+            return f"Dynamic Background saved as '{name}'."
+
+        return f"[DYNAMIC BACKGROUND ERROR] unknown action '{kind}'."
+
+    # ── Dynamic Background UI bridges (sidebar picker; user-side only) ──
+    def dynamic_background_get_active(self):
+        """Called by the frontend at startup to restore the active background."""
+        if self._dyn_bg_code is None:
+            return {"ok": True, "active": False}
+        return {"ok": True, "active": True, "code": self._dyn_bg_code,
+                "title": self._dyn_bg_title or "", "name": self._dyn_bg_name or ""}
+
+    def dynamic_background_list_saved(self):
+        """Populate the sidebar's Dynamic Backgrounds picker."""
+        d = _dynamic_background_tools.DYNAMIC_BACKGROUNDS_DIR
+        os.makedirs(d, exist_ok=True)
+        try:
+            files = sorted(f for f in os.listdir(d) if f.endswith(".json"))
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        items = []
+        for fname in files:
+            try:
+                with open(os.path.join(d, fname), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                items.append({
+                    "name": data.get("name") or fname[:-5],
+                    "title": data.get("title") or fname[:-5],
+                    "saved_at": data.get("saved_at", ""),
+                })
+            except Exception:
+                items.append({"name": fname[:-5], "title": fname[:-5], "saved_at": ""})
+        return {"ok": True, "items": items, "active_name": self._dyn_bg_name or "",
+                "has_active": self._dyn_bg_code is not None}
+
+    def dynamic_background_load_ui(self, name):
+        """The USER picks a saved Dynamic Background: make it the active one."""
+        name = (name or "").strip()
+        if not name:
+            return {"ok": False, "message": "A name is required."}
+        path = _dynamic_background_tools._saved_dynamic_bg_path(name)
+        if not os.path.exists(path):
+            return {"ok": False, "message": f"No saved Dynamic Background named '{name}'."}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            return {"ok": False, "message": f"Could not read '{name}': {e}"}
+        code = data.get("code") or ""
+        if not code.strip():
+            return {"ok": False, "message": f"Saved Dynamic Background '{name}' is empty."}
+        self._dyn_bg_code = code
+        self._dyn_bg_title = data.get("title") or name
+        self._dyn_bg_name = data.get("name") or name
+        self._dyn_bg_persist_active()
+        self._dyn_bg_push()
+        return {"ok": True, "message": f"Dynamic Background '{name}' is now active."}
+
+    def dynamic_background_clear_ui(self):
+        """The USER turns the Dynamic Background off (saved ones are untouched)."""
+        self._dyn_bg_code = self._dyn_bg_title = self._dyn_bg_name = None
+        self._dyn_bg_persist_active()
+        self._dyn_bg_push()
+        return {"ok": True}
+
+    def dynamic_background_delete_ui(self, name):
+        """The USER deletes a saved Dynamic Background from disk. If it is the
+        one currently showing, it stays active as an unsaved draft."""
+        path = _dynamic_background_tools._saved_dynamic_bg_path(name)
+        if not os.path.exists(path):
+            return {"ok": False, "message": f"No saved Dynamic Background named '{name}'."}
+        try:
+            os.remove(path)
+        except Exception as e:
+            return {"ok": False, "message": f"Could not delete '{name}': {e}"}
+        if self._dyn_bg_name and self._dyn_bg_name == (name or "").strip():
+            self._dyn_bg_name = None
+            self._dyn_bg_persist_active()
+        return {"ok": True, "message": f"Deleted saved Dynamic Background '{name}'."}
+
     def render_surface_submit(self, data):
         """Called from JS whenever the sandboxed Render Surface iframe posts
         a message up to the parent window (see the 'message' listener on
@@ -4375,6 +4665,39 @@ class Api(EditorMixin):
     def midumdocs_manual_close(self):
         midumdocs.on_closed()
         return {"ok": True}
+
+    # -- small persisted editor preferences (e.g. "Custom pages"). Kept on disk, not in the browser: the pages are served from
+    #    localhost ports that change between launches, so localStorage would not survive a restart.
+    @staticmethod
+    def _md_prefs_path():
+        import config as _cfg
+        return os.path.join(_cfg.STORAGE_DIR, "midumdocs_prefs.json")
+
+    def midumdocs_get_prefs(self):
+        try:
+            with open(self._md_prefs_path(), "r", encoding="utf-8") as fh:
+                prefs = json.load(fh)
+            return {"ok": True, "prefs": prefs if isinstance(prefs, dict) else {}}
+        except (OSError, ValueError):
+            return {"ok": True, "prefs": {}}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "prefs": {}}
+
+    def midumdocs_set_pref(self, key, value):
+        if key not in ("customPages",) or not isinstance(value, bool):
+            return {"ok": False, "error": "unknown preference"}
+        try:
+            path = self._md_prefs_path()
+            prefs = self.midumdocs_get_prefs().get("prefs", {})
+            prefs[key] = value
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(prefs, fh)
+            os.replace(tmp, path)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def midumdocs_reopen_ui(self):
         return midumdocs.reopen_ui()
@@ -4604,6 +4927,8 @@ class Api(EditorMixin):
             {"key": "skills", "label": "Skills",       "icon": "🧠", "count": skills_count},
             {"key": "flows",  "label": "Flows",        "icon": "🔗", "count": flows_count},
             {"key": "kbs",    "label": "KBs",          "icon": "📚", "count": kbs_count},
+            {"key": "midumdocs", "label": "MidumDocs", "icon": "file-text", "count": self._picker_count(True)},
+            {"key": "artifacts", "label": "Artifacts", "icon": "package",   "count": self._picker_count(False)},
         ]
 
     def list_native_tool_categories(self):
@@ -4693,6 +5018,63 @@ class Api(EditorMixin):
         except Exception:
             pass
         return out
+
+    def _picker_artifact_items(self, docs: bool):
+        """Items for the "/" picker's MidumDocs (docs=True) and Artifacts (docs=False) sections.
+        Covers EVERY chat, newest first. A MidumDoc is an editable LaTeX artifact; everything else
+        (attached files, pages, code, images...) is listed under Artifacts, so the two never overlap."""
+        try:
+            recs = list(artifacts._load().values())
+        except Exception:
+            return []
+        here = self._current_chat_id or ""
+        picked = []
+        for r in recs:
+            try:
+                is_doc = bool(midumdocs.is_latex(r)) and artifacts.is_editable(r)
+            except Exception:
+                is_doc = False
+            if is_doc != docs:
+                continue
+            if r.get("origin") == "upload" and not r.get("sent") and (r.get("chat_id") or "") != here:
+                continue        # another tab's unsent composer chip, not a real artifact yet
+            picked.append(r)
+        picked.sort(key=lambda r: max(float(r.get("md_opened") or 0), float(r.get("created") or 0)), reverse=True)
+        counts = {}
+        for r in picked:
+            k = str(r.get("name") or "").lower()
+            counts[k] = counts.get(k, 0) + 1
+        out = []
+        for r in picked[:200]:
+            name = str(r.get("name") or r.get("id"))
+            editable = artifacts.is_editable(r)
+            bits = []
+            if editable:
+                bits.append("v%d" % int(r.get("version") or 1))
+            if not docs:
+                bits.insert(0, str(artifacts.art_type(r) if editable else (r.get("kind") or "file")))
+            bits.append("this chat" if (r.get("chat_id") or "") == here else "other chat")
+            if r.get("origin") == "upload":
+                bits.append("attached, editable copy" if editable else "attached, read-only")
+            else:
+                bits.append("created by Midum")
+            dup = counts.get(name.lower(), 0) > 1
+            if dup:
+                bits.append(str(r.get("id")))
+            out.append({"name": name, "desc": " · ".join(bits), "insert": str(r.get("id")) if dup else name})
+        return out
+
+    def _picker_count(self, docs: bool) -> int:
+        try:
+            return len(self._picker_artifact_items(docs))
+        except Exception:
+            return 0
+
+    def list_midumdocs_capability(self):
+        return self._picker_artifact_items(True)
+
+    def list_artifacts_capability(self):
+        return self._picker_artifact_items(False)
 
     def get_pdf_source(self, name: str):
         try:
@@ -5681,6 +6063,7 @@ _HTML = r"""<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;1,9..144,400;1,9..144,500&display=swap">
 <!-- Feather Icons -- tiny external icon library used purely for the custom
      titlebar's minimize/maximize/close glyphs (see #app-titlebar below).
      Loaded from a CDN like the Google Font above; if it fails to load
@@ -5983,7 +6366,9 @@ input[type="checkbox"]:focus-visible{
   box-shadow:inset 0 1px 0 color-mix(in srgb, white 13%, transparent), inset 0 -1px 0 color-mix(in srgb, white 4%, transparent), 0 6px 16px -12px rgba(0,0,0,.6);
   transition:background-color .18s var(--ease),border-color .18s var(--ease),box-shadow .18s var(--ease);
 }
-#status-dot{width:8px;height:8px;border-radius:50%;background:var(--yellow);transition:background .2s;}
+#status-dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;position:relative;background:var(--yellow);transition:background .2s, box-shadow .2s;}
+/* busy: the dot becomes the particle-network AI spinner (see AiSpinner) */
+#status-row.status-busy #status-dot{width:26px;height:26px;border-radius:0;}
 #status-label{font-size:12px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 
 /* Centered pill tab bar — 80% width of top bar, fully rounded bar + tabs */
@@ -6046,6 +6431,25 @@ input[type="checkbox"]:focus-visible{
   display:none;
 }
 html.has-bg-image #bg-image-layer{ display:block; }
+
+/* -- Dynamic Background layer: an app-wide, model-written HTML+CSS+JS backdrop
+   (see tools/dynamic_background_tools.py). Same fixed/full-viewport/z-index:0
+   stacking context as #bg-image-layer and #blob-layer; it sits BETWEEN them in
+   DOM order, so it paints directly above the static background image and
+   below the ambient blobs, the panes and every control. The iframe is
+   sandboxed (scripts only) and pointer-events:none end to end, so it can never
+   intercept a click or drag. While active, JS also turns on html.has-bg-image
+   (see _syncBgClass) so the panes stay transparent and it shows through
+   exactly like a background image would. */
+#dyn-bg-layer{
+  position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden;
+  display:none;isolation:isolate;contain:strict;
+}
+html.has-dyn-bg #dyn-bg-layer{ display:block; }
+#dyn-bg-frame{
+  position:absolute;inset:0;width:100%;height:100%;border:0;
+  background:transparent;pointer-events:none;
+}
 
 /* ── Ambient gradient blobs ──────────────────────────────────────────────
    Purely decorative, always-on ambience layer sitting behind the panes
@@ -6408,6 +6812,38 @@ html.liquid-glass-on:not(.blobs-off) input[type="checkbox"]:checked{
   background-color:color-mix(in srgb, var(--accent) 72%, var(--glass-fill)) !important;
   border-color:var(--accent) !important;
 }
+/* MidumDocs header strip + its Source / Split / Page switcher: same glass recipe as #tabbar */
+html.liquid-glass-on.has-bg-image #midumdocs-header,
+html.liquid-glass-on:not(.blobs-off) #midumdocs-header,
+html.liquid-glass-on.has-bg-image .md-seg,
+html.liquid-glass-on:not(.blobs-off) .md-seg{
+  background-color:var(--glass-fill) !important;
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
+  border-color:var(--glass-edge) !important;
+  box-shadow:inset 0 1px 0 var(--glass-edge), inset 0 -1px 0 var(--glass-edge-dim), var(--glass-glow) !important;
+}
+/* Audio player (voiceover clips) above the prompt box: same recipe as #input-box / the MidumDocs header (translucent
+   fill + baked sheen + bright top edge + soft glow, all static paint -- no backdrop-filter). Its Save / Hide buttons are
+   .icon-btn, which the rules around this block already glass. The play button stays accent-coloured but is tinted into
+   the glass, and the seek track becomes a translucent trough so it reads over the blobs / background image. */
+html.liquid-glass-on.has-bg-image #vo-player,
+html.liquid-glass-on:not(.blobs-off) #vo-player{
+  background-color:var(--glass-fill) !important;
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
+  border-color:var(--glass-edge) !important;
+  box-shadow:inset 0 1px 0 var(--glass-edge), inset 0 -1px 0 var(--glass-edge-dim), var(--glass-glow) !important;
+  transition:background-color .18s var(--ease), box-shadow .18s var(--ease), border-color .18s var(--ease);
+}
+html.liquid-glass-on.has-bg-image #vo-play,
+html.liquid-glass-on:not(.blobs-off) #vo-play{
+  background-color:color-mix(in srgb, var(--accent) 78%, var(--glass-fill)) !important;
+  box-shadow:inset 0 1px 0 var(--glass-edge), var(--glass-glow);
+}
+html.liquid-glass-on.has-bg-image #vo-bar::before,
+html.liquid-glass-on:not(.blobs-off) #vo-bar::before{
+  background-color:color-mix(in srgb, var(--text) 18%, transparent);
+  box-shadow:inset 0 1px 0 var(--glass-edge-dim);
+}
 /* Small/round controls read better a touch more opaque than big flat
    surfaces (icon glyphs and short labels need more contrast to stay
    legible over the moving blobs/image behind them). */
@@ -6442,21 +6878,62 @@ html.liquid-glass-on:not(.blobs-off) .capability-picker-row.active{
   background-color:var(--glass-fill-strong) !important;
   box-shadow:inset 0 0 0 1px var(--glass-edge) !important;
 }
-/* #sidebar-settings-overlay is a full-panel replacement -- it covers the
-   ENTIRE sidebar (see its own rule: position:absolute;inset:0) while
-   open, sitting directly on top of #sidebar-main-view underneath (the
-   workspace list + chat history it's replacing). Making a panel THAT
-   size translucent doesn't read as "glass", it reads as the history list
-   bleeding through and overlapping the settings controls' own text --
-   unreadable, not stylish. Every other glass surface here is a small
-   child control sitting on top of the ambient blobs/background image
-   (which is what should show through); this one would sit on top of
-   more opaque UI instead, so it stays a normal solid panel regardless of
-   the toggle. */
-html.liquid-glass-on #sidebar-settings-overlay{
-  background-color:var(--panel) !important;
-  background-image:none !important;
-  box-shadow:none !important;
+/* Settings is a centered popup window (#sidebar-settings-overlay = dim scrim, .st-dialog = the window).
+   With Glass Surfaces on, the window uses EXACTLY the recipe of the menus / popups in the Workbench IDE
+   (gui/workbench/theme.ts + index.html): panel fill at min(85%, glass% + 15%), the diagonal sheen, the
+   glass edge + inset highlight, and a blur(18px) saturate(1.25) backdrop. The scrim stays a plain dim
+   layer (no filter), so the window's own backdrop blur is what you see. Glass off = solid panel. */
+html.liquid-glass-on .st-dialog{
+  background-color:color-mix(in srgb, var(--panel) min(85%, calc(var(--glass-pct) + 15%)), transparent);
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%);
+  border-color:var(--glass-edge);
+  box-shadow:inset 0 1px 0 var(--glass-edge), 0 10px 30px rgba(0,0,0,.4);
+  -webkit-backdrop-filter:blur(18px) saturate(1.25);backdrop-filter:blur(18px) saturate(1.25);
+}
+html.liquid-glass-on .st-card{border-color:var(--glass-edge-dim);background-color:color-mix(in srgb, var(--surface) var(--glass-pct), transparent);}
+html.liquid-glass-on .st-head,html.liquid-glass-on .st-foot,html.liquid-glass-on .st-nav{border-color:var(--glass-edge-dim);}
+
+/* ── Glass Surfaces: MidumDocs pane, Editor pane, and prompt-box / bubble file-upload cards ──────────────
+   Both iframe pages (gui/midumdocs_assets/editor.html, gui/editor_assets/editor.html) paint their own
+   backgrounds, so the host elements must be clear for the ambient blobs / background image to show through
+   at all; the pages themselves go translucent when the --mz-glass-* theme vars (see _glassThemeVars()) say
+   so. html.liquid-glass-on is only ever set while the panes are transparent, so no extra gating here. */
+html.liquid-glass-on #mz-ed-host,
+html.liquid-glass-on #mz-ed-host iframe,
+html.liquid-glass-on #mz-ide,
+html.liquid-glass-on #mz-ide iframe,
+html.liquid-glass-on #midumdocs-frame{
+  background:transparent !important;
+}
+html.liquid-glass-on #midumdocs-header{
+  background-color:var(--glass-fill) !important;
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
+  border-bottom:1px solid var(--glass-edge-dim) !important;
+}
+html.liquid-glass-on .md-seg{
+  background-color:var(--glass-fill) !important;
+  border-color:var(--glass-edge-dim) !important;
+  box-shadow:inset 0 1px 0 var(--glass-edge-dim);
+}
+/* File-upload cards: the pending chips in the prompt box tray and the read-only chips inside sent prompt
+   bubbles. Same recipe as every other glass surface (translucent fill + baked sheen + bright top edge). */
+html.liquid-glass-on .att-chip,
+html.liquid-glass-on .att-chip-ro{
+  background-color:var(--glass-fill) !important;
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
+  box-shadow:inset 0 0 0 1px var(--glass-edge-dim), inset 0 1px 0 var(--glass-edge), var(--glass-glow) !important;
+}
+html.liquid-glass-on .att-chip:not(.err){border-color:transparent;}
+html.liquid-glass-on .att-ico{
+  background-color:color-mix(in srgb, var(--accent) 16%, transparent);
+  box-shadow:inset 0 1px 0 var(--glass-edge-dim);
+}
+html.liquid-glass-on .att-chip.err .att-ico{background-color:color-mix(in srgb, var(--red) 16%, transparent);}
+html.liquid-glass-on .att-x:hover{background-color:var(--glass-fill-strong);}
+html.liquid-glass-on .att-prog{background-color:color-mix(in srgb, var(--text) 14%, transparent);}
+html.liquid-glass-on #drop-overlay{
+  background-color:var(--glass-fill);
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%);
 }
 
 /* Tool pane */
@@ -6466,6 +6943,49 @@ html.liquid-glass-on #sidebar-settings-overlay{
    shown only while the Editor tab is active, never rebuilt (so open files survive tab switches). */
 #mz-ed-host{position:absolute;inset:0;display:none;background:var(--bg);}
 #mz-ed-host iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:var(--bg);}
+/* Full IDE (VS Code workbench): a second, full-window editor layered over the app UI inside #root. The top bar and content are
+   hidden (visibility, so nothing reflows) but the background / blob / dynamic-background layers stay, which is what lets Glass
+   Surface show through the IDE. z-index 800 keeps it below #modal-overlay (1000), so tool approvals can never hide behind it. */
+#mz-ide{position:absolute;inset:0;z-index:800;display:none;background:var(--bg);}
+#mz-ide iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:var(--bg);}
+#mz-ide-x{position:absolute;top:10px;right:14px;z-index:2;padding:5px 12px;border-radius:8px;border:1px solid var(--border2);background:var(--panel);color:var(--text);cursor:pointer;font:12px 'Segoe UI',sans-serif;}
+#mz-ide.booted #mz-ide-x{display:none;}
+html.mz-ide-open #topbar-wrap,html.mz-ide-open #content{visibility:hidden !important;pointer-events:none !important;}
+html.mz-ide-open #conv-tabbar-row{display:none !important;}
+/* Midum chat docked in the IDE's secondary (right) sidebar. The real #chat-pane-wrap is moved in here while the IDE is open, so the
+   composer, tool pills, Markdown/LaTeX rendering, uploads and chat storage are the main chat's own. */
+#mz-ide-chat{position:absolute;z-index:3;left:0;top:0;width:380px;height:400px;display:flex;flex-direction:column;min-width:0;overflow:hidden;visibility:hidden;pointer-events:none;background:var(--bg);color:var(--text);border-left:1px solid var(--border2);}
+#mz-ide-chat.show{visibility:visible;pointer-events:auto;}
+html.liquid-glass-on #mz-ide-chat{background:transparent;}
+#mz-ic-head{flex:0 0 auto;display:flex;align-items:center;gap:6px;height:38px;padding:0 8px;border-bottom:1px solid var(--border2);}
+#mz-ic-status{display:flex;align-items:center;gap:7px;min-width:0;flex:1;font-size:11px;color:var(--subtext);}
+#mz-ic-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#mz-ic-dot{flex:0 0 auto;width:7px;height:7px;border-radius:50%;background:var(--muted);}
+#mz-ic-head.st-ok #mz-ic-dot{background:var(--green);}
+#mz-ic-head.st-busy #mz-ic-dot{background:var(--accent);animation:mzIcPulse 1.1s ease-in-out infinite;}
+#mz-ic-head.st-err #mz-ic-dot{background:var(--red);}
+@keyframes mzIcPulse{0%,100%{opacity:1}50%{opacity:.35}}
+.mz-ic-btn{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 8px;border:1px solid var(--border2);border-radius:8px;background:transparent;color:var(--subtext);font:inherit;font-size:11px;cursor:pointer;flex:0 0 auto;}
+.mz-ic-btn:hover,.mz-ic-btn.on{color:var(--text);background:var(--surface2);}
+.mz-ic-btn svg{width:13px;height:13px;}
+#mz-ic-abort{color:var(--red);border-color:var(--red);}
+#mz-ic-hist{display:none;position:absolute;z-index:5;top:42px;right:8px;width:min(340px,calc(100% - 16px));max-height:min(60vh,calc(100% - 56px));overflow:auto;padding:6px;border:1px solid var(--border2);border-radius:12px;background:var(--panel);box-shadow:0 10px 30px rgba(0,0,0,.35);}
+#mz-ic-hist.open{display:block;}
+html.liquid-glass-on #mz-ic-hist{background:var(--glass-fill-strong, var(--panel));-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px);}
+#mz-ic-hist .history-card{margin-bottom:4px;}
+#mz-ic-body{position:relative;flex:1 1 0;min-height:0;}
+#mz-ic-body > #chat-pane-wrap{position:absolute !important;left:0 !important;top:0 !important;width:100% !important;height:100% !important;opacity:1 !important;pointer-events:auto !important;transition:none !important;}
+/* In the IDE sidebar the Knowledge-Base button gives way to a model picker holding the whole Model tab. */
+html.mz-chat-docked #kb-toggle-btn{display:none !important;}
+#mz-model-btn{display:none;flex:0 0 auto;width:auto;height:36px;padding:0 12px;border-radius:18px;align-items:center;justify-content:center;gap:6px;font-size:11px;white-space:nowrap;}
+html.mz-chat-docked #mz-model-btn{display:inline-flex;}
+#mz-model-btn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
+#mz-model-btn .ic{width:14px;height:14px;flex:0 0 auto;}
+#mz-model-btn.on{background:var(--accent);color:#fff;}
+#mz-model-pop{position:absolute;bottom:calc(100% + 8px);left:0;right:0;max-height:min(580px,calc(100vh - 230px));overflow-y:auto;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.35);display:none;z-index:20;}
+#mz-model-pop.open{display:block;}
+html.liquid-glass-on #mz-model-pop{background:var(--glass-fill-strong, var(--panel));-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px);}
+#mz-model-pop .mz-mp-head{display:flex;align-items:center;justify-content:space-between;font-size:12px;font-weight:600;color:var(--text);padding-bottom:8px;border-bottom:1px solid var(--border);margin-bottom:10px;}
 .mz-ed-err{padding:30px;color:var(--subtext);text-align:center;font-size:13px;line-height:1.8;}
 .tab-btn.has-dirty::after{content:"";position:absolute;top:6px;right:9px;width:6px;height:6px;border-radius:50%;background:var(--accent);}
 
@@ -6492,6 +7012,53 @@ html.liquid-glass-on #sidebar-settings-overlay{
 }
 #send-btn:hover{background:var(--accent-dim);}
 #send-hint{text-align:center;font-size:9px;color:var(--muted);padding-bottom:6px;}
+
+/* ── New-chat welcome screen ─────────────────────────────────────────────
+   While the chat is empty (new tab / New Chat), #chat-pane-wrap gets .welcome:
+   the prompt box slides up to just below the vertical centre and a big greeting
+   fades in above it. Sending the first message removes .welcome, so the box
+   glides back down to its normal docked spot and the chat takes over.
+   Positioning is PURE CSS, as percentages of the chat pane: the prompt row's top edge sits at 42%
+   of the pane height and the greeting's middle at 24%. Because the browser re-resolves those on
+   every resize, maximising / fullscreen / dragging the window edge can never leave them stale.
+   (The pane starts below the top bar, so these land just below / well above the window's centre.)
+   JS only reports the row's own height in --welcome-row-h (see welcomeLayout()). */
+#input-row{position:relative;top:0;}
+#chat-pane-wrap.welcome-anim #input-row{transition:top .65s cubic-bezier(.22,1,.36,1);}
+#chat-pane-wrap.welcome #input-row{top:calc(var(--welcome-row-h, 90px) - 58%);}
+#chat-pane-wrap > .pane{container-type:inline-size;}
+#welcome-greet{
+  position:absolute;left:24px;right:24px;top:24%;text-align:center;box-sizing:border-box;padding:0 8px;z-index:1;
+  font-family:"Fraunces","Iowan Old Style","Palatino Linotype",Georgia,serif;font-optical-sizing:auto;
+  font-size:clamp(32px, 5vw, 72px);   /* fallback */
+  font-size:clamp(32px, 5.5cqw, 72px);   /* scales with the chat pane's width where container units exist */
+  font-weight:400;line-height:1.2;letter-spacing:-.02em;
+  color:var(--text);text-wrap:balance;user-select:none;pointer-events:none;
+  opacity:0;visibility:hidden;transform:translateY(calc(-50% + 10px));
+  transition:opacity .22s ease, transform .22s ease, visibility 0s linear .22s;
+}
+#chat-pane-wrap.welcome #welcome-greet{
+  opacity:1;visibility:visible;transform:translateY(-50%);
+  transition:opacity .7s ease .12s, transform .7s cubic-bezier(.22,1,.36,1) .12s, visibility 0s;
+}
+#welcome-greet .wg-accent{
+  display:inline-block;padding:0 .08em .06em;font-style:italic;font-weight:500;
+  color:var(--accent); /* fallback if background-clip:text is unsupported */
+  background:linear-gradient(100deg, var(--accent) 0%, #a78bfa 48%, #f472b6 100%);
+  background-size:140% 100%;
+  -webkit-background-clip:text;background-clip:text;
+  -webkit-text-fill-color:transparent;color:transparent;
+  animation:wgShimmer 7s ease-in-out infinite alternate;
+}
+@keyframes wgShimmer{from{background-position:0% 50%;}to{background-position:100% 50%;}}
+#welcome-greet.wg-swap{animation:wgIn .6s cubic-bezier(.22,1,.36,1);}
+@keyframes wgIn{from{opacity:0;transform:translateY(calc(-50% + 12px));}}
+@media (prefers-reduced-motion:reduce){
+  #chat-pane-wrap.welcome-anim #input-row{transition:none;}
+  #welcome-greet,#chat-pane-wrap.welcome #welcome-greet{transition:opacity .2s ease;}
+  #welcome-greet.wg-swap{animation:none;}
+  #welcome-greet .wg-accent{animation:none;}
+}
 
 /* ── Prompt-box file attachments (artifact system) ───────────────────── */
 #input-box{flex-wrap:wrap;}
@@ -6604,19 +7171,84 @@ html.liquid-glass-on #sidebar-settings-overlay{
 #sidebar-pane-wrap{left:100%;width:0;}
 #sidebar-inner{flex:1;position:relative;overflow:hidden;display:flex;flex-direction:column;}
 #sidebar-main-view{flex:1;padding:14px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;}
-/* Settings overlay -- covers the ENTIRE sidebar pane (not just a strip)
-   while open, so it gets full room for theme/background/provider controls
-   instead of being squeezed under the workspace + history sections. */
+/* Settings popup window. #sidebar-settings-overlay is the dim scrim (moved to <body> when the sidebar is built so
+   position:fixed is always relative to the viewport); .st-dialog is the window: header, left nav, one page of
+   cards at a time, footer. z-index 950 keeps it above the panes but below #modal-overlay (1000), so the
+   confirm / prompt dialogs opened from inside Settings (delete preset, ...) always show on top of it. */
 #sidebar-settings-overlay{
-  position:absolute;inset:0;background:var(--panel);z-index:5;
-  padding:14px;overflow-y:auto;display:none;flex-direction:column;gap:6px;
+  position:fixed;left:0;right:0;bottom:0;top:var(--titlebar-h,36px);z-index:950;
+  display:none;align-items:center;justify-content:center;padding:28px;
+  background:rgba(2,1,10,.42);
 }
-#sidebar-settings-overlay.open{display:flex;}
+#sidebar-settings-overlay.open{display:flex;animation:stFade .14s ease-out;}
+@keyframes stFade{from{opacity:0}to{opacity:1}}
+@keyframes stPop{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}
+.st-dialog{
+  width:min(880px,100%);height:min(660px,100%);display:flex;flex-direction:column;overflow:hidden;
+  background:var(--panel);border:1px solid var(--border2);border-radius:20px;
+  box-shadow:0 10px 30px rgba(0,0,0,.4);animation:stPop .18s var(--ease) both;
+}
+.st-head{flex:0 0 auto;display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border2);}
+.st-head-ic{width:30px;height:30px;border-radius:10px;display:flex;align-items:center;justify-content:center;
+  background:var(--accent-faint);color:var(--accent);}
+.st-head-ic svg{width:16px;height:16px;}
+.st-head-t{font-size:15px;font-weight:700;color:var(--text);line-height:1.2;}
+.st-head-s{font-size:11px;color:var(--subtext);margin-top:1px;}
+.st-head-sp{flex:1;}
 #settings-back-btn{
-  width:26px;height:26px;border-radius:50%;border:none;background:var(--surface2);
+  width:30px;height:30px;border-radius:50%;border:none;background:var(--surface2);
   color:var(--text);font-size:12px;display:flex;align-items:center;justify-content:center;
 }
 #settings-back-btn:hover{background:var(--border2);}
+.st-body{flex:1;min-height:0;display:flex;}
+.st-nav{flex:0 0 190px;display:flex;flex-direction:column;gap:4px;padding:12px;border-right:1px solid var(--border2);overflow-y:auto;}
+.st-nav button{
+  display:flex;align-items:center;gap:10px;height:38px;padding:0 12px;border:none;border-radius:12px;
+  background:transparent;color:var(--subtext);font-size:12.5px;font-weight:600;text-align:left;
+  transition:background .15s,color .15s;
+}
+.st-nav button svg{width:15px;height:15px;flex:0 0 auto;}
+.st-nav button:hover{background:var(--surface2);color:var(--text);}
+.st-nav button.active{background:var(--accent-faint);color:var(--text);box-shadow:inset 2px 0 0 var(--accent);}
+.st-nav button.active svg{color:var(--accent);}
+.st-content{flex:1;min-width:0;overflow-y:auto;padding:16px 20px 20px;display:flex;flex-direction:column;gap:14px;}
+.st-card{
+  display:none;flex-direction:column;gap:12px;padding:14px 16px;border-radius:16px;
+  border:1px solid var(--border2);background:color-mix(in srgb, var(--surface) 70%, transparent);
+}
+#sidebar-settings-overlay[data-page="general"] .st-card[data-page="general"],
+#sidebar-settings-overlay[data-page="appearance"] .st-card[data-page="appearance"],
+#sidebar-settings-overlay[data-page="effects"] .st-card[data-page="effects"],
+#sidebar-settings-overlay[data-page="models"] .st-card[data-page="models"]{display:flex;}
+.st-card-h{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:22px;}
+.st-card-t{font-size:13px;font-weight:700;color:var(--text);}
+.st-note{font-size:11px;line-height:1.55;color:var(--subtext);margin:0;}
+.st-lbl{font-size:11px;font-weight:600;color:var(--subtext);}
+.st-sw{display:inline-flex;align-items:center;gap:8px;font-size:11.5px;color:var(--subtext);cursor:pointer;user-select:none;}
+.st-dialog .btn-row{gap:8px;}
+.st-dialog .btn-row .ghost-btn{font-size:12px;height:34px;}
+.st-dialog select,.st-dialog input[type="text"],.st-dialog input:not([type]),.st-dialog input[list]{height:34px;font-size:12px;}
+.st-dialog input[type="range"]{width:100%;accent-color:var(--accent);}
+.st-slider{display:grid;grid-template-columns:104px 1fr;align-items:center;gap:12px;}
+.st-chips{display:flex;flex-wrap:wrap;gap:8px;}
+.st-chip{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;border:1px solid var(--border2);
+  font-size:11.5px;color:var(--subtext);background:var(--surface);cursor:pointer;user-select:none;}
+.st-colors{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;}
+.st-color{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:12px;border:1px solid var(--border2);
+  background:var(--surface);font-size:11.5px;color:var(--subtext);cursor:pointer;}
+.st-color input[type="color"]{width:26px;height:26px;padding:0;border:none;background:none;cursor:pointer;flex:0 0 auto;}
+.st-color input[type="color"]::-webkit-color-swatch-wrapper{padding:0;}
+.st-color input[type="color"]::-webkit-color-swatch{border:1px solid var(--border2);border-radius:50%;}
+.st-foot{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:12px 18px;border-top:1px solid var(--border2);}
+.st-foot #settings-status{flex:1;min-width:0;font-size:11px;color:var(--subtext);}
+.st-foot .ghost-btn,.st-foot .btn{height:34px;padding:0 18px;font-size:12px;}
+@media (max-width:660px){
+  #sidebar-settings-overlay{padding:10px;}
+  .st-nav{flex-basis:54px;padding:10px 6px;}
+  .st-nav button{justify-content:center;padding:0;}
+  .st-nav button span{display:none;}
+  .st-slider{grid-template-columns:1fr;gap:4px;}
+}
 .section-label{font-size:9px;font-weight:700;color:var(--subtext);letter-spacing:.5px;}
 .hdr-row{display:flex;align-items:center;justify-content:space-between;}
 select, .btn, .ghost-btn{
@@ -6701,6 +7333,17 @@ body.render-surface-active #settings-panel-toggle .ghost-btn{
 .md-seg button{border:0;background:transparent;color:var(--subtext);font-size:11px;padding:3px 11px;border-radius:12px;cursor:pointer;}
 .md-seg button.active{background:var(--accent);color:#04121f;}
 #midumdocs-frame{flex:1;width:100%;height:100%;border:none;background:transparent;}
+#midumdocs-full.active{color:var(--accent);}
+/* Full screen hides the app's own bars (brand / tab bar and the chat-switching tab strip) and grows the content area to the whole
+   window. The MidumDocs header stays visible, with every option (layout switch, recompile, save PDF / .tex, close); its full screen
+   button turns into the exit button in the same spot. */
+body.midumdocs-full #topbar-wrap{display:none;}
+body.midumdocs-full #conv-tabbar-row{display:none !important;}      /* the chat-switching tab strip too */
+body.midumdocs-full #content{top:0;height:100%;}
+#midumdocs-hot{display:none !important;}
+/* Opening / closing MidumDocs and entering / leaving full screen snap in a single step: the 0.28 s slide made the editor frame
+   resize on every animation frame, so its pages were laid out and redrawn repeatedly mid transition (visible as flashing). */
+body.md-snap .pane-wrap{transition:none !important;}
 body.midumdocs-active #sidebar-toggle{opacity:1;}
 
 /* Chat bubbles */
@@ -6869,40 +7512,26 @@ div.code-area.log-view{
 
 /* status dots */
 .tg-dot,.tc-dot{
+  --dot-c:var(--green);
   width:7px;height:7px;border-radius:50%;flex:0 0 auto;
-  background:color-mix(in srgb, var(--green) 78%, transparent);
-  transition:background .2s;
+  background:color-mix(in srgb, var(--dot-c) 85%, transparent);
+  box-shadow:0 0 5px 1px color-mix(in srgb, var(--dot-c) 65%, transparent), 0 0 11px 2px color-mix(in srgb, var(--dot-c) 28%, transparent);
+  transition:background .2s, box-shadow .2s;
 }
-/* Active (running) state: the status dot becomes the orbit spinner. Every
-   length of the original 70px loader is expressed in --u (= size / 70) so it
-   scales cleanly down to pill size. */
+/* Active (running) state: the status dot becomes the particle-network AI
+   spinner (a <canvas class="ai-spin"> driven by AiSpinner in the script
+   below). The canvas is hidden unless the group is live / the call is
+   pending, where it replaces the plain dot. */
+.tg-dot .ai-spin,.tc-dot .ai-spin,#status-dot .ai-spin{display:none;width:100%;height:100%;pointer-events:none;}
 .tool-group.live .tg-dot,.tc.pending .tc-dot{
-  --sz:24px;--u:calc(var(--sz) / 70);
-  width:var(--sz);height:var(--sz);border-radius:0;position:relative;
-  background:
-    radial-gradient(farthest-side,lightskyblue 90%,#0000) center/calc(16 * var(--u)) calc(16 * var(--u)),
-    radial-gradient(farthest-side,green   90%,#0000) bottom/calc(12 * var(--u)) calc(12 * var(--u));
-  background-repeat:no-repeat;
-  animation:l17 1s infinite linear;
+  --sz:30px;
+  width:var(--sz);height:var(--sz);border-radius:0;position:relative;background:none;box-shadow:none;
 }
-.tc.pending .tc-dot{--sz:20px;}
-.tool-group.live .tg-dot::before,.tc.pending .tc-dot::before{
-  content:"";
-  position:absolute;
-  width:calc(8 * var(--u));
-  aspect-ratio:1;
-  inset:auto 0 calc(16 * var(--u));
-  margin:auto;
-  background:#ccc;
-  border-radius:50%;
-  transform-origin:50% calc(100% + 10 * var(--u));
-  animation:inherit;
-  animation-duration:.5s;
-}
-@keyframes l17{ 100%{transform:rotate(1turn)} }
-.tool-group.has-err:not(.live) .tg-dot{background:var(--yellow);}
-.tc.err .tc-dot{background:var(--red);}
-.tc.stale .tc-dot{background:var(--muted);}
+.tc.pending .tc-dot{--sz:24px;}
+.tool-group.live .tg-dot .ai-spin,.tc.pending .tc-dot .ai-spin,#status-row.status-busy #status-dot .ai-spin{display:block;}
+.tool-group.has-err:not(.live) .tg-dot{--dot-c:var(--yellow);background:var(--yellow);}
+.tc.err .tc-dot{--dot-c:var(--red);background:var(--red);}
+.tc.stale .tc-dot{--dot-c:var(--muted);background:var(--muted);box-shadow:0 0 4px 1px color-mix(in srgb, var(--muted) 40%, transparent);}
 /* soft light sweep while the group is still working */
 .tool-group.live .tg-pill{border-color:color-mix(in srgb, var(--accent) 34%, var(--border2));}
 .tool-group.live .tg-pill::after{
@@ -7408,6 +8037,227 @@ textarea.code-area{
 </style>
 </head>
 <body>
+<!-- ── Startup splash: animated silk-wave field + a random quote. Covers the app (below the titlebar, so the
+     window controls stay usable) until boot finishes, then fades out. See window.__midumSplashReady in the boot block. -->
+<style>
+#midum-splash{position:fixed;left:0;right:0;bottom:0;top:var(--titlebar-h,36px);z-index:100000;background:#030305;overflow:hidden;opacity:1;transition:opacity 1s cubic-bezier(.4,0,.2,1);}
+#midum-splash.ms-out{opacity:0;pointer-events:none;}
+#midum-splash.ms-gone{display:none;}
+#ms-canvas{position:absolute;inset:0;width:100%;height:100%;display:block;}
+#ms-veil{position:absolute;inset:0;pointer-events:none;background:radial-gradient(ellipse 62% 40% at 50% 50%,rgba(0,0,0,.66) 0%,rgba(0,0,0,0) 100%);}
+#ms-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 6vw;text-align:center;transition:transform 1s cubic-bezier(.4,0,.2,1),filter 1s cubic-bezier(.4,0,.2,1);}
+#midum-splash.ms-out #ms-center{transform:scale(1.03);}
+#ms-quote{font-family:"Cormorant Garamond","Didot","Bodoni MT","Palatino Linotype","Book Antiqua",Georgia,serif;font-weight:400;font-size:clamp(28px,3.5vw,56px);line-height:1.14;letter-spacing:.012em;color:#f6f6f4;max-width:88vw;}
+.ms-line{display:block;}
+.ms-w{display:inline-block;opacity:0;transform:translateY(12px);animation:msWord 1.6s cubic-bezier(.22,.8,.24,1) forwards;will-change:opacity,transform;}
+.ms-line.ms-w{display:block;}
+@keyframes msWord{to{opacity:1;transform:none;}}
+@keyframes msFade{to{opacity:1;}}
+@keyframes msDraw{to{transform:scaleX(1);}}
+@keyframes msDia{to{opacity:1;transform:scale(1);}}
+#ms-rule{display:flex;align-items:center;justify-content:center;margin-top:clamp(22px,3.4vh,42px);width:min(46vw,640px);}
+.ms-ln{flex:1;height:1px;transform:scaleX(0);animation:msDraw 1.3s cubic-bezier(.65,0,.25,1) forwards;}
+.ms-ln.l{background:linear-gradient(90deg,rgba(255,255,255,0),rgba(255,255,255,.95));transform-origin:right center;}
+.ms-ln.r{background:linear-gradient(270deg,rgba(255,255,255,0),rgba(255,255,255,.95));transform-origin:left center;}
+#ms-dia{width:14px;height:26px;flex:0 0 auto;margin:0 -1px;opacity:0;transform:scale(.2);animation:msDia .9s cubic-bezier(.22,.8,.24,1) forwards;}
+#ms-brand{position:absolute;left:0;right:0;bottom:5.5vh;text-align:center;padding-left:.55em;font:600 11px/1 system-ui,"Segoe UI",sans-serif;letter-spacing:.55em;text-transform:uppercase;color:rgba(255,255,255,.4);opacity:0;animation:msFade 1.4s ease 1.6s forwards;}
+@media (prefers-reduced-motion:reduce){
+  .ms-w{animation:none;opacity:1;filter:none;transform:none;}
+  .ms-ln{animation:none;transform:none;}
+  #ms-dia{animation:none;opacity:1;transform:none;}
+  #ms-brand{animation:none;opacity:1;}
+}
+</style>
+<div id="midum-splash" aria-hidden="true">
+  <canvas id="ms-canvas"></canvas>
+  <div id="ms-veil"></div>
+  <div id="ms-center">
+    <div id="ms-quote"></div>
+    <div id="ms-rule">
+      <span class="ms-ln l"></span>
+      <svg id="ms-dia" viewBox="0 0 28 52"><polygon points="14,0 28,26 14,52 0,26" fill="#fff"/></svg>
+      <span class="ms-ln r"></span>
+    </div>
+  </div>
+  <div id="ms-brand">Midum</div>
+</div>
+<script>
+(function(){
+  var root = document.getElementById("midum-splash");
+  if (!root) return;
+  var QUOTES = [
+    "The universe is full of unanswered questions. Go find one.",
+    "Every great discovery begins with a curious mind.",
+    "Never underestimate what a curious mind can uncover.",
+    "There is always something new to learn. Always.",
+    "The best ideas often begin with a simple “what if”.",
+    "Stay curious. The world has not run out of wonders.",
+    "Every question is a door. Some lead to extraordinary places.",
+    "Keep exploring. Familiarity is not the same as understanding.",
+    "There is more to discover than there is time to wonder.",
+    "Let curiosity take the lead. See where it takes you.",
+    "The limits of yesterday are not the limits of tomorrow.",
+    "Imagine beyond what exists. Then make it real.",
+    "Every creation begins as something that exists only in a mind.",
+    "You don’t need permission to imagine something extraordinary.",
+    "The world changes when someone decides to build something new.",
+    "Think differently. The obvious answer isn’t always the interesting one.",
+    "A blank page isn’t empty. It’s full of possibilities.",
+    "Don’t just follow possibilities. Create new ones.",
+    "The future belongs to those who dare to imagine it.",
+    "Your next great idea might be one thought away.",
+    "One small step is still a step forward.",
+    "Progress doesn’t need to be spectacular to be meaningful.",
+    "Keep going. Great things take their time.",
+    "Every attempt teaches you something. Make it count.",
+    "You don’t have to see the whole staircase. Just take the next step.",
+    "Mistakes are not the opposite of progress. They are part of it.",
+    "Build patiently. Excellence is rarely accidental.",
+    "A difficult beginning does not make an impossible ending.",
+    "Keep refining, keep learning, keep creating.",
+    "The distance between an idea and reality is crossed one decision at a time.",
+    "Make something that matters. Even if it matters to just one person.",
+    "Your time is an opportunity. Spend it on something meaningful.",
+    "The world needs more thoughtful creators.",
+    "Intelligence is powerful. What you do with it matters more.",
+    "Never let convenience replace curiosity.",
+    "Build a future worth looking forward to.",
+    "Leave things a little better than you found them.",
+    "The greatest achievements begin with someone caring enough to try.",
+    "Your perspective is unique. Don’t be afraid to use it.",
+    "Make room for wonder. Not everything needs an explanation.",
+    "Big ideas await. I have prepared absolutely nothing. Let’s begin.",
+    "The world is your canvas. I brought the tools.",
+    "Ready to make something wonderfully unnecessary?",
+    "Your imagination called. It has some ambitious plans.",
+    "Take a deep breath. The possibilities aren’t going anywhere.",
+    "Today looks like a good day to overthink something brilliant.",
+    "Go make something extraordinary. I’ll try not to distract you.",
+    "Even the most ambitious journeys begin with a single prompt.",
+    "Think big. The keyboard can handle it.",
+    "Whatever you choose to create today, make it yours."
+  ];
+
+  // Pick a random quote, never the same one twice in a row.
+  var idx = Math.floor(Math.random() * QUOTES.length);
+  try {
+    var prev = parseInt(localStorage.getItem("midum_splash_last"), 10);
+    if (QUOTES.length > 1 && idx === prev) idx = (prev + 1 + Math.floor(Math.random() * (QUOTES.length - 1))) % QUOTES.length;
+    localStorage.setItem("midum_splash_last", String(idx));
+  } catch (e) { /* storage unavailable -- plain random is fine */ }
+  var quote = QUOTES[idx];
+
+  // Break into two balanced lines (preferring sentence / comma boundaries), like the reference image.
+  function splitQuote(q){
+    if (q.length < 34) return [q];
+    var words = q.split(" "), mid = q.length / 2, pos = 0, best = 0, bestScore = 1e9;
+    for (var i = 0; i < words.length - 1; i++){
+      pos += words[i].length + 1;
+      var last = words[i].charAt(words[i].length - 1), bonus = 0;
+      if (last === "." || last === "?" || last === "!") bonus = -10; else if (last === ",") bonus = -6;
+      var score = Math.abs(pos - mid) + bonus;
+      if (score < bestScore){ bestScore = score; best = i; }
+    }
+    return [words.slice(0, best + 1).join(" "), words.slice(best + 1).join(" ")];
+  }
+
+  var qEl = document.getElementById("ms-quote"), n = 0, D0 = 0.5, STEP = 0.5;
+  splitQuote(quote).forEach(function(line){
+    var lineEl = document.createElement("div");
+    lineEl.className = "ms-line ms-w";
+    lineEl.textContent = line;
+    lineEl.style.animationDelay = (D0 + n * STEP).toFixed(3) + "s";
+    n++;
+    qEl.appendChild(lineEl);
+  });
+  var ruleDelay = D0 + n * STEP + 0.35;
+  root.querySelectorAll(".ms-ln").forEach(function(el){ el.style.animationDelay = ruleDelay.toFixed(3) + "s"; });
+  document.getElementById("ms-dia").style.animationDelay = (ruleDelay + 0.45).toFixed(3) + "s";
+
+  // ── Silk-wave field (same animation as the saved "Midum Silk Waves" Dynamic Background) ──
+  var canvas = document.getElementById("ms-canvas"), ctx = canvas.getContext("2d");
+  var w = 0, h = 0, grad = null, vig = null, glow = null, N = 44, SEG = 56, INTENSITY = 1.15;
+  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  function resize(){
+    var dpr = 1;
+    w = root.clientWidth || window.innerWidth; h = root.clientHeight || window.innerHeight;
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    grad = ctx.createLinearGradient(0, 0, w, 0);
+    grad.addColorStop(0, "rgba(255,255,255,0.35)");
+    grad.addColorStop(0.5, "rgba(255,255,255,1)");
+    grad.addColorStop(1, "rgba(255,255,255,0.55)");
+    vig = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.2, w / 2, h / 2, Math.max(w, h) * 0.75);
+    vig.addColorStop(0, "rgba(0,0,0,0)");
+    vig.addColorStop(1, "rgba(0,0,0,0.7)");
+    glow = ctx.createRadialGradient(0, h * 0.84, 0, 0, h * 0.84, w * 0.36);
+    glow.addColorStop(0, "rgba(255,255,255,0.10)");
+    glow.addColorStop(1, "rgba(255,255,255,0)");
+  }
+  function draw(t){
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#030305"; ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = glow; ctx.fillRect(0, 0, w, h);
+    var A1 = h * 0.07, A2 = h * 0.11, slope = -0.17;
+    ctx.lineWidth = 1; ctx.strokeStyle = '#fff';
+    for (var i = 0; i < N; i++){
+      var y0 = (i / (N - 1)) * (h * 1.6) - h * 0.25;
+      ctx.globalAlpha = (0.03 + 0.055 * (0.5 + 0.5 * Math.sin(i * 0.31 + t * 0.4))) * INTENSITY * 1.6;
+      ctx.beginPath();
+      for (var x = -SEG; x <= w + SEG; x += SEG){
+        var y = y0 + slope * (x - w / 2)
+              + A1 * Math.sin(x * 0.0042 + t * 0.35 + i * 0.045)
+              + A2 * Math.sin(x * 0.0021 - t * 0.22 + i * 0.03 + 1.7);
+        if (x === -SEG) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1; ctx.fillStyle = vig; ctx.fillRect(0, 0, w, h);
+  }
+  var raf = 0, lastT = 0, waveT0 = 0, t0 = performance.now();
+  function frame(now){
+    raf = requestAnimationFrame(frame);
+    if (now - lastT < 42) return;
+    lastT = now;
+    draw(4 + (now - waveT0) / 1000);
+  }
+  resize();
+  window.addEventListener("resize", function(){ resize(); if (reduce) draw(4); });
+  // Waves drift from the very first frame (they freeze when the intro ends so boot gets the CPU).
+  draw(4);
+  if (!reduce){
+    waveT0 = performance.now();
+    raf = requestAnimationFrame(frame);
+  }
+
+  // ── Lifecycle: stay up for a minimum time, then fade once the app has finished booting ──
+  var MIN_MS = 4600, MAX_MS = 25000, bootDone = false, closed = false, introDone = false, gateRes = null;
+  // The app's boot code awaits this gate, so none of Midum's startup work runs until the intro has played out.
+  window.__midumSplashGate = new Promise(function(res){ gateRes = res; });
+  function finishIntro(){
+    if (introDone) return;
+    introDone = true;
+    cancelAnimationFrame(raf);   // freeze the waves so the boot work gets the whole CPU
+    if (gateRes) gateRes();
+  }
+  setTimeout(finishIntro, MIN_MS);
+  function close(){
+    if (closed || !introDone) return;
+    closed = true;
+    root.classList.add("ms-out");
+    setTimeout(function(){ root.classList.add("ms-gone"); cancelAnimationFrame(raf); }, 1100);
+  }
+  function tryClose(){
+    if (closed || !bootDone) return;
+    var el = performance.now() - t0;
+    if (el >= MIN_MS) close(); else setTimeout(tryClose, MIN_MS - el);
+  }
+  window.__midumSplashReady = function(){ bootDone = true; tryClose(); };
+  setTimeout(function(){ finishIntro(); bootDone = true; tryClose(); }, MAX_MS);   // failsafe: never trap the user behind the splash
+  root.addEventListener("click", function(){ if (bootDone && performance.now() - t0 > 1500) close(); });
+  document.addEventListener("keydown", function(e){ if (!closed && bootDone && (e.key === "Escape" || e.key === "Enter" || e.key === " ")) close(); });
+})();
+</script>
 <div id="app-titlebar">
   <div id="titlebar-left">
     <span id="titlebar-chat-title">Untitled chat</span>
@@ -7440,6 +8290,8 @@ textarea.code-area{
 <div id="root">
 
   <div id="bg-image-layer"></div>
+
+  <div id="dyn-bg-layer"><iframe id="dyn-bg-frame" sandbox="allow-scripts" tabindex="-1" aria-hidden="true" allowtransparency="true"></iframe></div>
 
   <div id="blob-layer">
     <div class="blob" id="blob-center"></div>
@@ -7479,9 +8331,10 @@ textarea.code-area{
           style="position:absolute;top:52px;right:10px;z-index:5;"><svg class="ic ic-image" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></button>
         <button class="icon-btn" id="reopen-midumdocs-btn" title="Open MidumDocs (LaTeX editor)"
           style="position:absolute;top:94px;right:10px;z-index:5;"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg></button>
+        <div id="welcome-greet" aria-live="polite"></div>
         <div id="chat-scroll"><div id="chat-col"></div></div>
         <div id="input-row">
-          <div style="width:100%;max-width:760px;position:relative;">
+          <div id="input-wrap" style="width:100%;max-width:760px;position:relative;">
             <div id="kb-only-badge"><span><svg class="ic ic-lock" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span><span id="kb-only-badge-text">KB Only — internet disabled, answering from selected PDF sources</span></div>
             <div id="kb-explain-actions-row" style="display:none;gap:6px;margin-bottom:8px;">
               <button id="kb-next-part-btn" style="flex:1;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;">Next Part <svg class="ic ic-arrow-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M12 5l7 7-7 7"/></svg></button>
@@ -7508,6 +8361,36 @@ textarea.code-area{
               </div>
               <button id="kb-start-explanation-btn" style="display:none;width:100%;margin-top:8px;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;"><svg class="ic ic-play ic-fill" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4l14 8-14 8z"/></svg> Start Explanation</button>
               <div class="kb-only-hint" id="kb-explain-hint" style="display:none;">Walks through the selected source(s) part by part (one sub-sub-heading per response) — say "next" to continue.</div>
+            </div>
+            <style>
+              #vo-player{display:none;align-items:center;gap:10px;margin:0 0 8px;padding:7px 8px 7px 8px;border:1px solid var(--border2);border-radius:16px;background:var(--surface2);color:var(--text);font-size:12px;}
+              #vo-player.show{display:flex;}
+              #vo-play{flex:0 0 auto;width:32px;height:32px;border-radius:50%;border:none;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0;}
+              #vo-play svg{width:14px;height:14px;}
+              #vo-play .vo-i-pause{display:none;}
+              #vo-player.playing #vo-play .vo-i-play{display:none;}
+              #vo-player.playing #vo-play .vo-i-pause{display:block;}
+              #vo-main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:6px;}
+              #vo-top{display:flex;align-items:baseline;gap:8px;min-width:0;}
+              #vo-title{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;}
+              #vo-tag{flex:0 0 auto;font-size:10px;opacity:.65;text-transform:uppercase;letter-spacing:.04em;}
+              #vo-time{flex:0 0 auto;margin-left:auto;font-variant-numeric:tabular-nums;opacity:.75;}
+              #vo-bar{position:relative;height:14px;display:flex;align-items:center;cursor:pointer;touch-action:none;}
+              #vo-bar::before{content:"";position:absolute;left:0;right:0;height:4px;border-radius:2px;background:var(--border2);}
+              #vo-fill{position:absolute;left:0;height:4px;width:100%;border-radius:2px;background:var(--accent);transform-origin:left center;transform:scaleX(0);}
+              #vo-player .icon-btn{flex:0 0 auto;}
+            </style>
+            <div id="vo-player" role="group" aria-label="Voiceover player">
+              <button id="vo-play" title="Play / pause" aria-label="Play or pause voiceover">
+                <svg class="vo-i-play" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+                <svg class="vo-i-pause" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>
+              </button>
+              <div id="vo-main">
+                <div id="vo-top"><span id="vo-title"></span><span id="vo-tag"></span><span id="vo-time">0:00 / 0:00</span></div>
+                <div id="vo-bar" title="Seek"><div id="vo-fill"></div></div>
+              </div>
+              <button class="icon-btn" id="vo-save" title="Save this version as .wav"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/></svg></button>
+              <button class="icon-btn" id="vo-hide" title="Hide player (the clip stays in memory and returns on the next change)"><svg class="ic ic-x" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
             </div>
             <div id="input-box">
               <button class="icon-btn" id="kb-toggle-btn" title="Knowledge Base options"><svg class="ic ic-chevron-down" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
@@ -7539,6 +8422,7 @@ textarea.code-area{
 
     <div class="pane-wrap pane-hidden" id="midumdocs-pane-wrap">
       <div class="pane" id="midumdocs-pane">
+        <div id="midumdocs-hot"></div>
         <div id="midumdocs-header">
           <span id="midumdocs-title">MidumDoc</span>
           <span class="md-status" id="midumdocs-status"><i></i><span id="midumdocs-status-text"></span></span>
@@ -7546,6 +8430,7 @@ textarea.code-area{
           <button class="icon-btn" id="midumdocs-recompile" title="Recompile (Shift = clean rebuild)"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg></button>
           <button class="icon-btn" id="midumdocs-pdf" title="Save as PDF"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></button>
           <button class="icon-btn" id="midumdocs-tex" title="Save .tex source"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg></button>
+          <button class="icon-btn" id="midumdocs-full" title="Full screen (F11)"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg></button>
           <button class="icon-btn" id="midumdocs-close" title="Close"><svg class="ic ic-x" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
         </div>
         <iframe id="midumdocs-frame" sandbox="allow-scripts allow-same-origin allow-forms allow-modals" referrerpolicy="no-referrer"></iframe>
@@ -7576,6 +8461,7 @@ let state = {
   sidebarOpen: false,
   renderSurfaceOpen: false,
   midumDocOpen: false,
+  midumDocFull: false,
   thinking: false,
   kbOnly: false,
   kbSources: [],
@@ -8141,6 +9027,13 @@ async function _loadCapabilityLevel(){
   } else if (root === "kbs"){
     const items = await api("list_kbs_capability");
     capabilityPicker.entries = (items || []).map(i=>({ label: i.name, desc: i.desc, icon: "book-open", is_leaf: true }));
+  } else if (root === "midumdocs" || root === "artifacts"){
+    // Saved MidumDocs and Artifacts from every chat, listed separately. `insert` is the bare name, or the id when
+    // two items share a name, so the model can always resolve what was picked.
+    const items = await api(root === "midumdocs" ? "list_midumdocs_capability" : "list_artifacts_capability");
+    capabilityPicker.entries = (items || []).map(i=>({
+      label: i.name, desc: i.desc, insert: i.insert, icon: root === "midumdocs" ? "file-text" : "package", is_leaf: true,
+    }));
   } else {
     capabilityPicker.entries = [];
   }
@@ -8228,7 +9121,7 @@ function _activateCapabilityPickerRow(drillOnly, index){
   if (!entry.is_leaf){
     _drillIntoCapabilityPicker(entry);
   } else {
-    insertCapabilityPickerResult(entry.label);
+    insertCapabilityPickerResult(entry.insert || entry.label);
   }
 }
 
@@ -8342,6 +9235,7 @@ function targetGeo(){
   // visible and usable while it's open. Tool/sidebar panes collapse to 0
   // width while it's active (they're also dimmed via body.render-
   // surface-active, see CSS) so nothing fights the surface for space.
+  if (state.midumDocOpen && state.midumDocFull) return {tool:[0,0], chat:[0,0], side:[100,0], render:[100,0], docs:[0,100]};   // MidumDocs full screen
   if (state.midumDocOpen)        return {tool:[0,0], chat:[0,38], side:[100,0], render:[100,0], docs:[38,62]};
   if (showRender)                return {tool:[0,0], chat:[0,50], side:[100,0], render:[50,50]};
   if (showTool && showSide)      return isFlows ? {tool:[0,55], chat:[55,25], side:[80,20], render:[100,0]} : {tool:[0,30], chat:[30,50], side:[80,20], render:[100,0]};
@@ -8363,6 +9257,7 @@ function applyLayout(){
   if (renderWrap){ renderWrap.style.left = g.render[0]+"%"; renderWrap.style.width = g.render[1]+"%"; }
 
   toolWrap.classList.toggle("pane-hidden", g.tool[1] === 0);
+  chatWrap.classList.toggle("pane-hidden", g.chat[1] === 0);        // only ever 0 in MidumDocs full screen
   sideWrap.classList.toggle("pane-hidden", g.side[1] === 0);
   if (renderWrap) renderWrap.classList.toggle("pane-hidden", g.render[1] === 0);
   const docsWrap = document.getElementById("midumdocs-pane-wrap");
@@ -8461,7 +9356,17 @@ const MIDUM_BRIDGE_SCRIPT = `<scr` + `ipt>
 // Python (Api.midumdocs_*). The iframe is kept loaded after closing so reopening is instant and the engine stays warm.
 let _mdReady = false, _mdPendingInit = null, _mdMode = "split", _mdDoc = null, _mdThemeTimer = null;
 const _MD_THEME_VARS = ["--bg","--panel","--surface","--surface2","--border2","--accent","--accent-faint","--text","--subtext","--muted","--red","--green","--yellow"];
-function _mdTheme(){ const cs = getComputedStyle(document.documentElement), v = {}; _MD_THEME_VARS.forEach(k=>{ const x = cs.getPropertyValue(k).trim(); if (x) v[k] = x; }); return v; }
+function _mdTheme(){ const cs = getComputedStyle(document.documentElement), v = {}; _MD_THEME_VARS.forEach(k=>{ const x = cs.getPropertyValue(k).trim(); if (x) v[k] = x; }); return Object.assign(v, _glassThemeVars()); }
+// Glass Surfaces state for the iframe pages (MidumDocs + Editor). They are separate documents, so they can't see
+// html.liquid-glass-on -- instead the state rides along with the theme vars (the --mz-* keys are control values, not
+// CSS: the pages read them, turn their own surfaces translucent, and never apply them as styles).
+function _glassThemeVars(){
+  return {
+    "--mz-glass-on": document.documentElement.classList.contains("liquid-glass-on") ? "1" : "0",
+    "--mz-glass-pct": String(typeof _glassOpacity === "number" ? _glassOpacity : 55),
+    "--mz-glass-sheen": (typeof _glassSheenEnabled === "boolean" ? _glassSheenEnabled : true) ? "1" : "0"
+  };
+}
 function _mdPost(msg){ const f = document.getElementById("midumdocs-frame"); if (f && f.contentWindow) f.contentWindow.postMessage(msg, "*"); }
 function _mdBusy(v){ _mdPost({md:"busy", value:!!v}); }
 function _mdStatus(m){
@@ -8469,7 +9374,13 @@ function _mdStatus(m){
   el.className = "md-status " + (m.kind === "ok" ? "ok" : m.kind === "error" ? "error" : "compiling");
   document.getElementById("midumdocs-status-text").textContent = m.text || "";
 }
-function _mdSendInit(){ if (!_mdPendingInit) return; _mdPost({md:"init", doc:_mdPendingInit, theme:_mdTheme(), mode:_mdMode}); _mdPendingInit = null; }
+async function _mdSendInit(){
+  if (!_mdPendingInit) return;
+  const doc = _mdPendingInit; _mdPendingInit = null;
+  let prefs = {};
+  try { const r = await api("midumdocs_get_prefs"); if (r && r.ok) prefs = r.prefs || {}; } catch (e) { /* defaults */ }
+  _mdPost({md:"init", doc:doc, theme:_mdTheme(), mode:_mdMode, prefs:prefs});
+}
 async function openMidumDoc(doc){
   if (state.renderSurfaceOpen) closeRenderSurfaceUI();
   _mdDoc = doc; _mdPendingInit = doc;
@@ -8481,14 +9392,42 @@ async function openMidumDoc(doc){
     _mdReady = false; frame.setAttribute("src", info.url);
   }
   state.midumDocOpen = true;
+  _mdSnap();
   document.body.classList.add("midumdocs-active");
   applyLayout();
   if (_mdReady) _mdSendInit();
 }
 function updateMidumDoc(payload){ if (state.midumDocOpen && _mdDoc && payload && payload.id === _mdDoc.id) _mdPost(Object.assign({md:"doc_changed"}, payload)); }
+let _mdSnapT = null;
+function _mdSnap(){
+  document.body.classList.add("md-snap"); clearTimeout(_mdSnapT);
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{ _mdSnapT = setTimeout(()=>document.body.classList.remove("md-snap"), 80); }));
+}
+const _MD_SVG_EXPAND = '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
+const _MD_SVG_COMPRESS = '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>';
+function _mdFullIcon(){
+  const b = document.getElementById("midumdocs-full"); if (!b) return;
+  const v = !!state.midumDocFull;
+  b.title = v ? "Exit full screen (Esc or F11)" : "Full screen (F11)"; b.classList.toggle("active", v);
+  b.innerHTML = v ? _MD_SVG_COMPRESS : _MD_SVG_EXPAND;
+}
+// Full screen: the MidumDocs pane takes the whole window (chat collapses). Editing, Custom pages, the Source / Split / Page
+// layouts and the in-page "Ask Midum" box all live in the same iframe, so they keep working; the model's reply still arrives
+// as a normal chat turn and its edits appear live in the document.
+function _mdSetFull(v){
+  v = !!v && !!state.midumDocOpen;
+  if (!!state.midumDocFull === v) return;
+  state.midumDocFull = v;
+  _mdSnap();
+  document.body.classList.toggle("midumdocs-full", v);
+  _mdFullIcon();
+  applyLayout();
+}
 function closeMidumDocUI(){
   if (!state.midumDocOpen) return;
   state.midumDocOpen = false;
+  _mdSnap();
+  state.midumDocFull = false; document.body.classList.remove("midumdocs-full"); _mdFullIcon();
   document.body.classList.remove("midumdocs-active");
   applyLayout();
 }
@@ -8505,6 +9444,8 @@ window.addEventListener("message", (e)=>{
   else if (m.md === "make_copy"){ api("midumdocs_make_copy", m.id); }
   else if (m.md === "export"){ api("midumdocs_export", m.kind, m.name, m.kind === "pdf" ? m.b64 : m.text); }
   else if (m.md === "status"){ _mdStatus(m); }
+  else if (m.md === "toggle_full"){ _mdSetFull(!state.midumDocFull); }
+  else if (m.md === "pref"){ api("midumdocs_set_pref", m.key, m.value); }
 });
 new MutationObserver(()=>{ clearTimeout(_mdThemeTimer); _mdThemeTimer = setTimeout(()=>{ if (state.midumDocOpen) _mdPost({md:"theme", vars:_mdTheme()}); }, 250); })
   .observe(document.documentElement, {attributes:true, attributeFilter:["class","style","data-theme"]});
@@ -8668,12 +9609,14 @@ function setViewingAgentTab(agentName){
     input.placeholder = agentName ? `Viewing "${agentName}" \u2014 read-only` : "Message Midum...";
   }
   if (btn) btn.disabled = !!agentName;
+  try { welcomeEval(); } catch (e) {}
 }
 
 async function newConvTab(){
   const r = await api("new_conversation_tab");
   if (!r.ok){ showAlert(r.error, "Error"); return; }
   clearChat();
+  welcomeNewChat();
   applyKbState(r.kb_state);
   setViewingAgentTab(null);
   await buildConversationTabs();
@@ -9538,6 +10481,187 @@ function _tgDuration(ms){
   return (ms < 10000 ? (ms / 1000).toFixed(1) : Math.round(ms / 1000)) + "s";
 }
 
+// ── Particle-network AI spinner ──────────────────────────────────────────
+// Replaces the old three-body CSS orbit loader. One <canvas class="ai-spin">
+// is attached to a status dot only while it is active (live group / pending
+// call). A single shared rAF loop steps every active spinner and stops itself
+// once none are left. World space is the original 220x220 design; only the
+// central SPAN x SPAN window is drawn, scaled to the dot's pixel size, with
+// minimum particle / line sizes so it stays legible at pill scale.
+const AiSpinner = (function(){
+  const N = 32, SIZE = 220, C = SIZE / 2, SPAN = 120;
+  const PHASE_MS = [3500, 5000, 3000, 3000];
+  const COLORS = ["#8b5cf6", "#06b6d4", "#ec4899", "#10b981"];
+  const GLOWS = ["139,92,246", "6,182,212", "236,72,153", "16,185,129"];
+  const active = new Set();
+  let raf = null;
+
+  class Particle {
+    constructor(id){
+      this.id = id;
+      this.x = C + (Math.random() - 0.5) * 60;
+      this.y = C + (Math.random() - 0.5) * 60;
+      this.vx = (Math.random() - 0.5) * 1;
+      this.vy = (Math.random() - 0.5) * 1;
+      this.radius = Math.random() * 2 + 1.5;
+      this.baseAngle = (id / N) * Math.PI * 2;
+      this.orbitRadius = 25 + Math.random() * 25;
+      this.speed = 0.03 + Math.random() * 0.02;
+      this.color = COLORS[0];
+    }
+    update(phase, time, sub){
+      this.color = COLORS[phase];
+      if (phase === 0){
+        this.vx += (Math.random() - 0.5) * 0.3;
+        this.vy += (Math.random() - 0.5) * 0.3;
+        this.vx *= 0.92; this.vy *= 0.92;
+        this.x += this.vx; this.y += this.vy;
+        const dx = C - this.x, dy = C - this.y;
+        if (Math.sqrt(dx * dx + dy * dy) > 35){ this.x += dx * 0.03; this.y += dy * 0.03; }
+      } else if (phase === 1){
+        const subCycle = Math.floor(sub / 1200) % 4;
+        let tx = C, ty = C;
+        const r = 30;
+        if (subCycle === 0){
+          const angle = (this.id / N) * Math.PI * 2 + (time * 0.001);
+          const tAngle = Math.floor(this.id / (N / 3)) * ((Math.PI * 2) / 3) + (time * 0.001);
+          tx = C + Math.cos(tAngle) * r + Math.cos(angle) * 6;
+          ty = C + Math.sin(tAngle) * r + Math.sin(angle) * 6;
+        } else if (subCycle === 1){
+          const cols = 6, row = Math.floor(this.id / cols), col = this.id % cols;
+          tx = C - 30 + col * 12;
+          ty = C - 30 + row * 12;
+        } else if (subCycle === 2){
+          const hAngle = (this.id / N) * Math.PI * 2;
+          const hR = 15 + (this.id % 2 === 0 ? 25 : 12);
+          tx = C + Math.cos(hAngle + time * 0.002) * hR;
+          ty = C + Math.sin(hAngle + time * 0.002) * hR;
+        } else {
+          const dAngle = (this.id / N) * Math.PI * 2;
+          tx = C + Math.cos(dAngle) * (18 + Math.sin(dAngle * 2) * 12);
+          ty = C + Math.sin(dAngle) * (18 + Math.cos(dAngle * 2) * 12);
+        }
+        this.x += (tx - this.x) * 0.1;
+        this.y += (ty - this.y) * 0.1;
+      } else if (phase === 2){
+        this.baseAngle += this.speed * 3;
+        const tx = C + Math.cos(this.baseAngle) * this.orbitRadius;
+        const ty = C + Math.sin(this.baseAngle) * this.orbitRadius;
+        this.x += (tx - this.x) * 0.15;
+        this.y += (ty - this.y) * 0.15;
+      } else {
+        const r = 12 + Math.sin(time * 0.006) * 6;
+        const tx = C + Math.cos(this.baseAngle) * r;
+        const ty = C + Math.sin(this.baseAngle) * r;
+        this.x += (tx - this.x) * 0.12;
+        this.y += (ty - this.y) * 0.12;
+      }
+    }
+  }
+
+  class Spin {
+    constructor(canvas, px){
+      this.canvas = canvas;
+      this.dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const bk = Math.max(16, Math.round(px * this.dpr));
+      canvas.width = bk; canvas.height = bk;
+      this.ctx = canvas.getContext("2d");
+      this.s = bk / SPAN;
+      this.born = Date.now();
+      this.phase = 0;
+      this.phaseStart = this.born;
+      this.particles = [];
+      for (let i = 0; i < N; i++) this.particles.push(new Particle(i));
+    }
+    frame(now){
+      if (now - this.phaseStart >= PHASE_MS[this.phase]){
+        this.phase = (this.phase + 1) % PHASE_MS.length;
+        this.phaseStart = now;
+      }
+      const sub = now - this.phaseStart;
+      for (const p of this.particles) p.update(this.phase, now, sub);
+      this.draw();
+    }
+    draw(){
+      const ctx = this.ctx, s = this.s, bk = this.canvas.width, ps = this.particles;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, bk, bk);
+      const o = -(C - SPAN / 2) * s;
+      ctx.setTransform(s, 0, 0, s, o, o);
+      // soft phase-coloured glow behind the particles
+      const g = ctx.createRadialGradient(C, C, 0, C, C, SPAN / 2);
+      g.addColorStop(0, "rgba(" + GLOWS[this.phase] + ",0.35)");
+      g.addColorStop(1, "rgba(" + GLOWS[this.phase] + ",0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(C - SPAN / 2, C - SPAN / 2, SPAN, SPAN);
+      // connections
+      const maxDist = 45;
+      ctx.shadowBlur = 0;
+      ctx.lineWidth = Math.max(1, (0.75 * this.dpr) / s);
+      for (let i = 0; i < ps.length; i++){
+        for (let j = i + 1; j < ps.length; j++){
+          const dx = ps[i].x - ps[j].x, dy = ps[i].y - ps[j].y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < maxDist){
+            ctx.beginPath();
+            ctx.moveTo(ps[i].x, ps[i].y);
+            ctx.lineTo(ps[j].x, ps[j].y);
+            ctx.strokeStyle = ps[i].color;
+            ctx.globalAlpha = (1 - dist / maxDist) * 0.7;
+            ctx.stroke();
+          }
+        }
+      }
+      ctx.globalAlpha = 1;
+      // particles (shadowBlur is in canvas pixels, so size it from the scale)
+      const minR = (0.95 * this.dpr) / s;
+      ctx.shadowBlur = Math.max(2 * this.dpr, 10 * s * 1.5);
+      for (const p of ps){
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, Math.max(p.radius, minR), 0, Math.PI * 2);
+        ctx.fillStyle = p.color;
+        ctx.shadowColor = p.color;
+        ctx.fill();
+      }
+      ctx.shadowBlur = 0;
+    }
+  }
+
+  function isOn(sp){
+    const host = sp.canvas.parentElement;
+    if (!host) return false;
+    if (host.id === "status-dot") return !!host.closest("#status-row.status-busy");
+    return host.classList.contains("tg-dot") ? !!host.closest(".tool-group.live")
+                                             : !!host.closest(".tc.pending");
+  }
+  function tick(){
+    raf = null;
+    const now = Date.now();
+    active.forEach(sp=>{
+      if (!sp.canvas.isConnected){ active.delete(sp); return; }
+      if (!isOn(sp)){ if (now - sp.born > 1500) active.delete(sp); return; }
+      sp.frame(now);
+    });
+    if (active.size) raf = requestAnimationFrame(tick);
+  }
+  // Adds a spinner canvas to a status dot (idempotent) and starts the loop.
+  function attach(dot, px){
+    if (!dot) return;
+    let cv = dot.querySelector("canvas.ai-spin");
+    if (!cv){
+      cv = document.createElement("canvas");
+      cv.className = "ai-spin";
+      dot.appendChild(cv);
+      cv._spin = new Spin(cv, px);
+    }
+    // re-arm: the status dot goes busy -> idle -> busy on the same canvas
+    cv._spin.born = Date.now();
+    active.add(cv._spin);
+    if (raf === null) raf = requestAnimationFrame(tick);
+  }
+  return { attach };
+})();
+
 function createToolGroup(){
   const row = document.createElement("div");
   row.className = "row tool-group";
@@ -9594,6 +10718,7 @@ function _tgLiveGroup(){
   if (!_currentToolGroup || !_currentToolGroup.isConnected){
     _currentToolGroup = createToolGroup();
     _currentToolGroup.classList.add("live");
+    AiSpinner.attach(_currentToolGroup.querySelector(".tg-dot"), 30);
     chatCol().appendChild(_currentToolGroup);
   }
   return _currentToolGroup;
@@ -9664,6 +10789,7 @@ function buildToolCallPill(info){
     };
   });
   if (info.pending){
+    AiSpinner.attach(el.querySelector(".tc-dot"), 24);
     el.dataset.t0 = String(Date.now());
     el.querySelector(".tc-preview").textContent = "running…";
     el.querySelector(".tc-call").textContent = `${info.name || "tool"}(…)`;
@@ -10119,6 +11245,146 @@ function clearChat(){
   try { attRestoreForTab().catch(()=>{}); } catch (e) {}
 }
 
+// ── New-chat welcome screen ------------------------------------------------
+// Whenever #chat-col is empty (fresh tab, New Chat, or an empty chat), the
+// prompt box floats to just below the vertical centre with a big greeting
+// above it. The first message makes #chat-col non-empty, which drops the
+// "welcome" class so the box glides down to its normal spot (CSS transition).
+const WELCOME_QUOTES = [
+  "Let's Ponder, Human.",
+  "What shall we create today, Human?",
+  "Welcome back, Human.",
+  "Have an interesting idea, Human?",
+  "The possibilities are yours, Human.",
+  "Ready when you are, Human.",
+  "Another day of discovery, Human.",
+  "What are we building today, Human?",
+  "Think freely, Human.",
+  "Your workspace awaits, Human.",
+  "Take your time, Human.",
+  "The world is full of interesting problems, Human.",
+];
+let _welcomeReady = false;   // false until startup finished (avoids flashing the welcome screen over a chat that is still being restored)
+let _welcomeOn = false;
+let _welcomeLast = -1;
+let _welcomeAnimT = 0;
+let _welcomeShowT = 0;
+let _welcomeBooted = false;
+
+// True only when the chat holds REAL conversation content. Background system lines
+// ("[Agent finished its task]", "[Workspace context switched]", ...) are injected into
+// #chat-col at arbitrary times and must not dismiss the welcome screen.
+function welcomeHasContent(){
+  const col = chatCol();
+  if (!col) return false;
+  const isSystem = (el)=> el.classList.contains("row") && el.classList.contains("system");
+  for (const el of col.children){
+    if (el.classList.contains("turn-block")){
+      for (const c of el.children){ if (!isSystem(c)) return true; }
+    } else if (el.classList.contains("tool-group")
+            || (el.classList.contains("row") && (el.classList.contains("user") || el.classList.contains("midum")
+                || el.classList.contains("interjection") || el.classList.contains("error")))){
+      return true;
+    }
+  }
+  return false;
+}
+
+function welcomeShouldShow(){
+  return !!chatCol() && !welcomeHasContent() && !state.viewingAgentTab;
+}
+
+function welcomePickQuote(){
+  const el = document.getElementById("welcome-greet");
+  if (!el) return;
+  let i = 0;
+  if (WELCOME_QUOTES.length > 1){
+    do { i = Math.floor(Math.random() * WELCOME_QUOTES.length); } while (i === _welcomeLast);
+  }
+  _welcomeLast = i;
+  const q = WELCOME_QUOTES[i];
+  const k = q.lastIndexOf("Human");
+  el.innerHTML = k < 0
+    ? escapeHtml(q)
+    : escapeHtml(q.slice(0, k)) + '<span class="wg-accent">Human</span>' + escapeHtml(q.slice(k + 5));
+}
+
+// Placement itself is pure CSS (percentages of the pane -- see the welcome-screen CSS block), so it
+// can't go stale when the window is resized or maximised. The only thing CSS can't know is the
+// prompt row's own height (it grows with the textarea), which the slide offset needs so the box's
+// TOP edge stays put while you type. That is a measurement of the row itself, never of the window.
+function welcomeLayout(){
+  const wrap = document.getElementById("chat-pane-wrap");
+  const row = document.getElementById("input-row");
+  if (!wrap || !row) return;
+  const h = row.offsetHeight;
+  if (h) wrap.style.setProperty("--welcome-row-h", h + "px");
+}
+
+function welcomeEval(){
+  if (!_welcomeReady) return;
+  const wrap = document.getElementById("chat-pane-wrap");
+  if (!wrap) return;
+  const show = welcomeShouldShow();
+  if (show === _welcomeOn){ if (show) welcomeLayout(); return; }
+  if (_welcomeBooted){
+    // animate the slide only for real transitions, never for the very first paint
+    wrap.classList.add("welcome-anim");
+    clearTimeout(_welcomeAnimT);
+    _welcomeAnimT = setTimeout(()=> wrap.classList.remove("welcome-anim"), 800);
+  }
+  _welcomeBooted = true;
+  if (show){ welcomeLayout(); welcomePickQuote(); }
+  wrap.classList.toggle("welcome", show);
+  _welcomeOn = show;
+  if (show){
+    setTimeout(()=>{
+      const inp = document.getElementById("msg-input");
+      const modal = document.getElementById("modal-overlay");
+      if (inp && !inp.disabled && state.activeTab === "Chat" && !(modal && modal.classList.contains("open"))) inp.focus();
+    }, 60);
+  }
+}
+
+// Called when "New Chat" is pressed while an empty chat is already showing:
+// the screen stays put, but we hand out a fresh greeting.
+function welcomeNewChat(){
+  if (!_welcomeOn) return;
+  welcomePickQuote();
+  const el = document.getElementById("welcome-greet");
+  if (el){ el.classList.remove("wg-swap"); void el.offsetWidth; el.classList.add("wg-swap"); }
+  const inp = document.getElementById("msg-input");
+  if (inp && !inp.disabled) inp.focus();
+}
+
+function welcomeStart(){
+  if (_welcomeReady) return;
+  const col = chatCol();
+  if (!col) return;
+  // Rows appearing -> leave welcome immediately; chat going empty -> wait a beat so
+  // a clear-then-render sequence (tab switch / chat load) never flickers the welcome screen.
+  new MutationObserver(()=>{
+    if (welcomeShouldShow() && !_welcomeOn){
+      clearTimeout(_welcomeShowT);
+      _welcomeShowT = setTimeout(welcomeEval, 90);
+    } else {
+      clearTimeout(_welcomeShowT);
+      welcomeEval();
+    }
+  }).observe(col, {childList: true});
+  const pane = document.querySelector("#chat-pane-wrap > .pane");
+  const row = document.getElementById("input-row");
+  if (window.ResizeObserver){
+    const ro = new ResizeObserver(()=>{ if (_welcomeOn) welcomeLayout(); });
+    if (pane) ro.observe(pane);
+    if (row) ro.observe(row);
+  }
+  window.addEventListener("resize", ()=>{ if (_welcomeOn) welcomeLayout(); });
+  _welcomeReady = true;
+  // let any chat restored by startup (tabs_restored event) land before the first decision
+  setTimeout(welcomeEval, 250);
+}
+
 // ── Ask cards --------------------------------------------------------------
 function appendAsk(id, kind, payload){
   closeToolGroup();   // an inline question/approval card ends the current tool group
@@ -10517,8 +11783,15 @@ function setStatus(text, level){
   row.classList.remove("status-ok", "status-busy", "status-err");
   if (level) row.classList.add("status-" + level);
   const dot = document.getElementById("status-dot");
-  dot.style.background = level === "ok" ? "var(--green)" : level === "err" ? "var(--red)" :
-                         level === "busy" ? "var(--yellow)" : "var(--subtext)";
+  if (level === "busy"){
+    dot.style.background = "transparent";
+    dot.style.boxShadow = "none";
+    AiSpinner.attach(dot, 26);
+    return;
+  }
+  const col = level === "ok" ? "var(--green)" : level === "err" ? "var(--red)" : "var(--subtext)";
+  dot.style.background = col;
+  dot.style.boxShadow = "0 0 5px 1px color-mix(in srgb, " + col + " 65%, transparent), 0 0 11px 2px color-mix(in srgb, " + col + " 28%, transparent)";
 }
 
 // ── KB Only (prompt-box dropdown) ────────────────────────────────────────────
@@ -10766,6 +12039,7 @@ window.__midumEvent = function(evt){
   else if (kind === "schedule_ran"){ if (state.activeTab === "Schedule") showToolPane("Schedule"); }
   else if (kind === "tool_result"){ const box=document.getElementById("tool-output"); if(box) box.value = payload.output; }
   else if (kind === "voice_status"){ handleVoiceStatus(payload); }
+  else if (kind === "voiceover_state"){ voUpdate(payload); }
   else if (kind === "voice_transcript"){ appendVoiceTranscript(payload.role, payload.text); }
   else if (kind === "voice_say"){ _voiceStreamRow = null; appendRow("midum", payload.text); }
   else if (kind === "voice_tool_call"){ appendVoiceToolEvent("call", payload.name, payload.args); }
@@ -10780,6 +12054,8 @@ window.__midumEvent = function(evt){
   else if (kind === "render_surface_open"){ openRenderSurface(payload.code, payload.title); }
   else if (kind === "render_surface_update"){ updateRenderSurfaceCode(payload.code); }
   else if (kind === "render_surface_close"){ closeRenderSurfaceUI(); }
+  else if (kind === "dynamic_background_set"){ applyDynamicBackground(payload.code, payload); }
+  else if (kind === "dynamic_background_clear"){ clearDynamicBackground(); }
   else if (kind === "midumdocs_open"){ openMidumDoc(payload); }
   else if (kind === "midumdocs_changed"){ updateMidumDoc(payload); }
   else if (kind === "midumdocs_close"){ closeMidumDocUI(); }
@@ -11071,12 +12347,110 @@ function buildSurfacesPane(box){
   };
 }
 
+// ── Dynamic Background (app-wide animated backdrop) ----------------------
+// The model writes the document (create_dynamic_background) and the user
+// picks saved ones from the sidebar -- see tools/dynamic_background_tools.py.
+// It renders in #dyn-bg-frame, a sandboxed (scripts-only) iframe in
+// #dyn-bg-layer, which sits directly above #bg-image-layer and below every
+// other layer. Kept deliberately bridge-free: it is decoration, so it gets no
+// midum.call and no postMessage channel back into the app.
+function applyDynamicBackground(code, meta){
+  const frame = document.getElementById("dyn-bg-frame");
+  if (!frame) return;
+  if (!code || !String(code).trim()){ clearDynamicBackground(); return; }
+  _dynBgActive = true;
+  document.documentElement.classList.add("has-dyn-bg");
+  frame.srcdoc = code;
+  _syncBgClass();
+  applyLiquidGlass(_glassEnabled);   // availability of the glass toggle depends on this
+}
+
+function clearDynamicBackground(){
+  _dynBgActive = false;
+  document.documentElement.classList.remove("has-dyn-bg");
+  const frame = document.getElementById("dyn-bg-frame");
+  // Drop the document entirely so its timers/animation frames stop running.
+  if (frame) frame.srcdoc = "";
+  _syncBgClass();
+  applyLiquidGlass(_glassEnabled);
+}
+
+// Saved Dynamic Backgrounds picker -- opened from the sidebar button right
+// under "Render Surfaces". The user alone chooses which saved background is
+// active here; there is intentionally no model tool for it.
+function buildDynamicBackgroundsPane(box){
+  box.innerHTML = `
+    <div class="hdr-row"><div class="section-label">DYNAMIC BACKGROUNDS</div>
+      <button class="ghost-btn" id="dynbg-off" style="height:22px;font-size:10px;">Turn off</button></div>
+    <div id="dynbg-body" style="flex:1;overflow-y:auto;margin-top:6px;"></div>
+  `;
+  const bodyEl = document.getElementById("dynbg-body");
+  const offBtn = document.getElementById("dynbg-off");
+  bodyEl.innerHTML = `<div style="font-size:11px;color:var(--subtext);padding:10px;">Loading...</div>`;
+
+  async function refresh(){
+    const r = await api("dynamic_background_list_saved");
+    if (!r.ok){
+      bodyEl.innerHTML = `<div style="font-size:11px;color:var(--red);padding:10px;">${escapeHtml(r.error || "Failed to load saved Dynamic Backgrounds.")}</div>`;
+      return;
+    }
+    offBtn.disabled = !r.has_active;
+    offBtn.style.opacity = r.has_active ? "" : ".5";
+    if (!r.items.length){
+      bodyEl.innerHTML = `<div style="font-size:11px;color:var(--subtext);padding:10px;">No saved Dynamic Backgrounds yet. Ask Midum to create one and save it.</div>`;
+      return;
+    }
+    bodyEl.innerHTML = r.items.map(it => {
+      const isActive = r.has_active && r.active_name && it.name === r.active_name;
+      return `
+      <div class="mcp-tool-row" data-name="${escapeHtml(it.name)}">
+        <div class="mcp-tool-info">
+          <div class="mcp-tool-name">${escapeHtml(it.title || it.name)}${isActive ? ` <span style="font-size:10px;color:var(--accent);font-weight:700;">\u2022 ACTIVE</span>` : ""}</div>
+          <div class="mcp-tool-desc">${escapeHtml(it.name)}${it.saved_at ? " \u00b7 saved " + escapeHtml(it.saved_at) : ""}</div>
+        </div>
+        <div class="mcp-tool-actions">
+          <button class="mini-btn open" data-act="load">${isActive ? "Reapply" : "Use"}</button>
+          <button class="mini-btn del" data-act="delete">Delete</button>
+        </div>
+      </div>`;
+    }).join("");
+  }
+  refresh();
+
+  offBtn.onclick = async ()=>{
+    if (offBtn.disabled) return;
+    await api("dynamic_background_clear_ui");
+    refresh();
+  };
+
+  bodyEl.onclick = async (e)=>{
+    const btn = e.target.closest("[data-act]");
+    if (!btn || btn.disabled) return;
+    const row = btn.closest("[data-name]");
+    const name = row.dataset.name;
+    btn.disabled = true;
+    if (btn.dataset.act === "load"){
+      const r = await api("dynamic_background_load_ui", name);
+      if (!r.ok){ await showConfirm(r.message || "Failed to apply.", "Error"); }
+      refresh();
+      return;
+    }
+    const ok = await showConfirm(`Delete saved Dynamic Background "${name}"? This can't be undone.`, "Delete", {danger:true, okLabel:"Delete"});
+    if (ok){ await api("dynamic_background_delete_ui", name); }
+    refresh();
+  };
+}
+
 // ── Sidebar -------------------------------------------------------------
 function buildSidebar(){
+  // The Settings popup lives on <body> (so position:fixed is relative to the viewport, never to a transformed pane).
+  // A rebuild re-creates it inside #sidebar-inner below, so drop the stale copy first to avoid duplicate ids.
+  document.querySelectorAll("body > #sidebar-settings-overlay").forEach(n=>n.remove());
   const el = document.getElementById("sidebar-inner");
   el.innerHTML = `
     <div id="sidebar-main-view">
       <button class="ghost-btn" id="sidebar-surfaces-btn" style="width:100%;text-align:left;">${icon("image")} Render Surfaces</button>
+      <button class="ghost-btn" id="sidebar-dynbg-btn" style="width:100%;text-align:left;margin-top:6px;">${icon("sparkles")} Dynamic Backgrounds</button>
       <div class="divider"></div>
       <div class="hdr-row">
         <div class="section-label">WORKSPACE</div>
@@ -11103,129 +12477,158 @@ function buildSidebar(){
         <button class="ghost-btn" id="shutdown-btn" style="color:var(--red);">${icon("power")} Shutdown</button>
       </div>
     </div>
-    <div id="sidebar-settings-overlay">
-      <div class="hdr-row">
-        <button id="settings-back-btn">${icon("arrow-left")}</button>
-        <div class="section-label">SETTINGS</div>
-        <div style="width:26px;"></div>
+    <div id="sidebar-settings-overlay" data-page="general">
+     <div class="st-dialog" role="dialog" aria-modal="true" aria-label="Settings">
+      <div class="st-head">
+        <div class="st-head-ic">${icon("settings")}</div>
+        <div><div class="st-head-t">Settings</div><div class="st-head-s">Appearance, effects and defaults</div></div>
+        <div class="st-head-sp"></div>
+        <button id="settings-back-btn" title="Close (Esc)">${icon("x")}</button>
       </div>
-      <div class="field-label" style="margin:2px 0 0;">PANELS</div>
-      <div class="btn-row" id="settings-panel-toggle">
-        <button class="ghost-btn" data-panel="Log" style="flex:1;">${icon("file-text")} Logs</button>
-        <button class="ghost-btn" data-panel="Parameters" style="flex:1;">${icon("settings")} Parameters</button>
+      <div class="st-body">
+       <div class="st-nav" id="settings-nav">
+        <button data-page="general" class="active">${icon("settings")}<span>General</span></button>
+        <button data-page="appearance">${icon("sparkles")}<span>Appearance</span></button>
+        <button data-page="effects">${icon("image")}<span>Background &amp; Glass</span></button>
+        <button data-page="models">${icon("bot")}<span>Models</span></button>
+       </div>
+       <div class="st-content">
+      <div class="st-card" data-page="general">
+        <div class="st-card-h"><div class="st-card-t">Panels</div></div>
+        <p class="st-note">Open the log or the model parameters in the main window. Click the active one again to go back to Chat.</p>
+        <div class="btn-row" id="settings-panel-toggle">
+          <button class="ghost-btn" data-panel="Log" style="flex:1;">${icon("file-text")} Logs</button>
+          <button class="ghost-btn" data-panel="Parameters" style="flex:1;">${icon("settings")} Parameters</button>
+        </div>
       </div>
-      <div class="field-label" style="margin:2px 0 0;">THEME</div>
-      <div class="btn-row" id="settings-theme-toggle">
-        <button class="ghost-btn" data-theme="dark" style="flex:1;">${icon("moon")} Dark</button>
-        <button class="ghost-btn" data-theme="light" style="flex:1;">${icon("sun")} Light</button>
+      <div class="st-card" data-page="appearance">
+        <div class="st-card-h"><div class="st-card-t">Theme</div></div>
+        <div class="btn-row" id="settings-theme-toggle">
+          <button class="ghost-btn" data-theme="dark" style="flex:1;">${icon("moon")} Dark</button>
+          <button class="ghost-btn" data-theme="light" style="flex:1;">${icon("sun")} Light</button>
+        </div>
       </div>
-      <div class="field-label" style="margin:4px 0 0;">PRESETS</div>
-      <div class="btn-row">
-        <select id="settings-preset-select" style="flex:1;"><option value="">Choose a preset…</option></select>
-        <button class="ghost-btn" id="settings-preset-delete" style="flex:0 0 auto;display:none;" title="Delete preset">${icon("x")}</button>
+      <div class="st-card" data-page="appearance">
+        <div class="st-card-h"><div class="st-card-t">Presets</div></div>
+        <div class="btn-row">
+          <select id="settings-preset-select" style="flex:1;"><option value="">Choose a preset…</option></select>
+          <button class="ghost-btn" id="settings-preset-delete" style="flex:0 0 auto;display:none;" title="Delete preset">${icon("x")}</button>
+        </div>
+        <button class="ghost-btn" id="settings-preset-save" style="width:100%;height:34px;font-size:12px;">+ Save current as preset</button>
       </div>
-      <button class="ghost-btn" id="settings-preset-save" style="width:100%;">+ Save current as preset</button>
-      <div class="hdr-row" style="margin-top:4px;">
-        <div class="field-label" style="margin:0;">AMBIENT BLOBS</div>
-        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);">
-          <input type="checkbox" id="settings-blobs-enabled" style="width:14px;height:14px;"/> Enabled
-        </label>
+      <div class="st-card" data-page="effects">
+        <div class="st-card-h"><div class="st-card-t">Ambient blobs</div>
+          <label class="st-sw"><input type="checkbox" id="settings-blobs-enabled"/> Enabled</label>
+        </div>
+        <p class="st-note">Soft animated colour glows behind the interface. Choose which ones are shown.</p>
+        <div id="blob-individual-toggles" class="st-chips">
+          <label class="st-chip"><input type="checkbox" id="settings-blob-center-enabled" checked/> Center</label>
+          <label class="st-chip"><input type="checkbox" id="settings-blob-a-enabled" checked/> Blob A</label>
+          <label class="st-chip"><input type="checkbox" id="settings-blob-b-enabled" checked/> Blob B</label>
+          <label class="st-chip"><input type="checkbox" id="settings-blob-cursor-enabled" checked/> Cursor</label>
+        </div>
       </div>
-      <div id="blob-individual-toggles" style="display:flex;flex-wrap:wrap;gap:8px 14px;margin:-2px 0 2px;">
-        <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--subtext);">
-          <input type="checkbox" id="settings-blob-center-enabled" checked style="width:12px;height:12px;"/> Center
-        </label>
-        <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--subtext);">
-          <input type="checkbox" id="settings-blob-a-enabled" checked style="width:12px;height:12px;"/> Blob A
-        </label>
-        <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--subtext);">
-          <input type="checkbox" id="settings-blob-b-enabled" checked style="width:12px;height:12px;"/> Blob B
-        </label>
-        <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--subtext);">
-          <input type="checkbox" id="settings-blob-cursor-enabled" checked style="width:12px;height:12px;"/> Cursor
-        </label>
+      <div class="st-card" data-page="effects">
+        <div class="st-card-h"><div class="st-card-t">Background image</div>
+          <label class="st-sw"><input type="checkbox" id="settings-bg-enabled"/> Enabled</label>
+        </div>
+        <div class="btn-row">
+          <button class="ghost-btn" id="bg-choose" style="flex:1;">${icon("image")} Choose Image...</button>
+          <button class="ghost-btn" id="bg-clear" style="flex:0 0 auto;">${icon("x")}</button>
+        </div>
+        <div id="bg-filename" class="st-note" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></div>
+        <div class="st-slider"><span class="st-lbl">Brightness</span><input type="range" id="bg-brightness" min="40" max="160" value="100"/></div>
+        <div class="st-slider"><span class="st-lbl">Blur</span><input type="range" id="bg-blur" min="0" max="40" value="0"/></div>
+        <div class="st-slider"><span class="st-lbl">Opacity</span><input type="range" id="bg-opacity" min="10" max="100" value="100"/></div>
       </div>
-      <div class="hdr-row" style="margin-top:4px;">
-        <div class="field-label" style="margin:0;">BACKGROUND IMAGE</div>
-        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);">
-          <input type="checkbox" id="settings-bg-enabled" style="width:14px;height:14px;"/> Enabled
-        </label>
+      <div class="st-card" data-page="effects">
+        <div class="st-card-h"><div class="st-card-t">Glass surfaces</div>
+          <label class="st-sw"><input type="checkbox" id="settings-glass-enabled"/> Enabled</label>
+        </div>
+        <div id="glass-hint" class="st-note">Needs ambient blobs or a background image turned on.</div>
+        <div class="st-slider"><span class="st-lbl">Glass opacity</span><input type="range" id="settings-glass-opacity" min="35" max="75" value="55"/></div>
+        <label class="st-sw"><input type="checkbox" id="settings-glass-sheen-enabled" checked/> Frosted highlight</label>
       </div>
-      <div class="btn-row">
-        <button class="ghost-btn" id="bg-choose" style="flex:1;">${icon("image")} Choose Image...</button>
-        <button class="ghost-btn" id="bg-clear" style="flex:0 0 auto;">${icon("x")}</button>
+      <div class="st-card" data-page="general">
+        <div class="st-card-h"><div class="st-card-t">Ambient surfaces</div>
+          <label class="st-sw"><input type="checkbox" id="settings-ambient-hide-capture" checked/> Hide from screenshots</label>
+        </div>
+        <p class="st-note">When on, floating widgets are invisible to Midum's own screenshots, OCR and screen-share (you still see them). Windows 10 2004+.</p>
       </div>
-      <div id="bg-filename" style="font-size:9px;color:var(--subtext);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></div>
-      <div class="field-label" style="margin-top:2px;">Brightness</div>
-      <input type="range" id="bg-brightness" min="40" max="160" value="100" style="width:100%;"/>
-      <div class="field-label">Blur</div>
-      <input type="range" id="bg-blur" min="0" max="40" value="0" style="width:100%;"/>
-      <div class="field-label">Opacity</div>
-      <input type="range" id="bg-opacity" min="10" max="100" value="100" style="width:100%;"/>
-      <div class="hdr-row" style="margin-top:4px;">
-        <div class="field-label" style="margin:0;">GLASS SURFACES</div>
-        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);">
-          <input type="checkbox" id="settings-glass-enabled" style="width:14px;height:14px;"/> Enabled
-        </label>
+      <div class="st-card" data-page="appearance">
+        <div class="st-card-h"><div class="st-card-t">Chat text size</div>
+          <button class="ghost-btn" id="settings-chat-fs-reset" style="flex:0 0 auto;height:26px;font-size:11px;padding:0 12px;" title="Reset chat text size to default">Reset</button>
+        </div>
+        <div class="chat-fs-row">
+          <input type="range" id="settings-chat-fs" min="10" max="32" step="0.05" value="15" aria-label="Chat text size"/>
+          <input type="number" id="settings-chat-fs-num" min="10" max="32" step="0.05" value="15.00" aria-label="Chat text size in pixels"/>
+          <span class="chat-fs-unit">px</span>
+        </div>
+        <p class="st-note">Main chat window only (messages, tool calls, code, prompt box). Drag, type an exact value, or use the arrow keys: 0.05 px per step, Shift = 1 px.</p>
       </div>
-      <div id="glass-hint" style="font-size:9px;color:var(--subtext);margin:-4px 0 2px;">
-        Needs ambient blobs or a background image turned on.
+      <div class="st-card" data-page="models">
+        <div class="st-card-h"><div class="st-card-t">Defaults</div></div>
+        <p class="st-note">The provider and model Midum starts new chats with.</p>
+        <div class="st-lbl">Default provider</div>
+        <select id="settings-provider"></select>
+        <div class="st-lbl">Default model</div>
+        <input list="settings-model-list" id="settings-model" style="height:34px;border-radius:16px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 12px;"/>
+        <datalist id="settings-model-list"></datalist>
       </div>
-      <div class="field-label" style="margin-top:2px;">Glass Opacity</div>
-      <input type="range" id="settings-glass-opacity" min="35" max="75" value="55" style="width:100%;"/>
-      <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);margin-top:4px;">
-        <input type="checkbox" id="settings-glass-sheen-enabled" checked style="width:14px;height:14px;"/> Frosted highlight
-      </label>
-      <div class="hdr-row" style="margin-top:4px;">
-        <div class="field-label" style="margin:0;">AMBIENT SURFACES</div>
-        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--subtext);">
-          <input type="checkbox" id="settings-ambient-hide-capture" checked style="width:14px;height:14px;"/> Hide from screenshots
-        </label>
+      <div class="st-card" data-page="appearance">
+        <div class="st-card-h"><div class="st-card-t">Colours</div></div>
+        <div class="st-colors">
+          <label class="st-color"><input type="color" id="settings-color-accent"/>Accent</label>
+          <label class="st-color"><input type="color" id="settings-color-accent2"/>Accent 2</label>
+          <label class="st-color"><input type="color" id="settings-color-bg"/>Background</label>
+          <label class="st-color"><input type="color" id="settings-color-panel"/>Panel</label>
+          <label class="st-color"><input type="color" id="settings-color-text"/>Text</label>
+          <label class="st-color"><input type="color" id="settings-color-user_msg"/>User bubble</label>
+        </div>
       </div>
-      <div style="font-size:9px;color:var(--subtext);margin:-4px 0 2px;">
-        When on, floating widgets are invisible to Midum's own screenshots, OCR and screen-share (you still see them). Windows 10 2004+.
+      <div class="st-card" data-page="appearance">
+        <div class="st-card-h"><div class="st-card-t">Blob colours</div></div>
+        <div class="st-colors">
+          <label class="st-color"><input type="color" id="settings-color-blob_center"/>Center</label>
+          <label class="st-color"><input type="color" id="settings-color-blob_a"/>Blob A</label>
+          <label class="st-color"><input type="color" id="settings-color-blob_b"/>Blob B</label>
+          <label class="st-color"><input type="color" id="settings-color-blob_cursor"/>Cursor</label>
+        </div>
       </div>
-      <div class="hdr-row" style="margin-top:4px;">
-        <div class="field-label" style="margin:0;">CHAT TEXT SIZE</div>
-        <button class="ghost-btn" id="settings-chat-fs-reset" style="flex:0 0 auto;height:22px;font-size:10px;padding:0 8px;" title="Reset chat text size to default">Reset</button>
+       </div>
       </div>
-      <div class="chat-fs-row">
-        <input type="range" id="settings-chat-fs" min="10" max="32" step="0.05" value="15" aria-label="Chat text size"/>
-        <input type="number" id="settings-chat-fs-num" min="10" max="32" step="0.05" value="15.00" aria-label="Chat text size in pixels"/>
-        <span class="chat-fs-unit">px</span>
-      </div>
-      <div style="font-size:9px;color:var(--subtext);margin:-2px 0 2px;">
-        Main chat window only (messages, tool calls, code, prompt box). Drag, type an exact value, or use the arrow keys: 0.05 px per step, Shift = 1 px.
-      </div>
-      <div class="field-label">DEFAULT PROVIDER</div>
-      <select id="settings-provider"></select>
-      <div class="field-label">DEFAULT MODEL</div>
-      <input list="settings-model-list" id="settings-model" style="height:32px;border-radius:16px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 10px;"/>
-      <datalist id="settings-model-list"></datalist>
-      <div class="field-label">COLORS</div>
-      <div style="display:flex;flex-wrap:wrap;gap:8px;">
-        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Accent<input type="color" id="settings-color-accent" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
-        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Accent 2<input type="color" id="settings-color-accent2" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
-        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Background<input type="color" id="settings-color-bg" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
-        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Panel<input type="color" id="settings-color-panel" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
-        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Text<input type="color" id="settings-color-text" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
-        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">User bubble<input type="color" id="settings-color-user_msg" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
-      </div>
-      <div class="field-label">BLOB COLORS</div>
-      <div style="display:flex;flex-wrap:wrap;gap:8px;">
-        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Center<input type="color" id="settings-color-blob_center" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
-        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Blob A<input type="color" id="settings-color-blob_a" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
-        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Blob B<input type="color" id="settings-color-blob_b" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
-        <label style="display:flex;flex-direction:column;align-items:center;font-size:9px;color:var(--subtext);gap:2px;">Cursor<input type="color" id="settings-color-blob_cursor" style="width:32px;height:24px;padding:0;border:none;background:none;"/></label>
-      </div>
-      <div class="btn-row" style="margin-top:4px;">
+      <div class="st-foot">
+        <div id="settings-status"></div>
         <button class="ghost-btn" id="settings-reset">Reset defaults</button>
         <button class="btn" id="settings-save" style="background:var(--accent);color:#fff;">Save</button>
       </div>
-      <div id="settings-status" style="font-size:9px;color:var(--subtext);"></div>
+     </div>
     </div>
   `;
   document.getElementById("sidebar-close").onclick = toggleSidebar;
+  // ── Settings popup: move to <body>, nav between pages, close on Esc / click outside ──
+  (function(){
+    const ov = document.getElementById("sidebar-settings-overlay");
+    if (!ov) return;
+    document.body.appendChild(ov);
+    const setPage = (p)=>{
+      ov.dataset.page = p;
+      ov.querySelectorAll("#settings-nav button").forEach(b=>b.classList.toggle("active", b.dataset.page === p));
+      const c = ov.querySelector(".st-content"); if (c) c.scrollTop = 0;
+    };
+    ov.querySelectorAll("#settings-nav button").forEach(b=>{ b.onclick = ()=>setPage(b.dataset.page); });
+    ov.addEventListener("mousedown", (e)=>{ if (e.target === ov) ov.classList.remove("open"); });
+    if (!window.__stEscBound){
+      window.__stEscBound = true;
+      document.addEventListener("keydown", (e)=>{
+        if (e.key !== "Escape") return;
+        const o = document.getElementById("sidebar-settings-overlay");
+        if (!o || !o.classList.contains("open")) return;
+        if (document.querySelector("#modal-overlay.open")) return;   // a confirm / prompt on top handles its own Esc
+        o.classList.remove("open");
+      });
+    }
+  })();
   enhanceSelect(document.getElementById("settings-preset-select"));
   document.getElementById("sidebar-surfaces-btn").onclick = ()=>{
     // Jumps straight to the Surfaces tool pane (formerly a top tab, now a
@@ -11235,11 +12638,17 @@ function buildSidebar(){
     toggleSidebar();
     switchTab("Surfaces");
   };
+  document.getElementById("sidebar-dynbg-btn").onclick = ()=>{
+    // Same shortcut pattern as the Render Surfaces button just above: jump to
+    // the saved Dynamic Backgrounds picker tool pane.
+    toggleSidebar();
+    switchTab("Dynamic Backgrounds");
+  };
   enhanceSelect(document.getElementById("project-select"));
   enhanceSelect(document.getElementById("settings-provider"));
   attachLitellmPicker({ providerSelId: "settings-provider", modelInputId: "settings-model", prefix: "st" });
   document.getElementById("new-session-btn").onclick = async ()=>{
-    await api("new_session"); clearChat(); applyKbState(null); refreshHistory(); refreshTitlebarInfo(); buildConversationTabs();
+    await api("new_session"); clearChat(); welcomeNewChat(); applyKbState(null); refreshHistory(); refreshTitlebarInfo(); buildConversationTabs();
   };
   document.getElementById("project-select").onchange = async (e)=>{
     const info = await api("switch_project", e.target.value);
@@ -11267,9 +12676,8 @@ function buildSidebar(){
   };
 
   document.getElementById("settings-toggle").onclick = ()=>{
-    // Settings takes over the ENTIRE sidebar pane (an overlay covering the
-    // whole thing), rather than a small strip squeezed in below workspace
-    // + history -- there's a dedicated back button to return.
+    // Settings opens as a centered popup window (glass-styled like the Workbench IDE menus), with a
+    // dim scrim behind it. Close with the X, Esc, or by clicking outside the window.
     document.getElementById("sidebar-settings-overlay").classList.add("open");
     loadSettingsPanel();
   };
@@ -11585,10 +12993,21 @@ function applyColors(colors){
   if (colors.blob_cursor) root.setProperty("--blob-cursor", colors.blob_cursor);
 }
 
+// Two independent things can make the panes need to stay transparent so a
+// layer behind them shows through: a static background image and an active
+// Dynamic Background. Both funnel into the one html.has-bg-image class every
+// pane/liquid-glass rule already keys off, so neither can clobber the other.
+let _bgImageOn = false;
+let _dynBgActive = false;
+function _syncBgClass(){
+  document.documentElement.classList.toggle("has-bg-image", _bgImageOn || _dynBgActive);
+}
+
 function applyBgImage(cfg, dataUrl){
   const layer = document.getElementById("bg-image-layer");
   const on = !!(cfg && cfg.enabled && dataUrl);
-  document.documentElement.classList.toggle("has-bg-image", on);
+  _bgImageOn = on;
+  _syncBgClass();
   if (layer){
     // dataUrl already has brightness/blur/opacity baked into its pixels
     // server-side -- no CSS filter or opacity assignment here, so there
@@ -12017,16 +13436,35 @@ async function refreshHistory(){
 // is only shown/hidden. Isolation also keeps Monaco's AMD loader and CSS away from this page.
 // Page <-> app traffic is postMessage only: the iframe asks for editor_* Api methods (whitelisted by
 // name below) and Python pushes editor_* events down the same pipe (see mzEdEvent).
-var MZED = {frame:null, host:null, ready:false, queue:[], origin:"", booting:null, themeTimer:null};
+var MZED = {frame:null, host:null, ready:false, queue:[], origin:"", booting:null, themeTimer:null, dirty:0, waiters:{}};
+var MZIDE = {frame:null, host:null, ready:false, queue:[], origin:"", booting:null, open:false, opening:false, booted:false, workspace:"", dirty:0, waiters:{}};
 const MZED_VARS = ["bg","panel","surface","surface2","border","border2","accent","accent-dim","accent-faint","text","subtext","muted","green","red","yellow"];
 function mzEdThemeVars(){
   const cs = getComputedStyle(document.documentElement), out = {};
   MZED_VARS.forEach(k=>{ const v = cs.getPropertyValue("--" + k).trim(); if (v) out["--" + k] = v; });
-  return out;
+  return Object.assign(out, _glassThemeVars());
 }
-function mzEdPost(msg){
-  if (!MZED.frame || !MZED.ready){ MZED.queue.push(msg); return; }
-  try { MZED.frame.contentWindow.postMessage(msg, MZED.origin); } catch (e) {}
+function mzPostTo(ep, msg){
+  if (!ep.frame || !ep.ready){ ep.queue.push(msg); return; }
+  try { ep.frame.contentWindow.postMessage(msg, ep.origin); } catch (e) {}
+}
+function mzEdPost(msg){ mzPostTo(MZED, msg); }
+// Send the theme to an editor page only when it differs from what that page already has.
+function mzPushTheme(ep, force){
+  const vars = mzEdThemeVars(), sig = JSON.stringify(vars);
+  if (!force && ep.themeSig === sig) return;
+  ep.themeSig = sig;
+  mzPostTo(ep, {__ed:"theme", vars:vars});
+}
+// The editor the chat model talks to: the IDE while it is on screen and booted, otherwise the simple editor.
+function mzActive(){ return (MZIDE.open && MZIDE.booted) ? MZIDE : MZED; }
+// Chat-model requests go to the active editor only; shell output and artifact changes go to both so neither falls behind.
+function mzRoute(kind, payload){
+  const msg = {__ed:"event", kind, payload};
+  if (kind === "editor_shell_line" || kind === "editor_shell_lines" || kind === "editor_artifact_changed"){
+    mzPostTo(MZED, msg);
+    if (MZIDE.frame) mzPostTo(MZIDE, msg);
+  } else mzPostTo(mzActive(), msg);
 }
 function mzEdShow(show){ if (typeof MZED !== "undefined" && MZED && MZED.host) MZED.host.style.display = show ? "block" : "none"; }
 function mzEdEnsureFrame(){
@@ -12046,6 +13484,7 @@ function mzEdEnsureFrame(){
     }
     const fr = document.createElement("iframe");
     MZED.origin = new URL(info.url).origin;
+    fr.allow = "clipboard-read; clipboard-write; fullscreen";
     fr.src = info.url;
     host.appendChild(fr);
     MZED.frame = fr;
@@ -12059,6 +13498,301 @@ function buildEditorPane(box){
 }
 // Python -> editor. editor_open_* also brings the Editor tab to the front (closing the Render Surface
 // first, since while it is open the layout reserves the whole right half for it).
+// ── Full IDE (VS Code workbench, CodinGame monaco-vscode-api) ───────────────────────────────────────
+// Opened from the simple editor's "Full IDE" button into #mz-ide. The two editors are separate pages over the SAME files,
+// workspace and editor_state.json; only one is on screen at a time and every switch runs a handoff (workspace, open tabs,
+// unsaved buffers, active tab, cursor, shared settings) so they always show one session.
+let _mzSeq = 0;
+function mzAsk(ep, type, extra, timeoutMs){
+  return new Promise((resolve)=>{
+    const id = "h" + (++_mzSeq);
+    ep.waiters[id] = resolve;
+    mzPostTo(ep, Object.assign({__ed:type, id:id}, extra || {}));
+    setTimeout(()=>{ if (ep.waiters[id]){ delete ep.waiters[id]; resolve(null); } }, timeoutMs || 30000);
+  });
+}
+function mzSyncDirty(){
+  const b = document.querySelector('.tab-btn[data-name="Editor"]');
+  if (b) b.classList.toggle("has-dirty", (mzActive().dirty || 0) > 0);
+}
+// ── Midum chat in the IDE's secondary (right) sidebar ───────────────────────────────────────────────
+// The Workbench registers a "Midum" view in its right sidebar and reports that view's rectangle (aux_rect). While the IDE is open the
+// real #chat-pane-wrap is moved into #mz-ide-chat, which is laid exactly over that rectangle. Same DOM, same handlers: the prompt box,
+// tool pills, Markdown + LaTeX rendering, uploads and chat storage are the main chat's own.
+var MZIC = {dock:null, body:null, hist:null, head:null, home:null, next:null, stick:true, rect:null, obs:null};
+function mzIcEnsure(){
+  if (MZIC.dock) return MZIC.dock;
+  if (!MZIDE.host) return null;
+  const dock = document.createElement("div"); dock.id = "mz-ide-chat";
+  dock.innerHTML = `
+    <div id="mz-ic-head">
+      <div id="mz-ic-status"><span id="mz-ic-dot"></span><span id="mz-ic-label">Midum</span></div>
+      <button class="mz-ic-btn" id="mz-ic-abort" title="Abort the running task">Abort</button>
+      <button class="mz-ic-btn" id="mz-ic-new" title="New chat">+ New</button>
+      <button class="mz-ic-btn" id="mz-ic-hist-btn" title="Chat history">${icon("clock")}<span>History</span>${icon("chevron-down")}</button>
+    </div>
+    <div id="mz-ic-hist"></div>
+    <div id="mz-ic-body"></div>`;
+  MZIDE.host.appendChild(dock);
+  MZIC.dock = dock; MZIC.body = dock.querySelector("#mz-ic-body"); MZIC.hist = dock.querySelector("#mz-ic-hist"); MZIC.head = dock.querySelector("#mz-ic-head");
+  dock.querySelector("#mz-ic-abort").onclick = ()=>{ const b = document.getElementById("abort-btn"); if (b) b.click(); };
+  dock.querySelector("#mz-ic-new").onclick = async ()=>{
+    mzIcHistClose();
+    await newConvTab();
+  };
+  dock.querySelector("#mz-ic-hist-btn").onclick = (e)=>{ e.stopPropagation(); MZIC.hist.classList.contains("open") ? mzIcHistClose() : mzIcHistOpen(); };
+  document.addEventListener("mousedown", (e)=>{ if (MZIC.hist.classList.contains("open") && !MZIC.hist.contains(e.target) && !e.target.closest("#mz-ic-hist-btn")) mzIcHistClose(); }, true);
+  // the top bar (with the status line) is hidden while the IDE is open: mirror the status into the dock header
+  const sync = ()=>{
+    const lab = document.getElementById("status-label"), row = document.getElementById("status-row");
+    document.getElementById("mz-ic-label").textContent = (lab && lab.textContent.trim()) || "Midum";
+    const c = (row && row.className) || "";
+    MZIC.head.classList.toggle("st-busy", /busy|run|think|work/i.test(c));
+    MZIC.head.classList.toggle("st-err", /err|fail/i.test(c));
+    MZIC.head.classList.toggle("st-ok", /ok|ready|idle/i.test(c) && !/busy|err/i.test(c));
+  };
+  const lab = document.getElementById("status-label"), row = document.getElementById("status-row");
+  MZIC.obs = new MutationObserver(sync);
+  if (lab) MZIC.obs.observe(lab, {childList:true, characterData:true, subtree:true});
+  if (row) MZIC.obs.observe(row, {attributes:true, attributeFilter:["class"]});
+  sync();
+  return dock;
+}
+function mzIcHistClose(){ if (!MZIC.hist) return; MZIC.hist.classList.remove("open"); const b = document.getElementById("mz-ic-hist-btn"); if (b) b.classList.remove("on"); }
+function mzIcHistOpen(){ if (typeof mzIcModelClose === "function") mzIcModelClose(); MZIC.hist.classList.add("open"); document.getElementById("mz-ic-hist-btn").classList.add("on"); mzIcRefreshHistory(); }
+async function mzIcRefreshHistory(){
+  const box = MZIC.hist; if (!box) return;
+  let list = [];
+  try { list = (await api("list_chats")) || []; } catch (e) {}
+  box.innerHTML = "";
+  if (!list.length){ box.innerHTML = `<div style="font-size:11px;color:var(--subtext);padding:8px;">No saved chats yet.</div>`; return; }
+  list.forEach(chat=>{
+    const card = document.createElement("div");
+    card.className = "history-card" + (chat.current ? " current" : "");
+    card.style.cursor = "pointer";
+    let title = chat.title || "Untitled chat";
+    if (title.length > 34) title = title.slice(0,33) + "…";
+    card.innerHTML = `
+      <div style="min-width:0;flex:1;">
+        <div class="history-title">${escapeHtml(title)}</div>
+        <div class="history-ts">${(chat.updated_at||"").replace("T","  ")}</div>
+      </div>
+      <div class="history-actions">
+        <button class="mini-btn rename" title="Rename">${icon("pencil")}</button>
+        <button class="mini-btn del">${icon("trash")}</button>
+      </div>`;
+    card.onclick = async ()=>{
+      mzIcHistClose();
+      const r = await api("open_chat_in_new_tab", chat.id);
+      if (!r.ok){ showAlert(r.error, "Error"); return; }
+      clearChat();
+      renderHistoryWindow(r.display||[]);
+      applyKbState(r.kb_state);
+      refreshHistory(); refreshTitlebarInfo(); buildConversationTabs();     // no switchTab("Chat"): the chat stays docked in the IDE
+    };
+    card.querySelector(".rename").onclick = async (e)=>{
+      e.stopPropagation();
+      const newTitle = await showPrompt("New chat title:", "Rename Chat", title);
+      if (newTitle === null || newTitle === undefined) return;
+      const trimmed = newTitle.trim();
+      if (!trimmed || trimmed === title) return;
+      const r = await api("rename_chat", chat.id, trimmed);
+      if (!r.ok){ showAlert(r.error, "Error"); return; }
+      refreshHistory(); refreshTitlebarInfo(); mzIcRefreshHistory();
+    };
+    card.querySelector(".del").onclick = async (e)=>{
+      e.stopPropagation();
+      const ok = await showConfirm(`Permanently delete "${title}"?`, "Delete Chat", {danger:true, okLabel:"Delete"});
+      if (!ok) return;
+      await api("delete_chat", chat.id);
+      if (chat.current){ clearChat(); applyKbState(null); }
+      refreshHistory(); mzIcRefreshHistory();
+    };
+    box.appendChild(card);
+  });
+}
+// Model picker (replaces the KB button in the docked prompt box): the popup hosts the real Model tab, so every control is there.
+function mzIcModelSetup(){
+  if (MZIC.modelBtn) return;
+  const kb = document.getElementById("kb-toggle-btn"), box = document.getElementById("input-box"), kbPop = document.getElementById("kb-popover");
+  if (!kb || !box || !kbPop) return;
+  const btn = document.createElement("button");
+  btn.className = "icon-btn"; btn.id = "mz-model-btn"; btn.title = "Model: provider, model, context window, LiteLLM";
+  btn.innerHTML = `${icon("cpu")}${icon("chevron-down")}`;
+  box.insertBefore(btn, kb);
+  const pop = document.createElement("div"); pop.id = "mz-model-pop";
+  kbPop.parentNode.insertBefore(pop, kbPop);
+  MZIC.modelBtn = btn; MZIC.modelPop = pop;
+  btn.onclick = (e)=>{ e.stopPropagation(); pop.classList.contains("open") ? mzIcModelClose() : mzIcModelOpen(); };
+  document.addEventListener("mousedown", (e)=>{
+    if (pop.classList.contains("open") && !pop.contains(e.target) && !btn.contains(e.target)) mzIcModelClose();
+  }, true);
+  document.addEventListener("keydown", (e)=>{ if (e.key === "Escape" && pop.classList.contains("open")) mzIcModelClose(); });
+  // the tooltip follows the titlebar's model pill, which refreshTitlebarInfo() keeps current (also after Apply)
+  const pill = document.getElementById("titlebar-model-pill");
+  const sync = ()=>{ const n = (pill && pill.textContent.trim()) || ""; btn.title = n ? "Model: " + n + " (provider, model, context window, LiteLLM)" : "Model: provider, model, context window, LiteLLM"; };
+  if (pill) new MutationObserver(sync).observe(pill, {childList:true, characterData:true, subtree:true});
+  sync(); try { refreshTitlebarInfo(); } catch (e) {}
+}
+function mzIcModelClose(){
+  if (!MZIC.modelPop) return;
+  MZIC.modelPop.classList.remove("open"); MZIC.modelBtn.classList.remove("on"); MZIC.modelPop.innerHTML = "";
+}
+function mzIcModelOpen(){
+  const pop = MZIC.modelPop; if (!pop) return;
+  mzIcHistClose();
+  document.getElementById("kb-popover").classList.remove("open");
+  // buildModelPane addresses its fields by id: make sure a stale copy in the (hidden) Model tab cannot shadow this one
+  const tc = document.getElementById("tool-content");
+  if (tc && tc.querySelector("#provider-select")) tc.innerHTML = "";
+  pop.innerHTML = `<div class="mz-mp-head"><span>Model</span><button class="ghost-btn" id="mz-mp-close" title="Close">${icon("x")}</button></div><div id="mz-mp-body" style="display:flex;flex-direction:column;"></div>`;
+  pop.querySelector("#mz-mp-close").onclick = mzIcModelClose;
+  buildModelPane(pop.querySelector("#mz-mp-body"));
+  pop.classList.add("open"); MZIC.modelBtn.classList.add("on");
+}
+function mzIcPlace(r){
+  const dock = MZIC.dock; if (!dock) return;
+  const sc = document.getElementById("chat-scroll");
+  if (!r){                                                  // sidebar hidden / another view active
+    if (dock.classList.contains("show") && sc) MZIC.stick = (sc.scrollHeight - sc.scrollTop - sc.clientHeight) < 80;
+    dock.classList.remove("show"); mzIcHistClose(); mzIcModelClose(); return;
+  }
+  dock.style.left = r.x + "px"; dock.style.top = r.y + "px"; dock.style.width = r.w + "px"; dock.style.height = r.h + "px";
+  if (!dock.classList.contains("show")){
+    dock.classList.add("show");
+    if (sc && MZIC.stick) requestAnimationFrame(()=>{ sc.scrollTop = sc.scrollHeight; });
+  }
+}
+function mzIcDock(v){
+  if (v){
+    const dock = mzIcEnsure(); if (!dock) return;
+    const chat = document.getElementById("chat-pane-wrap");
+    if (chat && chat.parentNode !== MZIC.body){ MZIC.home = chat.parentNode; MZIC.next = chat.nextSibling; MZIC.body.appendChild(chat); }
+    document.documentElement.classList.add("mz-chat-docked");
+    mzIcModelSetup();
+    if (MZIC.rect) mzIcPlace(MZIC.rect);
+  } else if (MZIC.dock){
+    const chat = document.getElementById("chat-pane-wrap");
+    if (chat && MZIC.home && chat.parentNode === MZIC.body){
+      const ref = (MZIC.next && MZIC.next.parentNode === MZIC.home) ? MZIC.next : document.getElementById("sidebar-pane-wrap");
+      MZIC.home.insertBefore(chat, ref && ref.parentNode === MZIC.home ? ref : null);
+    }
+    document.documentElement.classList.remove("mz-chat-docked");
+    MZIC.dock.classList.remove("show"); mzIcHistClose(); mzIcModelClose();
+    try { applyLayout(); } catch (e) {}
+  }
+}
+function mzIdeSetOpen(v){
+  MZIDE.open = v;
+  try { Promise.resolve(api("editor_set_ide_open", !!v)).catch(()=>{}); } catch (e) { /* remembered so the next launch reopens in the IDE */ }
+  document.documentElement.classList.toggle("mz-ide-open", v);
+  if (MZIDE.host) MZIDE.host.style.display = v ? "block" : "none";
+  if (MZIDE.frame) mzPostTo(MZIDE, {__ed:"visibility", visible:v});
+  mzIcDock(v);
+  mzSyncDirty();
+}
+function mzIdeEnsureFrame(){
+  if (MZIDE.booting) return MZIDE.booting;
+  MZIDE.booting = (async ()=>{
+    const root = document.getElementById("root");
+    let host = MZIDE.host;
+    if (!host){
+      host = document.createElement("div"); host.id = "mz-ide";
+      host.innerHTML = '<button id="mz-ide-x" title="Return to the simple editor">Back to editor</button>';
+      root.appendChild(host); MZIDE.host = host;
+      host.querySelector("#mz-ide-x").onclick = ()=>mzIdeClose(true);
+    }
+    const info = await api("editor_server_info", "ide");
+    if (!info || !info.ok) throw new Error((info && info.error) || "The IDE could not start.");
+    const fr = document.createElement("iframe");
+    MZIDE.origin = new URL(info.url).origin;
+    fr.allow = "clipboard-read; clipboard-write; fullscreen";
+    fr.setAttribute("allowtransparency", "true");
+    fr.src = info.url;
+    host.appendChild(fr);
+    MZIDE.frame = fr;
+  })();
+  MZIDE.booting.catch(()=>{ MZIDE.booting = null; });
+  return MZIDE.booting;
+}
+// First use: build the workbench bundle once (needs Node.js 18+ and internet). Resolves true when it is ready.
+function mzIdeBuildDialog(){
+  return new Promise((resolve)=>{
+    const ov = document.createElement("div");
+    ov.style.cssText = "position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;";
+    ov.innerHTML = `<div style="width:min(600px,92vw);padding:20px;border-radius:14px;background:var(--panel);color:var(--text);border:1px solid var(--border2);font:13px 'Segoe UI',sans-serif;box-shadow:0 20px 60px rgba(0,0,0,.5)">` +
+      `<div style="font-size:16px;font-weight:600;margin-bottom:6px">Setting up the full IDE</div>` +
+      `<div id="mz-ide-bs" style="color:var(--subtext);margin-bottom:10px;line-height:1.5"></div>` +
+      `<pre id="mz-ide-bl" style="white-space:pre-wrap;max-height:190px;overflow:auto;margin:0 0 14px;padding:8px;border-radius:8px;background:var(--bg);color:var(--muted);font:11px Consolas,monospace;user-select:text"></pre>` +
+      `<div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost-btn" id="mz-ide-bx">Cancel</button><button class="ghost-btn" id="mz-ide-br" style="display:none">Retry</button></div></div>`;
+    document.body.appendChild(ov);
+    const $s = ov.querySelector("#mz-ide-bs"), $l = ov.querySelector("#mz-ide-bl"), $x = ov.querySelector("#mz-ide-bx"), $r = ov.querySelector("#mz-ide-br");
+    let timer = null, done = false;
+    const finish = (ok)=>{ if (done) return; done = true; clearInterval(timer); ov.remove(); resolve(ok); };
+    $x.onclick = ()=>finish(false);          // a running build keeps going in the background
+    const start = async ()=>{
+      $r.style.display = "none"; $s.textContent = "Starting...";
+      let st = null;
+      try { st = await api("editor_workbench_status"); } catch (e) {}
+      if (st && st.ok && !st.node){
+        $s.innerHTML = "The IDE is built once on this PC and needs <b>Node.js 18 or newer</b> (nodejs.org) plus an internet connection. Node.js was not found. Install it, then press Retry.";
+        $r.style.display = ""; return;
+      }
+      let b = null;
+      try { b = await api("editor_workbench_build", false); } catch (e) {}
+      if (!b || !b.ok){ $s.textContent = (b && b.error) || "Could not start the build."; $r.style.display = ""; return; }
+      $s.textContent = "Building the VS Code workbench. This happens once (about 2-5 minutes); after that the IDE opens in a few seconds.";
+      clearInterval(timer);
+      timer = setInterval(async ()=>{
+        let s = null; try { s = await api("editor_workbench_status"); } catch (e) { return; }
+        if (!s || !s.ok) return;
+        $l.textContent = (s.log || []).slice(-10).join(String.fromCharCode(10));
+        $l.scrollTop = $l.scrollHeight;
+        if (s.state === "error"){ clearInterval(timer); $s.textContent = "The build failed: " + (s.error || "unknown error"); $r.style.display = ""; return; }
+        if (s.built && s.state === "ready"){ finish(true); return; }
+        $s.textContent = (s.step || "Building") + (s.elapsed ? "  (" + s.elapsed + " s)" : "");
+      }, 1500);
+    };
+    $r.onclick = start;
+    start();
+  });
+}
+async function mzIdeEnsureBuilt(){
+  let st = null;
+  try { st = await api("editor_workbench_status"); } catch (e) {}
+  if (!st || !st.ok){ await showConfirm((st && st.error) || "The IDE backend is not available.", "Full IDE"); return false; }
+  if (st.state === "unavailable"){ await showConfirm("gui/workbench_backend.py is missing, so the full IDE is not installed.", "Full IDE"); return false; }
+  // rebuild only when nothing is built, or sources changed and the IDE page is not running (swapping files under a live page would break it)
+  const need = !st.built || (st.stale && st.sources && st.node && !MZIDE.frame);
+  if (!need) return true;
+  return await mzIdeBuildDialog();
+}
+async function mzIdeOpen(){
+  if (MZIDE.open || MZIDE.opening) return;
+  MZIDE.opening = true;
+  try {
+    if (!(await mzIdeEnsureBuilt())) return;
+    let data = null;
+    if (MZED.frame && MZED.ready) data = await mzAsk(MZED, "handoff_out", {}, 15000);     // the simple editor's session
+    await mzIdeEnsureFrame();
+    mzIdeSetOpen(true);                                  // the IDE's own splash shows while it boots / adopts the session
+    if (data) await mzAsk(MZIDE, "handoff_in", {data:data}, 120000);
+  } catch (e) {
+    mzIdeSetOpen(false);
+    await showConfirm("The full IDE could not open: " + ((e && e.message) || e), "Full IDE");
+  } finally { MZIDE.opening = false; }
+}
+async function mzIdeClose(force){
+  if (!MZIDE.open) return;
+  const data = (MZIDE.booted && !force) ? await mzAsk(MZIDE, "handoff_out", {}, 15000) : null;
+  if (data){
+    await mzEdEnsureFrame();
+    await mzAsk(MZED, "handoff_in", {data:data}, 60000);
+  }
+  mzIdeSetOpen(false);
+  switchTab("Editor");
+  mzEdShow(true);
+}
 function mzEdEvent(kind, payload){
   // editor_ai_request = the chat model reading/editing through the Editor (editor_link.py). Its open_file /
   // open_folder ops show the Editor like the plain open events; state/snapshot/edit ops must NOT steal the
@@ -12067,21 +13801,22 @@ function mzEdEvent(kind, payload){
   const aiOpen = (aiOp === "open_file" || aiOp === "open_folder" || aiOp === "approve_edit");   // approve_edit: the dialog must be seen
   if (kind === "editor_open_artifact" || kind === "editor_open_file" || kind === "editor_open_folder" || aiOpen){
     if (state.renderSurfaceOpen){ closeRenderSurfaceUI(); api("render_surface_manual_close"); }
-    switchTab("Editor");
-  } else if (kind === "editor_ai_request" && !MZED.frame){
+    if (!MZIDE.open) switchTab("Editor");
+  } else if (kind === "editor_ai_request" && !MZED.frame && !MZIDE.open){
     mzEdEnsureFrame();
   }
-  mzEdPost({__ed:"event", kind, payload});
+  mzRoute(kind, payload);
 }
 window.addEventListener("message", (e)=>{
-  if (!MZED.frame || e.source !== MZED.frame.contentWindow) return;
+  const ep = (MZED.frame && e.source === MZED.frame.contentWindow) ? MZED : (MZIDE.frame && e.source === MZIDE.frame.contentWindow) ? MZIDE : null;
+  if (!ep) return;
   const d = e.data;
   if (!d || typeof d !== "object" || !d.__ed) return;
-  const reply = (o)=>{ try { MZED.frame.contentWindow.postMessage(o, MZED.origin); } catch (x) {} };
+  const reply = (o)=>{ try { ep.frame.contentWindow.postMessage(o, ep.origin); } catch (x) {} };
   if (d.__ed === "ready"){
-    MZED.ready = true;
-    mzEdPost({__ed:"theme", vars: mzEdThemeVars()});
-    MZED.queue.splice(0).forEach(m=>mzEdPost(m));
+    ep.ready = true;
+    mzPushTheme(ep, true);
+    ep.queue.splice(0).forEach(m=>mzPostTo(ep, m));
   } else if (d.__ed === "rpc"){
     const m = String(d.method || "");
     if (!/^editor_[a-z_]+$/.test(m)){ reply({__ed:"rpc_result", id:d.id, error:"method not allowed: " + m}); return; }
@@ -12089,15 +13824,126 @@ window.addEventListener("message", (e)=>{
       .then(r=>reply({__ed:"rpc_result", id:d.id, result:r}))
       .catch(err=>reply({__ed:"rpc_result", id:d.id, error:String((err && err.message) || err)}));
   } else if (d.__ed === "dirty"){
-    const b = document.querySelector('.tab-btn[data-name="Editor"]');
-    if (b) b.classList.toggle("has-dirty", d.count > 0);
+    ep.dirty = d.count | 0;
+    mzSyncDirty();
+  } else if (d.__ed === "ide_open"){
+    mzIdeOpen();
+  } else if (d.__ed === "ide_close"){
+    mzIdeClose(false);
+  } else if (d.__ed === "aux_rect" && ep === MZIDE){
+    MZIC.rect = (d.rect && d.rect.w > 0) ? {x:d.rect.x|0, y:d.rect.y|0, w:d.rect.w|0, h:d.rect.h|0} : null;
+    if (MZIDE.open) mzIcPlace(MZIC.rect);
+  } else if (d.__ed === "chat_focus" && ep === MZIDE){
+    const ta = document.getElementById("msg-input"); if (ta) setTimeout(()=>ta.focus(), 60);
+  } else if (d.__ed === "booted" && ep === MZIDE){
+    MZIDE.booted = true; MZIDE.workspace = String(d.workspace || "");
+    if (MZIDE.host) MZIDE.host.classList.add("booted");
+  } else if (d.__ed === "handoff" || d.__ed === "handoff_done"){
+    const w = ep.waiters[d.id];
+    if (w){ delete ep.waiters[d.id]; w(d.__ed === "handoff" ? d.data : true); }
   }
 });
 // Keep Monaco's colors in step with the app theme (applyTheme/applyColors set CSS vars on <html>).
 new MutationObserver(()=>{
   clearTimeout(MZED.themeTimer);
-  MZED.themeTimer = setTimeout(()=>{ if (MZED.ready) mzEdPost({__ed:"theme", vars: mzEdThemeVars()}); }, 120);
+  MZED.themeTimer = setTimeout(()=>{
+    if (MZED.ready) mzPushTheme(MZED);
+    if (MZIDE.ready) mzPushTheme(MZIDE);
+  }, 120);
 }).observe(document.documentElement, {attributes:true, attributeFilter:["style","class"]});
+
+// ── Audio player (voiceover clips) ─────────────────────────────────────────────────────
+// Python (voiceover.py) is the source of truth; it pushes a "voiceover_state" event on every change. While
+// playing, the bar is advanced locally from the last known position (no polling, transform-only painting).
+const VO = {st:null, hidden:false, raf:0, base:0, t0:0, flash:"", flashT:0, seeking:false, seekPos:0};
+function voFmt(s){ s = Math.max(0, Math.floor(s || 0)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); }
+function voCur(){
+  const st = VO.st;
+  if (!st) return 0;
+  if (!st.playing) return st.position;
+  return Math.min(st.duration, VO.base + (performance.now() - VO.t0) / 1000);
+}
+function voPaint(){
+  const el = document.getElementById("vo-player");
+  if (!el) return;
+  const st = VO.st;
+  if (!st || VO.hidden){ el.classList.remove("show", "playing"); return; }
+  el.classList.add("show");
+  const dur = st.duration || 0;
+  const cur = VO.seeking ? VO.seekPos : voCur();
+  const playing = !!st.playing && cur < dur - 0.05;
+  el.classList.toggle("playing", playing);
+  document.getElementById("vo-fill").style.transform = "scaleX(" + (dur ? Math.min(1, cur / dur) : 0) + ")";
+  document.getElementById("vo-time").textContent = voFmt(cur) + " / " + voFmt(dur);
+  document.getElementById("vo-title").textContent = st.title + (st.version > 1 ? "  ·  v" + st.version : "");
+  document.getElementById("vo-tag").textContent = VO.flash || (st.saved_to ? "saved" : "not saved");
+}
+function voTick(){
+  cancelAnimationFrame(VO.raf);
+  voPaint();
+  if (VO.st && VO.st.playing && !VO.hidden) VO.raf = requestAnimationFrame(voTick);
+}
+function voUpdate(st){
+  if (!st || !st.id){ VO.st = null; VO.hidden = false; cancelAnimationFrame(VO.raf); voPaint(); return; }
+  const prev = VO.st;
+  // a new clip or a new version of it brings the player back even if it was hidden
+  if (!prev || prev.id !== st.id || prev.version !== st.version) VO.hidden = false;
+  VO.st = st;
+  VO.base = st.position;
+  VO.t0 = performance.now();
+  voTick();
+}
+function voFlash(text){
+  VO.flash = text;
+  voPaint();
+  clearTimeout(VO.flashT);
+  VO.flashT = setTimeout(function(){ VO.flash = ""; voPaint(); }, 2600);
+}
+async function voToggle(){
+  try { voUpdate(await api("voiceover_toggle")); } catch (e) { voFlash("Playback failed"); }
+}
+async function voSave(){
+  try {
+    const r = await api("voiceover_save");
+    if (r && r.state) voUpdate(r.state);
+    if (r && r.ok) voFlash("Saved");
+    else if (r && !r.cancelled) voFlash("Save failed");
+  } catch (e) { voFlash("Save failed"); }
+}
+function voInit(){
+  const play = document.getElementById("vo-play"), save = document.getElementById("vo-save"),
+        hide = document.getElementById("vo-hide"), bar = document.getElementById("vo-bar");
+  if (!play || !bar) return;
+  play.addEventListener("click", voToggle);
+  save.addEventListener("click", voSave);
+  hide.addEventListener("click", function(){ VO.hidden = true; cancelAnimationFrame(VO.raf); voPaint(); });
+  const fracAt = function(ev){
+    const r = bar.getBoundingClientRect();
+    return r.width ? Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width)) : 0;
+  };
+  bar.addEventListener("pointerdown", function(ev){
+    if (!VO.st) return;
+    VO.seeking = true;
+    VO.seekPos = fracAt(ev) * (VO.st.duration || 0);
+    try { bar.setPointerCapture(ev.pointerId); } catch (e) {}
+    voPaint();
+  });
+  bar.addEventListener("pointermove", function(ev){
+    if (!VO.seeking || !VO.st) return;
+    VO.seekPos = fracAt(ev) * (VO.st.duration || 0);
+    voPaint();
+  });
+  const endSeek = async function(ev){
+    if (!VO.seeking) return;
+    VO.seeking = false;
+    try { voUpdate(await api("voiceover_seek", fracAt(ev))); } catch (e) { voPaint(); }
+  };
+  bar.addEventListener("pointerup", endSeek);
+  bar.addEventListener("pointercancel", function(){ VO.seeking = false; voPaint(); });
+  // restore the player if a clip already exists (e.g. the page was reloaded)
+  setTimeout(function(){ try { api("voiceover_state").then(voUpdate).catch(function(){}); } catch (e) {} }, 1200);
+}
+if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", voInit); else voInit();
 
 function showToolPane(name){
   const box = document.getElementById("tool-content");
@@ -12108,6 +13954,7 @@ function showToolPane(name){
     "Agents": buildAgentsPane,
     "Permissions": buildPermissionsPane,
     "Surfaces": buildSurfacesPane,
+    "Dynamic Backgrounds": buildDynamicBackgroundsPane,
     "Editor": buildEditorPane,
   };
   box.innerHTML = "";
@@ -14897,7 +16744,8 @@ function initBlobLayer(){
     if (w === lastW && h === lastH) return;
     lastW = w; lastH = h;
 
-    document.documentElement.classList.add("blob-settling");
+    // the IDE is a transparent iframe over this layer: fading the blobs there reads as the IDE background flashing
+    if (!document.documentElement.classList.contains("mz-ide-open")) document.documentElement.classList.add("blob-settling");
     clearTimeout(resizeSettleTimer);
     resizeSettleTimer = setTimeout(()=>{
       setBlobScale();
@@ -14970,31 +16818,25 @@ function initBlobLayer(){
   // external trigger individually, just stop doing any work and hide the
   // layer the moment focus or visibility is lost, and fade it back in
   // only once this window is genuinely focused and visible again.
-  let hidden = false;
-  function setHidden(v){
-    if (v === hidden) return;
-    hidden = v;
-    document.documentElement.classList.toggle("blob-hidden", v);
-    if (v){
-      cursorStop();
-      active = false;
-    } else if (!blobsPaused){
-      active = true;
-      cursorStart();
-    }
+  // Blur/focus only PAUSE the animation loops; they never change what is painted. (Fading the layer on blur made the
+  // transparent IDE iframe flash on every focus change, and the <html> class flip re-sent the theme to the IDE.)
+  let paused = false;
+  function setPaused(v){
+    if (v === paused) return;
+    paused = v;
+    if (v){ cursorStop(); active = false; }
+    else if (!blobsPaused){ active = true; cursorStart(); }
   }
-  window.addEventListener("blur", ()=> setHidden(true));
-  window.addEventListener("focus", ()=> setHidden(false));
-  document.addEventListener("visibilitychange", ()=>{
-    setHidden(document.hidden || !document.hasFocus());
-  });
-  // In case this boots already unfocused/occluded (e.g. opened in the
-  // background), start in the hidden state instead of flashing on first paint.
-  setHidden(document.hidden || !document.hasFocus());
+  // blur caused by focus moving into our own iframe (IDE/editor) is not "app in background": hasFocus() stays true
+  const syncPaused = ()=> setTimeout(()=> setPaused(document.hidden || !document.hasFocus()), 0);
+  window.addEventListener("blur", syncPaused);
+  window.addEventListener("focus", syncPaused);
+  document.addEventListener("visibilitychange", syncPaused);
+  setPaused(document.hidden || !document.hasFocus());
 
   return {
     pause(){ active = false; blobsPaused = true; cursorStop(); },
-    resume(){ active = true; blobsPaused = false; if (!hidden) cursorStart(); },
+    resume(){ active = true; blobsPaused = false; if (!paused) cursorStart(); },
   };
 }
 
@@ -15039,12 +16881,15 @@ function initTitlebar(){
 function _applyFeatherIcons(){
   if (window.feather){ feather.replace({ "stroke-width": 2, width: 14, height: 14 }); }
 }
+let _lastReportedDpr = 0;
 function _reportDpiScale(){
-  api("set_dpi_scale", window.devicePixelRatio || 1);
-  // Re-arm the one-shot matchMedia listener at the new ratio so a further
-  // scale change (e.g. dragged to yet another monitor) is still caught.
+  // Runs on every resize too: only talk to Python and re-arm the one-shot listener when the ratio really changed.
+  const dpr = window.devicePixelRatio || 1;
+  if (dpr === _lastReportedDpr) return;
+  _lastReportedDpr = dpr;
+  api("set_dpi_scale", dpr);
   try{
-    matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`).addEventListener("change", _reportDpiScale, { once: true });
+    matchMedia(`(resolution: ${dpr}dppx)`).addEventListener("change", _reportDpiScale, { once: true });
   }catch(e){}
 }
 function setTitlebarMaxIcon(isMaximized){
@@ -15063,8 +16908,11 @@ async function refreshTitlebarInfo(){
 }
 
 // ── Boot -----------------------------------------------------------------
-_blobLayerCtl = initBlobLayer(); // pure DOM/CSS, doesn't need the pywebview bridge -- start immediately
+// (initBlobLayer now runs inside the pywebviewready handler, after the splash intro -- see __midumSplashGate)
 window.addEventListener("pywebviewready", async ()=>{
+  // Hold ALL startup work until the splash intro has finished playing.
+  try { if (window.__midumSplashGate) await window.__midumSplashGate; } catch (e) { /* splash is cosmetic */ }
+  _blobLayerCtl = initBlobLayer();
   initTitlebar();
   buildTabbar();
   buildSidebar();
@@ -15094,6 +16942,12 @@ window.addEventListener("pywebviewready", async ()=>{
   document.getElementById("midumdocs-recompile").onclick = (e)=>_mdPost({md:"cmd", cmd:"recompile", clean:!!e.shiftKey});
   document.getElementById("midumdocs-pdf").onclick = ()=>_mdPost({md:"cmd", cmd:"download_pdf"});
   document.getElementById("midumdocs-tex").onclick = ()=>_mdPost({md:"cmd", cmd:"download_tex"});
+  document.getElementById("midumdocs-full").onclick = ()=>_mdSetFull(!state.midumDocFull);
+  document.addEventListener("keydown", (e)=>{
+    if (!state.midumDocOpen) return;
+    if (e.key === "F11"){ e.preventDefault(); _mdSetFull(!state.midumDocFull); }
+    else if (e.key === "Escape" && state.midumDocFull && !document.getElementById("modal-overlay").classList.contains("open")) _mdSetFull(false);
+  });
   document.querySelectorAll("#midumdocs-modes button").forEach(b=>{ b.onclick = ()=>{
     _mdMode = b.dataset.mode;
     document.querySelectorAll("#midumdocs-modes button").forEach(x=>x.classList.toggle("active", x === b));
@@ -15133,6 +16987,14 @@ window.addEventListener("pywebviewready", async ()=>{
     });
   } catch (e) { /* pywebview bridge not ready yet on some platforms — fine */ }
 
+  // Restore the app-wide Dynamic Background (if one was active when the app
+  // last closed). Separate from the settings block above so a failure in
+  // either can't stop the other.
+  try {
+    const dyn = await api("dynamic_background_get_active");
+    if (dyn && dyn.ok && dyn.active) applyDynamicBackground(dyn.code, dyn);
+  } catch (e) { /* no active background / bridge not ready -- fine */ }
+
   // Pygments token-color CSS for syntax-highlighted code blocks -- fetched
   // once and injected as a <style> tag. Injected here (rather than baked
   // into the static CSS below) since the palette lives server-side next to
@@ -15148,6 +17010,18 @@ window.addEventListener("pywebviewready", async ()=>{
   } catch (e) { /* Pygments not installed server-side -- code blocks just stay unhighlighted */ }
 
   await api("startup");
+  try { if (window.__midumSplashReady) window.__midumSplashReady(); } catch (e) { /* splash is cosmetic */ }
+  welcomeStart();
+
+  // If the app was last closed while the full IDE was open, go straight back into it (only when the IDE bundle is already
+  // built: a first-time build prompt must never appear on its own at launch).
+  try {
+    const es = await api("editor_get_state");
+    if (es && es.ok && es.state && es.state.ideOpen){
+      const ws = await api("editor_workbench_status");
+      if (ws && ws.ok && ws.built) mzIdeOpen();
+    }
+  } catch (e) { /* editor backend unavailable: stay on the normal screen */ }
 });
 </script>
 </body>
@@ -15155,7 +17029,75 @@ window.addEventListener("pywebviewready", async ()=>{
 """
 
 
+def _configure_chromium_flags():
+    """Disable Chromium's native window-occlusion tracking (a multi-monitor flicker source). Must run before Qt starts."""
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()
+    disabled, kept = [], []
+    for f in flags:
+        if f.startswith("--disable-features="):
+            disabled += [x for x in f.split("=", 1)[1].split(",") if x]
+        else:
+            kept.append(f)
+    if "CalculateNativeWinOcclusion" not in disabled:
+        disabled.append("CalculateNativeWinOcclusion")
+    kept.append("--disable-features=" + ",".join(disabled))
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(kept)
+
+
+def _hide_window_from_js_bridge(api_cls):
+    """Keep Api.window usable from Python but invisible to pywebview's js_api introspection.
+
+    pywebview walks every public attribute of the js_api object recursively to build
+    window.pywebview.api. Because Api.window is the pywebview Window (whose .native is the
+    Qt QMainWindow), that walk descends into Qt enums and spams
+    "Error while processing window.native.* ... sip.enumtype ... has no member
+    'as_integer_ratio'" hundreds of times (and wastes startup time). The walk goes through
+    dir(), so the attribute is stored privately and filtered out of dir().
+    """
+    def _get(self):
+        return self.__dict__.get("_window")
+
+    def _set(self, value):
+        self.__dict__["_window"] = value
+
+    def _dir(self):
+        return [n for n in object.__dir__(self) if n not in ("window", "_window")]
+
+    api_cls.window = property(_get, _set)
+    api_cls.__dir__ = _dir
+
+
 def main():
+    _configure_chromium_flags()
+    # Crash diagnostics: a native crash (Qt / QtWebEngine / a C extension) kills the process with no
+    # Python traceback. faulthandler dumps the Python stack of every thread to this file at the moment
+    # of the crash, and Chromium logs (renderer/GPU process deaths) go to chromium.log beside it.
+    try:
+        import faulthandler
+        _diag_dir = os.path.join(_PKG_ROOT, "storage")
+        os.makedirs(_diag_dir, exist_ok=True)
+        _fh_file = open(os.path.join(_diag_dir, "gui_crash.log"), "a", buffering=1)
+        _fh_file.write("\n=== launch %s ===\n" % datetime.datetime.now().isoformat())
+        try:
+            from importlib import metadata as _md
+            _vers = []
+            for _pkg in ("PyQt5", "PyQt5-Qt5", "PyQt5-sip", "PyQtWebEngine", "PyQtWebEngine-Qt5",
+                         "PySide6", "qtpy", "pywebview", "pynput"):
+                try:
+                    _vers.append("%s==%s" % (_pkg, _md.version(_pkg)))
+                except Exception:
+                    pass
+            _fh_file.write("python %s | %s\n" % (sys.version.split()[0], ", ".join(_vers)))
+        except Exception:
+            pass
+        faulthandler.enable(file=_fh_file, all_threads=True)
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+            os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+            + " --enable-logging --log-level=0 --log-file="
+            + os.path.join(_diag_dir, "chromium.log")
+        ).strip()
+    except Exception:
+        pass
     # Fail loudly if QtWebEngine isn't actually importable, instead of
     # letting pywebview silently fall back to the broken legacy WinForms
     # renderer (which is what produces the AccessibilityObject.Bounds /
@@ -15193,10 +17135,20 @@ def main():
         )
         sys.exit(1)
 
+    _hide_window_from_js_bridge(Api)
     api = Api()
+    # Serve the UI from http://localhost:<port>/ instead of html=: an html= page has an opaque origin, which makes the IDE
+    # iframe third-party (IndexedDB denied, not a secure context). Falls back to html= if the server can't start.
+    _shell_url = None
+    try:
+        from gui.editor_backend import serve_shell
+        _shell_url = serve_shell(_HTML)
+    except Exception:
+        traceback.print_exc()
     window = webview.create_window(
         "Midum Control Center",
-        html=_HTML,
+        url=_shell_url,
+        html=None if _shell_url else _HTML,
         js_api=api,
         width=1600,
         height=950,
@@ -15222,7 +17174,20 @@ def main():
     # the machine, which avoids the WinForms/legacy-Trident fallback and
     # the AccessibleObject.Bounds spam that comes with it. On Linux this
     # also uses QtWebEngine (Chromium) rather than WebKitGTK.
-    webview.start(gui="qt", debug=False)
+    # pywebview defaults to private_mode=True, which makes QtWebEngine use an off-the-record profile. In that mode
+    # Chromium refuses IndexedDB ("UnknownError: The user denied permission to access the database"), and the VS Code
+    # workbench (Editor tab IDE) cannot start because it keeps its file/state databases there. Use a persistent profile.
+    _wv_storage = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "storage", "webview_profile")
+    try:
+        import config as _cfg
+        _wv_storage = os.path.join(_cfg.STORAGE_DIR, "webview_profile")
+    except Exception:
+        pass
+    try:
+        os.makedirs(_wv_storage, exist_ok=True)
+    except OSError:
+        pass
+    webview.start(gui="qt", debug=False, private_mode=False, storage_path=_wv_storage)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,81 @@
+Date : 2026-10-27 16:59:23
+Directory : d:\Midum\jarvis_project\midum_pkg
+Total : 41 files,  11794 codes, 937 comments, 1014 blanks, all 13745 lines
+
+Languages
++--------------------+------------+------------+------------+------------+------------+
+| language           | files      | code       | comment    | blank      | total      |
++--------------------+------------+------------+------------+------------+------------+
+| Python             |         21 |      7,898 |        912 |        862 |      9,672 |
+| HTML               |          2 |      2,563 |          0 |         63 |      2,626 |
+| JSON               |          2 |        567 |          0 |          1 |        568 |
+| JavaScript         |          2 |        378 |         17 |         20 |        415 |
+| Markdown           |          6 |        268 |          0 |         68 |        336 |
+| Java               |          6 |         71 |          0 |         -4 |         67 |
+| TypeScript         |          1 |         41 |          8 |          3 |         52 |
+| JSON with Comments |          1 |          8 |          0 |          1 |          9 |
++--------------------+------------+------------+------------+------------+------------+
+
+Directories
++-----------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| path                                                                        | files      | code       | comment    | blank      | total      |
++-----------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| .                                                                           |         41 |     11,794 |        937 |      1,014 |     13,745 |
+| . (Files)                                                                   |         19 |      4,295 |        504 |        443 |      5,242 |
+| docs                                                                        |          6 |        268 |          0 |         68 |        336 |
+| gui                                                                         |         12 |      7,024 |        292 |        463 |      7,779 |
+| gui (Files)                                                                 |          5 |      3,930 |        267 |        375 |      4,572 |
+| gui\editor_assets                                                           |          1 |      1,982 |          0 |         35 |      2,017 |
+| gui\midumdocs_assets                                                        |          2 |        951 |         16 |         47 |      1,014 |
+| gui\workbench                                                               |          4 |        161 |          9 |          6 |        176 |
+| providers                                                                   |          1 |        147 |         18 |         19 |        184 |
+| tools                                                                       |          3 |         60 |        123 |         21 |        204 |
++-----------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+
+Files
++-----------------------------------------------------------------------------+--------------------+------------+------------+------------+------------+
+| filename                                                                    | language           | code       | comment    | blank      | total      |
++-----------------------------------------------------------------------------+--------------------+------------+------------+------------+------------+
+| d:\Midum\jarvis_project\midum_pkg\Car.class                                 | Java               |          6 |          0 |          0 |          6 |
+| d:\Midum\jarvis_project\midum_pkg\Main.class                                | Java               |         18 |          0 |          0 |         18 |
+| d:\Midum\jarvis_project\midum_pkg\Main.java                                 | Java               |         14 |          0 |         -4 |         10 |
+| d:\Midum\jarvis_project\midum_pkg\MethodExamples.class                      | Java               |         21 |          0 |          0 |         21 |
+| d:\Midum\jarvis_project\midum_pkg\SUV.class                                 | Java               |          6 |          0 |          0 |          6 |
+| d:\Midum\jarvis_project\midum_pkg\Sedan.class                               | Java               |          6 |          0 |          0 |          6 |
+| d:\Midum\jarvis_project\midum_pkg\artifacts.py                              | Python             |      1,425 |        117 |        185 |      1,727 |
+| d:\Midum\jarvis_project\midum_pkg\docs\README.md                            | Markdown           |          2 |          0 |          0 |          2 |
+| d:\Midum\jarvis_project\midum_pkg\docs\artifacts.md                         | Markdown           |         36 |          0 |         11 |         47 |
+| d:\Midum\jarvis_project\midum_pkg\docs\dynamic_background.md                | Markdown           |         53 |          0 |         27 |         80 |
+| d:\Midum\jarvis_project\midum_pkg\docs\editor.md                            | Markdown           |        151 |          0 |         23 |        174 |
+| d:\Midum\jarvis_project\midum_pkg\docs\gui_frontend.md                      | Markdown           |          9 |          0 |          2 |         11 |
+| d:\Midum\jarvis_project\midum_pkg\docs\midumdocs.md                         | Markdown           |         17 |          0 |          5 |         22 |
+| d:\Midum\jarvis_project\midum_pkg\editor_link.py                            | Python             |        869 |         64 |        118 |      1,051 |
+| d:\Midum\jarvis_project\midum_pkg\flow_meta.json                            | JSON               |        463 |          0 |          0 |        463 |
+| d:\Midum\jarvis_project\midum_pkg\flow_tools.py                             | Python             |         30 |         44 |          3 |         77 |
+| d:\Midum\jarvis_project\midum_pkg\flows.py                                  | Python             |         56 |         34 |          5 |         95 |
+| d:\Midum\jarvis_project\midum_pkg\gui\ambient_surface.py                    | Python             |         64 |        -20 |          0 |         44 |
+| d:\Midum\jarvis_project\midum_pkg\gui\app.py                                | Python             |      1,860 |        123 |         78 |      2,061 |
+| d:\Midum\jarvis_project\midum_pkg\gui\editor_assets\editor.html             | HTML               |      1,982 |          0 |         35 |      2,017 |
+| d:\Midum\jarvis_project\midum_pkg\gui\editor_backend.py                     | Python             |        758 |         67 |        112 |        937 |
+| d:\Midum\jarvis_project\midum_pkg\gui\inline_suggest.py                     | Python             |        513 |         59 |         72 |        644 |
+| d:\Midum\jarvis_project\midum_pkg\gui\midumdocs_assets\editor.html          | HTML               |        581 |          0 |         28 |        609 |
+| d:\Midum\jarvis_project\midum_pkg\gui\midumdocs_assets\pageedit.js          | JavaScript         |        370 |         16 |         19 |        405 |
+| d:\Midum\jarvis_project\midum_pkg\gui\workbench\package.json                | JSON               |        104 |          0 |          1 |        105 |
+| d:\Midum\jarvis_project\midum_pkg\gui\workbench\stub-diagnostics-channel.js | JavaScript         |          8 |          1 |          1 |         10 |
+| d:\Midum\jarvis_project\midum_pkg\gui\workbench\tsconfig.json               | JSON with Comments |          8 |          0 |          1 |          9 |
+| d:\Midum\jarvis_project\midum_pkg\gui\workbench\vite.config.ts              | TypeScript         |         41 |          8 |          3 |         52 |
+| d:\Midum\jarvis_project\midum_pkg\gui\workbench_backend.py                  | Python             |        735 |         38 |        113 |        886 |
+| d:\Midum\jarvis_project\midum_pkg\main.py                                   | Python             |          1 |          0 |          0 |          1 |
+| d:\Midum\jarvis_project\midum_pkg\midumdocs.py                              | Python             |        909 |         82 |         60 |      1,051 |
+| d:\Midum\jarvis_project\midum_pkg\orchestration.py                          | Python             |         21 |        100 |          2 |        123 |
+| d:\Midum\jarvis_project\midum_pkg\permissions.py                            | Python             |          3 |          8 |          0 |         11 |
+| d:\Midum\jarvis_project\midum_pkg\providers\gemini_api_backend.py           | Python             |        147 |         18 |         19 |        184 |
+| d:\Midum\jarvis_project\midum_pkg\shell_session.py                          | Python             |        245 |         37 |         68 |        350 |
+| d:\Midum\jarvis_project\midum_pkg\system_prompt.py                          | Python             |         73 |          0 |          0 |         73 |
+| d:\Midum\jarvis_project\midum_pkg\tools\dynamic_background_tools.py         | Python             |         48 |        122 |         20 |        190 |
+| d:\Midum\jarvis_project\midum_pkg\tools\render_surface_tools.py             | Python             |         11 |          1 |          1 |         13 |
+| d:\Midum\jarvis_project\midum_pkg\tools\surface_delegate_tools.py           | Python             |          1 |          0 |          0 |          1 |
+| d:\Midum\jarvis_project\midum_pkg\tools_registry.py                         | Python             |         31 |         18 |          6 |         55 |
+| d:\Midum\jarvis_project\midum_pkg\tools_schema.py                           | Python             |         98 |          0 |          0 |         98 |
+| Total                                                                       |                    |     11,794 |        937 |      1,014 |     13,745 |
++-----------------------------------------------------------------------------+--------------------+------------+------------+------------+------------+

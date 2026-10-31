@@ -2,21 +2,23 @@
 <html lang="en" class="dark">
 <head>
     <!-- Google tag (gtag.js) -->
-<script async src="https://www.googletagmanager.com/gtag/js?id=G-QXP92KSRTE"></script>
-<script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){dataLayer.push(arguments);}
-  gtag('js', new Date());
-
-  gtag('config', 'G-QXP92KSRTE');
-</script>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-QXP92KSRTE"></script>
+    <script>
+        window.dataLayer = window.dataLayer || [];
+        function gtag(){dataLayer.push(arguments);}
+        gtag('js', new Date());
+        gtag('config', 'G-QXP92KSRTE');
+    </script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Midum | Local Agentic Desktop Assistant</title>
+    <title>Midum Documentation</title>
+    <meta name="description" content="End-User Documentation for Midum">
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
 
     <script>
         tailwind.config = {
@@ -28,194 +30,141 @@
                         mono: ['JetBrains Mono', 'monospace'],
                     },
                     colors: {
-                        brand: {
-                            50: '#f0f7ff',
-                            100: '#e0effe',
-                            500: '#3b82f6',
-                            600: '#1d4ed8',
-                            900: '#0f172a',
-                            darkBg: '#05070c',
-                            cardBg: '#0b0f19',
-                            accent: '#60a5fa',
-                            glow: '#3b82f6'
-                        }
-                    },
-                    animation: {
-                        'float': 'float 6s ease-in-out infinite',
-                        'pulse-slow': 'pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-                    },
-                    keyframes: {
-                        float: {
-                            '0%, 100%': { transform: 'translateY(0px)' },
-                            '50%': { transform: 'translateY(-10px)' },
-                        }
+                        brand: { 500: '#3b82f6', 600: '#1d4ed8', accent: '#60a5fa', glow: '#3b82f6' }
                     }
                 }
             }
         }
     </script>
+
     <style>
         :root {
             --bg-page: #05070c;
-            --text-primary: #f3f4f6;
+            --text: #e5e7eb;
+            --text-strong: #ffffff;
+            --text-muted: #9ca3af;
             --panel-bg: rgba(11, 15, 25, 0.7);
-            --panel-border: rgba(255, 255, 255, 0.05);
+            --panel-hover: rgba(30, 41, 59, 0.7);
+            --border: rgba(255, 255, 255, 0.07);
+            --accent: #60a5fa;
             --glow-opacity: 0.12;
             --code-bg: rgba(59,130,246,0.08);
             --code-border: rgba(59,130,246,0.18);
             --code-text: #93c5fd;
             --pre-bg: #0a0e17;
-            --pre-border: rgba(255,255,255,0.06);
             --pre-text: #cbd5e1;
-            --nav-link: #9ca3af;
-            --footer-bg: rgba(3, 7, 18, 0.4);
         }
-
         html.light {
             --bg-page: #f7f9fc;
-            --text-primary: #10182b;
+            --text: #1f2937;
+            --text-strong: #10182b;
+            --text-muted: #5b6676;
             --panel-bg: rgba(255, 255, 255, 0.85);
-            --panel-border: rgba(15, 23, 42, 0.08);
+            --panel-hover: rgba(226, 232, 240, 0.8);
+            --border: rgba(15, 23, 42, 0.1);
+            --accent: #1d4ed8;
             --glow-opacity: 0.08;
             --code-bg: rgba(29, 78, 216, 0.06);
             --code-border: rgba(29, 78, 216, 0.18);
             --code-text: #1d4ed8;
             --pre-bg: #eef2f9;
-            --pre-border: rgba(15, 23, 42, 0.08);
             --pre-text: #1f2937;
-            --nav-link: #4b5563;
-            --footer-bg: rgba(241, 245, 249, 0.6);
         }
 
-        body {
-            background-color: var(--bg-page);
-            color: var(--text-primary);
-            overflow-x: hidden;
-            transition: background-color 0.25s ease, color 0.25s ease;
-        }
-        .glass-panel {
-            background: var(--panel-bg);
-            backdrop-filter: blur(16px);
-            border: 1px solid var(--panel-border);
-            transition: background-color 0.25s ease, border-color 0.25s ease;
-        }
-        .ambient-glow {
-            filter: blur(130px);
-            opacity: var(--glow-opacity);
-            pointer-events: none;
-            will-change: transform;
-        }
-        details > summary { list-style: none; cursor: pointer; }
-        details > summary::-webkit-details-marker { display: none; }
-        details[open] .chev { transform: rotate(90deg); }
-        .chev { transition: transform 0.2s ease; }
-        code, .inline-code {
-            font-family: 'JetBrains Mono', monospace;
-            background: var(--code-bg);
-            border: 1px solid var(--code-border);
-            border-radius: 4px;
-            padding: 0.1rem 0.4rem;
-            font-size: 0.85em;
-            color: var(--code-text);
-        }
-        pre.code-block {
-            font-family: 'JetBrains Mono', monospace;
-            background: var(--pre-bg);
-            border: 1px solid var(--pre-border);
-            border-radius: 0.6rem;
-            padding: 1rem 1.25rem;
-            overflow-x: auto;
-            font-size: 0.82rem;
-            line-height: 1.6;
-            color: var(--pre-text);
-            transition: background-color 0.25s ease, color 0.25s ease;
-        }
-        .anchor-offset { scroll-margin-top: 6rem; }
+        body { background: var(--bg-page); color: var(--text); overflow-x: hidden; transition: background-color .25s, color .25s; }
+        .t-strong { color: var(--text-strong); }
+        .t-muted { color: var(--text-muted); }
+        .t-accent { color: var(--accent); }
+        .bdr { border-color: var(--border); }
+        .glass-panel { background: var(--panel-bg); backdrop-filter: blur(16px); border: 1px solid var(--border); }
+        .ambient-glow { filter: blur(130px); opacity: var(--glow-opacity); pointer-events: none; }
 
-        /* ---- Light-mode overrides for fixed Tailwind utility colors ---- */
-        html.light body { background-color: var(--bg-page); }
-        html.light .text-white { color: #10182b; }
-        html.light .text-gray-200 { color: #1f2937; }
-        html.light .text-gray-300 { color: #334155; }
-        html.light .text-gray-400 { color: #52606d; }
-        html.light .text-gray-500 { color: #6b7280; }
-        html.light .text-gray-600 { color: #9ca3af; }
-        html.light .border-gray-900 { border-color: rgba(15,23,42,0.08); }
-        html.light .border-gray-800 { border-color: rgba(15,23,42,0.12); }
-        html.light .border-gray-800\/60 { border-color: rgba(15,23,42,0.1); }
-        html.light .border-gray-700 { border-color: rgba(15,23,42,0.18); }
-        html.light .bg-gray-950\/40 { background-color: rgba(226,232,240,0.5); }
-        html.light .bg-gray-900\/60 { background-color: rgba(226,232,240,0.7); }
-        html.light .bg-gray-900\/60:hover,
-        html.light .hover\:bg-gray-800:hover { background-color: rgba(203,213,225,0.8); }
-        html.light .bg-gray-950\/40.border-t { border-color: rgba(15,23,42,0.08); }
-        html.light footer.bg-gray-950\/40 { background-color: var(--footer-bg); }
-        html.light nav a.text-gray-400 { color: var(--nav-link); }
-        html.light .bg-blue-950\/50 { background-color: rgba(219,234,254,0.8); }
-        html.light .bg-brand-accent\/5 { background-color: rgba(59,130,246,0.06); }
-        html.light .border-brand-accent\/25 { border-color: rgba(59,130,246,0.3); }
-        html.light .border-blue-500\/20 { border-color: rgba(59,130,246,0.25); }
-        html.light .border-gray-800 { border-color: rgba(15,23,42,0.1); }
-        html.light .border-emerald-500\/20 { border-color: rgba(16,185,129,0.25); }
-        html.light .border-amber-500\/20 { border-color: rgba(245,158,11,0.3); }
-        html.light .bg-emerald-500\/5 { background-color: rgba(16,185,129,0.06); }
-        html.light .bg-amber-500\/5 { background-color: rgba(245,158,11,0.07); }
-        html.light .bg-emerald-500\/10 { background-color: rgba(16,185,129,0.08); }
-        html.light .from-emerald-600\/20 { --tw-gradient-from: rgba(5,150,105,0.12); }
-        html.light .to-teal-600\/10 { --tw-gradient-to: rgba(13,148,136,0.06); }
-        html.light table thead tr { border-color: rgba(15,23,42,0.1); }
-        html.light table tbody tr { border-color: rgba(15,23,42,0.06); }
-        html.light .bg-gray-900\/60.h-full { background-color: rgba(226,232,240,0.9); }
-
-        /* theme toggle button */
-        #theme-toggle {
-            width: 2.25rem;
-            height: 2.25rem;
-            border-radius: 9999px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            border: 1px solid var(--panel-border);
-            background: var(--panel-bg);
-            color: var(--text-primary);
-            transition: transform 0.15s ease, background-color 0.25s ease, border-color 0.25s ease;
-            cursor: pointer;
-        }
+        /* theme toggle */
+        #theme-toggle { width: 2.25rem; height: 2.25rem; border-radius: 9999px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--border); background: var(--panel-bg); color: var(--text-strong); cursor: pointer; transition: transform .15s; }
         #theme-toggle:hover { transform: scale(1.06); }
         #theme-toggle svg { width: 1.1rem; height: 1.1rem; }
         html.light #icon-moon { display: none; }
         html:not(.light) #icon-sun { display: none; }
+
+        /* hero */
+        .hero-title { background: linear-gradient(90deg, var(--text-strong), var(--accent), #5eead4); -webkit-background-clip: text; background-clip: text; color: transparent; }
+
+        /* search */
+        #search { width: 100%; background: var(--panel-bg); border: 1px solid var(--border); color: var(--text-strong); border-radius: .75rem; padding: .8rem 1rem .8rem 2.6rem; font-size: .95rem; outline: none; transition: border-color .2s, box-shadow .2s; }
+        #search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(96,165,250,.15); }
+
+        /* home categories */
+        .cat-heading { color: var(--text-strong); font-weight: 700; display: flex; align-items: baseline; gap: .6rem; }
+        .cat-count { font-size: .7rem; font-weight: 600; color: var(--text-muted); border: 1px solid var(--border); padding: .05rem .5rem; border-radius: 9999px; }
+        .sub-cat { margin-top: 1.5rem; padding-left: 1rem; border-left: 2px solid var(--border); }
+        .doc-card { display: flex; align-items: center; gap: .65rem; padding: .75rem 1rem; border-radius: .7rem; background: var(--panel-bg); border: 1px solid var(--border); color: var(--text-strong); font-size: .92rem; font-weight: 500; transition: background-color .15s, border-color .15s, transform .15s; }
+        .doc-card:hover { background: var(--panel-hover); border-color: var(--accent); transform: translateY(-1px); }
+        .doc-card .ico { color: var(--accent); flex-shrink: 0; }
+
+        /* sidebar */
+        .side-link { display: block; padding: .3rem .6rem; border-radius: .45rem; font-size: .85rem; color: var(--text-muted); transition: background-color .15s, color .15s; }
+        .side-link:hover { background: var(--panel-hover); color: var(--text-strong); }
+        .side-link.active { background: var(--code-bg); color: var(--accent); font-weight: 600; }
+        .side-group > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: .35rem; padding: .35rem .6rem; font-size: .78rem; font-weight: 700; letter-spacing: .03em; color: var(--text-strong); border-radius: .45rem; }
+        .side-group > summary::-webkit-details-marker { display: none; }
+        .side-group > summary:hover { background: var(--panel-hover); }
+        .side-group > summary .chev { transition: transform .2s; color: var(--accent); }
+        .side-group[open] > summary .chev { transform: rotate(90deg); }
+        .side-children { margin-left: .75rem; padding-left: .5rem; border-left: 1px solid var(--border); }
+
+        /* markdown content */
+        .md { color: var(--text); line-height: 1.75; font-size: .97rem; overflow-wrap: anywhere; }
+        .md > *:first-child { margin-top: 0; }
+        .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { color: var(--text-strong); font-weight: 700; line-height: 1.3; scroll-margin-top: 6rem; }
+        .md h1 { font-size: 2rem; margin: 0 0 1.25rem; }
+        .md h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; padding-bottom: .4rem; border-bottom: 1px solid var(--border); }
+        .md h3 { font-size: 1.2rem; margin: 2rem 0 .75rem; }
+        .md h4 { font-size: 1.05rem; margin: 1.5rem 0 .5rem; }
+        .md p { margin: .9rem 0; }
+        .md a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+        .md strong { color: var(--text-strong); }
+        .md ul, .md ol { margin: .9rem 0; padding-left: 1.5rem; }
+        .md ul { list-style: disc; }
+        .md ol { list-style: decimal; }
+        .md li { margin: .3rem 0; }
+        .md li > ul, .md li > ol { margin: .3rem 0; }
+        .md blockquote { margin: 1.1rem 0; padding: .6rem 1rem; border-left: 3px solid var(--accent); background: var(--code-bg); border-radius: 0 .5rem .5rem 0; color: var(--text-muted); }
+        .md hr { border: 0; border-top: 1px solid var(--border); margin: 2rem 0; }
+        .md img { max-width: 100%; height: auto; border-radius: .6rem; border: 1px solid var(--border); margin: 1rem 0; cursor: zoom-in; display: block; }
+        .md img.img-broken { display: inline-block; padding: .4rem .75rem; font-size: .8rem; color: var(--text-muted); cursor: default; }
+        .md code { font-family: 'JetBrains Mono', monospace; background: var(--code-bg); border: 1px solid var(--code-border); border-radius: 4px; padding: .1rem .4rem; font-size: .85em; color: var(--code-text); }
+        .md pre { font-family: 'JetBrains Mono', monospace; background: var(--pre-bg); border: 1px solid var(--border); border-radius: .6rem; padding: 1rem 1.25rem; overflow-x: auto; font-size: .8rem; line-height: 1.55; color: var(--pre-text); margin: 1.1rem 0; }
+        .md pre code { background: none; border: 0; padding: 0; color: inherit; font-size: inherit; }
+        .md .table-wrap { overflow-x: auto; margin: 1.1rem 0; }
+        .md table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+        .md th, .md td { border: 1px solid var(--border); padding: .5rem .75rem; text-align: left; vertical-align: top; }
+        .md th { background: var(--code-bg); color: var(--text-strong); font-weight: 600; }
+
+        /* lightbox */
+        #lightbox { position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,.85); display: none; align-items: center; justify-content: center; padding: 2rem; cursor: zoom-out; }
+        #lightbox.open { display: flex; }
+        #lightbox img { max-width: 100%; max-height: 100%; border-radius: .5rem; }
+
+        .spinner { width: 1.75rem; height: 1.75rem; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 9999px; animation: spin .8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
-<body class="font-sans antialiased text-gray-200 min-h-screen flex flex-col justify-between">
+<body class="font-sans antialiased min-h-screen flex flex-col">
 
-    <!-- Decorative Ambient Background Glows -->
     <div class="fixed top-[-10%] left-1/4 w-[600px] h-[600px] bg-brand-glow rounded-full ambient-glow"></div>
     <div class="fixed bottom-1/4 right-1/4 w-[500px] h-[500px] bg-indigo-500 rounded-full ambient-glow"></div>
 
-    <!-- Navigation Header -->
+    <!-- Navigation -->
     <nav class="w-full max-w-6xl mx-auto px-6 h-20 flex items-center justify-between z-50 relative">
-        <div class="flex items-center gap-3">
-            <div class="w-8 h-8 rounded-lg bg-gradient-to-tr from-brand-500 to-indigo-600 flex items-center justify-center font-bold text-white shadow-md shadow-brand-500/10">
-                M
-            </div>
-            <div class="flex items-center">
-                <span class="text-lg font-bold tracking-tight text-white">Midum</span>
-                <span id="version-badge" class="ml-2 text-[10px] font-semibold bg-blue-950/50 text-brand-accent px-2.5 py-0.5 rounded-full border border-blue-500/20 transition-all duration-300">
-                    loading...
-                </span>
-            </div>
-        </div>
+        <a href="#/" class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded-lg bg-gradient-to-tr from-brand-500 to-indigo-600 flex items-center justify-center font-bold text-white shadow-md shadow-brand-500/10">M</div>
+            <span class="text-lg font-bold tracking-tight t-strong">Midum</span>
+            <span class="text-[10px] font-semibold t-accent px-2.5 py-0.5 rounded-full border bdr">Docs</span>
+        </a>
         <div class="flex items-center gap-5">
-            <a href="#problem" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">The Problem</a>
-            <a href="#solution" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">The Solution</a>
-            <a href="#how-it-works" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">How It Works</a>
-            <a href="#features" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">Features</a>
-            <a href="#setup" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">Setup</a>
-            <a href="#why-midum" class="hidden sm:inline text-sm font-medium text-gray-400 hover:text-white transition-colors">Why Midum</a>
-            <a href="https://github.com/parth-satija/Midum" target="_blank" rel="noopener noreferrer" class="text-sm font-medium text-gray-400 hover:text-white transition-colors flex items-center gap-1.5">
+            <a href="https://github.com/parth-satija/Midum" target="_blank" rel="noopener noreferrer" class="text-sm font-medium t-muted hover:opacity-80 transition-opacity flex items-center gap-1.5">
                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.483 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.579.688.481C19.137 20.162 22 16.418 22 12c0-5.523-4.477-10-10-10z"/></svg>
-                <span>GitHub</span>
+                <span class="hidden sm:inline">GitHub</span>
             </a>
             <button id="theme-toggle" type="button" aria-label="Toggle light and dark mode">
                 <svg id="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path></svg>
@@ -224,785 +173,391 @@
         </div>
     </nav>
 
-    <!-- Main Content Section -->
-    <main class="flex-grow flex flex-col z-10 relative">
-    <div class="flex flex-col justify-center py-10 md:py-16 px-6">
-        <div class="max-w-4xl mx-auto w-full text-center">
-
-            <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-brand-accent/10 border border-brand-accent/20 text-xs text-brand-accent font-semibold mb-8">
-                Open-source · runs on your machine
-            </div>
-
-            <div class="relative mb-6 select-none">
-                <span class="absolute inset-0 flex items-center justify-center text-6xl sm:text-8xl font-extrabold tracking-tight bg-gradient-to-r from-brand-500 via-brand-accent to-teal-400 blur-2xl opacity-40" aria-hidden="true">
-                    Midum
-                </span>
-                <h2 class="relative text-6xl sm:text-8xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white via-brand-accent to-teal-300 drop-shadow-[0_0_35px_rgba(59,130,246,0.35)]">
-                    Midum
-                </h2>
-            </div>
-
-            <h1 class="text-4xl sm:text-6xl font-extrabold tracking-tight leading-tight text-white mb-6">
-                Your computer, driven by <br>
-                <span class="text-transparent bg-clip-text bg-gradient-to-r from-brand-accent via-indigo-400 to-teal-400">
-                    local agentic intelligence.
-                </span>
-            </h1>
-
-            <p class="max-w-2xl mx-auto text-base sm:text-lg text-gray-400 leading-relaxed font-light mb-10">
-                Midum is an agentic framework built for local AI desktop assistance. It can help with code, UI automation, repetitive tasks, browsing, research, and file management — all driven by a tool-calling AI agent that runs on your machine.
-            </p>
-
-            <!-- Download Action Buttons -->
-            <div class="flex flex-col sm:flex-row items-center justify-center gap-4 mb-6">
-                <a href="https://github.com/parth-satija/Midum/releases/latest/download/midum.exe" class="w-full sm:w-auto px-8 py-4 bg-gradient-to-r from-brand-500 to-indigo-600 hover:from-brand-600 hover:to-indigo-700 text-white font-semibold rounded-xl shadow-xl shadow-brand-500/10 hover:shadow-brand-500/25 transition-all flex items-center justify-center gap-3 text-base group border border-white/10">
-                    <svg class="w-5 h-5 text-white" viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M0 3.449L9.75 2.1v9.451H0V3.449zM0 12.45h9.75v9.451L0 20.551V12.45zM11.25 1.9L24 0v11.55H11.25V1.9zM11.25 12.45H24v11.55l-12.75-1.9V12.45z"/>
-                    </svg>
-                    <span>Download for Windows</span>
-                    <span id="btn-subtext" class="text-xs text-brand-100/70 font-normal border-l border-white/20 pl-2">
-                        .exe executable
-                    </span>
-                </a>
-
-                <a href="https://github.com/parth-satija/Midum" target="_blank" rel="noopener noreferrer" class="w-full sm:w-auto px-8 py-4 bg-gray-900/60 hover:bg-gray-800 text-white font-semibold rounded-xl border border-gray-800 hover:border-gray-700 transition-all flex items-center justify-center gap-3 text-base">
-                    <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.483 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.464-1.11-1.464-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.579.688.481C19.137 20.162 22 16.418 22 12c0-5.523-4.477-10-10-10z"/></svg>
-                    <span>View Repository</span>
-                </a>
-            </div>
-
-            <!-- Recommended: git clone -->
-            <div class="max-w-xl mx-auto mb-16">
-                <div class="flex items-center justify-center gap-2 mb-3">
-                    <span class="text-[11px] font-bold uppercase tracking-wide text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 rounded-full">Recommended</span>
-                    <span class="text-sm text-gray-400">Clone the repo instead of downloading the .exe</span>
-                </div>
-                <div class="relative text-left">
-                    <pre class="code-block pr-14">git clone https://github.com/parth-satija/Midum.git</pre>
-                    <button type="button" id="copy-clone-btn" aria-label="Copy git clone command" class="absolute top-1/2 -translate-y-1/2 right-3 text-gray-500 hover:text-brand-accent transition-colors p-1.5 rounded-md hover:bg-white/5">
-                        <svg id="copy-icon" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"></path></svg>
-                        <svg id="copy-check-icon" class="w-4 h-4 hidden text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                    </button>
-                </div>
-                <p class="text-xs text-gray-500 mt-2">The prebuilt .exe is a convenience option, but cloning gets you the actual source running under your own Python — no packaging quirks, and you can see and edit exactly what's running.</p>
-            </div>
-
-            <!-- Core Value Props -->
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-6 max-w-3xl mx-auto mt-16 pt-8 border-t border-gray-900 text-sm text-gray-400">
-                <div class="flex items-center justify-center gap-2.5">
-                    <span class="text-brand-accent text-base">🛡️</span>
-                    <span class="text-left leading-tight"><strong class="text-white block font-medium">Local option</strong> Ollama runs fully offline</span>
-                </div>
-                <div class="flex items-center justify-center gap-2.5">
-                    <span class="text-brand-accent text-base">🔌</span>
-                    <span class="text-left leading-tight"><strong class="text-white block font-medium">MCP support</strong> Connect external tool servers</span>
-                </div>
-                <div class="flex items-center justify-center gap-2.5">
-                    <span class="text-brand-accent text-base">⚙️</span>
-                    <span class="text-left leading-tight"><strong class="text-white block font-medium">UI Automation</strong> Acts on native apps and the browser</span>
-                </div>
-            </div>
-
-        </div>
-    </div>
-
-    <!-- ============ THE PROBLEM ============ -->
-    <section id="problem" class="anchor-offset max-w-5xl mx-auto w-full px-6 py-16 border-t border-gray-900">
-        <div class="text-center mb-12">
-            <h2 class="text-3xl sm:text-4xl font-bold text-white mb-3">The Problem: AI is Trapped in the Browser</h2>
-            <p class="text-gray-400 max-w-2xl mx-auto">
-                Most AI assistants can talk about a task, but they can't actually do it on your machine.
-            </p>
-        </div>
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
-            <div class="glass-panel rounded-xl p-6">
-                <div class="flex items-center gap-2.5 mb-3">
-                    <span class="text-red-400 text-xl">⚠️</span>
-                    <h3 class="text-white font-semibold text-lg">Chatbots Can't Act</h3>
-                </div>
-                <p class="text-sm text-gray-400 leading-relaxed">Traditional AI assistants give instructions and text, but leave the clicking, typing, and file management to you.</p>
-                <p class="text-xs text-gray-500 mt-4">Result: High user fatigue &amp; manual overhead</p>
-            </div>
-            <div class="glass-panel rounded-xl p-6">
-                <div class="flex items-center gap-2.5 mb-3">
-                    <span class="text-red-400 text-xl">🔒</span>
-                    <h3 class="text-white font-semibold text-lg">Privacy &amp; Cloud Lock-in</h3>
-                </div>
-                <p class="text-sm text-gray-400 leading-relaxed">Most AI automation ships sensitive desktop data to proprietary cloud endpoints just to get anything done.</p>
-                <p class="text-xs text-gray-500 mt-4">Result: Enterprise adoption barriers</p>
-            </div>
-            <div class="glass-panel rounded-xl p-6">
-                <div class="flex items-center gap-2.5 mb-3">
-                    <span class="text-red-400 text-xl">🧩</span>
-                    <h3 class="text-white font-semibold text-lg">No Unified AI Platform</h3>
-                </div>
-                <p class="text-sm text-gray-400 leading-relaxed">No single AI platform combines coding, voice assistance, computer use, and studying aid in one place.</p>
-                <p class="text-xs text-gray-500 mt-4">Result: Users juggle a different tool for every job</p>
-            </div>
-            <div class="glass-panel rounded-xl p-6">
-                <div class="flex items-center gap-2.5 mb-3">
-                    <span class="text-red-400 text-xl">🔀</span>
-                    <h3 class="text-white font-semibold text-lg">Context Gets Lost Between Tools</h3>
-                </div>
-                <p class="text-sm text-gray-400 leading-relaxed">Switching apps for every capability means constantly re-explaining context and copy-pasting between them.</p>
-                <p class="text-xs text-gray-500 mt-4">Result: Wasted time &amp; broken workflows</p>
-            </div>
-        </div>
-    </section>
-
-    <!-- ============ SOLUTION ============ -->
-    <section id="solution" class="anchor-offset max-w-5xl mx-auto w-full px-6 py-16 border-t border-gray-900">
-        <div class="text-center mb-12">
-            <h2 class="text-3xl sm:text-4xl font-bold text-white mb-3">The Solution: Midum</h2>
-            <p class="text-gray-400 max-w-2xl mx-auto">
-                One local, agentic runtime that gives any model hands, keeps your data on your machine, and covers every capability in a single app.
-            </p>
-        </div>
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
-            <div class="glass-panel rounded-xl p-6">
-                <div class="flex items-center gap-2.5 mb-3">
-                    <span class="text-emerald-400 text-xl">✅</span>
-                    <h3 class="text-white font-semibold text-lg">Gives Chatbots Hands</h3>
-                </div>
-                <ul class="text-sm text-gray-400 leading-relaxed list-disc list-inside space-y-1">
-                    <li>Tool-calling agent loop that clicks, types, and navigates for you</li>
-                    <li>UI Automation + browser CDP control on real apps and pages</li>
-                    <li>Reads results back and keeps acting until the goal is done</li>
-                </ul>
-            </div>
-            <div class="glass-panel rounded-xl p-6">
-                <div class="flex items-center gap-2.5 mb-3">
-                    <span class="text-emerald-400 text-xl">✅</span>
-                    <h3 class="text-white font-semibold text-lg">Local-First &amp; Private</h3>
-                </div>
-                <ul class="text-sm text-gray-400 leading-relaxed list-disc list-inside space-y-1">
-                    <li>Runs fully offline on Ollama, no cloud round-trip required</li>
-                    <li>Files, memory, and skills stay on your own disk</li>
-                    <li>Cloud providers are opt-in, never mandatory</li>
-                </ul>
-            </div>
-            <div class="glass-panel rounded-xl p-6">
-                <div class="flex items-center gap-2.5 mb-3">
-                    <span class="text-emerald-400 text-xl">✅</span>
-                    <h3 class="text-white font-semibold text-lg">One Platform, Every Capability</h3>
-                </div>
-                <ul class="text-sm text-gray-400 leading-relaxed list-disc list-inside space-y-1">
-                    <li>Coding, file/document handling, and browser research in one loop</li>
-                    <li>Real-time voice control via Gemini Live, full tool parity with text</li>
-                    <li>Computer-use automation across native desktop apps</li>
-                    <li>Knowledge base + Explain Mode for studying and document walkthroughs</li>
-                </ul>
-            </div>
-            <div class="glass-panel rounded-xl p-6">
-                <div class="flex items-center gap-2.5 mb-3">
-                    <span class="text-emerald-400 text-xl">✅</span>
-                    <h3 class="text-white font-semibold text-lg">Context Stays in One Place</h3>
-                </div>
-                <ul class="text-sm text-gray-400 leading-relaxed list-disc list-inside space-y-1">
-                    <li>Persistent memory and goal tracking across a whole conversation</li>
-                    <li>Reusable skills, knowledge files, and saved Flows instead of re-explaining</li>
-                    <li>MCP servers plug in as first-class tools, no app-switching needed</li>
-                </ul>
-            </div>
-        </div>
-    </section>
-
-    <!-- ============ HOW IT WORKS / LAYER DIAGRAM ============ -->
-    <section id="how-it-works" class="anchor-offset max-w-5xl mx-auto w-full px-6 py-16 border-t border-gray-900">
-        <div class="text-center mb-12">
-            <h2 class="text-3xl sm:text-4xl font-bold text-white mb-3">Where Midum Sits</h2>
-            <p class="text-gray-400 max-w-2xl mx-auto">
-                Midum is the middle layer: it takes what you ask for, decides what the model should reason about, and turns that reasoning into actual actions on your computer.
-            </p>
-        </div>
-
-        <div class="glass-panel rounded-xl p-6 sm:p-8 mb-10 overflow-x-auto">
-            <svg viewBox="0 0 900 460" xmlns="http://www.w3.org/2000/svg" class="w-full min-w-[640px] h-auto" role="img" aria-label="Diagram showing User, Midum, Model, and Computer layers">
-                <defs>
-                    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
-                        <path d="M0,0 L0,6 L9,3 z" fill="#60a5fa" />
-                    </marker>
-                </defs>
-
-                <!-- User -->
-                <rect x="30" y="170" width="170" height="120" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5" class="diagram-box"/>
-                <text x="115" y="222" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="20" font-weight="700" class="diagram-title">You</text>
-                <text x="115" y="246" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Types a goal in</text>
-                <text x="115" y="262" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">plain language</text>
-
-                <!-- Midum (middle, spans more vertically to show it's the orchestration layer) -->
-                <rect x="290" y="90" width="220" height="300" rx="16" fill="rgba(59,130,246,0.08)" stroke="#3b82f6" stroke-width="2"/>
-                <text x="400" y="130" text-anchor="middle" fill="#60a5fa" font-family="Plus Jakarta Sans, sans-serif" font-size="22" font-weight="800">Midum</text>
-                <text x="400" y="152" text-anchor="middle" fill="#93c5fd" font-family="Plus Jakarta Sans, sans-serif" font-size="12">agent &amp; tool-calling loop</text>
-
-                <rect x="312" y="170" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b" class="diagram-box"/>
-                <text x="400" y="198" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12" class="diagram-title">Plans next step</text>
-
-                <rect x="312" y="224" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b" class="diagram-box"/>
-                <text x="400" y="252" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12" class="diagram-title">Calls a tool</text>
-
-                <rect x="312" y="278" width="176" height="46" rx="8" fill="#0b0f19" stroke="#1e293b" class="diagram-box"/>
-                <text x="400" y="306" text-anchor="middle" fill="#e5e7eb" font-family="JetBrains Mono, monospace" font-size="12" class="diagram-title">Reads the result</text>
-
-                <text x="400" y="358" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Repeats this loop until</text>
-                <text x="400" y="374" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">the goal is done</text>
-
-                <!-- Model -->
-                <rect x="600" y="60" width="270" height="130" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5" class="diagram-box"/>
-                <text x="735" y="100" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="18" font-weight="700" class="diagram-title">Model</text>
-                <text x="735" y="122" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Ollama · Gemini · OpenRouter</text>
-                <text x="735" y="140" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Groq · Ollama Cloud</text>
-                <text x="735" y="164" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11" class="diagram-sub">Reasons about what to do next —</text>
-                <text x="735" y="178" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11" class="diagram-sub">doesn't touch your machine directly</text>
-
-                <!-- Computer -->
-                <rect x="600" y="260" width="270" height="130" rx="14" fill="#0b0f19" stroke="#334155" stroke-width="1.5" class="diagram-box"/>
-                <text x="735" y="300" text-anchor="middle" fill="#f3f4f6" font-family="Plus Jakarta Sans, sans-serif" font-size="18" font-weight="700" class="diagram-title">Your Computer</text>
-                <text x="735" y="322" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Desktop apps · Browser</text>
-                <text x="735" y="340" text-anchor="middle" fill="#9ca3af" font-family="Plus Jakarta Sans, sans-serif" font-size="12" class="diagram-sub">Files · MCP servers</text>
-                <text x="735" y="364" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11" class="diagram-sub">Where the actual clicks, typing,</text>
-                <text x="735" y="378" text-anchor="middle" fill="#6b7280" font-family="Plus Jakarta Sans, sans-serif" font-size="11" class="diagram-sub">and file edits happen</text>
-
-                <!-- Arrows -->
-                <line x1="200" y1="230" x2="285" y2="230" stroke="#60a5fa" stroke-width="2" marker-end="url(#arrow)"/>
-                <text x="242" y="220" text-anchor="middle" fill="#60a5fa" font-family="Plus Jakarta Sans, sans-serif" font-size="11">goal</text>
-
-                <line x1="515" y1="180" x2="595" y2="130" stroke="#60a5fa" stroke-width="2" marker-end="url(#arrow)"/>
-                <text x="565" y="145" text-anchor="middle" fill="#60a5fa" font-family="Plus Jakarta Sans, sans-serif" font-size="11">asks</text>
-
-                <line x1="595" y1="150" x2="515" y2="200" stroke="#4ade80" stroke-width="2" marker-end="url(#arrow)"/>
-                <text x="565" y="215" text-anchor="middle" fill="#4ade80" font-family="Plus Jakarta Sans, sans-serif" font-size="11">decides</text>
-
-                <line x1="515" y1="290" x2="595" y2="330" stroke="#60a5fa" stroke-width="2" marker-end="url(#arrow)"/>
-                <text x="565" y="325" text-anchor="middle" fill="#60a5fa" font-family="Plus Jakarta Sans, sans-serif" font-size="11">acts on</text>
-
-                <line x1="595" y1="350" x2="515" y2="310" stroke="#4ade80" stroke-width="2" marker-end="url(#arrow)"/>
-                <text x="565" y="298" text-anchor="middle" fill="#4ade80" font-family="Plus Jakarta Sans, sans-serif" font-size="11">result</text>
-
-                <line x1="200" y1="260" x2="285" y2="340" stroke="#4ade80" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
-                <text x="255" y="315" text-anchor="middle" fill="#4ade80" font-family="Plus Jakarta Sans, sans-serif" font-size="11">reports back</text>
-            </svg>
-
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-6 text-xs text-gray-500">
-                <div class="flex items-start gap-2"><span class="text-brand-accent">●</span><span><strong class="text-gray-300">You</strong> describe a goal — nothing more than plain language.</span></div>
-                <div class="flex items-start gap-2"><span class="text-brand-accent">●</span><span><strong class="text-gray-300">Midum</strong> is the loop in between: it plans, calls a tool, reads the result, and repeats.</span></div>
-                <div class="flex items-start gap-2"><span class="text-brand-accent">●</span><span>The <strong class="text-gray-300">model</strong> only reasons; the <strong class="text-gray-300">computer</strong> is where the action actually happens.</span></div>
-            </div>
-        </div>
-
-        <!-- See It In Action -->
-        <div class="text-center mb-10">
-            <h3 class="text-2xl sm:text-3xl font-bold text-white mb-2">See It In Action</h3>
-            <p class="text-sm text-gray-500 max-w-2xl mx-auto">A look at the Midum Control Centre and real tasks it completes end-to-end, from the interface itself to live desktop and browser automation.</p>
-        </div>
-
-        <!-- Screenshots — large, stacked one after another -->
-        <div class="mb-4">
-            <h3 class="text-xl font-semibold text-white mb-1">Screenshots</h3>
-            <p class="text-sm text-gray-500 mb-6">A closer look at the Control Centre and the agent in action.</p>
-        </div>
-        <div class="space-y-10 mb-20">
-
-            <div class="glass-panel rounded-xl overflow-hidden">
-                <div class="w-full h-[420px] sm:h-[520px] flex items-center justify-center border-b border-gray-800/60 bg-gray-950/40">
-                    <img src="demo_assets\Screenshot 2026-07-22 163650.png" alt="Midum Control Centre overview" class="w-full h-full object-cover">
-                </div>
-                <div class="p-5">
-                    <p class="text-base text-white font-medium">Midum Control Centre</p>
-                    <p class="text-sm text-gray-500 mt-1">The main interface of Midum.</p>
-                </div>
-            </div>
-
-            <div class="glass-panel rounded-xl overflow-hidden">
-                <div class="w-full h-[420px] sm:h-[520px] flex items-center justify-center border-b border-gray-800/60 bg-gray-950/40">
-                    <img src="demo_assets\Screenshot 2026-07-22 162623.png" alt="Flows Node Editor" class="w-full h-full object-cover">
-                </div>
-                <div class="p-5">
-                    <p class="text-base text-white font-medium">Flows Node Editor</p>
-                    <p class="text-sm text-gray-500 mt-1">Add a screenshot of the Flows tab here.</p>
-                </div>
-            </div>
-
-        </div>
-
-        <!-- GIFs — large, stacked one after another -->
-        <div class="mb-4">
-            <h3 class="text-xl font-semibold text-white mb-1">Live Demos</h3>
-            <p class="text-sm text-gray-500 mb-6">Short clips of Midum completing real tasks end-to-end.</p>
-        </div>
-        <div class="space-y-10">
-
-            <div class="glass-panel rounded-xl overflow-hidden border border-brand-accent/15">
-                <div class="w-full h-[420px] sm:h-[520px] flex items-center justify-center border-b border-gray-800/60 bg-gray-950/40">
-                    <img src="demo_assets\MidumBrowserDemo.gif" alt="Youtube tutorial opening" class="w-full h-full object-cover">
-                </div>
-                <div class="p-5">
-                    <p class="text-base text-white font-medium">Desktop Automation</p>
-                    <p class="text-sm text-gray-500 mt-1">A clip of Midum opening a Youtube tutorial, opeining both the most relevant video and the search results page in case the user wants to look through options</p>
-                </div>
-            </div>
-
-            <div class="glass-panel rounded-xl overflow-hidden border border-brand-accent/15">
-                <div class="w-full h-[420px] sm:h-[520px] flex items-center justify-center border-b border-gray-800/60 bg-gray-950/40">
-                    <img src="demo_assets\MidumWebDemo.gif" alt="Flows builder in use" class="w-full h-full object-cover">
-                </div>
-                <div class="p-5">
-                    <p class="text-base text-white font-medium">Giving Web Search capability</p>
-                    <p class="text-sm text-gray-500 mt-1">A simple 30b model is able to retrieve up-to-date information using Midum's sophisticated web search capabilities</p>
-                </div>
-            </div>
-
-        </div>
-    </section>
-
-    <!-- ============ FEATURES (from README) ============ -->
-    <section id="features" class="anchor-offset max-w-5xl mx-auto w-full px-6 py-16 border-t border-gray-900">
-        <div class="text-center mb-12">
-            <h2 class="text-3xl sm:text-4xl font-bold text-white mb-3">What Midum Can Do</h2>
-            <p class="text-gray-400 max-w-2xl mx-auto">
-                Midum is built around a large tool-calling loop, so it isn't limited to chatting — it can actually take action on your computer.
-            </p>
-        </div>
-
-        <div class="space-y-3">
-
-            <details class="glass-panel rounded-xl p-5" open>
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">🖥️ Automate desktop tasks<span class="text-gray-500 font-normal">, controlling native Windows apps via clicks, typing, and UI automation</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <ul class="mt-4 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li>Control the desktop through <strong class="text-gray-200">UI Automation (UIA)</strong> — click buttons, type into fields, navigate menus, and interact with native Windows applications.</li>
-                    <li>Scan and inspect application UI trees (<span class="inline-code">manual_scan_app_layouts</span>, <span class="inline-code">manual_inspect_app_subtree</span>) before acting.</li>
-                    <li>Click specific UI elements directly by control ID/name (<span class="inline-code">click_ui_element</span>).</li>
-                    <li>Take an automatic <span class="inline-code">snapshot</span> of the active window and <span class="inline-code">act</span> on the elements it finds, planning a sequence of interactions.</li>
-                    <li>List all active windows (<span class="inline-code">list_active_windows</span>).</li>
-                    <li>Fallback vision-based control when UIA isn't reliable enough: screen snapshots, OCR-based text finding and clicking.</li>
-                    <li>Type arbitrary text into focused fields (<span class="inline-code">type_text</span>).</li>
-                    <li>Global <strong class="text-gray-200">Ctrl+Q</strong> abort hotkey to immediately interrupt a running task.</li>
-                </ul>
-            </details>
-
-            <details class="glass-panel rounded-xl p-5">
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">🌐 Automate the browser<span class="text-gray-500 font-normal">, reading pages and clicking, typing, and navigating for you</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <ul class="mt-4 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li>Full browser page reading and interaction via the <strong class="text-gray-200">Chrome DevTools Protocol</strong> (remote debugging) for navigation, clicking, and typing on complex pages.</li>
-                    <li>Read the current page (<span class="inline-code">read_browser_page</span>), list open tabs (<span class="inline-code">list_browser_tabs</span>), run JavaScript in the page context (<span class="inline-code">run_js_in_browser</span>), and open new URLs (<span class="inline-code">open_url</span>).</li>
-                    <li>Falls back gracefully to UIA-based control when remote debugging isn't enabled.</li>
-                    <li>Live internet search (<span class="inline-code">search_internet</span>) via DuckDuckGo, with indexed result opening.</li>
-                </ul>
-            </details>
-
-            <details class="glass-panel rounded-xl p-5">
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">📁 Read and write files<span class="text-gray-500 font-normal">, handling text, code, PDFs, and Word documents</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <ul class="mt-4 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li>Read and write local files directly (<span class="inline-code">read_local_file</span>, <span class="inline-code">write_local_file</span>, <span class="inline-code">append_local_file</span>).</li>
-                    <li>Smart chunked reading for large files, supporting <span class="inline-code">.txt</span>, <span class="inline-code">.md</span>, <span class="inline-code">.py</span>, <span class="inline-code">.json</span>, <span class="inline-code">.csv</span>, <span class="inline-code">.html</span>, <span class="inline-code">.pdf</span> (via pymupdf), and <span class="inline-code">.docx</span> (via mammoth).</li>
-                    <li>Generate Word documents from Markdown-style text (<span class="inline-code">write_docx_file</span>, via python-docx).</li>
-                    <li>Browse and search the filesystem: list directories, open files/folders, fuzzy-find by name.</li>
-                </ul>
-            </details>
-
-            <details class="glass-panel rounded-xl p-5">
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">🧠 Remember and plan<span class="text-gray-500 font-normal">, tracking goals and progress across a conversation</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <ul class="mt-4 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li>Persistent memory Midum can read and update across a conversation (<span class="inline-code">update_memory</span>).</li>
-                    <li>Goal tracking — set, remember, and clear an active objective (<span class="inline-code">set_current_goal</span>).</li>
-                    <li>A dedicated response scratchpad for multi-step tasks: Midum writes a plan first, appends progress notes, and reads it back to assemble a final answer.</li>
-                </ul>
-            </details>
-
-            <details class="glass-panel rounded-xl p-5">
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">📚 Learn skills and knowledge<span class="text-gray-500 font-normal">, saving reusable instructions and reference material</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <ul class="mt-4 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li>Create, load, and list reusable <strong class="text-gray-200">skills</strong> — self-contained instructions for recurring tasks.</li>
-                    <li>Create, read, and list custom domain knowledge files that act as a long-term reference library.</li>
-                    <li>Manage a persistent instruction set that shapes Midum's behavior.</li>
-                    <li>Manage saved filesystem paths/shortcuts for quick access.</li>
-                    <li>Indexed listing variants keep large libraries easy to browse without flooding context.</li>
-                </ul>
-            </details>
-
-            <details class="glass-panel rounded-xl p-5">
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">🤖 Switch AI providers<span class="text-gray-500 font-normal">, running on Ollama, Gemini, OpenRouter, Groq, or Ollama Cloud</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <p class="mt-3 text-sm text-gray-400">Midum isn't tied to a single model or provider — it can run its primary reasoning loop on any of the following, and can also consult or delegate sub-tasks to several side-by-side:</p>
-                <ul class="mt-3 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li><strong class="text-gray-200">Ollama</strong> — fully local, no internet required. Now optional.</li>
-                    <li><strong class="text-gray-200">Gemini</strong> — via the official Gemini API, or via <span class="inline-code">gemini_webapi</span> Google account cookie sign-in (no API key).</li>
-                    <li><strong class="text-gray-200">OpenRouter</strong> — any OpenRouter-hosted model, with automatic fallback across a configurable list if one is rate-limited.</li>
-                    <li><strong class="text-gray-200">GroqCloud</strong> — fast inference on models like <span class="inline-code">llama-3.3-70b-versatile</span> and <span class="inline-code">qwen/qwen3-32b</span>, with a free tier and automatic fallback.</li>
-                    <li><strong class="text-gray-200">Ollama Cloud</strong> — the same Ollama client pointed at Ollama's hosted GPUs, no local GPU or download required, with fallback across a configurable model list.</li>
-                    <li>Cross-consultation and delegation tools regardless of primary provider, plus tools to list and switch models per-provider on the fly.</li>
-                </ul>
-            </details>
-
-            <details class="glass-panel rounded-xl p-5">
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">🔗 Build visual automations<span class="text-gray-500 font-normal">, wiring reusable flows in a node-graph editor</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <p class="mt-3 text-sm text-gray-400">The GUI's Flows tab is a node-graph editor (built on Drawflow) for building repeatable, shareable automations without writing Python by hand:</p>
-                <ul class="mt-3 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li>Drag out Start/End markers, native-tool nodes, MCP-server tool nodes, and nodes that call other saved flows, then wire them together.</li>
-                    <li><strong class="text-gray-200">Variable</strong> nodes hold a named piece of data for downstream nodes.</li>
-                    <li><strong class="text-gray-200">Logic nodes</strong> — if/else branching and for-each loops.</li>
-                    <li><strong class="text-gray-200">AI nodes</strong> — Prompt AI, Ask AI to Summarize, Ask AI to Choose — call out to the currently configured provider mid-run.</li>
-                    <li>Saving a flow compiles the graph into a real Python function, safe to re-save repeatedly, with its graph persisted so it can be reloaded later.</li>
-                    <li>Every saved flow is discoverable and callable as a tool, the same two-step shape as calling an MCP tool.</li>
-                    <li><strong class="text-gray-200">Promoted flows</strong> get their own always-on tool schema, callable directly by name.</li>
-                    <li><strong class="text-gray-200">Scheduling</strong> — saved flows can run automatically (once, interval, daily, weekly) while the app is open; schedule configuration persists across restarts.</li>
-                </ul>
-            </details>
-
-            <details class="glass-panel rounded-xl p-5">
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">🎙️ Talk to it out loud<span class="text-gray-500 font-normal">, with real-time voice control via Gemini Live and full tool parity</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <ul class="mt-4 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li>Real-time, bidirectional speech-to-speech control through Google's official <strong class="text-gray-200">Gemini Live API</strong> — a persistent connection that streams your mic continuously and speaks replies back as they arrive.</li>
-                    <li>Every tool call made in voice mode runs through the exact same dispatcher as text chat — 100% tool parity: files, terminal, UI automation, browser, MCP servers, everything.</li>
-                    <li>Two independently rebindable <strong class="text-gray-200">global push-to-talk hotkeys</strong> (keyboard or mouse button, including side buttons) that work from anywhere — hold to talk, release to mute, connection stays open between presses.</li>
-                    <li>A small floating overlay shows live state: listening, running, or responding.</li>
-                </ul>
-            </details>
-
-            <details class="glass-panel rounded-xl p-5">
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">📖 Explain a Document<span class="text-gray-500 font-normal">, restricting answers to your own PDFs or walking through them part by part</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <ul class="mt-4 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li>Register a PDF, then manually tag heading lines in the Knowledge tab's Heading Tagger — click a line on the real rendered page and assign it a level. Nothing is auto-detected.</li>
-                    <li><strong class="text-gray-200">KB Only mode</strong> — a chat-input toggle that restricts a message to only the selected PDF source(s), disabling internet search/browsing for that turn so answers come strictly from your material.</li>
-                    <li><strong class="text-gray-200">Explain Mode</strong> — walks the selected source(s) part by part, using the boundary levels you picked, narrating each part like a guided walkthrough rather than reading it line by line — while making sure every detail still surfaces. Hit ▶ Start Explanation and say "next" (or tap Next Part) to continue.</li>
-                </ul>
-            </details>
-
-            <details class="glass-panel rounded-xl p-5">
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">🔌 Connect to MCP servers<span class="text-gray-500 font-normal">, calling tools from external Model Context Protocol servers</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <ul class="mt-4 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li>Connect Midum to external MCP servers over stdio or HTTP/SSE.</li>
-                    <li>List connected servers and their available tools.</li>
-                    <li>Call any tool exposed by a connected MCP server directly.</li>
-                    <li>Works uniformly across every model provider.</li>
-                </ul>
-            </details>
-
-            <details class="glass-panel rounded-xl p-5">
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">🎨 Generate content<span class="text-gray-500 font-normal">, producing images and flowcharts on request</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <ul class="mt-4 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li>Generate images on request.</li>
-                    <li>Generate flowcharts/diagrams.</li>
-                </ul>
-            </details>
-
-            <details class="glass-panel rounded-xl p-5">
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">🗣️ Ask for input<span class="text-gray-500 font-normal">, requesting text, files, or approval when it needs them</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <ul class="mt-4 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li>Midum can proactively ask for input: free text, a file path, explicit approval before a sensitive action, or a choice from a list.</li>
-                    <li>A <span class="inline-code">say</span> tool for clean, direct responses.</li>
-                    <li>Tool discovery on demand, keeping the active toolset lean for smaller/local models.</li>
-                    <li>A <span class="inline-code">wait</span> tool for timed pauses mid-task.</li>
-                </ul>
-            </details>
-
-            <details class="glass-panel rounded-xl p-5">
-                <summary class="flex items-center justify-between">
-                    <span class="text-white font-semibold flex items-center gap-2">🖼️ Run from a full GUI<span class="text-gray-500 font-normal">, the Midum Control Centre for chat, tools, and flows in one app</span></span>
-                    <span class="chev text-brand-accent">›</span>
-                </summary>
-                <p class="mt-3 text-sm text-gray-400">Running <span class="inline-code">gui.py</span> gives you the full Midum Control Centre, a desktop app (built with customtkinter) on top of the same agent engine, including:</p>
-                <ul class="mt-3 space-y-2 text-sm text-gray-400 list-disc list-inside">
-                    <li>A live chat interface with real-time activity/tool-call logging.</li>
-                    <li>A <strong class="text-gray-200">Model</strong> tab to pick provider and model, with live list refreshing.</li>
-                    <li>A <strong class="text-gray-200">Parameters</strong> tab showing live agent state.</li>
-                    <li>A <strong class="text-gray-200">System Core</strong> tab for managing the persistent instruction set.</li>
-                    <li><strong class="text-gray-200">Knowledge</strong> and <strong class="text-gray-200">Skills</strong> tabs for browsing and creating each.</li>
-                    <li>A <strong class="text-gray-200">Tools</strong> tab for inspecting native tools and promoting/demoting Flows and MCP tools.</li>
-                    <li>An <strong class="text-gray-200">MCP</strong> tab for adding, viewing, and managing connected servers.</li>
-                    <li>A <strong class="text-gray-200">Flows</strong> tab for the node-graph editor described above.</li>
-                    <li>Full editing access to every underlying file Midum uses — skills, knowledge bases, memory, instructions, and more.</li>
-                </ul>
-                <p class="mt-3 text-sm text-gray-500">This is the recommended way to run Midum, since it exposes everything the CLI does plus direct file editing.</p>
-            </details>
-
-        </div>
-    </section>
-
-    <!-- ============ WHY NOT JUST CHATGPT/GEMINI ============ -->
-    <section id="why-midum" class="anchor-offset max-w-4xl mx-auto w-full px-6 py-16 border-t border-gray-900">
-        <div class="text-center mb-12">
-            <h2 class="text-3xl sm:text-4xl font-bold text-white mb-3">Why not just use ChatGPT or Gemini?</h2>
-            <p class="text-2xl sm:text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-brand-accent via-indigo-400 to-teal-400 mt-4">
-                You can. Through Midum.
-            </p>
-        </div>
-
-        <div class="glass-panel rounded-xl p-6 sm:p-8">
-            <p class="text-base text-gray-300 leading-relaxed mb-6">
-                Chatbots are brilliant reasoning engines with no hands — they can't click, edit files, or drive your browser. Midum is the missing execution layer: keep using the model you trust, and give it a body to act with.
-            </p>
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
-                <div class="rounded-lg border border-gray-800 p-5">
-                    <h4 class="text-white font-semibold mb-2 flex items-center gap-2">🧠 The Model</h4>
-                    <p class="text-sm text-gray-400">Unchanged reasoning and quality of thought — ChatGPT, Gemini, or any provider you choose.</p>
-                </div>
-                <div class="rounded-lg border border-brand-accent/25 bg-brand-accent/5 p-5">
-                    <h4 class="text-brand-accent font-semibold mb-2 flex items-center gap-2">⚙️ Midum</h4>
-                    <p class="text-sm text-gray-400">The agentic runtime wrapped around it — UI automation, browser control, files, memory, and MCP tools.</p>
-                </div>
-            </div>
-            <p class="text-base text-gray-300 leading-relaxed">
-                No trade-off, no dumbed-down responses — the same model, now able to act on your computer instead of just talking about it.
-            </p>
-        </div>
-    </section>
-
-    <!-- ============ SETUP ============ -->
-    <section id="setup" class="anchor-offset max-w-4xl mx-auto w-full px-6 py-16 border-t border-gray-900">
-        <details class="group">
-        <summary class="flex items-center justify-center gap-3 mb-12 cursor-pointer select-none list-none">
-            <h2 class="text-3xl sm:text-4xl font-bold text-white text-center">Setup Instructions</h2>
-            <span class="chev text-brand-accent text-2xl group-open:rotate-90 transition-transform">›</span>
-        </summary>
-
-        <div class="space-y-6">
-            <div class="glass-panel rounded-xl p-6">
-                <h3 class="text-white font-semibold mb-2">Step 1 — Get the project</h3>
-                <p class="text-sm text-gray-400 mb-3">Download the ZIP from releases and extract it into an empty folder, or clone the repo. This is a proper Python package, so all commands should be run from inside it:</p>
-                <pre class="code-block">cd midum_pkg</pre>
-            </div>
-
-            <div class="glass-panel rounded-xl p-6">
-                <h3 class="text-white font-semibold mb-2">Step 2 — Install dependencies</h3>
-                <p class="text-sm text-gray-400 mb-3">The easiest way is via the included <span class="inline-code">requirements.txt</span>:</p>
-                <pre class="code-block">pip install -r requirements.txt</pre>
-                <p class="text-sm text-gray-400 my-3">Or install everything explicitly:</p>
-                <pre class="code-block">pip install ollama pillow ddgs keyboard pymupdf mammoth python-docx rich pytesseract pywin32 uiautomation customtkinter google-genai requests mcp
-pip install -U gemini_webapi
-pip install -U browser-cookie3   # optional but recommended</pre>
-            </div>
-
-            <div class="glass-panel rounded-xl p-6">
-                <h3 class="text-white font-semibold mb-2">Step 3 — Ollama (optional)</h3>
-                <p class="text-sm text-gray-400 mb-3">Ollama is optional. Midum can run its primary reasoning loop directly on Gemini instead, so you can skip to Step 6 if you'd rather not run anything locally. For a fully local, offline-capable setup:</p>
-                <pre class="code-block">ollama pull qwen2.5-coder:7b</pre>
-                <p class="text-sm text-gray-400 my-3">Then update the <span class="inline-code">Modelfile</span> to your chosen model and apply it from the folder it's in:</p>
-                <pre class="code-block">ollama create midum -f ./Modelfile</pre>
-            </div>
-
-            <div class="glass-panel rounded-xl p-6">
-                <h3 class="text-white font-semibold mb-2">Step 4 — Choose a provider</h3>
-                <p class="text-sm text-gray-400 mb-3">Open <span class="inline-code">config.py</span> and set <span class="inline-code">MODEL_PROVIDER</span>:</p>
-                <pre class="code-block">MODEL_PROVIDER = "ollama"       # local Ollama model
-MODEL_PROVIDER = "gemini_api"   # official Gemini API (API key from aistudio.google.com)
-MODEL_PROVIDER = "gemini_web"   # Gemini via browser-cookie sign-in, no API key
-MODEL_PROVIDER = "openrouter"   # any OpenRouter-hosted model
-MODEL_PROVIDER = "groq"         # GroqCloud (free tier, fast inference)
-MODEL_PROVIDER = "ollama_cloud" # Ollama's own hosted GPUs, no local GPU needed</pre>
-                <p class="text-sm text-gray-400 mt-3">Fill in the matching model/key settings just below <span class="inline-code">MODEL_PROVIDER</span> for whichever provider you chose.</p>
-            </div>
-
-            <div class="glass-panel rounded-xl p-6">
-                <h3 class="text-white font-semibold mb-2">Step 5 — Secrets file</h3>
-                <p class="text-sm text-gray-400 mb-3">Create a local JSON file holding your API keys / cookies, so nothing is hardcoded in <span class="inline-code">config.py</span>:</p>
-                <pre class="code-block">python -c "import config; created = config.ensure_secrets_file(); print('Created:' if created else 'Already exists:', config.SECRETS_FILE)"</pre>
-                <p class="text-sm text-gray-400 my-3">This writes a blank template to <span class="inline-code">%LOCALAPPDATA%\JarvisSecrets\jarvis_secrets.json</span> (Windows) or <span class="inline-code">~/.config/JarvisSecrets/jarvis_secrets.json</span> (Linux):</p>
-                <pre class="code-block">{
-  "GEMINI_API_KEY": "",
-  "OPENROUTER_API_KEY": "",
-  "GROQ_API_KEY": "",
-  "OLLAMA_API_KEY": "",
-  "GEMINI_SECURE_1PSID": "",
-  "GEMINI_SECURE_1PSIDTS": ""
-}</pre>
-                <p class="text-sm text-gray-400 mt-3">Fill in only the key(s) your chosen provider needs — a blank value is treated as "not configured", so the rest can stay empty. This file is also created automatically the first time you run <span class="inline-code">main.py</span> or <span class="inline-code">gui.py</span>.</p>
-            </div>
-
-            <div class="glass-panel rounded-xl p-6">
-                <h3 class="text-white font-semibold mb-2">Optional — OCR</h3>
-                <p class="text-sm text-gray-400">Install Tesseract to enable OCR-based screen reading and clicking. Midum is fully functional without it — OCR is only used as a fallback for UI interaction.</p>
-            </div>
-
-            <div class="glass-panel rounded-xl p-6">
-                <h3 class="text-white font-semibold mb-2">Step 6 — Launch</h3>
-                <p class="text-sm text-gray-400 mb-3">Run <span class="inline-code">gui.py</span> for the full Midum Control Centre (recommended), or <span class="inline-code">main.py</span> for the CLI. Both run from inside the project folder:</p>
-                <pre class="code-block">python gui.py
-# or
-python main.py</pre>
-            </div>
-        </div>
-
-        <!-- Alternative setup -->
-        <div class="mt-10 glass-panel rounded-xl p-6 border border-brand-accent/20">
-            <h3 class="text-white font-semibold mb-2">Alternative Setup — Prebuilt Executable</h3>
-            <p class="text-sm text-gray-400 mb-3">Windows users can skip the full setup above and instead:</p>
-            <ol class="text-sm text-gray-400 list-decimal list-inside space-y-2">
-                <li>Download <span class="inline-code">midum.exe</span> from the releases page and place it in its own empty folder (it creates <span class="inline-code">storage/</span> and other supporting files alongside itself on first run).</li>
-                <li>Launch it once and close it again — this creates the blank secrets template at <span class="inline-code">%LOCALAPPDATA%\JarvisSecrets\jarvis_secrets.json</span>. Open the file, fill in only the key(s) your chosen provider needs, and save it.</li>
-                <li>Relaunch <span class="inline-code">midum.exe</span> and you're straight into the Midum Control Centre — no pip install, no Ollama, no IDE required.</li>
-            </ol>
-        </div>
-
-        <!-- Browser support -->
-        <div class="mt-6 glass-panel rounded-xl p-6">
-            <h3 class="text-white font-semibold mb-2">Browser Support</h3>
-            <p class="text-sm text-gray-400 mb-3">For reliable browser page navigation and interaction, launch your browser with Remote Debugging enabled. Without it, Midum falls back to UI Automation (UIA), which works for many tasks but may be less reliable on complex web pages.</p>
-            <pre class="code-block">&amp; "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe" --remote-debugging-port=9222 --remote-allow-origins=*</pre>
-        </div>
-
-        <!-- Tested models -->
-        <div class="mt-6 glass-panel rounded-xl p-6">
-            <h3 class="text-white font-semibold mb-3">Models Tested</h3>
-            <ul class="text-sm text-gray-400 list-disc list-inside space-y-1">
-                <li><span class="inline-code">qwen2.5-coder:7b</span> (Ollama)</li>
-                <li><span class="inline-code">qwen3.5:4b</span> (Ollama)</li>
-                <li>Gemini (via <span class="inline-code">gemini_api</span> and <span class="inline-code">gemini_web</span>)</li>
-                <li><span class="inline-code">llama-3.3-70b-versatile</span> (Groq)</li>
-            </ul>
-        </div>
-        </details>
-    </section>
-
-    <!-- ============ CTA ============ -->
-    <section class="anchor-offset max-w-4xl mx-auto w-full px-6 py-20 border-t border-gray-900 text-center">
-        <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-brand-accent/10 border border-brand-accent/20 text-xs text-brand-accent font-semibold mb-6">
-            Join the evolution
-        </div>
-        <h2 class="text-4xl sm:text-5xl font-extrabold text-white mb-4">Invest in Midum</h2>
-        <p class="text-gray-400 text-lg mb-8">The future of AI is local, actionable, and autonomous.</p>
-        <div class="inline-flex items-center gap-2 px-6 py-3 rounded-full glass-panel text-brand-accent font-mono text-sm">
-            <span>&gt;_</span>
-            <span>midum.ai | Autonomous AI Desktop Runtime</span>
-        </div>
-    </section>
-
-    </main>
-
-    <!-- Footer -->
-    <footer class="w-full border-t border-gray-900 bg-gray-950/40 py-8 z-10 relative">
-        <div class="max-w-6xl mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-gray-500">
-            <div>
-                <p>&copy; 2026 Midum. Open source under MIT license. Built for local desktop assistance.</p>
-            </div>
+    <main id="app" class="flex-grow w-full max-w-6xl mx-auto px-6 pb-16 z-10 relative"></main>
+
+    <footer class="w-full border-t bdr py-8 z-10 relative">
+        <div class="max-w-6xl mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs t-muted">
+            <p>&copy; 2026 Midum. Open source under MIT license.</p>
             <div class="flex items-center gap-4">
-                <a href="https://github.com/parth-satija/Midum" target="_blank" rel="noopener noreferrer" class="hover:text-white transition-colors">GitHub</a>
-                <span class="text-gray-800">&bull;</span>
-                <a href="https://github.com/parth-satija/Midum/releases" target="_blank" rel="noopener noreferrer" class="hover:text-white transition-colors">All Releases</a>
+                <a href="https://github.com/parth-satija/Midum" target="_blank" rel="noopener noreferrer" class="hover:opacity-80">GitHub</a>
+                <span>&bull;</span>
+                <a href="https://github.com/parth-satija/Midum/releases" target="_blank" rel="noopener noreferrer" class="hover:opacity-80">All Releases</a>
             </div>
         </div>
     </footer>
 
-    <!-- Theme + diagram color handling -->
+    <div id="lightbox" role="dialog" aria-label="Image preview"><img alt=""></div>
+
     <script>
+    (function () {
+        'use strict';
+
+        /* ---------------- Configuration ---------------- */
+        const DOCS_DIR = 'docs/';                 // folder in the same directory as this file
+        const TITLE = 'Midum Documentation';
+        const SUBTITLE = 'End-User Documentation for Midum';
+        // Fallback for static hosts (e.g. GitHub Pages) that can't list directories.
+        const GITHUB = { owner: 'parth-satija', repo: 'Midum', ref: 'HEAD', dir: 'docs/' };
+
+        const app = document.getElementById('app');
+        const docsBase = new URL(DOCS_DIR, location.href);
+
+        let tree = null;          // root node of the docs tree
+        let loadError = null;
+        let searchQuery = '';
+
+        /* ---------------- Helpers ---------------- */
+        const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+        // "getting_started.md" -> "getting started"  (same capitalization, underscores -> spaces)
+        const pretty = name => name.replace(/\.md$/i, '').replace(/_+/g, ' ').replace(/\s+/g, ' ').trim();
+
+        const encPath = p => p.split('/').map(encodeURIComponent).join('/');
+        const docUrl = p => new URL(encPath(p), docsBase).href;
+        const routeFor = p => '#/' + encPath(p);
+
+        const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+        const byName = (a, b) => {
+            const ar = /^readme(\.md)?$/i.test(a.name), br = /^readme(\.md)?$/i.test(b.name);
+            if (ar !== br) return ar ? -1 : 1;
+            return collator.compare(pretty(a.name), pretty(b.name));
+        };
+
+        /* ---------------- Discovering the docs ---------------- */
+        // Crawl the directory listing the web server provides for docs/ (python -m http.server,
+        // nginx/apache autoindex, etc.), recursing into every sub folder.
+        async function crawl(dirUrl, rel, out) {
+            const res = await fetch(dirUrl, { cache: 'no-cache' });
+            if (!res.ok) throw new Error('HTTP ' + res.status + ' listing ' + dirUrl);
+            const html = await res.text();
+            const page = new DOMParser().parseFromString(html, 'text/html');
+            const base = new URL(dirUrl);
+            const subdirs = [];
+            let anchors = 0;
+
+            page.querySelectorAll('a[href]').forEach(a => {
+                const href = a.getAttribute('href');
+                if (!href || href.startsWith('#') || href.startsWith('?')) return;
+                let u;
+                try { u = new URL(href, base); } catch { return; }
+                if (u.origin !== base.origin) return;
+                if (!u.pathname.startsWith(base.pathname) || u.pathname === base.pathname) return;
+                const rest = u.pathname.slice(base.pathname.length);
+                const isDir = rest.endsWith('/');
+                const name = decodeURIComponent(rest.replace(/\/$/, ''));
+                if (!name || name.includes('/') || name.startsWith('.')) return;
+                anchors++;
+                if (isDir) subdirs.push(name);
+                else if (/\.md$/i.test(name)) out.push(rel + name);
+            });
+
+            if (!anchors && !/<a\s/i.test(html)) throw new Error('No directory listing at ' + dirUrl);
+            await Promise.all(subdirs.map(d => crawl(new URL(encodeURIComponent(d) + '/', base).href, rel + d + '/', out)));
+        }
+
+        async function discoverFromListing() {
+            const out = [];
+            await crawl(docsBase.href, '', out);
+            if (!out.length) throw new Error('Directory listing contained no .md files');
+            return out;
+        }
+
+        async function discoverFromGitHub() {
+            const { owner, repo, ref, dir } = GITHUB;
+            const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${ref}?recursive=1`);
+            if (!res.ok) throw new Error('GitHub API HTTP ' + res.status);
+            const data = await res.json();
+            const files = (data.tree || [])
+                .filter(n => n.type === 'blob' && n.path.startsWith(dir) && /\.md$/i.test(n.path))
+                .map(n => n.path.slice(dir.length))
+                .filter(p => !p.split('/').some(s => s.startsWith('.')));
+            if (!files.length) throw new Error('No .md files found in GitHub repo');
+            return files;
+        }
+
+        function buildTree(paths) {
+            const root = { name: '', path: '', dirs: [], files: [] };
+            paths.forEach(p => {
+                const parts = p.split('/');
+                let node = root;
+                parts.slice(0, -1).forEach((seg, i) => {
+                    let child = node.dirs.find(d => d.name === seg);
+                    if (!child) {
+                        child = { name: seg, path: parts.slice(0, i + 1).join('/'), dirs: [], files: [] };
+                        node.dirs.push(child);
+                    }
+                    node = child;
+                });
+                node.files.push({ name: parts[parts.length - 1], path: p });
+            });
+            const sortNode = n => { n.dirs.sort(byName); n.files.sort(byName); n.dirs.forEach(sortNode); };
+            sortNode(root);
+            return root;
+        }
+
+        async function loadTree() {
+            const errors = [];
+            for (const strategy of [discoverFromListing, discoverFromGitHub]) {
+                try { return buildTree(await strategy()); }
+                catch (e) { errors.push(e.message); }
+            }
+            const err = new Error(errors.join(' | '));
+            err.isFile = location.protocol === 'file:';
+            throw err;
+        }
+
+        const countDocs = n => n.files.length + n.dirs.reduce((s, d) => s + countDocs(d), 0);
+
+        /* ---------------- Home page ---------------- */
+        const docIcon = '<svg class="ico w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="14" y2="17"/></svg>';
+
+        function matches(file, catLabel, q) {
+            if (!q) return true;
+            return (pretty(file.name) + ' ' + catLabel).toLowerCase().includes(q);
+        }
+
+        function categoryHTML(node, depth, q, trail) {
+            const label = trail ? trail + ' / ' + pretty(node.name) : pretty(node.name);
+            const files = node.files.filter(f => matches(f, label, q));
+            const kids = node.dirs.map(d => categoryHTML(d, depth + 1, q, label)).join('');
+            if (!files.length && !kids) return '';
+            const h = depth === 0 ? 'text-2xl' : 'text-lg';
+            return `
+            <section class="${depth ? 'sub-cat' : 'mt-12'}">
+                <h2 class="cat-heading ${h}">${esc(pretty(node.name))}<span class="cat-count">${countDocs(node)} ${countDocs(node) === 1 ? 'doc' : 'docs'}</span></h2>
+                ${files.length ? `<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 mt-4">${files.map(cardHTML).join('')}</div>` : ''}
+                ${kids}
+            </section>`;
+        }
+
+        function cardHTML(f) {
+            return `<a class="doc-card" href="${routeFor(f.path)}">${docIcon}<span>${esc(pretty(f.name))}</span></a>`;
+        }
+
+        function renderHome() {
+            document.title = TITLE;
+            const q = searchQuery.trim().toLowerCase();
+            app.innerHTML = `
+            <header class="text-center pt-6 pb-4">
+                <h1 class="hero-title text-4xl sm:text-6xl font-extrabold tracking-tight pb-1">${esc(TITLE)}</h1>
+                <p class="t-muted text-base sm:text-lg mt-3 font-light">${esc(SUBTITLE)}</p>
+                <div class="relative max-w-xl mx-auto mt-8">
+                    <svg class="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 t-muted" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+                    <input id="search" type="search" placeholder="Search documentation…" autocomplete="off" value="${esc(searchQuery)}">
+                </div>
+            </header>
+            <div id="home-list"></div>`;
+            const input = document.getElementById('search');
+            input.addEventListener('input', () => { searchQuery = input.value; renderHomeList(); });
+            renderHomeList();
+        }
+
+        function renderHomeList() {
+            const el = document.getElementById('home-list');
+            if (!el) return;
+            if (loadError) { el.innerHTML = errorHTML(); return; }
+            if (!tree) { el.innerHTML = loadingHTML(); return; }
+            const q = searchQuery.trim().toLowerCase();
+
+            let html = '';
+            const general = tree.files.filter(f => matches(f, 'General', q));
+            if (general.length) {
+                html += `<section class="mt-12">
+                    <h2 class="cat-heading text-2xl">General<span class="cat-count">${tree.files.length} ${tree.files.length === 1 ? 'doc' : 'docs'}</span></h2>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 mt-4">${general.map(cardHTML).join('')}</div>
+                </section>`;
+            }
+            html += tree.dirs.map(d => categoryHTML(d, 0, q, '')).join('');
+            el.innerHTML = html || `<p class="text-center t-muted mt-16">No documents match “${esc(searchQuery)}”.</p>`;
+        }
+
+        const loadingHTML = () => `<div class="flex flex-col items-center gap-3 mt-20 t-muted"><div class="spinner"></div><p class="text-sm">Loading documentation…</p></div>`;
+
+        function errorHTML() {
+            const hint = loadError && loadError.isFile
+                ? `<p class="mt-3">This page was opened directly from disk, and browsers block <code>fetch()</code> on <code>file://</code> pages. Serve the folder over HTTP instead:</p>
+                   <pre class="mt-3 text-left text-sm overflow-x-auto" style="background:var(--pre-bg);border:1px solid var(--border);border-radius:.6rem;padding:1rem">cd midum_pkg
+python -m http.server 8000
+# then open http://localhost:8000</pre>`
+                : `<p class="mt-3">Make sure the <code>docs/</code> folder sits next to <code>index.html</code> and the web server allows directory listing.</p>`;
+            return `<div class="glass-panel rounded-xl p-8 max-w-2xl mx-auto mt-16 text-center t-muted">
+                <h2 class="t-strong text-xl font-bold">Couldn’t load the documentation</h2>${hint}
+                <p class="mt-3 text-xs opacity-70">${esc(loadError ? loadError.message : '')}</p></div>`;
+        }
+
+        /* ---------------- Document page ---------------- */
+        function findFile(node, path) {
+            for (const f of node.files) if (f.path === path) return f;
+            for (const d of node.dirs) { const r = findFile(d, path); if (r) return r; }
+            return null;
+        }
+
+        function sidebarHTML(node, current, isRoot) {
+            const files = node.files.map(f =>
+                `<a class="side-link ${f.path === current ? 'active' : ''}" href="${routeFor(f.path)}">${esc(pretty(f.name))}</a>`).join('');
+            const dirs = node.dirs.map(d => {
+                const open = current.startsWith(d.path + '/');
+                return `<details class="side-group" ${open ? 'open' : ''}>
+                    <summary><span class="chev">›</span>${esc(pretty(d.name))}</summary>
+                    <div class="side-children">${sidebarHTML(d, current, false)}</div></details>`;
+            }).join('');
+            if (isRoot && node.files.length && node.dirs.length) {
+                return `<details class="side-group" ${current.includes('/') ? '' : 'open'}>
+                    <summary><span class="chev">›</span>General</summary><div class="side-children">${files}</div></details>${dirs}`;
+            }
+            return files + dirs;
+        }
+
+        function slugify(t) {
+            return t.toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/\s+/g, '-');
+        }
+
+        function processContent(root, path) {
+            const fileUrl = new URL(docUrl(path));
+
+            // images: resolve relative to the markdown file's own folder
+            root.querySelectorAll('img').forEach(img => {
+                const src = img.getAttribute('src');
+                if (src && !/^(data:|blob:)/i.test(src)) {
+                    try { img.setAttribute('src', new URL(src, fileUrl).href); } catch {}
+                }
+                img.setAttribute('loading', 'lazy');
+                img.addEventListener('error', () => {
+                    img.classList.add('img-broken');
+                    img.removeAttribute('src');
+                    img.insertAdjacentText('afterend', '');
+                    img.alt = '[Image not found: ' + (img.alt || src || '') + ']';
+                    img.style.cssText = 'width:auto';
+                    const note = document.createElement('span');
+                    note.className = 't-muted text-xs';
+                    note.textContent = img.alt;
+                    img.replaceWith(note);
+                }, { once: true });
+            });
+
+            // links: .md -> in-app route, other relative -> real URL, external -> new tab
+            root.querySelectorAll('a[href]').forEach(a => {
+                const href = a.getAttribute('href');
+                if (!href || href.startsWith('#')) return;
+                let u;
+                try { u = new URL(href, fileUrl); } catch { return; }
+                if (u.origin === docsBase.origin && u.pathname.startsWith(docsBase.pathname) && /\.md$/i.test(u.pathname)) {
+                    const rel = decodeURIComponent(u.pathname.slice(docsBase.pathname.length));
+                    a.setAttribute('href', routeFor(rel));
+                } else {
+                    a.setAttribute('href', u.href);
+                    a.setAttribute('target', '_blank');
+                    a.setAttribute('rel', 'noopener noreferrer');
+                }
+            });
+
+            // headings get ids (for in-page anchor links)
+            const used = new Set();
+            root.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(h => {
+                let id = slugify(h.textContent) || 'section', n = id, i = 1;
+                while (used.has(n)) n = id + '-' + (++i);
+                used.add(n); h.id = n;
+            });
+
+            // scrollable tables
+            root.querySelectorAll('table').forEach(t => {
+                const wrap = document.createElement('div');
+                wrap.className = 'table-wrap';
+                t.replaceWith(wrap); wrap.appendChild(t);
+            });
+        }
+
+        async function renderDoc(path) {
+            const file = tree && findFile(tree, path);
+            const crumbs = path.split('/').map(pretty);
+            const title = crumbs[crumbs.length - 1];
+            document.title = title + ' — ' + TITLE;
+
+            app.innerHTML = `
+            <div class="flex items-center justify-between lg:hidden mb-4">
+                <a href="#/" class="text-sm t-accent">← All docs</a>
+                <button id="menu-btn" class="text-sm t-muted border bdr rounded-lg px-3 py-1.5">Browse docs</button>
+            </div>
+            <div class="flex gap-10">
+                <aside id="sidebar" class="hidden lg:block w-64 shrink-0">
+                    <div class="sticky top-6 max-h-[calc(100vh-3rem)] overflow-y-auto pr-2">
+                        <a href="#/" class="hidden lg:flex items-center gap-1.5 text-sm t-accent mb-4 px-2">← All docs</a>
+                        ${tree ? sidebarHTML(tree, path, true) : ''}
+                    </div>
+                </aside>
+                <article class="min-w-0 flex-1">
+                    <p class="text-xs t-muted mb-4">${crumbs.map(esc).join(' <span class="opacity-50">/</span> ')}</p>
+                    <div id="doc-body" class="md">${loadingHTML()}</div>
+                </article>
+            </div>`;
+            document.getElementById('menu-btn').addEventListener('click', () => {
+                document.getElementById('sidebar').classList.toggle('hidden');
+            });
+            window.scrollTo(0, 0);
+
+            const body = document.getElementById('doc-body');
+            try {
+                const res = await fetch(docUrl(path), { cache: 'no-cache' });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                let md = (await res.text()).replace(/^\uFEFF/, '');
+                const html = DOMPurify.sanitize(marked.parse(md, { gfm: true, breaks: false }));
+                const tpl = document.createElement('div');
+                tpl.innerHTML = html;
+                processContent(tpl, path);
+                body.innerHTML = '';
+                body.append(...tpl.childNodes);
+            } catch (e) {
+                body.innerHTML = `<div class="glass-panel rounded-xl p-6 t-muted"><h2 class="t-strong text-lg font-bold" style="margin:0">Document not found</h2>
+                    <p>Couldn’t load <code>${esc(path)}</code> (${esc(e.message)}).</p><p><a href="#/">Back to all docs</a></p></div>`;
+            }
+        }
+
+        /* ---------------- Router ---------------- */
+        function currentPath() {
+            const h = location.hash;
+            if (!h.startsWith('#/') || h.length <= 2) return '';
+            try { return h.slice(2).split('/').map(decodeURIComponent).join('/'); } catch { return ''; }
+        }
+
+        function route() {
+            const p = currentPath();
+            if (p) renderDoc(p); else renderHome();
+        }
+
+        window.addEventListener('hashchange', route);
+
+        // In-page anchors (#heading) inside a document
+        document.addEventListener('click', e => {
+            const a = e.target.closest && e.target.closest('.md a[href^="#"]');
+            if (a && !a.getAttribute('href').startsWith('#/')) {
+                e.preventDefault();
+                const el = document.getElementById(decodeURIComponent(a.getAttribute('href').slice(1)));
+                if (el) el.scrollIntoView({ behavior: 'smooth' });
+            }
+            const img = e.target.closest && e.target.closest('.md img');
+            if (img && img.src) {
+                const lb = document.getElementById('lightbox');
+                lb.querySelector('img').src = img.src;
+                lb.classList.add('open');
+            }
+        });
+        document.getElementById('lightbox').addEventListener('click', e => e.currentTarget.classList.remove('open'));
+        document.addEventListener('keydown', e => { if (e.key === 'Escape') document.getElementById('lightbox').classList.remove('open'); });
+
+        /* ---------------- Theme ---------------- */
         (function () {
             const root = document.documentElement;
-            const toggle = document.getElementById('theme-toggle');
-
-            function applyDiagramTheme(isLight) {
-                document.querySelectorAll('.diagram-box').forEach(el => {
-                    el.setAttribute('fill', isLight ? '#f8fafc' : '#0b0f19');
-                    el.setAttribute('stroke', isLight ? '#cbd5e1' : '#334155');
-                });
-                document.querySelectorAll('.diagram-title').forEach(el => {
-                    el.setAttribute('fill', isLight ? '#0f172a' : '#f3f4f6');
-                });
-                document.querySelectorAll('.diagram-sub').forEach(el => {
-                    el.setAttribute('fill', isLight ? '#64748b' : '#9ca3af');
-                });
-            }
-
-            function setTheme(mode) {
-                const isLight = mode === 'light';
-                root.classList.toggle('light', isLight);
-                localStorage.setItem('midum-theme', mode);
-                applyDiagramTheme(isLight);
-            }
-
-            const stored = localStorage.getItem('midum-theme');
-            const prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
-            setTheme(stored || (prefersLight ? 'light' : 'dark'));
-
-            toggle.addEventListener('click', () => {
-                const isCurrentlyLight = root.classList.contains('light');
-                setTheme(isCurrentlyLight ? 'dark' : 'light');
-            });
+            const set = mode => { root.classList.toggle('light', mode === 'light'); try { localStorage.setItem('midum-theme', mode); } catch {} };
+            let stored = null;
+            try { stored = localStorage.getItem('midum-theme'); } catch {}
+            set(stored || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
+            document.getElementById('theme-toggle').addEventListener('click', () => set(root.classList.contains('light') ? 'dark' : 'light'));
         })();
-    </script>
 
-    <!-- Copy git clone command -->
-    <script>
-        (function () {
-            const btn = document.getElementById('copy-clone-btn');
-            if (!btn) return;
-            const copyIcon = document.getElementById('copy-icon');
-            const checkIcon = document.getElementById('copy-check-icon');
-            btn.addEventListener('click', () => {
-                navigator.clipboard.writeText('git clone https://github.com/parth-satija/Midum.git').then(() => {
-                    copyIcon.classList.add('hidden');
-                    checkIcon.classList.remove('hidden');
-                    setTimeout(() => {
-                        checkIcon.classList.add('hidden');
-                        copyIcon.classList.remove('hidden');
-                    }, 1500);
-                });
-            });
-        })();
-    </script>
-
-    <!-- Dynamic Version Downloader Script -->
-    <script>
-        document.addEventListener('DOMContentLoaded', () => {
-            const versionBadge = document.getElementById('version-badge');
-            const btnSubtext = document.getElementById('btn-subtext');
-            const fallbackVersion = 'v1.2';
-
-            fetch('https://api.github.com/repos/parth-satija/Midum/releases/latest')
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error(`HTTP error! status: ${response.status}`);
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    if (data && data.tag_name) {
-                        const cleanVersion = data.tag_name;
-                        versionBadge.textContent = cleanVersion;
-                        btnSubtext.textContent = `${cleanVersion} executable`;
-                    } else {
-                        versionBadge.textContent = fallbackVersion;
-                    }
-                })
-                .catch(error => {
-                    console.warn('Could not retrieve latest tag from GitHub API, using fallback.', error);
-                    versionBadge.textContent = fallbackVersion;
-                });
-        });
+        /* ---------------- Boot ---------------- */
+        route(); // shows loading state immediately
+        loadTree().then(t => { tree = t; }).catch(e => { loadError = e; }).finally(route);
+    })();
     </script>
 </body>
 </html>

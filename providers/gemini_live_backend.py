@@ -48,6 +48,7 @@ from config import SECRETS_FILE
 from screen_capture import capture_screen_frame_jpeg_bytes
 from system_prompt import get_system_prompt
 from tools_schema import tools as _OPENAI_TOOLS
+import voiceover as _voiceover
 from tools.surface_delegate_tools import (
     VOICE_BLOCKED_TOOLS, VOICE_SURFACE_TOOL_NAMES, VOICE_SURFACE_TOOL_SCHEMAS,
     call_voice_surface_tool,
@@ -124,6 +125,7 @@ def voice_dependencies_status() -> str:
 #    JSON-schema `parameters` dicts directly, so this is mostly a re-shape,
 #    not a re-write. ────────────────────────────────────────────────────────
 def _build_live_tools():
+    _voiceover.register_tools(_OPENAI_TOOLS)   # idempotent; makes sure the voiceover tools are offered even if orchestration hasn't been imported yet
     declarations = []
     for t in _OPENAI_TOOLS:
         fn = t.get("function", {})
@@ -270,6 +272,10 @@ class VoiceSession:
             "are, then place it beside the thing it explains. Say one short line before calling "
             "(it takes a few seconds), and afterwards just confirm it's up. To change one that's "
             "already showing, call the same tool again (same surface_id, or edit_current=true)."
+            "\n\nVOICEOVERS: to make a voiceover clip, call record_voiceover with the exact script as "
+            "text -- do NOT speak the script yourself. The clip stays in memory; offer to play it "
+            "(play_voiceover), change it (revise_voiceover) or save it (save_voiceover). Only save "
+            "to disk when the user says so."
         )
 
         live_cfg = genai_types.LiveConnectConfig(
@@ -516,6 +522,11 @@ class VoiceSession:
                                     # 10-60s: run it off the event loop so the mic
                                     # drain / speaker playback tasks keep running.
                                     result = await asyncio.to_thread(call_voice_surface_tool, fc.name, args)
+                                elif fc.name in _voiceover.TOOL_NAMES:
+                                    # Recording/revising takes seconds to minutes (it talks to the Live
+                                    # model itself): run it off the event loop so the mic drain and
+                                    # speaker playback tasks keep running while it works.
+                                    result = (await asyncio.to_thread(_voiceover.dispatch, fc.name, args))[0]
                                 else:
                                     from gui.dispatch import _dispatch_midum_tool
                                     result = _dispatch_midum_tool(fc.name, args)

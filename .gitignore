@@ -8,9 +8,17 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+packaging/installer/Output/
+
+# Java source and compiled output
+*.java
+*.class
 
 # Log files
 *.log
 
 # App data / runtime storage (chats, memory, settings, secrets scaffolding)
 storage/
+
+# Launcher-created per-checkout state (venv, launcher config)
+.midum/

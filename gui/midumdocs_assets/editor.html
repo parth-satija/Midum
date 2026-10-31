@@ -56,6 +56,25 @@ button{font:inherit;color:inherit;cursor:pointer;}
   box-shadow:0 1px 2px rgba(0,0,0,.3),0 10px 30px -12px rgba(0,0,0,.55);}
 .page canvas{display:block;}
 #pages.stale .page{filter:saturate(.6) brightness(.82);transition:filter .2s;}
+
+/* "Custom pages" toggle: the typeset page becomes a rounded, translucent, menu-like pane with light text so it blends into the
+   GUI instead of sitting on it as a white sheet. The canvas is rendered with a transparent background and recoloured ONCE at render
+   time (see renderPages), so scrolling only moves finished bitmaps: no live CSS filter and no backdrop-filter on the pages (both
+   forced a full re-raster of every visible page on each scrolled frame, which showed up as flashing). */
+#pages.custom .page{background:var(--glass-pop, color-mix(in srgb, var(--panel-raw, var(--panel)) 72%, transparent));
+  background-image:linear-gradient(150deg, var(--glass-sheen, rgba(255,255,255,.10)) 0%, var(--glass-sheen-soft, rgba(255,255,255,.04)) 30%, transparent 55%);
+  border:1px solid var(--glass-edge, rgba(255,255,255,.18));border-radius:18px;overflow:hidden;
+  box-shadow:inset 0 1px 0 var(--glass-edge, rgba(255,255,255,.18)), 0 6px 14px -8px rgba(0,0,0,.5);}
+#custpg{display:inline-flex;align-items:center;gap:7px;font-size:12px;padding:0 10px;white-space:nowrap;}
+#custpg .sw{width:24px;height:14px;border-radius:8px;background:var(--border2,#1f2937);position:relative;transition:background .15s;flex:none;}
+#custpg .sw::after{content:"";position:absolute;top:2px;left:2px;width:10px;height:10px;border-radius:50%;background:#cbd5e1;transition:transform .15s;}
+#custpg[aria-pressed="true"] .sw{background:var(--accent);}
+#custpg[aria-pressed="true"] .sw::after{transform:translateX(10px);background:#fff;}
+#zoom .zsep{width:1px;align-self:stretch;margin:4px 2px;background:var(--glass-edge-dim, rgba(255,255,255,.12));}
+#zoom #custpg{width:auto;height:24px;}
+#zoom #custpg:hover{background:var(--surface2);}
+#zoom span.sw{min-width:0;}
+#zoom span.zsep{min-width:0;width:1px;}
 .textLayer{position:absolute;inset:0;overflow:hidden;line-height:1;}
 .textLayer span,.textLayer br{position:absolute;color:transparent;white-space:pre;cursor:text;transform-origin:0 0;}
 .textLayer ::selection{background:rgba(59,130,246,.38);}
@@ -115,6 +134,64 @@ button{font:inherit;color:inherit;cursor:pointer;}
 #ask.busy #ask-row,#ask.busy #ask-ctx{display:none;} #ask.busy #ask-busy{display:flex;}
 #ask-busy .grow{flex:1;} #ask-busy button{border:1px solid var(--border2);background:var(--surface2);border-radius:12px;padding:2px 10px;font-size:11.5px;}
 #ask-sugg{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;}
+
+/* ── Glass Surfaces ───────────────────────────────────────────────────────────────────────
+   applyTheme() sets html.glass-on (+ --glass-pct) from the Midum UI's Glass Surfaces setting. The page itself
+   is already clear (html,body are transparent and the host iframe is clear too), so the ambient blobs /
+   background image of the main window show straight through the source pane and page pane; only the floating
+   controls keep a glass fill so they stay readable. Same token recipe as the main window (no backdrop-filter). */
+:root{
+  --glass-pct:55%;
+  --glass-sheen:color-mix(in srgb, white calc(var(--glass-pct) * 0.55), transparent);
+  --glass-sheen-soft:color-mix(in srgb, white calc(var(--glass-pct) * 0.2), transparent);
+  --glass-edge:color-mix(in srgb, white calc(var(--glass-pct) * 0.6), transparent);
+  --glass-edge-dim:color-mix(in srgb, white calc(var(--glass-pct) * 0.22), transparent);
+  --glass-glow:0 6px 18px -10px rgba(0,0,0,.45);
+  --glass-fill:color-mix(in srgb, var(--panel-raw, var(--panel)) var(--glass-pct), transparent);
+  --glass-fill-strong:color-mix(in srgb, var(--panel-raw, var(--panel)) calc(var(--glass-pct) + 10%), transparent);
+  --glass-pop:color-mix(in srgb, var(--panel-raw, var(--panel)) calc(var(--glass-pct) + 20%), transparent);
+}
+html.glass-no-sheen{--glass-sheen:transparent;--glass-sheen-soft:transparent;}
+html.glass-on #src-wrap,html.glass-on #page-wrap{background:transparent;}
+html.glass-on #splitter::after{background:var(--glass-edge-dim);}
+html.glass-on #splitter:hover::after,html.glass-on #splitter.drag::after{background:var(--accent);}
+html.glass-on .CodeMirror-gutters{border-right-color:var(--glass-edge-dim);}
+html.glass-on .spin{border-color:var(--glass-edge-dim);border-top-color:var(--accent);}
+html.glass-on #zoom,html.glass-on #banner,html.glass-on #toast:not(.err),html.glass-on #savebtn:not(.draft),
+html.glass-on #ask-pill,html.glass-on #ask-box,html.glass-on #pepop{
+  background-color:var(--glass-pop);
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%);
+  border-color:var(--glass-edge);
+  box-shadow:inset 0 1px 0 var(--glass-edge), inset 0 -1px 0 var(--glass-edge-dim), var(--glass-glow);
+}
+html.glass-on #toast.err{background-color:var(--glass-pop);}
+html.glass-on #ask-box{border-color:color-mix(in srgb, var(--accent) 55%, var(--glass-edge));}
+html.glass-on #errpill{background-color:color-mix(in srgb, var(--red) 24%, var(--glass-pop));}
+html.glass-on #savebtn.draft{background-color:color-mix(in srgb, var(--accent) 20%, transparent);}
+html.glass-on #banner button,html.glass-on .chip,html.glass-on #empty button,html.glass-on #ask-busy button{
+  background-color:var(--glass-fill);border-color:var(--glass-edge-dim);box-shadow:inset 0 1px 0 var(--glass-edge-dim);
+}
+html.glass-on #zoom button:hover{background-color:var(--glass-fill-strong);}
+html.glass-on #ask-ctx .tag,html.glass-on #pedit.on{background-color:color-mix(in srgb, var(--accent) 18%, transparent);}
+html.glass-on #logview{background-color:var(--glass-pop) !important;border-color:var(--glass-edge) !important;}
+
+/* Glass Surfaces for the editor itself: the source pane and the page area are real glass panes (rounded, translucent fill, diagonal
+   sheen, bright top edge) like Midum's own panes, instead of bare transparent areas. Same static recipe: no backdrop-filter. */
+html.glass-on #app{padding:8px;}
+html.glass-on #src-wrap,html.glass-on #page-wrap{
+  border:1px solid var(--glass-edge);border-radius:16px;overflow:hidden;
+  background-color:var(--glass-fill);
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%);
+  box-shadow:inset 0 1px 0 var(--glass-edge), inset 0 -1px 0 var(--glass-edge-dim), var(--glass-glow);
+}
+/* the page area sits behind translucent "Custom pages" / white pages, so its own fill is lighter */
+html.glass-on #page-wrap{background-color:color-mix(in srgb, var(--panel-raw, var(--panel)) calc(var(--glass-pct) * .55), transparent);}
+html.glass-on #splitter{margin:0 -1px;flex-basis:8px;}
+html.glass-on #splitter::after{left:3.5px;}
+html.glass-on #splitter:hover::after,html.glass-on #splitter.drag::after{left:3px;}
+html.glass-on .CodeMirror{background:transparent;}
+html.glass-on .CodeMirror-gutters{background:transparent;}
+html.glass-on .CodeMirror-scroll{border-radius:inherit;}
 </style>
 </head>
 <body>
@@ -126,7 +203,7 @@ button{font:inherit;color:inherit;cursor:pointer;}
     <div id="empty"><div class="spin"></div><div class="big" id="empty-big">Looking for your LaTeX installation…</div>
       <div class="small" id="empty-small">MidumDocs compiles offline with the TeX distribution installed on this PC.</div></div>
     <div id="errpill" class="float"><span id="errtext"></span><button id="errlog" class="chip">Log</button></div>
-    <div id="zoom" class="float"><button id="zout" title="Zoom out">−</button><span id="zval">100%</span><button id="zin" title="Zoom in">+</button></div>
+    <div id="zoom" class="float"><button id="custpg" aria-pressed="false" title="Custom pages: rounded, translucent pages with light text that blend into the Midum window"><span class="sw"></span>Custom pages</button><span class="zsep"></span><button id="zout" title="Zoom out">−</button><span id="zval">100%</span><button id="zin" title="Zoom in">+</button></div>
   </section>
   <div id="banner" class="float"><span id="banner-text"></span><span id="banner-btns"></span></div>
   <button id="savebtn" class="float draft" title="Save this document (Ctrl/⌘ S). After the first save it autosaves."><span id="savetxt">Save</span><kbd>Ctrl S</kbd></button>
@@ -165,7 +242,28 @@ function rpc(md, data){ return new Promise((res)=>{ const rid=++_rid; _pending.s
   setTimeout(()=>{ if(_pending.has(rid)){ _pending.delete(rid); res({ok:false,error:"timed out"}); } }, 20000); }); }
 
 // ── theme ────────────────────────────────────────────────────────────────────────────────
-function applyTheme(vars){ if(!vars) return; for(const k in vars){ if(/^--[a-z0-9-]+$/i.test(k) && typeof vars[k]==="string") document.documentElement.style.setProperty(k, vars[k]); } }
+// Theme vars arrive from the Midum UI. The --mz-glass-* keys are Glass Surfaces control values (on / opacity % /
+// frosted highlight), never applied as CSS themselves. While glass is on the four surface colours become translucent
+// (--bg fully clear); the opaque originals stay available as --bg-raw/--panel-raw/... for anything that must remain
+// legible (floating pills, popups). Without glass this is exactly the old behaviour.
+const _RAW={}, _GLASS_KEYS=["--bg","--panel","--surface","--surface2"];
+function applyTheme(vars){
+  if(!vars) return;
+  for(const k in vars){ if(/^--[a-z0-9-]+$/i.test(k) && typeof vars[k]==="string") _RAW[k]=vars[k]; }
+  const root=document.documentElement, st=root.style;
+  const on=_RAW["--mz-glass-on"]==="1";
+  const pct=Math.max(0,Math.min(100,parseFloat(_RAW["--mz-glass-pct"])||55));
+  for(const k in _RAW){
+    if(k.indexOf("--mz-")===0) continue;
+    st.setProperty(k,_RAW[k]);
+    if(_GLASS_KEYS.indexOf(k)>=0) st.setProperty(k+"-raw",_RAW[k]);
+  }
+  st.setProperty("--glass-pct",pct+"%");
+  root.classList.toggle("glass-on",on);
+  root.classList.toggle("glass-no-sheen",_RAW["--mz-glass-sheen"]==="0");
+  if(on) _GLASS_KEYS.forEach(k=>{ if(_RAW[k]===undefined) return;
+    st.setProperty(k, k==="--bg" ? "transparent" : "color-mix(in srgb, "+_RAW[k]+" "+pct+"%, transparent)"); });
+}
 
 // ── editor ───────────────────────────────────────────────────────────────────────────────
 const cm = CodeMirror.fromTextArea($("src"), {
@@ -395,6 +493,15 @@ async function compileNow(){
 // ── PDF pages (pdf.js) ───────────────────────────────────────────────────────────────────
 pdfjsLib.GlobalWorkerOptions.workerSrc="/vendor/pdfjs/pdf.worker.min.js";
 let pdfDoc=null, renderToken=0;
+// Bake the "Custom pages" colours into the finished bitmap: invert + hue-rotate keeps colours roughly right while black text becomes
+// light; transparent pixels stay transparent (filters never touch alpha).
+function lightenCanvas(cv){
+  try{
+    const t=document.createElement("canvas"); t.width=cv.width; t.height=cv.height;
+    const tc=t.getContext("2d"); tc.filter="invert(1) hue-rotate(180deg) brightness(.94)"; tc.drawImage(cv,0,0);
+    const c=cv.getContext("2d"); c.save(); c.setTransform(1,0,0,1,0,0); c.clearRect(0,0,cv.width,cv.height); c.drawImage(t,0,0); c.restore();
+  }catch(_){ cv.style.filter="invert(1) hue-rotate(180deg) brightness(.94)"; }      // canvas filters unsupported: fall back to CSS
+}
 function fitWidth(pageW){ const avail=Math.max(200,pagesEl.clientWidth-48); return Math.max(220,Math.min(avail,880)*zoom); }
 async function renderPages(){
   if(!pdfDoc) return 0;
@@ -407,7 +514,8 @@ async function renderPages(){
     wrap.style.width=vp.width+"px"; wrap.style.height=vp.height+"px";
     const cv=document.createElement("canvas"); cv.width=Math.floor(vp.width*dpr); cv.height=Math.floor(vp.height*dpr);
     cv.style.width=vp.width+"px"; cv.style.height=vp.height+"px"; wrap.appendChild(cv);
-    await page.render({canvasContext:cv.getContext("2d"),viewport:vp,transform:[dpr,0,0,dpr,0,0]}).promise; if(token!==renderToken) return -1;
+    await page.render({canvasContext:cv.getContext("2d"),viewport:vp,transform:[dpr,0,0,dpr,0,0],background:customPages?"rgba(0,0,0,0)":"rgb(255,255,255)"}).promise; if(token!==renderToken) return -1;
+    if(customPages) lightenCanvas(cv);        // black text -> light, once, instead of a CSS filter that is re-applied on every scrolled frame
     const tl=document.createElement("div"); tl.className="textLayer"; tl.style.setProperty("--scale-factor",String(vp.scale)); wrap.appendChild(tl);
     try{ const tc=await page.getTextContent(); store[n]={items:tc.items,vp}; await pdfjsLib.renderTextLayer({textContentSource:tc,container:tl,viewport:vp,textDivs:[]}).promise; }catch(_){}
     frag.appendChild(wrap);
@@ -425,10 +533,22 @@ async function showPdf(bytes){
   if(old && old!==pdfDoc){ try{ old.destroy(); }catch(_){} }
   return n<0 ? pdfDoc.numPages : n;
 }
-let rsTimer=null;
-new ResizeObserver(()=>{ clearTimeout(rsTimer); rsTimer=setTimeout(()=>{ cm.refresh(); renderPages(); },220); }).observe($("page-wrap"));
+let rsTimer=null, lastPW=0;
+// Re-render the pages only when their available WIDTH changed: height-only changes (header / bars appearing, full screen) never alter
+// the page bitmaps, and redrawing them anyway swapped every canvas and flashed.
+new ResizeObserver(()=>{ clearTimeout(rsTimer); rsTimer=setTimeout(()=>{ cm.refresh(); const w=pagesEl.clientWidth; if(Math.abs(w-lastPW)>=2){ lastPW=w; renderPages(); } },220); }).observe($("page-wrap"));
 function setZoom(z){ zoom=Math.max(.5,Math.min(2.5,z)); $("zval").textContent=Math.round(zoom*100)+"%"; renderPages(); }
 $("zin").onclick=()=>setZoom(zoom+.1); $("zout").onclick=()=>setZoom(zoom-.1);
+// Custom pages toggle (remembered per browser profile)
+let customPages=false; try{ customPages=localStorage.getItem("midumdocs.customPages")==="1"; }catch(_){}
+function applyCustomPages(rerender){
+  pagesEl.classList.toggle("custom",customPages); $("custpg").setAttribute("aria-pressed",customPages?"true":"false");
+  if(rerender) renderPages();                // the canvas background (white vs transparent) is baked in at render time
+}
+$("custpg").onclick=()=>{ customPages=!customPages; try{ localStorage.setItem("midumdocs.customPages",customPages?"1":"0"); }catch(_){} post("pref",{key:"customPages",value:customPages}); applyCustomPages(true); };
+applyCustomPages(false);
+// F11 inside the editor frame toggles full screen in the Midum window (key events do not bubble out of an iframe)
+document.addEventListener("keydown",(e)=>{ if(e.key==="F11"){ e.preventDefault(); post("toggle_full"); } });
 pagesEl.addEventListener("wheel",(e)=>{ if(e.ctrlKey){ e.preventDefault(); setZoom(zoom+(e.deltaY<0?.1:-.1)); } },{passive:false});
 
 // ── page -> source (approximate: typeset text is matched back to the source) ─────────────
@@ -521,7 +641,7 @@ function loadDoc(d){
 window.addEventListener("message",(e)=>{
   if(e.source!==parent) return; const m=e.data; if(!m||typeof m.md!=="string") return;
   switch(m.md){
-    case "init": applyTheme(m.theme); if(m.mode) setMode(m.mode); loadDoc(m.doc); break;
+    case "init": applyTheme(m.theme); if(m.mode) setMode(m.mode); if(m.prefs && typeof m.prefs.customPages==="boolean"){ customPages=m.prefs.customPages; applyCustomPages(false); } loadDoc(m.doc); break;
     case "theme": applyTheme(m.vars); break;
     case "doc_changed": onDocChanged(m); break;
     case "busy": setBusy(!!m.value); if(!m.value) refreshAskCtx(); break;
