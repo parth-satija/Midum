@@ -97,11 +97,23 @@ try:
 except Exception as exc:  # pragma: no cover
     print(f"[midum.spec] skipping litellm: {exc}")
 
-for pkg in ("mcp", "pygments", "google.genai"):
+# mcp.cli needs 'typer' (an optional extra) and calls sys.exit(1) when it's missing, which aborted the
+# whole submodule collection and left the mcp package out of the bundle. Midum only uses the client SDK.
+try:
+    hiddenimports += collect_submodules("mcp", filter=lambda n: not n.startswith("mcp.cli"))
+except Exception as exc:  # pragma: no cover
+    print(f"[midum.spec] skipping mcp: {exc}")
+
+for pkg in ("pygments",):
     try:
         hiddenimports += collect_submodules(pkg)
     except Exception as exc:  # pragma: no cover
         print(f"[midum.spec] skipping {pkg}: {exc}")
+
+try:
+    hiddenimports += collect_submodules("google.genai", filter=lambda n: ".tests" not in n)
+except Exception as exc:  # pragma: no cover
+    print(f"[midum.spec] skipping google.genai: {exc}")
 
 hiddenimports += [
     "tiktoken_ext", "tiktoken_ext.openai_public",
@@ -174,8 +186,10 @@ def make_version_file():
             StringStruct("ProductName", "Midum"),
             StringStruct("ProductVersion", raw)])]),
               VarFileInfo([VarStruct("Translation", [1033, 1200])])])
-    os.makedirs(WORKPATH, exist_ok=True)                 # noqa: F821  (provided by PyInstaller)
-    path = os.path.join(WORKPATH, "midum_version_info.txt")  # noqa: F821
+    # WORKPATH is not a spec-file global in every PyInstaller version (6.22 removed it), so don't rely on it.
+    import tempfile
+    out_dir = tempfile.mkdtemp(prefix="midum_version_")
+    path = os.path.join(out_dir, "midum_version_info.txt")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(str(info))
     return path

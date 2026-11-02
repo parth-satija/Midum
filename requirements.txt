@@ -8,7 +8,7 @@ keyboard
 litellm
 loguru
 mammoth
-mcp
+mcp[cli]
 numpy
 ollama
 pillow
