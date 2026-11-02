@@ -1334,7 +1334,25 @@ class Api(EditorMixin, StepsMixin):
             # tab is already empty, reuse it instead of stacking up blank tabs.
             try:
                 if self._display_log:
-                    self.new_conversation_tab()
+                    # If a blank "New Tab" is already open among the restored tabs, switch to it
+                    # instead of stacking another one on top.
+                    _blank_tab_id = None
+                    for _row in conversation_tabs.list_tabs():
+                        if _row.get("kind") == "agent":
+                            continue
+                        _tid = _row["id"]
+                        if _tid == conversation_tabs.get_active_tab_id():
+                            continue
+                        _st = self._tab_gui_state.get(_tid) or {}
+                        if not _st.get("display_log"):
+                            _blank_tab_id = _tid
+                            break
+                    if _blank_tab_id is not None:
+                        _r = self.switch_conversation_tab(_blank_tab_id)
+                        if not (_r or {}).get("ok"):
+                            self.new_conversation_tab()
+                    else:
+                        self.new_conversation_tab()
             except Exception as _e:
                 print(f"[startup] could not open a fresh tab: {_e}")
 
@@ -2121,6 +2139,73 @@ class Api(EditorMixin, StepsMixin):
     def _settings_path(self):
         return os.path.join(midum.STORAGE_DIR, self._SETTINGS_FILENAME)
 
+    def copy_to_clipboard(self, text):
+        """Put text on the OS clipboard. QtWebEngine blocks navigator.clipboard / execCommand('copy') unless
+        JavascriptCanAccessClipboard is enabled, so every copy button in the UI goes through here."""
+        try:
+            text = "" if text is None else str(text)
+        except Exception:
+            return False
+        if not text:
+            return False
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                import time as _time
+                from ctypes import wintypes
+                k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                u32 = ctypes.WinDLL("user32", use_last_error=True)
+                k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+                k32.GlobalAlloc.restype = wintypes.HGLOBAL
+                k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+                k32.GlobalLock.restype = ctypes.c_void_p
+                k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+                k32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+                u32.OpenClipboard.argtypes = [wintypes.HWND]
+                u32.OpenClipboard.restype = wintypes.BOOL
+                u32.EmptyClipboard.restype = wintypes.BOOL
+                u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+                u32.SetClipboardData.restype = wintypes.HANDLE
+                u32.CloseClipboard.restype = wintypes.BOOL
+                data = (text + "\0").encode("utf-16-le")
+                opened = False
+                for _ in range(10):  # another process may briefly hold the clipboard
+                    if u32.OpenClipboard(None):
+                        opened = True
+                        break
+                    _time.sleep(0.03)
+                if not opened:
+                    return False
+                try:
+                    u32.EmptyClipboard()
+                    h = k32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+                    if not h:
+                        return False
+                    p = k32.GlobalLock(h)
+                    if not p:
+                        k32.GlobalFree(h)
+                        return False
+                    ctypes.memmove(p, data, len(data))
+                    k32.GlobalUnlock(h)
+                    if not u32.SetClipboardData(13, h):  # CF_UNICODETEXT
+                        k32.GlobalFree(h)
+                        return False
+                    return True  # the system owns the memory now
+                finally:
+                    u32.CloseClipboard()
+            except Exception:
+                traceback.print_exc()
+                return False
+        try:
+            try:
+                from PySide6.QtGui import QGuiApplication
+            except ImportError:
+                from PyQt5.QtGui import QGuiApplication
+            QGuiApplication.clipboard().setText(text)
+            return True
+        except Exception:
+            return False
+
     def get_settings(self):
         defaults = {
             "provider": _PROVIDER_KEY_TO_LABEL[DEFAULT_PROVIDER_KEY],
@@ -2136,7 +2221,7 @@ class Api(EditorMixin, StepsMixin):
             # which theme is active.
             "blobs_individual": {"center": True, "a": True, "b": True, "cursor": True},
             "liquid_glass_enabled": True,
-            "liquid_glass_opacity": 0,
+            "liquid_glass_opacity": 8,  # 10% of the slider's 0-75 range (7.5, rounded)
             "liquid_glass_sheen_enabled": False,
             "chat_font_size": self._CHAT_FONT_SIZE_DEFAULT,
             # Ambient Surfaces are excluded from screenshots/OCR/screen-share
@@ -10366,7 +10451,7 @@ function _mdTheme(){ const cs = getComputedStyle(document.documentElement), v = 
 function _glassThemeVars(){
   return {
     "--mz-glass-on": document.documentElement.classList.contains("liquid-glass-on") ? "1" : "0",
-    "--mz-glass-pct": String(typeof _glassOpacity === "number" ? _glassOpacity : 55),
+    "--mz-glass-pct": String(typeof _glassOpacity === "number" ? _glassOpacity : 8),
     "--mz-glass-sheen": (typeof _glassSheenEnabled === "boolean" ? _glassSheenEnabled : true) ? "1" : "0"
   };
 }
@@ -12262,16 +12347,21 @@ function bubblePlainText(b){
   return clone.innerText.trim();
 }
 
-function rowPlainText(row){
+// `labeled` is only true for the full-conversation copy, where "You:" / "Midum:"
+// speaker labels are needed to tell the turns apart. The per-row copy buttons
+// copy just the message/response text, with no label prepended.
+function rowPlainText(row, labeled){
   if (!row) return "";
   if (row.classList.contains("user")){
     const b = row.querySelector(".bubble");
-    return "You: " + bubblePlainText(b);
+    const t = bubblePlainText(b);
+    return (labeled && t) ? "You: " + t : t;
   }
   if (row.classList.contains("midum")){
     if (row.querySelector(".ask-card")) return "";   // inline ask cards aren't transcript text
     const b = row.querySelector(".bubble");
-    return bubblePlainText(b);
+    const t = bubblePlainText(b);
+    return (labeled && t) ? "Midum: " + t : t;
   }
   if (row.classList.contains("tool-group")){
     const parts = [];
@@ -12316,24 +12406,32 @@ function rowPlainText(row){
 
 async function copyTextToClipboard(text){
   if (!text) return false;
+  // 1) Native bridge. QtWebEngine leaves JavascriptCanAccessClipboard off, so both navigator.clipboard and
+  //    execCommand("copy") are blocked inside the app window; Python writes to the OS clipboard directly.
+  try {
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.copy_to_clipboard){
+      const r = await window.pywebview.api.copy_to_clipboard(String(text));
+      if (r === true) return true;
+    }
+  } catch (e) {}
+  // 2) Async Clipboard API (works in a normal browser / secure context).
   try {
     await navigator.clipboard.writeText(text);
     return true;
-  } catch (e) {
-    // Fallback for environments where the async Clipboard API is blocked.
-    try {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.focus(); ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-      return true;
-    } catch (e2) {
-      return false;
-    }
+  } catch (e) {}
+  // 3) Legacy fallback. execCommand returns false when blocked, so report that honestly.
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return !!ok;
+  } catch (e2) {
+    return false;
   }
 }
 
@@ -12476,11 +12574,49 @@ document.addEventListener("click", async (e)=>{
   if (ok) flashCopyFeedback(btn);
 });
 
+// chat-col's direct children are NOT always rows: a loaded chat's history is
+// grouped into ".turn-block" wrappers (see buildTurnBlock), which
+// rowPlainText doesn't understand -- that returned "" for every block, so
+// the full-conversation copy ended up empty and silently did nothing.
+// Flatten the wrappers into the real rows first.
+function _flattenChatRows(container){
+  const out = [];
+  Array.from(container.children).forEach(el=>{
+    if (el.classList && el.classList.contains("turn-block")) out.push(...Array.from(el.children));
+    else out.push(el);
+  });
+  return out;
+}
+
 async function copyFullConversation(){
-  const rows = Array.from(chatCol().children);
-  const parts = rows.map(rowPlainText).map(t=>t.trim()).filter(Boolean);
-  const ok = await copyTextToClipboard(parts.join("\n\n"));
-  if (ok) flashCopyFeedback(document.getElementById("copy-chat-btn"));
+  const btn = document.getElementById("copy-chat-btn");
+  try {
+    const texts = [];
+    // Windowed history only keeps the newest HIST_WINDOW turns in the DOM; build the
+    // older ones off-screen (innerText needs real layout) so the copy has the WHOLE chat.
+    if (typeof _histActive !== "undefined" && _histActive && _histWinStart > 0){
+      const stage = document.createElement("div");
+      stage.style.cssText = "position:fixed;left:-100000px;top:0;width:760px;pointer-events:none;opacity:0;";
+      document.body.appendChild(stage);
+      try {
+        for (let i = 0; i < _histWinStart; i++) stage.appendChild(buildTurnBlock(i));
+        _flattenChatRows(stage).forEach(r=>{
+          try { texts.push(rowPlainText(r, true)); } catch (e) {}
+        });
+      } finally {
+        stage.remove();
+      }
+    }
+    _flattenChatRows(chatCol()).forEach(r=>{
+      try { texts.push(rowPlainText(r, true)); } catch (e) {}
+    });
+    const parts = texts.map(t=>(t || "").trim()).filter(Boolean);
+    if (!parts.length) return;
+    const ok = await copyTextToClipboard(parts.join("\n\n"));
+    if (ok) flashCopyFeedback(btn);
+  } catch (e) {
+    console.error("copyFullConversation failed", e);
+  }
 }
 
 function scrollToBottom(){
@@ -13915,7 +14051,7 @@ function buildSidebar(){
           <label class="st-sw"><input type="checkbox" id="settings-glass-enabled"/> Enabled</label>
         </div>
         <div id="glass-hint" class="st-note">Needs ambient blobs or a background image turned on.</div>
-        <div class="st-slider"><span class="st-lbl">Glass opacity</span><input type="range" id="settings-glass-opacity" min="0" max="75" value="0"/></div>
+        <div class="st-slider"><span class="st-lbl">Glass opacity</span><input type="range" id="settings-glass-opacity" min="0" max="75" value="8"/></div>
         <label class="st-sw"><input type="checkbox" id="settings-glass-sheen-enabled"/> Frosted highlight</label>
       </div>
       <div class="st-card" data-page="general">
@@ -14536,10 +14672,11 @@ function applyLiquidGlass(enabled){
 // as applyColors()/applyTheme() above, not a filter, so dragging the
 // slider repaints instantly with nothing left for the browser to keep
 // recomputing afterward.
-let _glassOpacity = 0;
+const GLASS_OPACITY_DEFAULT = 8;  // 10% of the slider's 0-75 range (7.5, rounded)
+let _glassOpacity = GLASS_OPACITY_DEFAULT;
 function applyGlassOpacity(pct){
   const n = Number(pct);
-  _glassOpacity = Math.min(75, Math.max(0, Math.round(isFinite(n) ? n : 0)));
+  _glassOpacity = Math.min(75, Math.max(0, Math.round(isFinite(n) ? n : GLASS_OPACITY_DEFAULT)));
   document.documentElement.style.setProperty("--glass-pct", _glassOpacity + "%");
   const el = document.getElementById("settings-glass-opacity");
   if (el) el.value = _glassOpacity;
@@ -14863,7 +15000,7 @@ async function loadSettingsPanel(){
   }
   applyBgImage(_bgState.cfg, _bgState.dataUrl);
   applyLiquidGlass(s.liquid_glass_enabled === true);
-  applyGlassOpacity(s.liquid_glass_opacity != null ? s.liquid_glass_opacity : 55);
+  applyGlassOpacity(s.liquid_glass_opacity != null ? s.liquid_glass_opacity : GLASS_OPACITY_DEFAULT);
   applyGlassSheen(s.liquid_glass_sheen_enabled !== false);
   applyChatFontSize(s.chat_font_size);
   applyAmbientHideCapture(s.ambient_hide_from_capture !== false);
@@ -14943,7 +15080,7 @@ async function saveSettingsPanel(){
     _bgState.cfg = r.settings.bg_image;
     applyBgImage(_bgState.cfg, _bgState.dataUrl);
     applyLiquidGlass(r.settings.liquid_glass_enabled === true);
-    applyGlassOpacity(r.settings.liquid_glass_opacity != null ? r.settings.liquid_glass_opacity : 55);
+    applyGlassOpacity(r.settings.liquid_glass_opacity != null ? r.settings.liquid_glass_opacity : GLASS_OPACITY_DEFAULT);
     applyGlassSheen(r.settings.liquid_glass_sheen_enabled !== false);
     applyChatFontSize(r.settings.chat_font_size);
     applyAmbientHideCapture(r.settings.ambient_hide_from_capture !== false);
@@ -18780,7 +18917,7 @@ window.addEventListener("pywebviewready", async ()=>{
     }
     applyBgImage(_bgState.cfg, _bgState.dataUrl);
     applyLiquidGlass(s.liquid_glass_enabled === true);
-    applyGlassOpacity(s.liquid_glass_opacity != null ? s.liquid_glass_opacity : 55);
+    applyGlassOpacity(s.liquid_glass_opacity != null ? s.liquid_glass_opacity : GLASS_OPACITY_DEFAULT);
     applyGlassSheen(s.liquid_glass_sheen_enabled !== false);
     applyChatFontSize(s.chat_font_size);
     applyAmbientHideCapture(s.ambient_hide_from_capture !== false);

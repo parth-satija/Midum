@@ -47,6 +47,8 @@ UninstallDisplayIcon={app}\{#AppExeName}
 UninstallDisplayName={#AppName}
 #ifexist "..\..\gui\assets\icon.ico"
 SetupIconFile=..\..\gui\assets\icon.ico
+#elif FileExists("..\..\gui\assets\rounded_square_icon.ico")
+SetupIconFile=..\..\gui\assets\rounded_square_icon.ico
 #endif
 
 [Languages]

@@ -160,9 +160,16 @@ add_file("Modelfile")
 add_file("LICENSE")
 add_file("TRADEMARK.md")
 
-ICON = os.path.join(ROOT, "gui", "assets", "icon.ico")
-if not os.path.isfile(ICON):
-    ICON = None
+# The icon lives in gui/assets. Accept the canonical name first, then the file that is actually in the repo.
+ICON = None
+for _name in ("icon.ico", "rounded_square_icon.ico"):
+    _candidate = os.path.join(ROOT, "gui", "assets", _name)
+    if os.path.isfile(_candidate):
+        ICON = _candidate
+        break
+if ICON is None:
+    raise SystemExit("[midum.spec] No .ico found in gui/assets (expected icon.ico or rounded_square_icon.ico)")
+print(f"[midum.spec] using icon: {ICON}")
 
 
 def make_version_file():

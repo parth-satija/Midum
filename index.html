@@ -177,7 +177,7 @@
 
     <footer class="w-full border-t bdr py-8 z-10 relative">
         <div class="max-w-6xl mx-auto px-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs t-muted">
-            <p>&copy; 2026 Midum. Open source under MIT license.</p>
+            <p>&copy; 2026 Midum. Source-available under BSL 1.1 License.</p>
             <div class="flex items-center gap-4">
                 <a href="https://github.com/parth-satija/Midum" target="_blank" rel="noopener noreferrer" class="hover:opacity-80">GitHub</a>
                 <span>&bull;</span>
@@ -209,8 +209,12 @@
         /* ---------------- Helpers ---------------- */
         const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-        // "getting_started.md" -> "getting started"  (same capitalization, underscores -> spaces)
-        const pretty = name => name.replace(/\.md$/i, '').replace(/_+/g, ' ').replace(/\s+/g, ' ').trim();
+        // "getting_started1_.md" -> "getting started"
+        const orderOf = name => {
+            const match = name.replace(/\.md$/i, '').match(/(\d+)_$/);
+            return match ? Number(match[1]) : null;
+        };
+        const pretty = name => name.replace(/\.md$/i, '').replace(/\d+_$/, '').replace(/_+/g, ' ').replace(/\s+/g, ' ').trim();
 
         const encPath = p => p.split('/').map(encodeURIComponent).join('/');
         const docUrl = p => new URL(encPath(p), docsBase).href;
@@ -220,7 +224,13 @@
         const byName = (a, b) => {
             const ar = /^readme(\.md)?$/i.test(a.name), br = /^readme(\.md)?$/i.test(b.name);
             if (ar !== br) return ar ? -1 : 1;
-            return collator.compare(pretty(a.name), pretty(b.name));
+            const ao = orderOf(a.name), bo = orderOf(b.name);
+            if (ao !== null || bo !== null) {
+                if (ao === null) return 1;
+                if (bo === null) return -1;
+                if (ao !== bo) return ao - bo;
+            }
+            return collator.compare(pretty(a.name), pretty(b.name)) || collator.compare(a.name, b.name);
         };
 
         /* ---------------- Discovering the docs ---------------- */
