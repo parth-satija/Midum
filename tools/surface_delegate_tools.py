@@ -33,12 +33,14 @@ import time
 
 import config
 import tools.ambient_surface_tools as _ambient
+import tools.chat_surface_tools as _chat
 import tools.render_surface_tools as _render
 
 # Tools the voice model must NOT call directly (they take model-written code).
 VOICE_BLOCKED_TOOLS = frozenset({
     "write_render_code", "edit_render_code",
     "show_ambient_surface", "edit_ambient_surface",
+    "show_chat_surface", "edit_chat_surface",
     "create_dynamic_background", "edit_dynamic_background",
 })
 
@@ -88,6 +90,14 @@ THIS IS A RENDER SURFACE: a panel filling roughly the right half of the Midum ap
 - Charts/visualisations: draw with inline SVG or <canvas> and your own JS (no libraries).
 - Interactive things should really work (state, handlers, keyboard where natural). Give it a background colour explicitly.
 - The panel has its own header/close; do NOT draw window chrome.
+"""
+
+_CHAT_RULES = """
+THIS IS A CHAT SURFACE: a compact block shown INLINE in the chat transcript, between paragraphs of text -- like a figure or a code block, not an app.
+- Its WIDTH is fixed to the chat text column (about 300-730 CSS px, fluid). Use flex/grid, %, rem; never fixed widths. Its HEIGHT auto-fits your content, so do NOT use 100vh or height:100% on html/body/root.
+- The host injects the app theme and makes <body> transparent. Colour with CSS variables, not hard-coded values: var(--text), var(--subtext), var(--muted), var(--accent), var(--border2), var(--surface2) (inner cards and buttons), var(--green), var(--red), var(--yellow). Size text with var(--chat-fs). Do NOT set a white/black page background and do not draw an outer frame or close button -- the host provides the card and the close button.
+- Keep it compact and glanceable: no big headings, logos or hero sections. Make interactive parts really work (hover/focus states, state, handlers). A choice button should call parent.postMessage({choice: "..."}, "*") and then disable itself.
+- `midum.close()` dismisses the block from inside (e.g. a "Done" button).
 """
 
 
@@ -248,9 +258,41 @@ def get_render_surface_made(request, title="", edit_current=False) -> str:
 
 
 # ── Voice wiring ─────────────────────────────────────────────────────────────
+# Tool: chat (inline Chat Surface)
+def get_chat_surface_made(request, surface_id="", title="", height=0) -> str:
+    request = (request or "").strip()
+    if not request:
+        return f"{_ERR} 'request' must describe what the block should show or do."
+    if _chat._gui_chat_hook is None:
+        return _chat._NO_GUI
+
+    sid = (surface_id or "").strip()
+    existing = ""
+    if sid:  # revising a block already in the chat -> give the coder its current code
+        cur = _chat._call_hook("code", {"surface_id": sid})
+        if isinstance(cur, str) and cur and not cur.startswith("[CHAT SURFACE ERROR]"):
+            existing = cur
+
+    label = _default_model_label()
+    html, err = _generate_html(_COMMON_RULES + _CHAT_RULES, _user_prompt(request, existing))
+    if not html:
+        return (f"{_ERR} The coding model ({label}) couldn't write the block: {err}. "
+                f"Tell the user briefly and offer to try again.")
+
+    result = _chat.show_chat_surface(html, surface_id=sid, title=title, height=height or 0)
+    if result.startswith("[CHAT SURFACE ERROR]"):
+        return result
+    return (f"{result} (Code written by the default model, {label}.) "
+            f"Just say one short line about it; don't describe any code.")
+
+
 def call_voice_surface_tool(name: str, args: dict) -> str:
     """Blocking; the voice backend runs it on a worker thread."""
     a = dict(args or {})
+    if name == "get_chat_surface_made":
+        return get_chat_surface_made(
+            a.get("request", ""), surface_id=a.get("surface_id", ""),
+            title=a.get("title", ""), height=a.get("height", 0))
     if name == "get_ambient_surface_made":
         return get_ambient_surface_made(
             a.get("request", ""), a.get("x"), a.get("y"),
@@ -266,6 +308,32 @@ def call_voice_surface_tool(name: str, args: dict) -> str:
 
 
 VOICE_SURFACE_TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_chat_surface_made",
+            "description": (
+                "Have the coding model build and show an interactive/visual block INLINE in the "
+                "chat (a Chat Surface): comparison, chart, checklist, timeline, calculator, "
+                "option buttons, form, palette, status card... Use it OFTEN -- whenever something "
+                "is clearer seen than spoken. You cannot write HTML yourself: describe in "
+                "`request` what it should show/do, with every piece of text or data word for "
+                "word. Width is fixed to the chat column and height fits the content. To revise "
+                "one already in the chat, reuse its surface_id and describe the change. Takes "
+                "~10-40s. Say a short line first, then call it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "request": {"type": "string", "description": "Plain-language spec of the block, with the exact content/data to show."},
+                    "surface_id": {"type": "string", "description": "Short name; reuse to revise/replace that block."},
+                    "title": {"type": "string", "description": "Optional internal label."},
+                    "height": {"type": "integer", "description": "Optional fixed height in CSS px; omit to auto-fit."},
+                },
+                "required": ["request"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {

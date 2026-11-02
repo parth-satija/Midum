@@ -47,6 +47,7 @@ import zipfile
 from datetime import datetime
 
 import config
+import contextvars
 
 ARTIFACTS_DIR = os.path.join(config.STORAGE_DIR, "artifacts")
 FILES_DIR = os.path.join(ARTIFACTS_DIR, "files")
@@ -73,6 +74,9 @@ MAX_VERSIONS = 30            # snapshots kept per model-created artifact
 _lock = threading.RLock()
 _index = None            # id -> record (lazy)
 _active_chat_id = ""
+# Per-turn override (concurrent tabs): a running turn calls set_turn_chat() so files it creates or lists
+# belong to ITS chat even while another tab is in the foreground. Unset -> the shared value above.
+_turn_chat_cv = contextvars.ContextVar("midum_turn_chat", default=None)
 _incoming = {}           # upload_id -> {"path":..., "next":int, "size":int}
 
 _TEXT_EXT = {
@@ -99,6 +103,17 @@ _MIME_FIXES = {
 
 
 # ── helpers ────────────────────────────────────────────────────────────
+def set_turn_chat(chat_id):
+    """Pin the chat that artifacts created/listed on THIS turn's context belong to. Unlike
+    set_active_chat() this never touches the shared foreground chat nor closes any open MidumDoc."""
+    _turn_chat_cv.set(chat_id or "")
+
+
+def _cur_chat():
+    v = _turn_chat_cv.get()
+    return v if v is not None else _active_chat_id
+
+
 def set_active_chat(chat_id):
     global _active_chat_id
     _active_chat_id = chat_id or ""
@@ -110,7 +125,7 @@ def set_active_chat(chat_id):
 
 
 def get_active_chat():
-    return _active_chat_id
+    return _cur_chat()
 
 
 def _safe_name(name):
@@ -314,7 +329,7 @@ def _finalize(tmp_path, name, mime, size, sha, chat_id, origin, source_path, mov
 
 def add_file(src_path=None, data=None, name=None, chat_id=None, origin="upload", mime=None, upload=True, sent=False):
     """Ingest a file from disk (``src_path``) or bytes (``data``). Returns the record."""
-    chat_id = chat_id if chat_id is not None else _active_chat_id
+    chat_id = chat_id if chat_id is not None else _cur_chat()
     os.makedirs(INCOMING_DIR, exist_ok=True)
     tmp = os.path.join(INCOMING_DIR, uuid.uuid4().hex + ".tmp")
     h = hashlib.sha256()
@@ -400,7 +415,7 @@ def get(ref, chat_id=None):
     if not ref:
         return None
     ref = str(ref).strip()
-    chat_id = chat_id if chat_id is not None else _active_chat_id
+    chat_id = chat_id if chat_id is not None else _cur_chat()
     idx = _load()
     with _lock:
         recs = sorted(idx.values(), key=lambda r: r.get("created", 0), reverse=True)
@@ -421,7 +436,7 @@ def get(ref, chat_id=None):
 
 
 def list_records(chat_id=None, scope="chat"):
-    chat_id = chat_id if chat_id is not None else _active_chat_id
+    chat_id = chat_id if chat_id is not None else _cur_chat()
     with _lock:
         recs = list(_load().values())
     if scope != "all":
@@ -1286,7 +1301,7 @@ def editor_save_copy(name, content):
         return {"ok": False, "error": "A file name is required."}
     if _find_generated(name):
         return {"ok": False, "error": f"An artifact named '{name}' already exists in this chat."}
-    rec = add_file(data=str(content).encode("utf-8"), name=name, chat_id=_active_chat_id,
+    rec = add_file(data=str(content).encode("utf-8"), name=name, chat_id=_cur_chat(),
                    origin="generated", upload=False, sent=True)
     _init_generated(rec, _infer_type(rec["name"]), "")
     return {"ok": True, "id": rec["id"], "name": rec["name"]}
@@ -1333,7 +1348,7 @@ def create_tool(arguments):
             head = (f"Rewrote existing artifact (an artifact named '{name}' already existed in this chat, so this was saved "
                     f"as a new version instead of a duplicate)")
         else:
-            rec = add_file(data=data, name=name, chat_id=_active_chat_id, origin="generated", upload=False, sent=True)
+            rec = add_file(data=data, name=name, chat_id=_cur_chat(), origin="generated", upload=False, sent=True)
             _init_generated(rec, atype, title)
             head = "Created artifact"
     except Exception as e:
@@ -1537,7 +1552,7 @@ def add_path_tool(arguments):
     name = str(arguments.get("name") or "").strip() or None
     started = time.time()
     try:
-        rec = add_file(src_path=path, name=name, chat_id=_active_chat_id, origin="upload", sent=True)
+        rec = add_file(src_path=path, name=name, chat_id=_cur_chat(), origin="upload", sent=True)
     except Exception as e:
         return f"Error: could not add '{path}' as an artifact: {e}"
     if rec.get("created", 0) < started:

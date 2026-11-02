@@ -9,7 +9,12 @@ import sys
 # Qt 5.15 Chromium 87 engine rendering the modern CSS wrongly (crammed top-left layout).
 if "QT_API" not in os.environ:
     import importlib.util as _ilu
-    if _ilu.find_spec("PySide6") is not None:
+    if getattr(sys, "frozen", False):
+        # find_spec() is unreliable inside a PyInstaller bundle. The spec bundles PySide6 only, so say so
+        # explicitly; if it is somehow missing the app then fails loudly instead of silently falling back
+        # to a different Qt (which is what produced the crammed layout).
+        os.environ["QT_API"] = "pyside6"
+    elif _ilu.find_spec("PySide6") is not None:
         os.environ["QT_API"] = "pyside6"
     elif _ilu.find_spec("PyQt5") is not None:
         os.environ["QT_API"] = "pyqt5"
@@ -92,6 +97,7 @@ import concurrent.futures
 import tools.user_prompt_tools as _user_prompt_tools
 import tools.render_surface_tools as _render_surface_tools
 import tools.ambient_surface_tools as _ambient_surface_tools
+import tools.chat_surface_tools as _chat_surface_tools
 import tools.dynamic_background_tools as _dynamic_background_tools
 from gui.ambient_surface import AmbientSurfaceManager
 
@@ -101,6 +107,10 @@ import permissions
 import artifacts
 import midumdocs
 from gui.editor_backend import EditorMixin
+from gui.steps_api import StepsMixin
+import gui.steps_ui as _steps_ui
+import gui.onboarding as _onboarding
+import step_prompting
 import midum_mcp.filesystem_policy as fs_policy
 
 CHATS_DIR = os.path.join(midum.STORAGE_DIR, "chats")
@@ -147,6 +157,62 @@ class _StdoutRedirector:
 
     def restore(self):
         sys.stdout = self._old
+
+
+# =============================================================================
+# PER-TAB RUNTIMES (concurrent conversation tabs)
+# =============================================================================
+# Every conversation tab owns a _TabRT: its session/history, display log, chat id/title, KB state, edit
+# markers, "thinking" flag, pending prompts and -- while a turn runs -- the state.TurnContext (own abort
+# flag, interjection queue, pinned Gemini key). Exactly one tab is the FOREGROUND tab (Api._fg_rt, the one
+# on screen); the others may keep running turns on their own threads.
+#
+# All the old per-tab attributes (self._display_log, self._session, self._thinking, ...) are now properties
+# that resolve to "the tab this thread is working FOR": the tab bound to the calling context by _run_turn
+# (_bound_rt_cv) if any, else the foreground tab. So a turn thread keeps reading/writing ITS OWN tab no
+# matter which tab the user is looking at, and GUI-thread code keeps acting on the visible tab, without
+# touching the ~300 existing call sites.
+import contextvars as _contextvars
+import state as _midum_state
+
+_bound_rt_cv = _contextvars.ContextVar("midum_bound_rt", default=None)
+
+
+class _TabRT:
+    def __init__(self, tab_id=None, session=None):
+        self.tab_id = tab_id
+        self.session = session if session is not None else MidumSession()
+        self.thinking = False
+        self.pending_agent_notes = []
+        self.chat_id = uuid.uuid4().hex
+        self.chat_title = None
+        self.display_log = []
+        self.kb_state = {
+            "kb_only": False, "kb_sources": [],
+            "explain_mode": False, "explain_mode_type": "part",
+        }
+        self.explain_progress = {}
+        self.explain_page_progress = {}
+        self.render_surface_open = False
+        self.render_surface_code = None
+        self.render_surface_title = None
+        self.turn_seq = 0
+        self.last_turn_history_start = None
+        self.last_turn_display_start = None
+        self.last_turn_display_end = None
+        self.turn_ctx = None                 # state.TurnContext while a turn is running here
+        self.status = {"text": "Ready", "level": "ok"}
+        self.pending_asks = {}               # ask_id -> {id, kind, payload}: prompts waiting on the user
+        self.attention = False               # finished / asked something while in the background
+
+
+def _rt_prop(attr):
+    def _get(self):
+        return getattr(self._rt(), attr)
+
+    def _set(self, value):
+        setattr(self._rt(), attr, value)
+    return property(_get, _set)
 
 
 def _default_model_for_provider(provider_key: str) -> str:
@@ -294,10 +360,7 @@ DEFAULT_PROVIDER_KEY = "ollama"
 # rather than as tabs, so they don't take up horizontal tab-bar space.
 TAB_DEFS = [
     ("Chat",         "💬"),
-    ("Model",        "🧬"),
-    ("System Core",  "🧠"),
-    ("Knowledge",    "📚"),
-    ("Skills",       "🛠"),
+    ("Library",      "📚"),   # System Core + Knowledge + Skills merged into one tab (Model/Voice live in the prompt-box popup)
     ("Tools",        "🔧"),
     ("Flows",        "🔗"),
     ("MCP",          "🔌"),
@@ -598,9 +661,80 @@ def _install_win_snap_hook(window):
 # JS <-> Python bridge — every method here is callable from the frontend as
 # `pywebview.api.<method>(...)` and returns JSON-serialisable data.
 # =============================================================================
-class Api(EditorMixin):
+class Api(EditorMixin, StepsMixin):
+    # ── Per-tab state proxies (see _TabRT above) ───────────────────────────────────────────────
+    _session                 = _rt_prop("session")
+    _thinking                = _rt_prop("thinking")
+    _pending_agent_notes     = _rt_prop("pending_agent_notes")
+    _current_chat_id         = _rt_prop("chat_id")
+    _chat_title              = _rt_prop("chat_title")
+    _display_log             = _rt_prop("display_log")
+    _kb_state                = _rt_prop("kb_state")
+    _explain_progress        = _rt_prop("explain_progress")
+    _explain_page_progress   = _rt_prop("explain_page_progress")
+    _render_surface_open     = _rt_prop("render_surface_open")
+    _render_surface_code     = _rt_prop("render_surface_code")
+    _render_surface_title    = _rt_prop("render_surface_title")
+    _turn_seq                = _rt_prop("turn_seq")
+    _last_turn_history_start = _rt_prop("last_turn_history_start")
+    _last_turn_display_start = _rt_prop("last_turn_display_start")
+    _last_turn_display_end   = _rt_prop("last_turn_display_end")
+
+    def _rt(self):
+        """The runtime of the tab this thread is working for: the tab bound by _run_turn, else the foreground one."""
+        rt = _bound_rt_cv.get()
+        return rt if rt is not None else self._fg_rt
+
+    def _all_rts(self):
+        rts = list(self._rts.values())
+        if self._fg_rt not in rts:
+            rts.append(self._fg_rt)
+        return rts
+
+    def _any_thinking(self) -> bool:
+        return any(rt.thinking for rt in self._all_rts())
+
+    def _rt_for_tab(self, tab_id):
+        rt = self._rts.get(tab_id)
+        if rt is None and self._fg_rt.tab_id == tab_id:
+            rt = self._fg_rt
+        return rt
+
+    def _tab_field(self, tab_id, field):
+        """chat_id / chat_title of ANY tab: its live runtime if it has one, else the saved snapshot."""
+        rt = self._rts.get(tab_id)
+        if rt is not None:
+            return getattr(rt, field, None)
+        return (self._tab_gui_state.get(tab_id) or {}).get(field)
+
+    def _new_tab_session(self):
+        s = MidumSession()
+        cur = self._fg_rt.session
+        s.system_prompt = cur.system_prompt
+        s.memory_injections = cur.memory_injections
+        return s
+
+    def _begin_fresh_fg_rt(self):
+        """Call right after _save_active_tab_gui_state() when assembling a NEW tab: the outgoing tab's runtime
+        stays registered (it may be mid-turn); a blank one becomes the foreground to be filled in."""
+        self._fg_rt = _TabRT(None, session=self._new_tab_session())
+
+    def _register_fg_rt(self, tab_id):
+        rt = self._fg_rt
+        rt.tab_id = tab_id
+        self._rts[tab_id] = rt
+
+    def _tab_runtime_info(self) -> dict:
+        """What the frontend needs when a tab becomes the one on screen: is it mid-turn, what the status bar
+        should say, and any prompts (approvals / questions) it is waiting on."""
+        rt = self._fg_rt
+        return {"busy": bool(rt.thinking), "status": dict(rt.status),
+                "asks": list(rt.pending_asks.values())}
+
     def __init__(self):
         self.window = None
+        self._rts = {}                       # tab_id -> _TabRT (every tab that has been opened this run)
+        self._fg_rt = _TabRT(None)           # the foreground tab's runtime
         self._closing       = False   # set once real teardown has started -- see _push_event / _on_closing
 
         self._session      = MidumSession()
@@ -754,6 +888,7 @@ class Api(EditorMixin):
         self._dyn_bg_title = None
         self._dyn_bg_name = None   # saved name it corresponds to, if any
         self._dyn_bg_load_active()
+        self._seed_default_dynamic_background()
 
         self._base_work_dir = r"D:\\"
         if not os.path.exists(self._base_work_dir):
@@ -787,6 +922,7 @@ class Api(EditorMixin):
         # question/input request through the raw Tkinter popup fallback
         # instead of this app's inline chat card, no matter what.
         _user_prompt_tools._gui_ask_hook = self._handle_gui_ask
+        step_prompting.set_event_hook(self._steps_event)
         # Same rebinding caveat as _gui_ask_hook just above applies here --
         # this must be set on tools.render_surface_tools itself, not on
         # `midum`, or write_render_code/edit_render_code/close_render_surface
@@ -820,6 +956,9 @@ class Api(EditorMixin):
             on_event=lambda t: self._push_event("log", {"text": t}),
         )
         _ambient_surface_tools._gui_ambient_hook = self._ambient.handle
+        # Chat Surfaces: inline blocks in the transcript (see tools/chat_surface_tools.py
+        # and _handle_chat_surface below). Same rebinding caveat: set on the tools module.
+        _chat_surface_tools._gui_chat_hook = self._handle_chat_surface
         # Sync the persisted "hide ambient surfaces from screenshots" toggle.
         try:
             self._ambient.set_hide_from_capture(
@@ -906,7 +1045,12 @@ class Api(EditorMixin):
         if not self.window or self._closing:
             return
         try:
-            data = json.dumps({"kind": kind, "payload": payload})
+            _rt0 = self._rt()
+            if kind == "status" and isinstance(payload, dict):
+                _rt0.status = {"text": payload.get("text", ""), "level": payload.get("level")}
+            # "tab" lets the frontend show only the events of the tab on screen (the rest are already in
+            # that tab's display log, which is re-rendered when it is switched to).
+            data = json.dumps({"kind": kind, "payload": payload, "tab": _rt0.tab_id})
         except Exception:
             return
 
@@ -1193,6 +1337,13 @@ class Api(EditorMixin):
                     self.new_conversation_tab()
             except Exception as _e:
                 print(f"[startup] could not open a fresh tab: {_e}")
+
+            # Auto-delete old saved chats (if the user turned it on). Runs after the tabs are restored so every
+            # chat that is open in a tab is protected, then repeats every few hours while Midum stays open.
+            try:
+                self._start_chat_auto_delete_loop()
+            except Exception as _e:
+                print(f"[startup] could not start chat auto-delete: {_e}")
 
             # Everything above this point is exactly what's needed to know
             # which tabs were open last time and show them -- cheap, local,
@@ -1711,6 +1862,62 @@ class Api(EditorMixin):
             self._push_event("log", {"text": f"🔑 [LiteLLM: saved credentials for '{provider}']\n"})
         return r
 
+    # ── In-app API keys (Settings > Models > API keys) ───────────────────────────────────────
+    # Write straight into the shared secrets file so nobody has to hand-edit
+    # JSON. Values never come back to the page -- only masked previews.
+    # (module attr on `midum`, loader fn, availability flag, key global)
+    _KEY_RELOADERS = {
+        "GEMINI_API_KEY":   ("providers_gemini_api_backend", "_load_gemini_api", "_GEMINI_API_AVAILABLE", "_GEMINI_API_KEY"),
+        "OPENROUTER_API_KEY": ("providers_openrouter_backend", "_load_openrouter", "_OPENROUTER_AVAILABLE", "_OPENROUTER_API_KEY"),
+        "GROQ_API_KEY":     ("providers_groq_backend", "_load_groq", "_GROQ_AVAILABLE", "_GROQ_API_KEY"),
+        "OLLAMA_API_KEY":   ("providers_ollama_cloud_backend", "_load_ollama_cloud", "_OLLAMA_CLOUD_AVAILABLE", "_OLLAMA_CLOUD_API_KEY"),
+    }
+
+    def get_api_keys(self):
+        """Masked status of every editable key + where the secrets file lives."""
+        return config.get_secret_status()
+
+    def save_api_keys(self, updates):
+        """updates: {SECRETS_KEY: value}. Empty string clears that key.
+        Applies immediately to the providers that cache their key at import
+        time, so no restart is needed for those."""
+        r = config.save_secret_values(updates if isinstance(updates, dict) else {})
+        if not r.get("ok"):
+            return r
+        saved = set(r.get("saved", []))
+        # Any GEMINI_API_KEY_2..5 change reloads the same Gemini API chain.
+        if saved & {"GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GEMINI_API_KEY_4", "GEMINI_API_KEY_5"}:
+            saved.add("GEMINI_API_KEY")
+        applied, needs_restart = [], []
+        for key in sorted(saved):
+            spec = self._KEY_RELOADERS.get(key)
+            if not spec:
+                if key != "GEMINI_API_KEY":
+                    needs_restart.append(key)
+                continue
+            mod_name, loader, avail_flag, key_var = spec
+            try:
+                mod = getattr(midum, mod_name)
+                ok, msg = getattr(mod, loader)()
+                if not ok:
+                    # Key was cleared (or is unusable): stop using the old one.
+                    setattr(mod, avail_flag, False)
+                    setattr(mod, key_var, None)
+                applied.append(key)
+            except Exception as e:
+                needs_restart.append(key)
+                print(f"⚠️ [API keys] Live reload of {key} failed: {e}")
+        if "GEMINI_API_KEY" in saved:
+            try:
+                midum.providers_gemini_reasoning._load_gemini()
+            except Exception:
+                pass
+        names = ", ".join(sorted(r.get("saved", [])))
+        self._push_event("log", {"text": f"🔑 [API keys saved: {names}]\n"})
+        r["applied_live"] = applied
+        r["needs_restart"] = needs_restart
+        return r
+
     def litellm_test(self, model: str):
         return midum.providers_litellm_backend.test_connection(model)
 
@@ -1739,8 +1946,8 @@ class Api(EditorMixin):
         "blob_center": "#60a5fa", "blob_a": "#f472b6", "blob_b": "#34d399", "blob_cursor": "#a78bfa",
     }
     _DEFAULT_THEME = "dark"
-    _DEFAULT_BLOBS_ENABLED_DARK = True
-    _DEFAULT_BLOBS_ENABLED_LIGHT = True
+    _DEFAULT_BLOBS_ENABLED_DARK = False
+    _DEFAULT_BLOBS_ENABLED_LIGHT = False
 
     # Built-in named presets, beyond the base Dark/Light toggle. Each is a
     # full editable-color bundle (same shape as colors_dark/colors_light)
@@ -1886,7 +2093,7 @@ class Api(EditorMixin):
     }
     # Main chat window text size in CSS px (SETTINGS -> Chat Text Size). It only
     # drives the chat pane, through the --chat-fs variable in the frontend.
-    _CHAT_FONT_SIZE_DEFAULT = 15.0
+    _CHAT_FONT_SIZE_DEFAULT = 14.8
     _CHAT_FONT_SIZE_MIN = 10.0
     _CHAT_FONT_SIZE_MAX = 32.0
 
@@ -1928,9 +2135,9 @@ class Api(EditorMixin):
             # hidden individually. Not per-theme; applies regardless of
             # which theme is active.
             "blobs_individual": {"center": True, "a": True, "b": True, "cursor": True},
-            "liquid_glass_enabled": False,
-            "liquid_glass_opacity": 55,
-            "liquid_glass_sheen_enabled": True,
+            "liquid_glass_enabled": True,
+            "liquid_glass_opacity": 0,
+            "liquid_glass_sheen_enabled": False,
             "chat_font_size": self._CHAT_FONT_SIZE_DEFAULT,
             # Ambient Surfaces are excluded from screenshots/OCR/screen-share
             # by default (the user still sees them). Turn off to let the
@@ -1943,6 +2150,8 @@ class Api(EditorMixin):
             # Distinct from _BUILTIN_PRESETS (read-only, shipped with the app);
             # these are created/deleted via save_preset()/delete_preset() below.
             "custom_presets": {},
+            # Auto-delete saved chats not used for `amount` `unit` (days/weeks/months). Off by default.
+            "chat_auto_delete": {"enabled": False, "amount": 30, "unit": "days"},
         }
         path = self._settings_path()
         try:
@@ -1986,7 +2195,7 @@ class Api(EditorMixin):
                 if isinstance(saved.get("liquid_glass_enabled"), bool):
                     defaults["liquid_glass_enabled"] = saved["liquid_glass_enabled"]
                 if isinstance(saved.get("liquid_glass_opacity"), (int, float)):
-                    defaults["liquid_glass_opacity"] = max(35, min(75, int(saved["liquid_glass_opacity"])))
+                    defaults["liquid_glass_opacity"] = max(0, min(75, int(saved["liquid_glass_opacity"])))
                 if isinstance(saved.get("liquid_glass_sheen_enabled"), bool):
                     defaults["liquid_glass_sheen_enabled"] = saved["liquid_glass_sheen_enabled"]
                 if isinstance(saved.get("chat_font_size"), (int, float)) and not isinstance(saved.get("chat_font_size"), bool):
@@ -1999,6 +2208,8 @@ class Api(EditorMixin):
                     defaults["workspaces"] = [p for p in saved["workspaces"] if isinstance(p, str) and p]
                 if isinstance(saved.get("active_workspace"), str):
                     defaults["active_workspace"] = saved["active_workspace"]
+                if isinstance(saved.get("chat_auto_delete"), dict):
+                    defaults["chat_auto_delete"] = self._clean_chat_auto_delete(saved["chat_auto_delete"])
                 if isinstance(saved.get("custom_presets"), dict):
                     clean_presets = {}
                     for name, preset in saved["custom_presets"].items():
@@ -2092,7 +2303,7 @@ class Api(EditorMixin):
             if isinstance(settings.get("liquid_glass_enabled"), bool):
                 current["liquid_glass_enabled"] = settings["liquid_glass_enabled"]
             if isinstance(settings.get("liquid_glass_opacity"), (int, float)):
-                current["liquid_glass_opacity"] = max(35, min(75, int(settings["liquid_glass_opacity"])))
+                current["liquid_glass_opacity"] = max(0, min(75, int(settings["liquid_glass_opacity"])))
             if isinstance(settings.get("liquid_glass_sheen_enabled"), bool):
                 current["liquid_glass_sheen_enabled"] = settings["liquid_glass_sheen_enabled"]
             if isinstance(settings.get("chat_font_size"), (int, float)) and not isinstance(settings.get("chat_font_size"), bool):
@@ -2107,6 +2318,8 @@ class Api(EditorMixin):
                 for key in ("enabled", "brightness", "blur", "opacity"):
                     if key in incoming:
                         current["bg_image"][key] = incoming[key]
+            if isinstance(settings.get("chat_auto_delete"), dict):
+                current["chat_auto_delete"] = self._clean_chat_auto_delete(settings["chat_auto_delete"])
 
             path = self._settings_path()
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2122,7 +2335,14 @@ class Api(EditorMixin):
                 pass
 
             self._push_event("log", {"text": "💾 [Settings saved — will be restored on next launch]\n"})
-            return {"ok": True, "settings": current}
+            # Apply the auto-delete rule right away (the same pass also runs at launch and every few hours).
+            auto_deleted = 0
+            if current["chat_auto_delete"]["enabled"]:
+                try:
+                    auto_deleted = int(self.run_chat_auto_delete().get("deleted", 0))
+                except Exception:
+                    auto_deleted = 0
+            return {"ok": True, "settings": current, "auto_deleted": auto_deleted}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -2595,8 +2815,6 @@ class Api(EditorMixin):
         chat history is a library of saved conversations to reopen; the
         titlebar's tab strip is what's actually open in RAM right now --
         this is what turns a library entry into an open tab."""
-        if self._thinking:
-            return {"ok": False, "error": "Busy — wait for the current run to finish or abort first."}
         import conversation_tabs
         try:
             data = self._chat_store.load(chat_id)
@@ -2612,6 +2830,7 @@ class Api(EditorMixin):
             # belong to whichever tab is active RIGHT NOW until this call
             # finishes and hands the new tab a snapshot of its own.
             self._save_active_tab_gui_state()
+            self._begin_fresh_fg_rt()      # the outgoing tab keeps its own runtime and may keep running
 
             history = list(data.get("history") or [])
             self._current_chat_id = data.get("id", chat_id)
@@ -2641,6 +2860,7 @@ class Api(EditorMixin):
             # NOW register the new tab, wrapping the reopened chat's own
             # (freshly copied, not shared with any other tab) history list.
             tab_id = conversation_tabs.open_tab(kind="user", history=self._session.history, activate=True)
+            self._register_fg_rt(tab_id)
             self._tab_gui_state[tab_id] = self._snapshot_gui_state()
             self._persist_open_tabs()
 
@@ -2658,6 +2878,173 @@ class Api(EditorMixin):
             if active_id:
                 self._tab_gui_state[active_id] = self._snapshot_gui_state()
             self._persist_open_tabs()
+        return {"ok": True, "chats": self.list_chats()}
+
+    # ── Bulk chat deletion + auto-delete ─────────────────────────────────────────────────────────────────────
+    # One selection routine (_select_chats_for_deletion) backs the manual "delete by date / by count" tools
+    # (with a dry-run preview) AND the auto-delete rule, so what the confirm dialog says is exactly what
+    # gets deleted. The current chat, every chat that is open in a tab, and every pinned or favorited chat
+    # are NEVER deleted by any of them (only the explicit per-chat trash button can remove those).
+    _CHAT_AD_UNIT_DAYS = {"days": 1, "weeks": 7, "months": 30}
+    _CHAT_AD_INTERVAL_S = 6 * 3600
+
+    @classmethod
+    def _clean_chat_auto_delete(cls, cfg):
+        cfg = cfg if isinstance(cfg, dict) else {}
+        try:
+            amount = int(cfg.get("amount", 30))
+        except (TypeError, ValueError):
+            amount = 30
+        unit = cfg.get("unit") if cfg.get("unit") in cls._CHAT_AD_UNIT_DAYS else "days"
+        return {"enabled": cfg.get("enabled") is True, "amount": max(1, min(3650, amount)), "unit": unit}
+
+    def _protected_chat_ids(self):
+        """Chat ids that bulk / auto delete must skip: the active chat + every chat open in a (non-agent) tab."""
+        ids = set()
+        if self._current_chat_id:
+            ids.add(self._current_chat_id)
+        try:
+            import conversation_tabs
+            for row in conversation_tabs.list_tabs():
+                if row.get("kind") == "agent":
+                    continue
+                cid = self._tab_field(row["id"], "chat_id")
+                if cid:
+                    ids.add(cid)
+        except Exception:
+            pass
+        return ids
+
+    @staticmethod
+    def _chat_ts(chat):
+        try:
+            return datetime.datetime.fromisoformat(str(chat.get("updated_at") or ""))
+        except Exception:
+            return None
+
+    def _select_chats_for_deletion(self, mode, params):
+        chats = self._chat_store.list_chats()          # newest first
+        matched = []
+        if mode == "date":
+            def _day(s):
+                try:
+                    return datetime.datetime.strptime(str(s)[:10], "%Y-%m-%d")
+                except Exception:
+                    raise ValueError("That date isn't valid.")
+            lo = _day(params["from"]) if params.get("from") else None
+            hi = (_day(params["to"]) + datetime.timedelta(days=1)) if params.get("to") else None   # "to" is inclusive
+            if lo is None and hi is None:
+                raise ValueError("Pick at least one date.")
+            if lo is not None and hi is not None and lo >= hi:
+                raise ValueError("'From' must be on or before 'To'.")
+            for c in chats:
+                t = self._chat_ts(c)
+                if t is None:
+                    continue                            # undated chats are never matched by a date rule
+                if (lo is None or t >= lo) and (hi is None or t < hi):
+                    matched.append(c)
+        elif mode == "count":
+            try:
+                n = int(params.get("count") or 0)
+            except (TypeError, ValueError):
+                n = 0
+            if n < 1:
+                raise ValueError("Enter a count of 1 or more.")
+            which = params.get("which")
+            if which == "oldest":
+                matched = chats[::-1][:n]               # the N oldest
+            elif which == "keep_newest":
+                matched = chats[n:]                     # everything except the N most recent
+            else:
+                matched = chats[:n]                     # the N most recent (counting back from the last chat)
+        elif mode == "older_than":
+            try:
+                days = float(params.get("days") or 0)
+            except (TypeError, ValueError):
+                days = 0
+            if days <= 0:
+                raise ValueError("Enter an age of at least 1.")
+            cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+            for c in chats:
+                t = self._chat_ts(c)
+                if t is not None and t < cutoff:
+                    matched.append(c)
+        else:
+            raise ValueError("Unknown delete mode.")
+        protected = self._protected_chat_ids()
+        kept = {c["id"] for c in chats if c.get("pinned") or c.get("favorite")}   # pinned / favorited chats are exempt
+        doomed, skipped_open, skipped_kept = [], 0, 0
+        for c in matched:
+            if c["id"] in protected:
+                skipped_open += 1
+            elif c["id"] in kept:
+                skipped_kept += 1
+            else:
+                doomed.append(c)
+        return {"matched": len(matched), "delete": doomed, "skipped_open": skipped_open, "skipped_kept": skipped_kept}
+
+    def bulk_delete_chats(self, mode: str, params: dict, preview_only: bool = False):
+        """mode = "date" {from, to} | "count" {count, which: newest|oldest|keep_newest} | "older_than" {days}.
+        preview_only=True deletes nothing and just reports what WOULD go."""
+        try:
+            sel = self._select_chats_for_deletion(mode, params or {})
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "error": f"Could not select chats: {e}"}
+        titles = [c.get("title") or "Untitled chat" for c in sel["delete"]]
+        out = {"ok": True, "count": len(sel["delete"]), "skipped_open": sel["skipped_open"], "skipped_kept": sel["skipped_kept"],
+               "samples": titles[:6], "more": max(0, len(titles) - 6)}
+        if preview_only:
+            return out
+        deleted = 0
+        for c in sel["delete"]:
+            try:
+                self._chat_store.delete(c["id"])
+                deleted += 1
+            except Exception:
+                pass
+        out["deleted"] = deleted
+        if deleted:
+            self._push_event("log", {"text": f"[Chats] Deleted {deleted} saved chat(s).\n"})
+        out["chats"] = self.list_chats()
+        return out
+
+    def run_chat_auto_delete(self):
+        """Applies the saved auto-delete rule (chats whose last activity is older than the configured age)."""
+        cfg = self._clean_chat_auto_delete(self.get_settings().get("chat_auto_delete"))
+        if not cfg["enabled"]:
+            return {"ok": True, "deleted": 0}
+        days = cfg["amount"] * self._CHAT_AD_UNIT_DAYS[cfg["unit"]]
+        r = self.bulk_delete_chats("older_than", {"days": days})
+        if r.get("ok") and r.get("deleted"):
+            self._push_event("chats_changed", {})
+        return r
+
+    def _start_chat_auto_delete_loop(self):
+        if getattr(self, "_chat_ad_thread", None):
+            return
+        def _loop():
+            while True:
+                try:
+                    self.run_chat_auto_delete()
+                except Exception as e:
+                    print(f"[auto-delete] {e}")
+                time.sleep(self._CHAT_AD_INTERVAL_S)
+        self._chat_ad_thread = threading.Thread(target=_loop, name="chat-auto-delete", daemon=True)
+        self._chat_ad_thread.start()
+
+    def set_chat_flag(self, chat_id: str, flag: str, value: bool):
+        """Pin or favorite a saved chat. Both flags exempt it from bulk + auto delete; pinned chats are also
+        listed at the top of the sidebar, favorites additionally appear in the Favorites dropdown."""
+        if flag not in ("pinned", "favorite"):
+            return {"ok": False, "error": "Unknown flag."}
+        try:
+            changed = self._chat_store.set_flags(chat_id, **{flag: bool(value)})
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if not changed:
+            return {"ok": False, "error": "That chat isn't saved yet \u2014 send a message in it first."}
         return {"ok": True, "chats": self.list_chats()}
 
     def rename_chat(self, chat_id: str, new_title: str):
@@ -2698,16 +3085,16 @@ class Api(EditorMixin):
         # method (rather than just aliasing new_conversation_tab) since
         # the two buttons may want to diverge again later; for now the
         # bodies are intentionally identical.
-        if self._thinking:
-            return {"ok": False, "error": "Busy — wait for the current run to finish or abort first."}
         import conversation_tabs
         try:
             self._viewing_agent_tab_id = None
             self._save_active_tab_gui_state()
+            self._begin_fresh_fg_rt()      # the outgoing tab keeps its own runtime and may keep running
             self._reset_session_memory_file()
             self._session.reset()  # reassigns self._session.history to a brand-new list
             self._start_new_chat_record()
             tab_id = conversation_tabs.open_tab(kind="user", history=self._session.history, activate=True)
+            self._register_fg_rt(tab_id)
             self._tab_gui_state[tab_id] = self._snapshot_gui_state()
             self._persist_open_tabs()
             return {"ok": True, "tab_id": tab_id, "tabs": conversation_tabs.list_tabs(),
@@ -2806,6 +3193,10 @@ class Api(EditorMixin):
             # current content anymore. Explicitly resync content here,
             # the one moment that matters: right before switching away.
             conversation_tabs.set_tab_history(active_id, self._session.history)
+            # The foreground runtime IS this tab's live state from here on. Registering it keeps it alive
+            # (and running, if a turn is in flight) when another tab takes the foreground.
+            self._fg_rt.tab_id = active_id
+            self._rts[active_id] = self._fg_rt
             self._tab_gui_state[active_id] = self._snapshot_gui_state()
 
     def _load_tab_gui_state(self, tab_id: str):
@@ -2817,26 +3208,33 @@ class Api(EditorMixin):
         # conversation_tabs holds for it, never a copy, so nothing written
         # during this tab's turns can bleed into any other tab.
         import conversation_tabs
-        state = self._tab_gui_state.get(tab_id) or self._blank_gui_state()
-        self._session.history = conversation_tabs.get_tab_history(tab_id)
-        if self._session.history is None:
-            self._session.history = []
-        self._session.turn_counter        = state['turn_counter']
-        self._current_chat_id             = state['chat_id']
-        self._chat_title                  = state['chat_title']
-        self._display_log                 = state['display_log']
-        self._kb_state                    = state['kb_state']
-        self._explain_progress            = state['explain_progress']
-        self._explain_page_progress       = state['explain_page_progress']
-        self._render_surface_code         = state['render_surface_code']
-        self._render_surface_title        = state['render_surface_title']
-        # Edit Prompt / Regenerate Response markers -- see __init__. Old
-        # tabs saved before this feature existed won't have these keys, so
-        # fall back to "no editable turn" rather than KeyError.
-        self._turn_seq                    = state.get('turn_seq', 0)
-        self._last_turn_history_start     = state.get('last_turn_history_start')
-        self._last_turn_display_start     = state.get('last_turn_display_start')
-        self._last_turn_display_end       = state.get('last_turn_display_end')
+        rt = self._rts.get(tab_id)
+        if rt is None:
+            # First time this tab is shown this run (e.g. restored at launch): build its runtime from the
+            # saved bundle. A tab that already has a runtime is simply brought to the foreground -- its live
+            # state (possibly mid-turn) is authoritative, so nothing is copied over it.
+            state = self._tab_gui_state.get(tab_id) or self._blank_gui_state()
+            rt = _TabRT(tab_id, session=self._new_tab_session())
+            rt.session.history = conversation_tabs.get_tab_history(tab_id)
+            if rt.session.history is None:
+                rt.session.history = []
+            rt.session.turn_counter    = state['turn_counter']
+            rt.chat_id                 = state['chat_id']
+            rt.chat_title              = state['chat_title']
+            rt.display_log             = state['display_log']
+            rt.kb_state                = state['kb_state']
+            rt.explain_progress        = state['explain_progress']
+            rt.explain_page_progress   = state['explain_page_progress']
+            rt.render_surface_code     = state['render_surface_code']
+            rt.render_surface_title    = state['render_surface_title']
+            # Edit Prompt / Regenerate Response markers -- old saved tabs may lack these keys.
+            rt.turn_seq                = state.get('turn_seq', 0)
+            rt.last_turn_history_start = state.get('last_turn_history_start')
+            rt.last_turn_display_start = state.get('last_turn_display_start')
+            rt.last_turn_display_end   = state.get('last_turn_display_end')
+            self._rts[tab_id] = rt
+        rt.attention = False
+        self._fg_rt = rt
         # Same reasoning as load_chat(): never auto-reopen a Render Surface
         # belonging to the tab being switched TO -- force-close whatever
         # panel is on screen (it belonged to the tab being left).
@@ -2920,10 +3318,13 @@ class Api(EditorMixin):
         for row in rows:
             if row["kind"] != "user":
                 continue
+            _rt_row = self._rt_for_tab(row["id"])
+            row["busy"] = bool(_rt_row is not None and _rt_row.thinking)
+            row["attention"] = bool(_rt_row is not None and _rt_row.attention and not row["active"])
             if row["active"]:
-                chat_title = self._chat_title
+                chat_title = self._fg_rt.chat_title
             else:
-                chat_title = (self._tab_gui_state.get(row["id"]) or {}).get("chat_title")
+                chat_title = self._tab_field(row["id"], "chat_title")
             if chat_title:
                 row["title"] = chat_title
         return rows
@@ -2981,9 +3382,9 @@ class Api(EditorMixin):
                     continue
                 tab_id = row["id"]
                 if tab_id == active_id:
-                    chat_id = self._current_chat_id
+                    chat_id = self._fg_rt.chat_id      # the FOREGROUND tab's id, even when called from a background turn's thread
                 else:
-                    chat_id = (self._tab_gui_state.get(tab_id) or {}).get("chat_id")
+                    chat_id = self._tab_field(tab_id, "chat_id")
                 if not chat_id:
                     continue
                 chat_ids.append(chat_id)
@@ -3017,6 +3418,7 @@ class Api(EditorMixin):
 
         def _start_single_fresh_tab():
             self._main_tab_id = conversation_tabs.open_tab(kind="user", history=self._session.history, activate=True)
+            self._register_fg_rt(self._main_tab_id)
             self._tab_gui_state[self._main_tab_id] = self._snapshot_gui_state()
 
         saved = self._load_open_tabs_state() or {}
@@ -3102,16 +3504,16 @@ class Api(EditorMixin):
         # additional, blank tab and leave whatever's currently open
         # untouched. Kept as a separate method for the same reason
         # new_session is -- see its comment.
-        if self._thinking:
-            return {'ok': False, 'error': 'Busy \u2014 wait for the current run to finish or abort first.'}
         import conversation_tabs
         try:
             self._viewing_agent_tab_id = None
             self._save_active_tab_gui_state()
+            self._begin_fresh_fg_rt()      # the outgoing tab keeps its own runtime and may keep running
             self._reset_session_memory_file()
             self._session.reset()  # reassigns self._session.history to a brand-new list
             self._start_new_chat_record()
             tab_id = conversation_tabs.open_tab(kind='user', history=self._session.history, activate=True)
+            self._register_fg_rt(tab_id)
             self._tab_gui_state[tab_id] = self._snapshot_gui_state()
             self._persist_open_tabs()
             return {'ok': True, 'tab_id': tab_id, 'tabs': conversation_tabs.list_tabs(),
@@ -3124,8 +3526,9 @@ class Api(EditorMixin):
         # I/O, unlike load_chat -- since every open tab's full state
         # already lives in RAM (self._tab_gui_state + conversation_tabs'
         # own history lists).
-        if self._thinking:
-            return {'ok': False, 'error': 'Busy \u2014 wait for the current run to finish or abort first.'}
+        #
+        # Switching is allowed while ANY tab is mid-turn: each tab owns its own runtime (_TabRT), so the
+        # running turn keeps going on its own thread and this just changes which tab is on screen.
         import conversation_tabs
         tab = conversation_tabs.get_tab(tab_id)
         if tab is None:
@@ -3149,15 +3552,15 @@ class Api(EditorMixin):
 
         self._viewing_agent_tab_id = None
         if tab_id == conversation_tabs.get_active_tab_id():
-            return {'ok': True, 'tabs': conversation_tabs.list_tabs(),
-                    'display': self._display_log, 'kb_state': self._kb_state}
+            return {'ok': True, 'tabs': self.list_conversation_tabs(),
+                    'display': self._display_log, 'kb_state': self._kb_state, **self._tab_runtime_info()}
         try:
             self._save_active_tab_gui_state()
             conversation_tabs.switch_tab(tab_id)
             self._load_tab_gui_state(tab_id)
             self._persist_open_tabs()
-            return {'ok': True, 'tabs': conversation_tabs.list_tabs(),
-                    'display': self._display_log, 'kb_state': self._kb_state}
+            return {'ok': True, 'tabs': self.list_conversation_tabs(),
+                    'display': self._display_log, 'kb_state': self._kb_state, **self._tab_runtime_info()}
         except Exception as e:
             return {'ok': False, 'error': str(e)}
 
@@ -3168,8 +3571,11 @@ class Api(EditorMixin):
         # / unregister_agent_tab). Closing the very last remaining tab isn't
         # allowed to leave zero tabs open -- it's reset in place instead,
         # same effect as clicking "New Chat" on it.
-        if self._thinking:
-            return {'ok': False, 'error': 'Busy \u2014 wait for the current run to finish or abort first.'}
+        # Closing a tab that is still working would orphan its turn thread, so it must be aborted (or
+        # finished) first -- but only THAT tab matters; other tabs running don't block closing this one.
+        _closing_rt = self._rt_for_tab(tab_id)
+        if _closing_rt is not None and _closing_rt.thinking:
+            return {'ok': False, 'error': 'That tab is still working \u2014 abort it (or wait for it to finish) before closing it.'}
         import conversation_tabs
         tab = conversation_tabs.get_tab(tab_id)
         if tab is None:
@@ -3194,6 +3600,7 @@ class Api(EditorMixin):
 
             was_active = (tab_id == conversation_tabs.get_active_tab_id())
             self._tab_gui_state.pop(tab_id, None)
+            self._rts.pop(tab_id, None)
             conversation_tabs.close_tab(tab_id)
             result = {'ok': True, 'tabs': conversation_tabs.list_tabs()}
             if was_active:
@@ -3202,6 +3609,7 @@ class Api(EditorMixin):
                 result['active_tab_id'] = new_active
                 result['display'] = self._display_log
                 result['kb_state'] = self._kb_state
+                result.update(self._tab_runtime_info())
             self._persist_open_tabs()
             return result
         except Exception as e:
@@ -3229,8 +3637,6 @@ class Api(EditorMixin):
     def open_conversation_tab_group(self, name: str):
         # Reopens a saved tab group: one fresh tab per saved seed, added
         # alongside whatever's already open, switching to the first of them.
-        if self._thinking:
-            return {'ok': False, 'error': 'Busy \u2014 wait for the current run to finish or abort first.'}
         import conversation_tabs
         try:
             self._save_active_tab_gui_state()
@@ -3247,7 +3653,8 @@ class Api(EditorMixin):
             self._load_tab_gui_state(active_id)
             self._persist_open_tabs()
             return {'ok': True, 'message': msg, 'tabs': conversation_tabs.list_tabs(),
-                    'active_tab_id': active_id, 'display': self._display_log, 'kb_state': self._kb_state}
+                    'active_tab_id': active_id, 'display': self._display_log, 'kb_state': self._kb_state,
+                    **self._tab_runtime_info()}
         except Exception as e:
             return {'ok': False, 'error': str(e)}
 
@@ -3290,13 +3697,18 @@ class Api(EditorMixin):
         has changed (the user switched/closed the chat, or manually
         renamed it via rename_chat in the meantime) this is a no-op rather
         than clobbering something that's no longer ours to update."""
-        if chat_id != self._current_chat_id:
+        _t_rt = next((r for r in self._all_rts() if r.chat_id == chat_id), None)
+        if _t_rt is None:
             return
-        if self._chat_title != fallback_used:
-            return
-        self._chat_title = title
-        self._persist_current_chat()
-        self._push_event("chat_title_updated", {"chat_id": chat_id, "title": title})
+        _tok = _bound_rt_cv.set(_t_rt)         # work on THAT chat's tab, foreground or not
+        try:
+            if self._chat_title != fallback_used:
+                return
+            self._chat_title = title
+            self._persist_current_chat()
+            self._push_event("chat_title_updated", {"chat_id": chat_id, "title": title})
+        finally:
+            _bound_rt_cv.reset(_tok)
 
     def _persist_current_chat(self):
         # Holds _persist_lock for the whole read-snapshot-and-save sequence
@@ -3331,6 +3743,17 @@ class Api(EditorMixin):
                 self._push_event("log", {"text": f"⚠ Failed to save chat history: {e}\n"})
 
     # ── Send / receive ──────────────────────────────────────────────────
+    def _persist_all_chats(self):
+        """Save every open tab's chat (used on shutdown, when background tabs may hold unsaved replies)."""
+        for _rt_p in self._all_rts():
+            _tok = _bound_rt_cv.set(_rt_p)
+            try:
+                self._persist_current_chat()
+            except Exception:
+                pass
+            finally:
+                _bound_rt_cv.reset(_tok)
+
     _KB_ONLY_MARKER = "[MIDUM KB-ONLY MODE]"
     _EXPLAIN_MODE_MARKER = "[MIDUM EXPLAIN MODE]"
 
@@ -3395,6 +3818,59 @@ class Api(EditorMixin):
         except Exception as e:
             return {"ok": False, "error": str(e), "files": []}
 
+    # ── Per-chat prompt drafts ──────────────────────────────────────────────────────────────────
+    # Unsent text in the prompt box belongs to the chat being shown. Stored as {chat_id: text} in storage/prompt_drafts.json
+    # (insertion-ordered, newest last, capped) so a draft survives tab switches and app restarts.
+    _DRAFTS_MAX = 200
+    _drafts_lock = threading.Lock()
+    _drafts_cache = None
+
+    def _drafts_file(self):
+        return os.path.join(midum.STORAGE_DIR, "prompt_drafts.json")
+
+    def _drafts_read(self):
+        if Api._drafts_cache is None:
+            data = {}
+            try:
+                with open(self._drafts_file(), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+            Api._drafts_cache = data if isinstance(data, dict) else {}
+        return Api._drafts_cache
+
+    def _drafts_write(self, data):
+        while len(data) > self._DRAFTS_MAX:
+            data.pop(next(iter(data)), None)
+        path = self._drafts_file()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:
+            pass
+
+    def prompt_draft_swap(self, old_chat_id=None, old_text=None):
+        """Save the prompt box text for the chat that WAS showing (old_chat_id; skipped when None, e.g. on startup),
+        then return the saved draft of the chat that is showing NOW. Also used as a plain save (result ignored)."""
+        try:
+            with Api._drafts_lock:
+                data = self._drafts_read()
+                if old_chat_id is not None and old_text is not None:
+                    old_chat_id = str(old_chat_id)
+                    if str(old_text).strip():
+                        data.pop(old_chat_id, None)       # re-insert so the most recently edited draft is newest
+                        data[old_chat_id] = str(old_text)
+                    else:
+                        data.pop(old_chat_id, None)
+                    self._drafts_write(data)
+                cur = self._current_chat_id
+                return {"ok": True, "chat_id": cur, "text": data.get(cur, "")}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def attach_status(self, ids: list):
         out = []
         for i in ids or []:
@@ -3414,6 +3890,8 @@ class Api(EditorMixin):
         if self._thinking:
             return {"ok": False, "error": "busy"}
         user_input = (user_input or "").strip()
+        if not user_input and not attachment_ids and step_prompting.has_pending(self._current_chat_id):
+            user_input = "Work through the checklist steps."
         if not user_input and not attachment_ids:
             return {"ok": False, "error": "empty"}
 
@@ -3448,6 +3926,13 @@ class Api(EditorMixin):
         approval_kw = ["yes", "grant", "approve", "run it", "go ahead", "y"]
         if any(kw in user_input.lower() for kw in approval_kw):
             payload = f"{user_input} [USER MANUALLY GRANTED BYPASS]"
+        elif step_prompting.has_pending(self._current_chat_id):
+            payload = (
+                f"{user_input}\n\n"
+                "[SYSTEM]: A step checklist is active for this chat. Follow the STEP CHECKLIST "
+                "in your instructions: do the steps in order and call complete_step after each one. "
+                "Do not write a separate plan with write_response_memory."
+            )
         else:
             payload = (
                 f"{user_input}\n\n"
@@ -3504,7 +3989,7 @@ class Api(EditorMixin):
 
         threading.Thread(
             target=self._run_turn,
-            args=(list(self._session.snapshot()), kb_only, kb_context_msg, this_turn_id),
+            args=(list(self._session.snapshot()), kb_only, kb_context_msg, this_turn_id, self._rt()),
             daemon=True,
         ).start()
         # turn_id lets the frontend attach the "Edit Prompt" hover button
@@ -3539,7 +4024,10 @@ class Api(EditorMixin):
             # finished in the gap between the click and this call landing.
             return {"ok": False, "error": "not_busy"}
         import state as _state
-        _state.queue_interjection(text)
+        _ij_ctx = self._rt().turn_ctx
+        if _ij_ctx is None:
+            return {"ok": False, "error": "not_busy"}
+        _state.queue_interjection(text, ctx=_ij_ctx)
         self._display_log.append(("interjection", text))
         self._persist_current_chat()
         return {"ok": True}
@@ -3808,7 +4296,7 @@ class Api(EditorMixin):
         )
         return f"{header}{rendered}{explain_block}"
 
-    def _run_turn(self, history_snapshot: list, kb_only: bool = False, kb_context_msg: str = None, turn_id: int = None):
+    def _run_turn(self, history_snapshot: list, kb_only: bool = False, kb_context_msg: str = None, turn_id: int = None, rt=None):
         # turn_id is only set for a turn started directly from send_message
         # or regenerate_last_response() -- i.e. one "most recent turn" the
         # Edit Prompt / Regenerate Response buttons are allowed to act on.
@@ -3818,10 +4306,32 @@ class Api(EditorMixin):
         # _last_turn_display_end unset for them makes the staleness check
         # in _pop_last_turn() correctly refuse to edit/regenerate a turn
         # that's no longer really "the last thing in the chat".
+        # ── Concurrent tabs: bind this thread to ITS tab ──────────────────────────────────────
+        # `rt` is the runtime of the tab that started this turn (captured on the starting thread). Binding it
+        # makes every self._display_log / self._session / self._thinking ... access on this thread (and on
+        # threads that inherit the context) resolve to THAT tab, whichever tab is on screen. The TurnContext
+        # gives the turn its own abort flag, interjection queue and (Gemini) API key.
+        rt = rt if rt is not None else self._rt()
+        _bound_rt_cv.set(rt)
+        ctx = _midum_state.TurnContext(tab_id=rt.tab_id, chat_id=rt.chat_id)
+        rt.turn_ctx = ctx
+        _midum_state.bind_ctx(ctx)
+        _gem_pinned = False
         try:
-            midum._abort_event.clear()
-            artifacts.set_active_chat(self._current_chat_id)
+            if self._selected_provider == "gemini_api":
+                from providers import gemini_api_backend as _gab
+                _gab.acquire_turn_key(ctx)       # least-used key of the chain (no-op with a single key)
+                _gem_pinned = True
+        except Exception as _gk_err:
+            print(f"⚠️ [Gemini key pinning skipped: {_gk_err}]")
+        try:
+            midum._abort_event.clear()           # this turn's own flag (the proxy resolves to ctx)
+            if not any(r.thinking and r is not rt for r in self._all_rts()):
+                _midum_state._global_abort_event.clear()   # nothing else running: clear a stale shared flag too
+            artifacts.set_turn_chat(self._current_chat_id)
             permissions.set_kb_only_mode(kb_only)
+            if turn_id is not None:
+                step_prompting.begin_turn(self._current_chat_id)
             if kb_only and kb_context_msg:
                 # Insert right before the newest (user) message so it's the
                 # freshest context for this turn only. It gets stripped
@@ -3849,6 +4359,12 @@ class Api(EditorMixin):
             with self._session._lock:
                 self._session.history = history_snapshot
                 self._session.turn_counter += 1
+            try:
+                import conversation_tabs as _ct_sync
+                if rt.tab_id:
+                    _ct_sync.set_tab_history(rt.tab_id, self._session.history)   # keep the tab record in step
+            except Exception:
+                pass
 
             cleaned_reply, visuals = self._extract_and_strip_visuals(reply, tool_outputs)
             # Hold _persist_lock across the append(s) AND the persist call
@@ -3875,6 +4391,12 @@ class Api(EditorMixin):
             for lang, body in visuals:
                 block = f"```{lang}\n{body}\n```"
                 self._push_event("reply", {"text": block})
+            _sp_card = step_prompting.end_turn() if turn_id is not None else None
+            if _sp_card:
+                with self._persist_lock:
+                    self._display_log.append(("steps", json.dumps(_sp_card)))
+                    self._last_turn_display_end = len(self._display_log)
+                self._push_event("steps_summary", _sp_card)
             self._persist_current_chat()
 
             threading.Thread(target=midum.python_trigger_memory_update, args=(tool_outputs, reply), daemon=True).start()
@@ -3900,6 +4422,14 @@ class Api(EditorMixin):
                 self._push_event("turn_ready", {"turn_id": turn_id})
         finally:
             permissions.set_kb_only_mode(False)
+            rt.turn_ctx = None
+            if _gem_pinned:
+                try:
+                    _gab.release_turn_key(ctx)
+                except Exception:
+                    pass
+            if rt is not self._fg_rt:
+                rt.attention = True               # finished while in the background: flag its tab
             # Atomically: clear _thinking AND drain any agent-done notes
             # that arrived (from other threads, via _on_agent_done) while
             # this turn was running. They couldn't be spliced into this
@@ -3926,7 +4456,7 @@ class Api(EditorMixin):
                 self._push_event("status", {"text": "Executing turns... (agent report)", "level": "busy"})
                 threading.Thread(
                     target=self._run_turn,
-                    args=(list(self._session.snapshot()), False, None),
+                    args=(list(self._session.snapshot()), False, None, None, rt),
                     daemon=True,
                 ).start()
             self._push_event("done", {})
@@ -3934,9 +4464,9 @@ class Api(EditorMixin):
             # generated (see _on_closing) -- the close was held off
             # specifically so this reply wouldn't be lost. Now that it's
             # persisted, actually close.
-            if self._close_requested:
+            if self._close_requested and not self._any_thinking():
                 self._close_requested = False
-                self._persist_current_chat()
+                self._persist_all_chats()
                 try:
                     midum.stop_scheduler()
                 except Exception:
@@ -3973,8 +4503,16 @@ class Api(EditorMixin):
         cleaned = self._ANY_FENCE_RE.sub(strip_if_echoed, reply).strip()
         return cleaned, visuals
 
-    def abort(self):
-        midum._abort_event.set()
+    def abort(self, tab_id=None):
+        # Aborts ONLY the tab on screen (or `tab_id`): each tab's turn has its own abort flag, so stopping one
+        # never disturbs another tab's running task.
+        _abort_rt = self._rt_for_tab(tab_id) if tab_id else self._fg_rt
+        _abort_ctx = _abort_rt.turn_ctx if _abort_rt is not None else None
+        if _abort_ctx is not None:
+            _abort_ctx.abort_event.set()
+        # The shared default flag too: sub-agent worker threads poll that one, so aborting still stops the
+        # agents it always stopped (no tab's own turn reads it).
+        _midum_state._global_abort_event.set()
         # Also force-cancel anything already in flight on an MCP server
         # (e.g. a Filesystem MCP call) rather than just letting the
         # already-shared _abort_event polling loop notice on its own --
@@ -3983,7 +4521,7 @@ class Api(EditorMixin):
         # state.py) are already covered by _abort_event.set() above with no
         # extra call needed.
         try:
-            n = midum.abort_active_mcp_calls()
+            n = midum.abort_active_mcp_calls(owner=_abort_ctx) if _abort_ctx is not None else 0
             if n:
                 self._push_event("log", {"text": f"🛑 Cancelled {n} in-flight MCP call(s)\n"})
         except Exception as _abort_mcp_err:
@@ -4024,9 +4562,12 @@ class Api(EditorMixin):
             # `finally` block -- see _run_turn) before touching history, so
             # we can never truncate out from under that thread mid-write.
             if self._thinking:
-                midum._abort_event.set()
+                _pl_ctx = self._rt().turn_ctx
+                if _pl_ctx is not None:
+                    _pl_ctx.abort_event.set()
                 try:
-                    midum.abort_active_mcp_calls()
+                    if _pl_ctx is not None:
+                        midum.abort_active_mcp_calls(owner=_pl_ctx)
                 except Exception as _abort_mcp_err:
                     print(f"⚠️ [abort_active_mcp_calls failed: {_abort_mcp_err}]")
                 waited = 0.0
@@ -4070,6 +4611,7 @@ class Api(EditorMixin):
                     del self._session.history[start_h:]
                 else:
                     del self._session.history[start_h + 1:]
+            step_prompting.rewind_last_turn(self._current_chat_id)
 
             if put_back_prompt:
                 self._last_turn_history_start = None
@@ -4091,7 +4633,7 @@ class Api(EditorMixin):
             self._push_event("status", {"text": "Executing turns...", "level": "busy"})
             threading.Thread(
                 target=self._run_turn,
-                args=(list(self._session.snapshot()), False, None, turn_id),
+                args=(list(self._session.snapshot()), False, None, turn_id, self._rt()),
                 daemon=True,
             ).start()
             return {"ok": True}
@@ -4103,10 +4645,15 @@ class Api(EditorMixin):
         ask_id = uuid.uuid4().hex
         done = threading.Event()
         box = {"value": "[USER CANCELLED]"}
+        _ask_rt = self._rt()
+        _ask_rt.pending_asks[ask_id] = {"id": ask_id, "kind": kind, "payload": payload}
+        if _ask_rt is not self._fg_rt:
+            _ask_rt.attention = True              # a background tab is waiting on the user: flag its tab
         self._pending_ask[ask_id] = (done, box)
         self._push_event("ask", {"id": ask_id, "kind": kind, "payload": payload})
         done.wait()
         self._pending_ask.pop(ask_id, None)
+        _ask_rt.pending_asks.pop(ask_id, None)
         return box["value"]
 
     def answer_ask(self, ask_id: str, value: str):
@@ -4390,6 +4937,207 @@ class Api(EditorMixin):
             rendered = str(data)
         return self.send_message(f"[Ambient Surface input: {surface_id}]\n{rendered}")
 
+    # ── Chat Surfaces ─────────────────────────────────────────────────
+    # Inline HTML blocks that live IN the chat transcript. Unlike Render/Ambient
+    # Surfaces they are part of the conversation: each one is a ("chatsurface",
+    # <json>) entry in self._display_log, so they are saved with the chat, come
+    # back when it is reopened, and follow conversation-tab switches for free.
+    # The display log is the single source of truth (no separate state dict).
+    # JSON record: {id, title, code, height, max_height, frame, background, closed}.
+    # Entries are only ever replaced in place (never removed) so the index
+    # bookkeeping used by edit/regenerate (_last_turn_display_start/end) stays valid.
+    def _cs_records(self):
+        out = []
+        with self._persist_lock:
+            entries = list(enumerate(self._display_log))
+        for i, ent in entries:
+            try:
+                if ent and ent[0] == "chatsurface":
+                    out.append((i, json.loads(ent[1])))
+            except Exception:
+                pass
+        return out
+
+    def _cs_open_records(self):
+        return [(i, r) for i, r in self._cs_records() if not r.get("closed")]
+
+    def _cs_find(self, sid):
+        for i, r in reversed(self._cs_open_records()):
+            if r.get("id") == sid:
+                return i, r
+        return None
+
+    def _cs_store(self, idx, rec):
+        with self._persist_lock:
+            if 0 <= idx < len(self._display_log):
+                self._display_log[idx] = ("chatsurface", json.dumps(rec, default=str))
+
+    def _cs_close_one(self, sid, push=True):
+        found = self._cs_find(sid)
+        if not found:
+            return False
+        idx, rec = found
+        self._cs_store(idx, {"id": rec.get("id"), "title": rec.get("title", ""), "closed": True})
+        if push:
+            self._push_event("chat_surface_close", {"id": sid})
+        return True
+
+    def _cs_pick(self, sid):
+        """Resolve an optional id to an open record. Returns (found, error)."""
+        sid = re.sub(r"[^A-Za-z0-9_-]+", "_", str(sid or "").strip()).strip("_")
+        opened = self._cs_open_records()
+        if sid:
+            f = self._cs_find(sid)
+            return (f, None) if f else (None, f"[CHAT SURFACE ERROR] No open Chat Surface with id '{sid}'.")
+        if not opened:
+            return None, "[CHAT SURFACE ERROR] No Chat Surface is open in this chat."
+        if len(opened) > 1:
+            ids = ", ".join(r.get("id", "?") for _, r in opened)
+            return None, f"[CHAT SURFACE ERROR] Several Chat Surfaces are open ({ids}); pass surface_id."
+        return opened[0], None
+
+    def _handle_chat_surface(self, kind: str, payload: dict) -> str:
+        _E = "[CHAT SURFACE ERROR]"
+        payload = payload or {}
+
+        if kind == "show":
+            code = payload.get("code") or ""
+            if not str(code).strip():
+                return f"{_E} 'code' must be a complete HTML document."
+
+            def _int(v, lo, hi, default):
+                try:
+                    v = int(float(v))
+                except (TypeError, ValueError):
+                    return default
+                return default if v <= 0 else max(lo, min(hi, v))
+
+            sid = re.sub(r"[^A-Za-z0-9_-]+", "_", str(payload.get("surface_id") or "").strip()).strip("_")
+            all_recs = self._cs_records()
+            if not sid:
+                used = {r.get("id") for _, r in all_recs}
+                n = len(all_recs) + 1
+                while f"chat{n}" in used:
+                    n += 1
+                sid = f"chat{n}"
+            frame = payload.get("frame", True)
+            if isinstance(frame, str):
+                frame = frame.strip().lower() not in ("0", "false", "no", "off")
+            bg = str(payload.get("background") or "").strip()
+            if len(bg) > 80 or any(c in bg for c in ';{}<>"\'\\'):
+                bg = ""
+            rec = {
+                "id": sid,
+                "title": str(payload.get("title") or "").strip()[:80],
+                "code": code,
+                "height": _int(payload.get("height"), 60, 1400, 0),
+                "max_height": _int(payload.get("max_height"), 120, 1600, 640),
+                "frame": bool(frame),
+                "background": bg,
+                "closed": False,
+            }
+            sizing = f"fixed {rec['height']}px" if rec["height"] else f"auto-fit (max {rec['max_height']}px)"
+            existing = self._cs_find(sid)
+            if existing:
+                self._cs_store(existing[0], rec)
+                self._push_event("chat_surface_replace", rec)
+                return (f"Chat Surface '{sid}' replaced in place ({len(code)} chars, {sizing}). "
+                        f"It is shown inline in the chat; continue your reply below it.")
+            with self._persist_lock:
+                self._display_log.append(("chatsurface", json.dumps(rec, default=str)))
+            self._push_event("chat_surface_show", rec)
+            return (f"Chat Surface '{sid}' shown inline in the chat ({len(code)} chars, {sizing}). "
+                    f"Continue your reply below it; don't repeat its contents in text.")
+
+        if kind == "edit":
+            found, err = self._cs_pick(payload.get("surface_id"))
+            if err:
+                return err
+            idx, rec = found
+            old = payload.get("old_code", "") or ""
+            new = payload.get("new_code", "") or ""
+            if not old:
+                return f"{_E} old_code must not be empty."
+            count = (rec.get("code") or "").count(old)
+            if count == 0:
+                return (f"{_E} old_code was not found in Chat Surface '{rec.get('id')}' -- "
+                        f"copy it exactly, character for character, from what you last wrote.")
+            if count > 1:
+                return (f"{_E} old_code matches {count} locations -- include a little more "
+                        f"surrounding context so it's unique.")
+            rec["code"] = rec["code"].replace(old, new, 1)
+            self._cs_store(idx, rec)
+            self._push_event("chat_surface_update", {"id": rec["id"], "code": rec["code"]})
+            return f"Chat Surface '{rec['id']}' updated in place."
+
+        if kind == "close":
+            sid = str(payload.get("surface_id") or "").strip()
+            if sid.lower() == "all":
+                ids = [r.get("id") for _, r in self._cs_open_records()]
+                for i in ids:
+                    self._cs_close_one(i)
+                return f"Closed {len(ids)} Chat Surface(s)."
+            if not sid:
+                opened = self._cs_open_records()
+                if not opened:
+                    return f"{_E} No Chat Surface is open in this chat."
+                sid = opened[-1][1].get("id")
+            sid = re.sub(r"[^A-Za-z0-9_-]+", "_", sid).strip("_")
+            if self._cs_close_one(sid):
+                return f"Chat Surface '{sid}' closed."
+            return f"{_E} No open Chat Surface with id '{sid}' (it may already be closed)."
+
+        if kind == "list":
+            opened = self._cs_open_records()
+            if not opened:
+                return "No Chat Surfaces are open in this chat."
+            lines = [f"Open Chat Surfaces ({len(opened)}):"]
+            for _, r in opened:
+                sizing = f"fixed {r.get('height')}px" if r.get("height") else f"auto-fit (max {r.get('max_height', 640)}px)"
+                title = f' "{r.get("title")}"' if r.get("title") else ""
+                lines.append(f"- {r.get('id')}{title}: {sizing}, {len(r.get('code') or '')} chars of code")
+            return "\n".join(lines)
+
+        if kind == "code":
+            # Read-only: current source, used by voice-mode delegation to revise a block.
+            found, err = self._cs_pick(payload.get("surface_id"))
+            return "" if err else (found[1].get("code") or "")
+
+        return f"{_E} unknown action '{kind}'."
+
+    def chat_surface_call_tool(self, tool_name: str, args=None):
+        """JS-callable: window.midum.call(name, args) inside a Chat Surface. Same
+        tool/MCP/Flow reach and permissions as the other surfaces. Logged to the
+        Log pane only (not persisted into the transcript) so a surface that polls
+        a tool can't flood the chat history."""
+        result = self._call_any_tool_from_surface(tool_name, args)
+        try:
+            self._push_event("log", {"text": f"[Chat Surface] {tool_name} -> {str(result)[:200]}\n"})
+        except Exception:
+            pass
+        try:
+            json.dumps(result)
+            return result
+        except Exception:
+            return str(result)
+
+    def chat_surface_submit(self, surface_id, data):
+        """parent.postMessage(...) from a Chat Surface -> a new chat turn."""
+        sid = re.sub(r"[^A-Za-z0-9_-]+", "_", str(surface_id or "").strip()).strip("_")
+        if not self._cs_find(sid):
+            return {"ok": False, "error": "not_open"}
+        try:
+            rendered = json.dumps(data, default=str)
+        except Exception:
+            rendered = str(data)
+        return self.send_message(f"[Chat Surface input: {sid}]\n{rendered}")
+
+    def chat_surface_manual_close(self, surface_id):
+        """The user clicked the block's own x; the JS already removed it."""
+        sid = re.sub(r"[^A-Za-z0-9_-]+", "_", str(surface_id or "").strip()).strip("_")
+        self._cs_close_one(sid, push=False)
+        return {"ok": True}
+
     def _close_ambient_surfaces(self):
         """Overlay windows must not outlive the app (pywebview stays alive
         while ANY window is open)."""
@@ -4406,6 +5154,37 @@ class Api(EditorMixin):
     # (dynamic_background_load_ui / _clear_ui below). The active background
     # (code included) is mirrored to storage/dynamic_background_active.json so
     # it is restored on the next launch.
+    def _seed_default_dynamic_background(self):
+        """First launch only: copy the shipped 'Midum Silk Waves' Dynamic Background
+        into the saved-backgrounds folder and, if the user has no active background,
+        make it the active default. A flag file makes this run exactly once, so
+        turning the background off (or choosing another) is never undone later."""
+        try:
+            flag = os.path.join(config.STORAGE_DIR, "dynamic_background_default_seeded.flag")
+            if os.path.exists(flag):
+                return
+            root = getattr(sys, "_MEIPASS", None) or config._PKG_DIR
+            src = os.path.join(root, "default_assets", "dynamic_backgrounds", "Midum_Silk_Waves.json")
+            if not os.path.isfile(src):
+                return
+            with open(src, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            dst = _dynamic_background_tools._saved_dynamic_bg_path(data.get("name") or "Midum Silk Waves")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if not os.path.exists(dst):
+                with open(dst, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            if self._dyn_bg_code is None and isinstance(data.get("code"), str) and data["code"].strip():
+                self._dyn_bg_code = data["code"]
+                self._dyn_bg_title = data.get("title") or data.get("name")
+                self._dyn_bg_name = data.get("name")
+                self._dyn_bg_persist_active()
+            os.makedirs(os.path.dirname(flag), exist_ok=True)
+            with open(flag, "w", encoding="utf-8") as f:
+                f.write("1")
+        except Exception as e:
+            print(f"⚠️ [Dynamic background] Could not seed default: {e}")
+
     def _dyn_bg_active_path(self):
         return os.path.join(config.STORAGE_DIR, "dynamic_background_active.json")
 
@@ -4701,6 +5480,18 @@ class Api(EditorMixin):
 
     def midumdocs_reopen_ui(self):
         return midumdocs.reopen_ui()
+
+    def midumdocs_new(self):
+        """MidumDocs tab: open a fresh, unsaved blank document."""
+        return midumdocs.new_doc()
+
+    def midumdocs_list(self):
+        """MidumDocs tab dropdown: every existing MidumDoc, newest first."""
+        return midumdocs.list_saved_docs()
+
+    def midumdocs_open(self, art_id):
+        """MidumDocs tab dropdown: open an existing document for editing."""
+        return midumdocs.open_saved_doc(art_id)
 
     def midumdocs_export(self, kind, name, data):
         """Save the compiled PDF (base64) or the .tex source through a native save dialog."""
@@ -5307,7 +6098,7 @@ class Api(EditorMixin):
         self._push_event("log", {"text": f"📄 Registering PDF source: {path}\n"})
         try:
             safe, record = midum.add_pdf_source(path)
-            self._push_event("log", {"text": f"✅ PDF source registered: {safe}.json ({record.get('page_count')} pages) — tag headings from the Knowledge tab next.\n"})
+            self._push_event("log", {"text": f"✅ PDF source registered: {safe}.json ({record.get('page_count')} pages) — tag headings from the Library tab (Knowledge) next.\n"})
             # Warm this new source's line-extraction cache in the background
             # too (same reasoning as _warm_pdf_source_cache at startup) so
             # it doesn't reintroduce the first-open Knowledge tab lag later.
@@ -6011,8 +6802,8 @@ class Api(EditorMixin):
         Flow that never returns, etc), the app force-closes anyway instead
         of leaving the window looking permanently frozen.
         """
-        self._persist_current_chat()
-        if self._thinking:
+        self._persist_all_chats()
+        if self._any_thinking():
             self._close_requested = True
             self._push_event("log", {"text": "⏳ Finishing the current response before closing...\n"})
             threading.Thread(target=self._force_close_watchdog, daemon=True).start()
@@ -6033,11 +6824,12 @@ class Api(EditorMixin):
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if not self._thinking:
+            if not self._any_thinking():
                 return   # _run_turn's own finally block will close it normally
             time.sleep(0.5)
-        if self._thinking and self.window:
-            self._thinking = False
+        if self._any_thinking() and self.window:
+            for _r in self._all_rts():
+                _r.thinking = False
             self._close_requested = False
             self._closing = True
             try:
@@ -6090,7 +6882,7 @@ _HTML = r"""<!DOCTYPE html>
      resolved once like any other background-color -- deliberately NOT a
      backdrop-filter recipe, so these are just colors, not anything that
      needs to be computed per-frame. */
-  --glass-pct: 55%; /* live intensity, driven by the SETTINGS slider (applyGlassOpacity()) -- kept in the 35-75 range so the whole slider stays at "ideal glass" instead of fading toward opaque-looking at one end */
+  --glass-pct: 0%; /* live intensity, driven by the SETTINGS slider (applyGlassOpacity()) -- kept in the 35-75 range so the whole slider stays at "ideal glass" instead of fading toward opaque-looking at one end */
   --glass-fill: color-mix(in srgb, var(--panel) var(--glass-pct), transparent);
   --glass-fill-strong: color-mix(in srgb, var(--panel) calc(var(--glass-pct) + 10%), transparent);
   /* Sheen/edge brightness scale WITH --glass-pct rather than sitting at a
@@ -6937,7 +7729,7 @@ html.liquid-glass-on #drop-overlay{
 }
 
 /* Tool pane */
-#tool-pane-wrap{left:0;width:0;}
+#tool-pane-wrap{left:100%;width:0;}   /* tool tabs/panels now live on the RIGHT; collapsed they tuck against the right edge */
 #tool-content{flex:1;padding:14px;overflow-y:auto;}
 /* Editor tab: persistent iframe host (see MZED in the script below). Parked inside the tool pane,
    shown only while the Editor tab is active, never rebuilt (so open files survive tab switches). */
@@ -6979,6 +7771,13 @@ html.liquid-glass-on #mz-ic-hist{background:var(--glass-fill-strong, var(--panel
 html.mz-chat-docked #kb-toggle-btn{display:none !important;}
 #mz-model-btn{display:none;flex:0 0 auto;width:auto;height:36px;padding:0 12px;border-radius:18px;align-items:center;justify-content:center;gap:6px;font-size:11px;white-space:nowrap;}
 html.mz-chat-docked #mz-model-btn{display:inline-flex;}
+/* Docked (Workbench sidebar) prompt box: the text area takes the full top row and the buttons that normally sit to its left
+   (model picker, KB, attach) drop onto a row underneath it, with Send staying at the right end of that row. */
+html.mz-chat-docked #input-box{padding:6px 8px;row-gap:2px;}
+html.mz-chat-docked #input-box > #msg-input{order:1;flex:1 1 100%;min-width:0;padding-left:8px;padding-right:8px;}
+html.mz-chat-docked #input-box > .icon-btn,
+html.mz-chat-docked #input-box > #mz-model-btn{order:2;}
+html.mz-chat-docked #input-box > #send-btn{order:3;margin-left:auto;}
 #mz-model-btn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
 #mz-model-btn .ic{width:14px;height:14px;flex:0 0 auto;}
 #mz-model-btn.on{background:var(--accent);color:#fff;}
@@ -7100,11 +7899,30 @@ html.liquid-glass-on #mz-model-pop{background:var(--glass-fill-strong, var(--pan
 #kb-toggle-btn{flex:0 0 auto;font-size:11px;}
 #kb-toggle-btn.active{background:var(--accent);color:#fff;}
 #kb-popover{
-  position:absolute;bottom:calc(100% + 8px);left:0;width:300px;max-height:280px;overflow-y:auto;
-  background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:10px;
-  box-shadow:0 8px 24px rgba(0,0,0,.35);display:none;z-index:20;
+  position:absolute;bottom:calc(100% + 8px);left:0;width:min(380px,100%);max-height:min(580px,calc(100vh - 230px));overflow-y:auto;
+  background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:12px;
+  box-shadow:0 8px 24px rgba(0,0,0,.35);display:none;z-index:20;font-size:12px;color:var(--text);
 }
 #kb-popover.open{display:block;}
+/* Same translucent glass as the step-prompting panel (#steps-panel, see gui/steps_ui.py _GLASS_CSS). */
+html.liquid-glass-on #kb-popover{
+  background-color:color-mix(in srgb, var(--panel) min(85%, calc(var(--glass-pct) + 15%)), transparent);
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%);
+  border-color:var(--glass-edge);
+  box-shadow:inset 0 1px 0 var(--glass-edge), 0 10px 30px rgba(0,0,0,.4);
+  -webkit-backdrop-filter:blur(18px) saturate(1.25);backdrop-filter:blur(18px) saturate(1.25);
+}
+/* Segmented switchers: popup tabs (Models / Source), Normal / Voice, and the Library tab's section switcher. */
+.mz-seg{display:flex;gap:4px;padding:3px;border:1px solid var(--border);border-radius:12px;background:var(--surface);}
+.mz-seg button{flex:1 1 0;display:inline-flex;align-items:center;justify-content:center;gap:6px;height:28px;padding:0 10px;border:none;border-radius:9px;
+  background:transparent;color:var(--subtext);font:inherit;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;}
+.mz-seg button:hover{color:var(--text);}
+.mz-seg button.active{background:var(--accent);color:#fff;}
+.mz-seg button .ic{width:13px;height:13px;}
+.mz-seg.mz-seg-sm button{height:24px;font-size:10px;}
+#kbp-tabs{margin-bottom:10px;}
+#kbp-model-kind{margin-bottom:10px;}
+.kbp-sec-label{font-size:10px;font-weight:700;letter-spacing:.04em;color:var(--subtext);text-transform:uppercase;margin:0 0 6px;}
 .kb-only-row{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:var(--text);
   padding-bottom:8px;border-bottom:1px solid var(--border);margin-bottom:8px;}
 .kb-only-row label{cursor:pointer;}
@@ -7168,9 +7986,113 @@ html.liquid-glass-on #mz-model-pop{background:var(--glass-fill-strong, var(--pan
 .capability-picker-empty{font-size:11px;color:var(--subtext);text-align:center;padding:14px 10px;}
 
 /* Sidebar pane */
-#sidebar-pane-wrap{left:100%;width:0;}
+#sidebar-pane-wrap{left:0;width:0;}   /* sidebar now lives on the LEFT; collapsed it tucks against the left edge */
 #sidebar-inner{flex:1;position:relative;overflow:hidden;display:flex;flex-direction:column;}
-#sidebar-main-view{flex:1;padding:14px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;}
+/* ── Sidebar redesign (left rail) ─────────────────────────────────────────────────────────────────
+   Column layout:  header · New chat · nav rail · collapsible Workspace card · Chat history (fills the
+   remaining height and scrolls on its own, with search + date groups) · pinned footer.
+   Every id the JS wires up (new-session-btn, project-select, proj-*, file-list, history-list,
+   settings-toggle, shutdown-btn, sidebar-close, sidebar-surfaces-btn, sidebar-dynbg-btn) is unchanged. */
+#sidebar-main-view{flex:1;min-height:0;padding:0;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;gap:0;}
+.sb-head{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:14px 12px 12px 14px;}
+.sb-logo{flex:0 0 auto;width:34px;height:34px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+  background:var(--accent-faint);color:var(--accent);box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);}
+.sb-logo svg{width:17px;height:17px;}
+.sb-title{min-width:0;flex:1;}
+.sb-title b{display:block;font-size:14px;font-weight:700;color:var(--text);line-height:1.15;letter-spacing:.2px;}
+.sb-title span{display:block;font-size:10.5px;color:var(--subtext);margin-top:2px;}
+#sidebar-main-view #sidebar-close{flex:0 0 auto;width:28px;height:28px;background:transparent;color:var(--subtext);}
+#sidebar-main-view #sidebar-close:hover{background:var(--surface2);color:var(--text);}
+#sidebar-main-view #sidebar-close svg{width:14px;height:14px;}
+.sb-new{flex:0 0 auto;margin:14px 14px 10px;height:40px;display:flex;align-items:center;justify-content:center;gap:8px;
+  border:none;border-radius:14px;background:var(--accent);color:#fff;font-size:13px;font-weight:600;
+  box-shadow:0 6px 16px -8px var(--accent);transition:filter .15s var(--ease),transform .15s var(--ease);}
+.sb-new:hover{filter:brightness(1.09);}
+.sb-new:active{transform:scale(.98);}
+.sb-new svg{width:15px;height:15px;}
+.sb-nav{flex:0 0 auto;display:flex;flex-direction:column;gap:2px;padding:0 8px;}
+.sb-nav-item{display:flex;align-items:center;gap:10px;width:100%;height:36px;padding:0 10px;border:none;border-radius:11px;
+  background:transparent;color:var(--subtext);font-size:12.5px;font-weight:600;text-align:left;
+  transition:background .15s var(--ease),color .15s var(--ease);}
+.sb-nav-item:hover{background:var(--surface2);color:var(--text);}
+.sb-nav-item > svg:first-child{flex:0 0 auto;width:16px;height:16px;color:var(--accent);}
+.sb-nav-item > span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.sb-nav-item .sb-chev{flex:0 0 auto;width:13px;height:13px;opacity:.45;}
+.sb-sec{flex:0 0 auto;padding:12px 14px 0;}
+.sb-sec-h{display:flex;align-items:center;gap:6px;width:100%;padding:0 0 8px;border:none;background:transparent;
+  color:var(--subtext);font-size:10px;font-weight:700;letter-spacing:.08em;text-align:left;}
+.sb-sec-h span{flex:1;}
+.sb-sec-h svg{width:12px;height:12px;transition:transform .2s var(--ease);}
+.sb-sec.collapsed .sb-sec-h svg{transform:rotate(-90deg);}
+.sb-sec.collapsed .sb-sec-body{display:none;}
+.sb-sec-body{display:flex;flex-direction:column;gap:8px;}
+.sb-ws-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;}
+.sb-ws-actions .ghost-btn{height:30px;padding:0 4px;font-size:11px;display:flex;align-items:center;justify-content:center;gap:5px;
+  min-width:0;white-space:nowrap;overflow:hidden;border-radius:12px;}
+.sb-ws-actions .ghost-btn svg{width:12px;height:12px;}
+#sidebar-main-view #file-list{height:auto;max-height:112px;white-space:normal;padding:6px;border-radius:14px;font-size:11px;
+  display:flex;flex-direction:column;gap:1px;}
+.sb-file{display:flex;align-items:center;gap:7px;padding:3px 6px;border-radius:7px;color:var(--subtext);min-width:0;}
+.sb-file svg{flex:0 0 auto;width:12px;height:12px;opacity:.85;}
+.sb-file span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.sb-file-root{color:var(--text);font-weight:600;}
+.sb-file-root svg{color:var(--accent);opacity:1;}
+.sb-hist{flex:1 1 220px;min-height:190px;display:flex;flex-direction:column;}
+.sb-search{position:relative;flex:0 0 auto;margin-bottom:8px;}
+.sb-search svg{position:absolute;left:11px;top:50%;transform:translateY(-50%);width:13px;height:13px;color:var(--subtext);pointer-events:none;}
+.sb-search input{width:100%;height:32px;box-sizing:border-box;padding:0 10px 0 31px;border-radius:12px;border:1px solid var(--border2);
+  background:var(--surface);color:var(--text);font-size:12px;outline:none;transition:border-color .15s var(--ease);}
+.sb-search input::placeholder{color:var(--subtext);}
+.sb-search input:focus{border-color:var(--accent);}
+#sidebar-main-view #history-list{flex:1;min-height:0;border-radius:16px;padding:6px;gap:1px;}
+.sb-grp{font-size:9.5px;font-weight:700;letter-spacing:.07em;color:var(--subtext);padding:9px 8px 4px;text-transform:uppercase;}
+.sb-grp:first-child{padding-top:4px;}
+.sb-chat{position:relative;display:flex;align-items:center;gap:8px;padding:7px 6px 7px 12px;border-radius:10px;cursor:pointer;
+  transition:background .15s var(--ease);}
+.sb-chat:hover{background:var(--surface2);}
+.sb-chat.current{background:var(--accent-faint);}
+.sb-chat.current::before{content:"";position:absolute;left:3px;top:9px;bottom:9px;width:3px;border-radius:2px;background:var(--accent);}
+.sb-chat-main{min-width:0;flex:1;}
+.sb-chat-title{font-size:12px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.sb-chat.current .sb-chat-title{font-weight:600;}
+.sb-chat-ts{font-size:10px;color:var(--subtext);margin-top:1px;}
+.sb-chat-actions{display:none;gap:2px;flex:0 0 auto;}
+.sb-chat:hover .sb-chat-actions{display:flex;}
+.sb-act{width:24px;height:24px;padding:0;border:none;border-radius:8px;background:transparent;color:var(--subtext);
+  display:flex;align-items:center;justify-content:center;transition:background .15s,color .15s;}
+.sb-act svg{width:12px;height:12px;}
+.sb-act:hover{background:var(--border2);color:var(--text);}
+.sb-act.del:hover{background:color-mix(in srgb, var(--red) 18%, transparent);color:var(--red);}
+.sb-empty{font-size:11px;color:var(--subtext);text-align:center;padding:18px 10px;line-height:1.5;}
+/* pinned / favorite chats */
+.sb-chat-flags{display:flex;align-items:center;gap:4px;flex:0 0 auto;}
+.sb-chat:hover .sb-chat-flags{display:none;}
+.sb-flag{display:inline-flex;}
+.sb-flag svg{width:11px;height:11px;fill:currentColor;}
+.sb-flag.f-pin{color:var(--accent);}
+.sb-flag.f-fav{color:#e8b339;}
+.sb-chat-actions .sb-act{width:22px;height:22px;}
+.sb-act.on{color:var(--accent);}
+.sb-act.fav.on{color:#e8b339;}
+.sb-act.on svg{fill:currentColor;}
+.sb-fav-h{display:flex;align-items:center;gap:6px;width:100%;padding:9px 8px 5px;border:none;background:transparent;cursor:pointer;
+  color:var(--subtext);font-size:9.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;text-align:left;transition:color .15s var(--ease);}
+.sb-fav-h:hover{color:var(--text);}
+.sb-fav-h > svg:first-child{width:11px;height:11px;color:#e8b339;fill:currentColor;flex:0 0 auto;}
+.sb-fav-h .sb-count{margin-left:auto;font-style:normal;font-weight:600;letter-spacing:0;opacity:.85;}
+.sb-fav-h > svg:last-child{width:12px;height:12px;flex:0 0 auto;transition:transform .2s var(--ease);}
+.sb-fav-h:not(.open) > svg:last-child{transform:rotate(-90deg);}
+.sb-fav-body{display:flex;flex-direction:column;gap:1px;margin-bottom:2px;}
+.sb-fav-empty{font-size:10.5px;color:var(--subtext);padding:2px 10px 8px;line-height:1.45;}
+.sb-foot{flex:0 0 auto;display:flex;flex-direction:column;gap:6px;margin-top:12px;padding:10px 8px 12px;border-top:1px solid var(--border2);}
+#sidebar-footer{display:flex;gap:6px;padding:0 6px;}
+.sb-foot-btn{flex:1;min-width:0;display:flex;align-items:center;justify-content:center;gap:7px;height:34px;border-radius:12px;
+  border:1px solid var(--border2);background:transparent;color:var(--text);font-size:12px;font-weight:600;
+  transition:background .15s var(--ease);}
+.sb-foot-btn:hover{background:var(--surface2);}
+.sb-foot-btn svg{width:14px;height:14px;flex:0 0 auto;}
+.sb-foot-btn.danger{color:var(--red);}
+.sb-foot-btn.danger:hover{background:color-mix(in srgb, var(--red) 14%, transparent);}
 /* Settings popup window. #sidebar-settings-overlay is the dim scrim (moved to <body> when the sidebar is built so
    position:fixed is always relative to the viewport); .st-dialog is the window: header, left nav, one page of
    cards at a time, footer. z-index 950 keeps it above the panes but below #modal-overlay (1000), so the
@@ -7219,7 +8141,22 @@ html.liquid-glass-on #mz-model-pop{background:var(--glass-fill-strong, var(--pan
 #sidebar-settings-overlay[data-page="general"] .st-card[data-page="general"],
 #sidebar-settings-overlay[data-page="appearance"] .st-card[data-page="appearance"],
 #sidebar-settings-overlay[data-page="effects"] .st-card[data-page="effects"],
-#sidebar-settings-overlay[data-page="models"] .st-card[data-page="models"]{display:flex;}
+#sidebar-settings-overlay[data-page="models"] .st-card[data-page="models"],
+#sidebar-settings-overlay[data-page="chats"] .st-card[data-page="chats"]{display:flex;}
+.st-row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.st-field{display:flex;flex-direction:column;gap:6px;min-width:0;}
+.st-in{height:34px;box-sizing:border-box;width:100%;min-width:0;border-radius:16px;border:1px solid var(--border2);background:var(--surface);
+  color:var(--text);padding:0 12px;font-size:12px;outline:none;color-scheme:var(--date-cs, dark);transition:border-color .15s var(--ease);}
+.st-in:focus{border-color:var(--accent);}
+.st-inline{display:flex;align-items:center;gap:8px;}
+.st-inline .st-in{flex:1;}
+.st-danger{color:var(--red);border-color:color-mix(in srgb, var(--red) 45%, transparent);}
+.st-danger:hover{background:color-mix(in srgb, var(--red) 14%, transparent);}
+.st-status{font-size:11px;color:var(--subtext);min-height:14px;margin:0;}
+.st-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;}
+.st-stat{display:flex;flex-direction:column;gap:2px;padding:10px 12px;border-radius:12px;border:1px solid var(--border2);background:var(--surface);}
+.st-stat b{font-size:20px;font-weight:700;line-height:1.1;color:var(--text);}
+.st-stat span{font-size:10.5px;color:var(--subtext);}
 .st-card-h{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:22px;}
 .st-card-t{font-size:13px;font-weight:700;color:var(--text);}
 .st-note{font-size:11px;line-height:1.55;color:var(--subtext);margin:0;}
@@ -7344,6 +8281,29 @@ body.midumdocs-full #content{top:0;height:100%;}
 /* Opening / closing MidumDocs and entering / leaving full screen snap in a single step: the 0.28 s slide made the editor frame
    resize on every animation frame, so its pages were laid out and redrawn repeatedly mid transition (visible as flashing). */
 body.md-snap .pane-wrap{transition:none !important;}
+/* MidumDocs tab: stays clickable while a document is open (the rest of the tab bar is disabled), caret opens the document list. */
+body.midumdocs-active #tabbar .tab-btn[data-name="MidumDocs"],
+body.render-surface-active #tabbar .tab-btn[data-name="MidumDocs"]{opacity:1;pointer-events:auto;}
+body.midumdocs-active #tabbar .tab-btn[data-name="MidumDocs"]{color:var(--accent);}
+#tabbar .tab-btn .tab-caret{display:inline-flex;align-items:center;margin-left:4px;padding:2px;border-radius:6px;opacity:.7;}
+#tabbar .tab-btn .tab-caret:hover{opacity:1;background:var(--surface2);}
+#tabbar .tab-btn .tab-caret svg{width:11px;height:11px;}
+#md-tab-menu{position:fixed;z-index:400;width:320px;max-height:min(60vh,420px);overflow-y:auto;background:var(--panel);border:1px solid var(--border);
+  border-radius:14px;padding:6px;box-shadow:0 8px 24px rgba(0,0,0,.35);font-size:12px;color:var(--text);}
+/* Same translucent glass as the step-prompting panel and the prompt-box popup. */
+html.liquid-glass-on #md-tab-menu{
+  background-color:color-mix(in srgb, var(--panel) min(85%, calc(var(--glass-pct) + 15%)), transparent);
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%);
+  border-color:var(--glass-edge);
+  box-shadow:inset 0 1px 0 var(--glass-edge), 0 10px 30px rgba(0,0,0,.4);
+  -webkit-backdrop-filter:blur(18px) saturate(1.25);backdrop-filter:blur(18px) saturate(1.25);
+}
+.md-tm-head{font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--subtext);padding:6px 8px 4px;}
+.md-tm-empty{padding:10px 8px;color:var(--subtext);font-size:11px;line-height:1.5;}
+.md-tm-item{display:flex;flex-direction:column;gap:2px;width:100%;text-align:left;padding:7px 8px;border:none;border-radius:10px;background:transparent;color:var(--text);font:inherit;cursor:pointer;}
+.md-tm-item:hover{background:var(--surface2);}
+.md-tm-name{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.md-tm-meta{font-size:10px;color:var(--subtext);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 body.midumdocs-active #sidebar-toggle{opacity:1;}
 
 /* Chat bubbles */
@@ -7370,6 +8330,14 @@ body.midumdocs-active #sidebar-toggle{opacity:1;}
   user-select:text;-webkit-user-select:text;cursor:text;}
 .bubble *{user-select:text;-webkit-user-select:text;}
 .bubble.user{background:var(--user-msg);}
+/* Long prompts: the bubble is clamped to a few lines with a fade; a "Show more" toggle (added by mzBubbleClampScan) expands it. */
+.bubble.user.clamped:not(.expanded){max-height:150px;overflow:hidden;-webkit-mask-image:linear-gradient(to bottom,#000 65%,transparent);mask-image:linear-gradient(to bottom,#000 65%,transparent);}
+.bubble-more-btn{align-self:flex-end;margin-top:4px;padding:2px 10px;border:none;border-radius:10px;background:transparent;color:var(--accent);font:inherit;font-size:11px;font-weight:600;cursor:pointer;}
+.bubble-more-btn:hover{background:var(--accent-faint);}
+/* Concurrent tabs: a tab that is mid-turn pulses; one that finished / is asking something while in the background shows a solid dot. */
+.conv-tab.attention .conv-tab-title::before{content:"";display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:var(--green);vertical-align:middle;}
+.conv-tab.busy .conv-tab-title::before{content:"";display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:var(--accent);vertical-align:middle;animation:mzTabPulse 1.1s ease-in-out infinite;}
+@keyframes mzTabPulse{0%,100%{opacity:.3;transform:scale(.8);}50%{opacity:1;transform:scale(1.15);}}
 /* "/capability" tokens inside a sent user message (see renderUserContent) --
    distinguished from the surrounding text so an explicit capability request
    reads at a glance, mirroring the "/" picker's own accent color. */
@@ -7409,6 +8377,17 @@ html.liquid-glass-on:not(.blobs-off) .row.interjection .bubble{
   border:1px solid var(--glass-edge-dim);
   box-shadow:inset 0 1px 0 var(--glass-edge-dim), var(--glass-glow);
 }
+/* Chat Surfaces: inline model-written blocks in the transcript. Width = the chat text
+   column (row padding matches the bubble's 16px text inset); height set from JS. */
+.row.chat-surface-row{padding:6px 16px;}
+.chat-surface{position:relative;width:100%;box-sizing:border-box;border-radius:16px;overflow:hidden;}
+.chat-surface.framed{background:var(--surface);border:1px solid var(--border2);}
+.chat-surface-frame{display:block;width:100%;border:0;background:transparent;height:80px;transition:height .18s ease;}
+.chat-surface-x{position:absolute;top:6px;right:6px;width:22px;height:22px;padding:0;border-radius:50%;
+  border:1px solid var(--border2);background:var(--surface2);color:var(--subtext);font-size:14px;line-height:1;
+  cursor:pointer;opacity:0;transition:opacity .15s;z-index:2;display:flex;align-items:center;justify-content:center;}
+.chat-surface:hover .chat-surface-x{opacity:.85;}
+.chat-surface-x:hover{color:var(--text);opacity:1;}
 .row.tool{align-items:flex-start;}
 .tool-line{display:flex;gap:6px;font-size:10px;color:var(--subtext);align-items:center;cursor:pointer;user-select:none;}
 .tool-line:hover{color:var(--text);}
@@ -7886,7 +8865,9 @@ textarea.code-area{
   font-size:12px;color:var(--subtext);}
 /* Node body rendered inside each Drawflow node's html */
 .flow-node{display:flex;align-items:center;gap:8px;padding:11px 16px;}
-.flow-node-icon{font-size:16px;}
+.flow-node-icon{font-size:16px;display:inline-flex;align-items:center;justify-content:center;flex:none;line-height:1;}
+/* the global .ic rule drops icons .22em below the baseline (right for inline text, wrong inside a flex row) -- centre them in their own box instead */
+.flow-node-icon .ic{display:block;vertical-align:baseline;}
 .flow-node-label{font-size:12px;font-weight:700;color:var(--text);white-space:nowrap;}
 /* Tool nodes: header (icon + name) plus a param-entry body. Each
    parameter now has a REAL Drawflow input pin (input_2, input_3, ...,
@@ -8304,7 +9285,7 @@ textarea.code-area{
     <div id="topbar">
       <div id="left-cluster">
         <div id="brand"><svg class="ic ic-zap" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg> Midum</div>
-        <button class="icon-btn" id="sidebar-toggle" title="Toggle sidebar"><svg class="ic ic-menu" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
+        <button class="icon-btn" id="sidebar-toggle" title="Toggle sidebar"><svg class="ic ic-panel-left" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M9 3v18"/></svg></button>
         <div id="status-row">
           <div id="status-dot"></div>
           <div id="status-label">Initializing...</div>
@@ -8318,8 +9299,8 @@ textarea.code-area{
   </div>
 
   <div id="content">
-    <div class="pane-wrap pane-hidden" id="tool-pane-wrap">
-      <div class="pane"><div id="tool-content"></div></div>
+    <div class="pane-wrap pane-hidden" id="sidebar-pane-wrap">
+      <div class="pane"><div id="sidebar-inner"></div></div>
     </div>
 
     <div class="pane-wrap" id="chat-pane-wrap">
@@ -8349,6 +9330,19 @@ textarea.code-area{
               <div id="capability-picker-list"></div>
             </div>
             <div id="kb-popover">
+              <div class="mz-seg" id="kbp-tabs">
+                <button type="button" data-kbp="models" class="active">Models</button>
+                <button type="button" data-kbp="source">Source</button>
+              </div>
+              <div id="kbp-pane-models">
+                <div class="mz-seg mz-seg-sm" id="kbp-model-kind">
+                  <button type="button" data-kind="normal" class="active">Normal</button>
+                  <button type="button" data-kind="voice">Voice</button>
+                </div>
+                <div id="kbp-normal"></div>
+                <div id="kbp-voice" style="display:none;"></div>
+              </div>
+              <div id="kbp-pane-source" style="display:none;">
               <div class="kb-only-row">
                 <input type="checkbox" id="kb-only-checkbox"/>
                 <label for="kb-only-checkbox">KB Only</label>
@@ -8361,6 +9355,7 @@ textarea.code-area{
               </div>
               <button id="kb-start-explanation-btn" style="display:none;width:100%;margin-top:8px;height:30px;border-radius:14px;border:none;background:var(--accent);color:#fff;font-size:11px;font-weight:600;"><svg class="ic ic-play ic-fill" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4l14 8-14 8z"/></svg> Start Explanation</button>
               <div class="kb-only-hint" id="kb-explain-hint" style="display:none;">Walks through the selected source(s) part by part (one sub-sub-heading per response) — say "next" to continue.</div>
+              </div>
             </div>
             <style>
               #vo-player{display:none;align-items:center;gap:10px;margin:0 0 8px;padding:7px 8px 7px 8px;border:1px solid var(--border2);border-radius:16px;background:var(--surface2);color:var(--text);font-size:12px;}
@@ -8393,7 +9388,7 @@ textarea.code-area{
               <button class="icon-btn" id="vo-hide" title="Hide player (the clip stays in memory and returns on the next change)"><svg class="ic ic-x" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
             </div>
             <div id="input-box">
-              <button class="icon-btn" id="kb-toggle-btn" title="Knowledge Base options"><svg class="ic ic-chevron-down" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
+              <button class="icon-btn" id="kb-toggle-btn" title="Models &amp; source"><svg class="ic ic-chevron-down" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
               <div id="attach-tray"></div>
               <button class="icon-btn" id="attach-btn" title="Attach files (or drag & drop / paste)"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
               <textarea id="msg-input" placeholder="Message Midum..." rows="1"></textarea>
@@ -8405,8 +9400,8 @@ textarea.code-area{
       </div>
     </div>
 
-    <div class="pane-wrap pane-hidden" id="sidebar-pane-wrap">
-      <div class="pane"><div id="sidebar-inner"></div></div>
+    <div class="pane-wrap pane-hidden" id="tool-pane-wrap">
+      <div class="pane"><div id="tool-content"></div></div>
     </div>
 
     <div class="pane-wrap pane-hidden" id="render-surface-pane-wrap">
@@ -8447,8 +9442,8 @@ textarea.code-area{
 // the "PANELS" section in buildSidebar's settings overlay) so they no
 // longer eat into the horizontal tab bar's space.
 const TABS = [
-  ["Chat","message"], ["Voice","mic"], ["Model","cpu"],
-  ["System Core","sparkles"], ["Knowledge","book-open"], ["Skills","layers"], ["Tools","wrench"], ["Shell","terminal"], ["Flows","link"], ["Agents","bot"], ["MCP","plug"], ["Permissions","lock"], ["Editor","code"]
+  ["Chat","message"],
+  ["Library","book-open"], ["MidumDocs","file-text"], ["Tools","wrench"], ["Shell","terminal"], ["Flows","link"], ["Agents","bot"], ["MCP","plug"], ["Permissions","lock"], ["Editor","code"]
   // "Surfaces" used to live here as a top tab, but it's a sidebar quick-
   // access button now (see #sidebar-surfaces-btn in buildSidebar) -- it's
   // a "jump to my saved surfaces" shortcut, not a work area someone tabs
@@ -8571,6 +9566,11 @@ const _ICONS = {
   "sun": '<circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>',
   "megaphone": '<path d="M3 11l18-5v12L3 14v-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/>',
   "dot": '<circle cx="12" cy="12" r="6"/>',
+  "plus": '<path d="M12 5v14M5 12h14"/>',
+  "pin": '<path d="M12 17v5"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/>',
+  "star": '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>',
+  "search": '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/>',
+  "panel-left": '<rect x="3" y="3" width="18" height="18" rx="3"/><path d="M9 3v18"/>',
   "code": '<path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/>'
 };
 const _ICON_FILLED = new Set(["dot", "play", "star-fill", "stop"]);
@@ -9235,13 +10235,16 @@ function targetGeo(){
   // visible and usable while it's open. Tool/sidebar panes collapse to 0
   // width while it's active (they're also dimmed via body.render-
   // surface-active, see CSS) so nothing fights the surface for space.
-  if (state.midumDocOpen && state.midumDocFull) return {tool:[0,0], chat:[0,0], side:[100,0], render:[100,0], docs:[0,100]};   // MidumDocs full screen
-  if (state.midumDocOpen)        return {tool:[0,0], chat:[0,38], side:[100,0], render:[100,0], docs:[38,62]};
-  if (showRender)                return {tool:[0,0], chat:[0,50], side:[100,0], render:[50,50]};
-  if (showTool && showSide)      return isFlows ? {tool:[0,55], chat:[55,25], side:[80,20], render:[100,0]} : {tool:[0,30], chat:[30,50], side:[80,20], render:[100,0]};
-  if (showTool && !showSide)     return isFlows ? {tool:[0,70], chat:[70,30], side:[100,0], render:[100,0]} : {tool:[0,40], chat:[40,60], side:[100,0], render:[100,0]};
-  if (!showTool && showSide)     return {tool:[0,0],  chat:[0,80],  side:[80,20], render:[100,0]};
-  return {tool:[0,0], chat:[0,100], side:[100,0], render:[100,0]};
+  // LAYOUT IS MIRRORED:  [ sidebar | chat | tool tab / Render Surface / MidumDocs ]
+  // Each entry is [left%, width%]. A hidden pane collapses to width 0 against its own edge: the sidebar
+  // against the LEFT edge ([0,0]), everything that opens on the right against the RIGHT edge ([100,0]).
+  if (state.midumDocOpen && state.midumDocFull) return {tool:[100,0], chat:[0,0], side:[0,0], render:[100,0], docs:[0,100]};   // MidumDocs full screen
+  if (state.midumDocOpen)        return {tool:[100,0], chat:[0,38], side:[0,0], render:[100,0], docs:[38,62]};
+  if (showRender)                return {tool:[100,0], chat:[0,50], side:[0,0], render:[50,50]};
+  if (showTool && showSide)      return isFlows ? {tool:[45,55], chat:[20,25], side:[0,20], render:[100,0]} : {tool:[70,30], chat:[20,50], side:[0,20], render:[100,0]};
+  if (showTool && !showSide)     return isFlows ? {tool:[30,70], chat:[0,30],  side:[0,0], render:[100,0]} : {tool:[60,40], chat:[0,60], side:[0,0], render:[100,0]};
+  if (!showTool && showSide)     return {tool:[100,0], chat:[20,80], side:[0,20], render:[100,0]};
+  return {tool:[100,0], chat:[0,100], side:[0,0], render:[100,0]};
 }
 
 function applyLayout(){
@@ -9423,6 +10426,62 @@ function _mdSetFull(v){
   _mdFullIcon();
   applyLayout();
 }
+// ── MidumDocs tab: click = new unsaved document, caret = dropdown of existing documents ─────────────────────
+async function mdTabNew(){
+  const r = await api("midumdocs_new");
+  if (r && r.ok === false) await showConfirm(r.error || "Could not open MidumDocs.", "MidumDocs");
+}
+let _mdTabMenu = null;
+function mdTabMenuClose(){ if (_mdTabMenu){ _mdTabMenu.remove(); _mdTabMenu = null; } }
+async function mdTabMenuToggle(tabBtn){
+  if (_mdTabMenu){ mdTabMenuClose(); return; }
+  const menu = document.createElement("div");
+  menu.id = "md-tab-menu";
+  menu.innerHTML = `<div class="md-tm-empty">Loading…</div>`;
+  document.body.appendChild(menu);
+  _mdTabMenu = menu;
+  const r = tabBtn.getBoundingClientRect();
+  menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 328)) + "px";
+  menu.style.top = (r.bottom + 6) + "px";
+  let res = null;
+  try { res = await api("midumdocs_list"); } catch (e) { /* shown as empty */ }
+  if (_mdTabMenu !== menu) return;   // closed while loading
+  const docs = (res && res.docs) || [];
+  menu.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "md-tm-head";
+  head.textContent = "Edit an existing document";
+  menu.appendChild(head);
+  if (!docs.length){
+    const empty = document.createElement("div");
+    empty.className = "md-tm-empty";
+    empty.textContent = "No MidumDocs yet — click the tab to start a new one.";
+    menu.appendChild(empty);
+    return;
+  }
+  docs.forEach(d=>{
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "md-tm-item";
+    const t = document.createElement("span"); t.className = "md-tm-name"; t.textContent = d.title || d.name;
+    const m = document.createElement("span"); m.className = "md-tm-meta";
+    let when = "";
+    try { when = new Date(d.stamp * 1000).toLocaleString([], {dateStyle:"medium", timeStyle:"short"}); } catch (e) {}
+    m.textContent = [d.name, "v" + d.version, d.here ? "this chat" : "another chat", when, d.open ? "open now" : ""].filter(Boolean).join(" · ");
+    item.appendChild(t); item.appendChild(m);
+    item.onclick = async ()=>{
+      mdTabMenuClose();
+      const o = await api("midumdocs_open", d.id);
+      if (o && o.ok === false) await showConfirm(o.error || "Could not open that document.", "MidumDocs");
+    };
+    menu.appendChild(item);
+  });
+}
+document.addEventListener("mousedown", (e)=>{
+  if (_mdTabMenu && !_mdTabMenu.contains(e.target) && !(e.target.closest && e.target.closest(".tab-caret"))) mdTabMenuClose();
+}, true);
+document.addEventListener("keydown", (e)=>{ if (e.key === "Escape" && _mdTabMenu) mdTabMenuClose(); });
+
 function closeMidumDocUI(){
   if (!state.midumDocOpen) return;
   state.midumDocOpen = false;
@@ -9508,6 +10567,153 @@ window.addEventListener("message", (e)=>{
   api("render_surface_submit", d);
 });
 
+// ── Chat Surfaces (inline blocks in the transcript) ───────────────────────────────────
+// Same sandbox + midum.call/postMessage contract as the Render Surface, but each block
+// is a row in #chat-col at the point the model called show_chat_surface. Width is the
+// chat text column; height auto-fits (the injected bridge reports document height) unless
+// the record pins one. Records live in Python's display log (tag "chatsurface"), so
+// they replay through buildStaticRow when a chat is reopened. See docs/chat_surface.md.
+const _CS_BRIDGE = `<scr` + `ipt>
+(function(){
+  var pend = {}, n = 0;
+  window.addEventListener("message", function(e){
+    var d = e.data;
+    if (d && d.__midum_call_result === true){
+      var p = pend[d.id];
+      if (p){ delete pend[d.id]; if (d.error) p.reject(new Error(d.error)); else p.resolve(d.result); }
+    } else if (d && d.__midum_theme){
+      var v = d.__midum_theme, r = document.documentElement;
+      for (var k in v){ r.style.setProperty(k, v[k]); }
+    }
+  });
+  window.midum = window.midum || {};
+  window.midum.call = function(tool, args){
+    return new Promise(function(res, rej){
+      var id = "c" + (++n) + "_" + Date.now();
+      pend[id] = {resolve: res, reject: rej};
+      parent.postMessage({__midum_call: true, id: id, tool: tool, args: args || {}}, "*");
+    });
+  };
+  window.midum.close = function(){ parent.postMessage({__midum_close: true}, "*"); };
+  var last = -1;
+  function measure(){
+    var b = document.body; if (!b) return;
+    var cs = getComputedStyle(b);
+    var h = Math.ceil(b.scrollHeight + (parseFloat(cs.marginTop) || 0) + (parseFloat(cs.marginBottom) || 0));
+    if (h !== last){ last = h; parent.postMessage({__midum_height: h}, "*"); }
+  }
+  function start(){
+    measure();
+    if (window.ResizeObserver){ var ro = new ResizeObserver(measure); ro.observe(document.body); ro.observe(document.documentElement); }
+    new MutationObserver(measure).observe(document.documentElement, {childList: true, subtree: true, attributes: true, characterData: true});
+    window.addEventListener("load", measure);
+    setInterval(measure, 500);
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
+})();
+<\/scr` + `ipt>`;
+
+const _CS_VARS = ["--bg","--panel","--surface","--surface2","--border2","--accent","--accent-faint","--text","--subtext","--muted","--red","--green","--yellow","--chat-fs"];
+function _csTheme(){
+  const cs = getComputedStyle(document.documentElement), v = {};
+  _CS_VARS.forEach(k=>{ const x = cs.getPropertyValue(k).trim(); if (x) v[k] = x; });
+  return v;
+}
+// Theme variables + a transparent, theme-coloured body, placed BEFORE the model's own
+// markup so anything the model writes overrides it.
+function _csBaseStyle(rec){
+  const v = _csTheme(), cs = getComputedStyle(document.documentElement);
+  let css = ":root{" + Object.keys(v).map(k=>k + ":" + v[k]).join(";") + ";";
+  const scheme = (cs.colorScheme || "").trim();   // must match the parent or the iframe paints an opaque canvas
+  if (scheme && scheme !== "normal") css += "color-scheme:" + scheme + ";";
+  css += "}html,body{background:transparent;}body{margin:0;padding:" + (rec.frame === false ? "4px 0" : "14px 16px") +
+         ";box-sizing:border-box;color:var(--text);font:var(--chat-fs,15px)/1.5 system-ui,-apple-system,'Segoe UI',sans-serif;}";
+  return "<sty" + "le id='midum-chat-base'>" + css + "</sty" + "le>";
+}
+function _csSrcdoc(code, rec){
+  const inj = _csBaseStyle(rec) + _CS_BRIDGE;
+  code = code || "";
+  let m = /<head(?:\s[^>]*)?>/i.exec(code);
+  if (m) return code.slice(0, m.index + m[0].length) + inj + code.slice(m.index + m[0].length);
+  m = /<html(?:\s[^>]*)?>/i.exec(code);
+  if (m) return code.slice(0, m.index + m[0].length) + "<head>" + inj + "</head>" + code.slice(m.index + m[0].length);
+  m = /^\s*<!doctype[^>]*>/i.exec(code);
+  if (m) return m[0] + "<head>" + inj + "</head>" + code.slice(m[0].length);
+  // NOTE: never write a literal closing body tag in this page's JS -- _HTML.replace() near the end of this file splices the Steps UI
+  // in before the FIRST one in the whole page, which would land inside this string. Hence the split literal below.
+  return "<!DOCTYPE html><html><head>" + inj + "</head><body>" + code + "</bo" + "dy></html>";
+}
+function _csApply(row, rec, keepHeight){
+  const box = row.querySelector(".chat-surface"), f = row.querySelector(".chat-surface-frame");
+  row._csRec = rec;
+  box.classList.toggle("framed", rec.frame !== false);
+  box.style.background = rec.background || "";
+  f.dataset.fixed = rec.height ? "1" : "";
+  f.dataset.max = String(rec.max_height || 640);
+  if (rec.height) f.style.height = rec.height + "px";
+  else if (!keepHeight) f.style.height = "80px";
+  f.srcdoc = _csSrcdoc(rec.code, rec);
+}
+function buildChatSurfaceRow(rec){
+  const row = document.createElement("div");
+  row.className = "row chat-surface-row";
+  row.dataset.surfaceId = rec.id;
+  row.innerHTML = '<div class="chat-surface"><button type="button" class="chat-surface-x" title="Dismiss">&times;</button>' +
+                  '<iframe class="chat-surface-frame" sandbox="allow-scripts allow-forms allow-popups allow-modals"></iframe></div>';
+  _csApply(row, rec, false);
+  row.querySelector(".chat-surface-x").onclick = ()=>_csDismiss(row);
+  return row;
+}
+function _csDismiss(row){
+  const id = row.dataset.surfaceId;
+  row.remove();
+  try { api("chat_surface_manual_close", id).catch(()=>{}); } catch(e){}
+}
+function _csFindRow(id){
+  const rows = chatCol().querySelectorAll(".chat-surface-row");
+  for (const r of rows){ if (r.dataset.surfaceId === id) return r; }
+  return null;
+}
+function csShow(rec){
+  closeToolGroup();          // the block sits after the "Ran N tools" pill, not inside it
+  _currentMidumRow = null;   // later say() text starts a fresh bubble BELOW the block
+  chatCol().appendChild(buildChatSurfaceRow(rec));
+  scrollToBottom();
+}
+function csReplace(rec){ const row = _csFindRow(rec.id); if (row) _csApply(row, rec, true); else csShow(rec); }
+function csUpdate(p){ const row = _csFindRow(p.id); if (row) _csApply(row, Object.assign({}, row._csRec, {code: p.code}), true); }
+function csClose(id){ const row = _csFindRow(id); if (row) row.remove(); }
+function _csSetHeight(f, h){
+  if (f.dataset.fixed) return;
+  const target = Math.max(40, Math.min(parseInt(f.dataset.max || "640", 10), Math.ceil(h)));
+  if (parseInt(f.style.height, 10) === target) return;
+  const sc = document.getElementById("chat-scroll");
+  const stick = !!sc && (sc.scrollHeight - sc.scrollTop - sc.clientHeight < 120);
+  f.style.height = target + "px";
+  if (stick){ scrollToBottom(); setTimeout(scrollToBottom, 220); }
+}
+window.addEventListener("message", (e)=>{
+  const col = chatCol(); if (!col) return;
+  let f = null;
+  for (const x of col.querySelectorAll(".chat-surface-frame")){ if (x.contentWindow === e.source){ f = x; break; } }
+  if (!f) return;   // not one of ours (other listeners handle their own frames)
+  const row = f.closest(".chat-surface-row"), id = row.dataset.surfaceId, d = e.data;
+  if (d && d.__midum_call === true){
+    api("chat_surface_call_tool", d.tool, d.args || {})
+      .then((result)=>{ f.contentWindow.postMessage({__midum_call_result: true, id: d.id, result: result}, "*"); })
+      .catch((err)=>{ f.contentWindow.postMessage({__midum_call_result: true, id: d.id, error: String(err && err.message || err)}, "*"); });
+    return;
+  }
+  if (d && d.__midum_close === true){ _csDismiss(row); return; }
+  if (d && typeof d.__midum_height === "number"){ _csSetHeight(f, d.__midum_height); return; }
+  api("chat_surface_submit", id, d);   // free-form input -> a new chat turn
+});
+let _csThemeT = null;
+new MutationObserver(()=>{ clearTimeout(_csThemeT); _csThemeT = setTimeout(()=>{
+  const v = _csTheme();
+  document.querySelectorAll(".chat-surface-frame").forEach(f=>{ try { f.contentWindow.postMessage({__midum_theme: v}, "*"); } catch(e){} });
+}, 250); }).observe(document.documentElement, {attributes: true, attributeFilter: ["class","style","data-theme"]});
+
 
 // ── Top bar build --------------------------------------------------------
 function buildTabbar(){
@@ -9517,7 +10723,17 @@ function buildTabbar(){
     b.className = "tab-btn" + (name === "Chat" ? " active" : "");
     b.dataset.name = name;
     b.innerHTML = `<span>${iconHtml(icon)}</span><span>${name}</span>`;
-    b.onclick = ()=>switchTab(name);
+    if (name === "MidumDocs"){
+      // Not a pane switch: clicking opens a new unsaved MidumDoc in the MidumDocs pane; the caret lists existing ones.
+      b.innerHTML += `<span class="tab-caret" role="button" title="Open an existing MidumDoc">${iconHtml("chevron-down")}</span>`;
+      b.title = "New MidumDoc";
+      b.onclick = (e)=>{
+        if (e.target.closest(".tab-caret")){ e.stopPropagation(); mdTabMenuToggle(b); return; }
+        mdTabMenuClose(); mdTabNew();
+      };
+    } else {
+      b.onclick = ()=>switchTab(name);
+    }
     bar.appendChild(b);
   });
   requestAnimationFrame(positionTabHighlight);
@@ -9549,10 +10765,12 @@ async function buildConversationTabs(){
   if (!bar) return;
   let tabs = [];
   try{ tabs = await api("list_conversation_tabs"); }catch(e){ return; }
+  const _actRow = tabs.find(t=>t.active);
+  if (_actRow) state.activeTabId = _actRow.id;
   bar.querySelectorAll(".conv-tab").forEach(e=>e.remove());
   tabs.forEach(t=>{
     const el = document.createElement("div");
-    el.className = "conv-tab" + (t.active ? " active" : "") + (t.kind === "agent" ? " agent" : "");
+    el.className = "conv-tab" + (t.active ? " active" : "") + (t.kind === "agent" ? " agent" : "") + (t.busy ? " busy" : "") + (t.attention ? " attention" : "");
     el.title = t.title;
     el.innerHTML = `<span class="conv-tab-title">${(t.kind === "agent" ? icon("bot") + " " : "")}${escapeHtml(t.title)}</span>` +
       (t.kind === "agent" ? "" : `<button class="conv-tab-close" title="Close tab">${icon("x")}</button>`);
@@ -9586,10 +10804,12 @@ function positionConvTabHighlight(){
 async function switchConvTab(tabId){
   const r = await api("switch_conversation_tab", tabId);
   if (!r.ok){ showAlert(r.error, "Error"); return; }
+  state.activeTabId = tabId;                 // from here on this tab's events are the live ones
   clearChat();
   renderHistoryWindow(r.display || []);
   applyKbState(r.kb_state);
   setViewingAgentTab(r.readonly ? (r.agent_name || "agent") : null);
+  if (!r.readonly) applyTabRuntime(r);       // spinner / status line / pending approvals of the tab now on screen
   await buildConversationTabs();
   refreshTitlebarInfo();
 }
@@ -9615,8 +10835,10 @@ function setViewingAgentTab(agentName){
 async function newConvTab(){
   const r = await api("new_conversation_tab");
   if (!r.ok){ showAlert(r.error, "Error"); return; }
+  if (r.tab_id) state.activeTabId = r.tab_id;
   clearChat();
   welcomeNewChat();
+  applyTabRuntime({});                       // a brand-new tab is idle, whatever the tab we left is doing
   applyKbState(r.kb_state);
   setViewingAgentTab(null);
   await buildConversationTabs();
@@ -9630,10 +10852,12 @@ async function closeConvTab(tabId){
     // The closed tab was the active one -- a different tab (or a freshly
     // reset version of the same tab, if it was the last one open) is now
     // showing, so the chat pane needs to catch up.
+    if (r.active_tab_id) state.activeTabId = r.active_tab_id;
     clearChat();
     renderHistoryWindow(r.display || []);
     applyKbState(r.kb_state);
     setViewingAgentTab(null);
+    applyTabRuntime(r);
   }
   await buildConversationTabs();
   refreshTitlebarInfo();
@@ -9694,9 +10918,11 @@ async function buildConvTabGroupMenu(){
       closeConvTabGroupMenu();
       const r = await api("open_conversation_tab_group", g.name);
       if (!r.ok){ showAlert(r.error, "Error"); return; }
+      if (r.active_tab_id) state.activeTabId = r.active_tab_id;
       clearChat();
       renderHistoryWindow(r.display || []);
       applyKbState(r.kb_state);
+      applyTabRuntime(r);
       await buildConversationTabs();
       refreshTitlebarInfo();
     };
@@ -10315,6 +11541,12 @@ function buildStaticRow(tag, text, extra){
   } else if (tag === "error"){
     row.className = "row error";
     row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+  } else if (tag === "stepdone"){
+    row.className = "row interjection stepdone";
+    row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+  } else if (tag === "steps"){
+    row.className = "row steps-row";
+    row.appendChild(StepsUI.card(text));
   } else if (tag === "toolcall"){
     let data;
     try { data = JSON.parse(text); } catch(e){ data = {name: "", args: {}, result: text}; }
@@ -10338,6 +11570,12 @@ function buildStaticRow(tag, text, extra){
       row.classList.toggle("open");
     };
     wireRowCopyBtn(row);
+  } else if (tag === "chatsurface"){
+    let rec = null;
+    try { rec = JSON.parse(text); } catch(e){}
+    if (rec && !rec.closed) return buildChatSurfaceRow(rec);
+    row.className = "row";
+    row.hidden = true;   // dismissed/closed block: keep the slot, draw nothing
   } else {
     row.className = "row";
     row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
@@ -10353,7 +11591,13 @@ function buildTurnBlock(turnIndex){
   // group (same grouping the live view does) -- any other row (say/reply,
   // system, error, ...) closes it, so the next tool call starts a new group.
   let group = null;
+  let heldSurfaces = [];   // a chatsurface record precedes its show_chat_surface pill in the log; live view shows pill THEN block, so hold them back
+  const flushSurfaces = ()=>{ heldSurfaces.forEach(r=>wrap.appendChild(r)); heldSurfaces = []; };
   _histTurns[turnIndex].forEach(([tag, text, extra])=>{
+    if (tag === "chatsurface"){
+      heldSurfaces.push(buildStaticRow(tag, text, extra));
+      return;
+    }
     if (tag === "toolcall"){
       let data;
       try { data = JSON.parse(text); } catch(e){ data = {name: "", args: {}, result: text}; }
@@ -10364,9 +11608,11 @@ function buildTurnBlock(turnIndex){
       _tgAdd(group, tc);
     } else {
       group = null;
+      flushSurfaces();
       wrap.appendChild(buildStaticRow(tag, text, extra));
     }
   });
+  flushSurfaces();
   return wrap;
 }
 
@@ -10970,6 +12216,17 @@ function appendRow(tag, text, extra){
     _tgAdd(_tgLiveGroup(), tc);
     scrollToBottom();
     return;
+  } else if (tag === "stepdone"){
+    row.className = "row interjection stepdone";
+    row.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+  } else if (tag === "steps"){
+    row.className = "row steps-row";
+    row.appendChild(StepsUI.card(text));
+  } else if (tag === "chatsurface"){
+    let rec = null;
+    try { rec = JSON.parse(text); } catch(e){}
+    if (rec && !rec.closed){ closeToolGroup(); _currentMidumRow = null; chatCol().appendChild(buildChatSurfaceRow(rec)); scrollToBottom(); }
+    return;
   } else if (tag === "toolcall"){
     // Persisted, already-resolved tool-call record (see Api._handle_tool_call):
     // call + result are both known up front, so it's added as a finished pill
@@ -11037,6 +12294,10 @@ function rowPlainText(row){
     if (callText) out += `\n${callText}`;
     if (resultText) out += `\n-> ${resultText}`;
     return out;
+  }
+  if (row.classList.contains("chat-surface-row")){
+    const r = row._csRec;
+    return "[Chat Surface" + (r && r.title ? ": " + r.title : "") + "]";
   }
   if (row.classList.contains("system")){
     const b = row.querySelector(".bubble");
@@ -11243,6 +12504,7 @@ function clearChat(){
   _histActive   = false;
   // The prompt box's attachment chips belong to the chat being shown -- reload them for it.
   try { attRestoreForTab().catch(()=>{}); } catch (e) {}
+  try { draftSwap(); } catch (e) {}                 // ...and so does its unsent text (per-chat prompt draft)
 }
 
 // ── New-chat welcome screen ------------------------------------------------
@@ -11726,9 +12988,11 @@ else initAttachments();
 
 async function sendMessage(){
   const input = document.getElementById("msg-input");
-  const text = input.value.trim();
+  let text = input.value.trim();
   const pendingAtt = ATT.items.filter(c=>c.status === "ready" && c.id);
-  if (!text && !pendingAtt.length) return;
+  const _stepsReady = !!(window.StepsUI && window.StepsUI.hasPending() && !state.thinking);
+  if (!text && !pendingAtt.length && !_stepsReady) return;
+  if (!text && _stepsReady && !pendingAtt.length) text = window.StepsUI.defaultPrompt();
   if (ATT.items.some(c=>c.status === "transferring")){
     showAlert("Your files are still being read -- one moment, then send again.", "Attachments");
     return;
@@ -11758,6 +13022,7 @@ async function sendMessage(){
   input.value = "";
   autosizeMsgInput();
   clearOldTurnButtons();   // this message supersedes whatever turn had them
+  if (window.StepsUI) window.StepsUI.onSend();
   const attIds = pendingAtt.map(c=>c.id);
   const attPublic = pendingAtt.map(c=>({id: c.id, name: c.name, mime: c.mime, size: c.size, kind: c.kind}));
   attClear();
@@ -11779,6 +13044,9 @@ async function sendMessage(){
 
 function setStatus(text, level){
   document.getElementById("status-label").textContent = text;
+  // While Midum is mid-task the composer stays usable (Enter sends an interjection), so say so in the placeholder.
+  const _mi = document.getElementById("msg-input");
+  if (_mi && !_mi.disabled) _mi.placeholder = (level === "busy") ? "Midum is working \u2014 type to interject..." : "Message Midum...";
   const row = document.getElementById("status-row");
   row.classList.remove("status-ok", "status-busy", "status-err");
   if (level) row.classList.add("status-" + level);
@@ -11859,7 +13127,7 @@ async function renderKbSourcesList(){
   const list = document.getElementById("kb-sources-list");
   const files = await api("list_pdf_sources");
   if (!files.length){
-    list.innerHTML = `<div style="font-size:10px;color:var(--subtext);">No PDF sources yet — add one from the Knowledge tab first.</div>`;
+    list.innerHTML = `<div style="font-size:10px;color:var(--subtext);">No PDF sources yet — add one from the Library tab (Knowledge) first.</div>`;
     state.kbSources = [];
     updateKbOnlyBadge();
     return;
@@ -11902,6 +13170,57 @@ function applyKbState(kbState){
   if (state.kbOnly) renderKbSourcesList(); else updateKbOnlyBadge();
 }
 
+// ── Prompt-box popup: Models (Normal / Voice) + Source tabs ────────────────────────────────────────
+// The Models tab hosts the former Model tab (buildModelPane) and the former Voice tab
+// (buildVoicePane, minus push-to-talk which moved to Settings). Both are mounted when the
+// popup opens and torn down when it closes, because those builders address their fields by
+// id and a stale copy would shadow the live one. The Source tab is the old KB Only content,
+// which stays in the DOM permanently (its logic below keys off those ids).
+function kbpIsOpen(){ const p = document.getElementById("kb-popover"); return !!(p && p.classList.contains("open")); }
+function kbpSetTab(tab){
+  state.kbpTab = (tab === "source") ? "source" : "models";
+  document.querySelectorAll("#kbp-tabs button").forEach(b=>b.classList.toggle("active", b.dataset.kbp === state.kbpTab));
+  document.getElementById("kbp-pane-models").style.display = state.kbpTab === "models" ? "" : "none";
+  document.getElementById("kbp-pane-source").style.display = state.kbpTab === "source" ? "" : "none";
+  if (state.kbpTab === "source") renderKbSourcesList();
+}
+function kbpSetModelKind(kind){
+  state.kbpKind = (kind === "voice") ? "voice" : "normal";
+  document.querySelectorAll("#kbp-model-kind button").forEach(b=>b.classList.toggle("active", b.dataset.kind === state.kbpKind));
+  document.getElementById("kbp-normal").style.display = state.kbpKind === "normal" ? "" : "none";
+  document.getElementById("kbp-voice").style.display  = state.kbpKind === "voice"  ? "" : "none";
+}
+function kbpMountModels(){
+  // The docked (IDE sidebar) model popup builds the same panes by id -- close it first.
+  try { if (typeof mzIcModelClose === "function") mzIcModelClose(); } catch (e) {}
+  const n = document.getElementById("kbp-normal"), v = document.getElementById("kbp-voice");
+  n.innerHTML = ""; v.innerHTML = "";
+  n.style.display = "flex"; n.style.flexDirection = "column";
+  v.style.display = "flex"; v.style.flexDirection = "column";
+  buildModelPane(n);
+  buildVoicePane(v);
+  kbpSetModelKind(state.kbpKind || "normal");
+  if (state.kbpKind !== "voice") v.style.display = "none"; else n.style.display = "none";
+}
+function kbpUnmountModels(){
+  const n = document.getElementById("kbp-normal"), v = document.getElementById("kbp-voice");
+  if (n) n.innerHTML = "";
+  if (v) v.innerHTML = "";
+}
+function kbpOpen(tab){
+  const pop = document.getElementById("kb-popover");
+  try { if (typeof mzIcHistClose === "function") mzIcHistClose(); } catch (e) {}
+  pop.classList.add("open");
+  kbpMountModels();
+  kbpSetTab(tab || state.kbpTab || "models");
+}
+function kbpClose(){
+  const pop = document.getElementById("kb-popover");
+  if (!pop) return;
+  pop.classList.remove("open");
+  kbpUnmountModels();
+}
+
 function initKbOnlyControls(){
   const toggleBtn = document.getElementById("kb-toggle-btn");
   const popover = document.getElementById("kb-popover");
@@ -11909,14 +13228,22 @@ function initKbOnlyControls(){
 
   toggleBtn.onclick = (e)=>{
     e.stopPropagation();
-    popover.classList.toggle("open");
-    if (popover.classList.contains("open")) renderKbSourcesList();
+    if (kbpIsOpen()) kbpClose(); else kbpOpen();
   };
-  document.addEventListener("click", (e)=>{
-    if (popover.classList.contains("open") && !popover.contains(e.target) && e.target !== toggleBtn){
-      popover.classList.remove("open");
-    }
+  document.querySelectorAll("#kbp-tabs button").forEach(b=>{
+    b.onclick = (e)=>{ e.stopPropagation(); kbpSetTab(b.dataset.kbp); };
   });
+  document.querySelectorAll("#kbp-model-kind button").forEach(b=>{
+    b.onclick = (e)=>{ e.stopPropagation(); kbpSetModelKind(b.dataset.kind); };
+  });
+  // composedPath() is captured at dispatch time, so clicks on controls that get re-rendered
+  // inside the popup (tab switches, dropdown picks) don't count as "outside" clicks.
+  document.addEventListener("click", (e)=>{
+    if (!kbpIsOpen()) return;
+    const path = e.composedPath ? e.composedPath() : [];
+    if (!path.includes(popover) && !path.includes(toggleBtn)) kbpClose();
+  });
+  document.addEventListener("keydown", (e)=>{ if (e.key === "Escape" && kbpIsOpen()) kbpClose(); });
   onlyCheckbox.onchange = ()=>{
     state.kbOnly = onlyCheckbox.checked;
     if (state.kbOnly) renderKbSourcesList(); else updateKbOnlyBadge();
@@ -11988,8 +13315,35 @@ function initKbOnlyControls(){
 }
 
 // ── Event bridge from Python (async pushes) -----------------------------
+// ── Concurrent tabs: event routing ───────────────────────────────────────────────────────────
+// Several tabs can be working at once. Python tags every event with the tab that produced it; only the tab
+// on screen draws into the chat pane. Everything a background tab does is also appended to its own display
+// log, which is re-rendered when you switch to it, so nothing is lost by dropping the live event here.
+const MZ_TAB_SCOPED_KINDS = new Set(["reply","say","system_line","error_line","tool_line","tool_call","tool_start","turn_ready",
+  "ask","status","done","steps_summary","chat_surface_show","chat_surface_replace","chat_surface_update","chat_surface_close",
+  "render_surface_open","render_surface_update","render_surface_close"]);
+let _mzStripTimer = 0;
+function mzTabStripRefreshSoon(){
+  if (_mzStripTimer) return;
+  _mzStripTimer = setTimeout(()=>{ _mzStripTimer = 0; try { buildConversationTabs(); } catch (e) {} }, 250);
+}
+// What a tab needs when it becomes the one on screen: its busy state, status line and any approval / question
+// cards it is waiting on (those were dropped as events while it was in the background).
+function applyTabRuntime(r){
+  const busy = !!(r && r.busy);
+  state.thinking = busy;
+  try { _mdBusy(busy); } catch (e) {}
+  try { setActiveToolDot(null); } catch (e) {}
+  const st = (r && r.status) || {text: "Ready", level: "ok"};
+  setStatus(st.text || "Ready", st.level || "ok");
+  if (r && Array.isArray(r.asks)) r.asks.forEach(a=>{ try { appendAsk(a.id, a.kind, a.payload); } catch (e) {} });
+}
 window.__midumEvent = function(evt){
   const {kind, payload} = evt;
+  if (evt.tab && state.activeTabId && evt.tab !== state.activeTabId && MZ_TAB_SCOPED_KINDS.has(kind)){
+    if (kind === "status" || kind === "done" || kind === "ask") mzTabStripRefreshSoon();   // busy / attention dots
+    return;
+  }
   if (kind === "status"){ setStatus(payload.text, payload.level); if (payload.text === "Ready") buildConversationTabs(); }
   else if (kind === "tabs_restored"){
     clearChat();
@@ -12054,11 +13408,20 @@ window.__midumEvent = function(evt){
   else if (kind === "render_surface_open"){ openRenderSurface(payload.code, payload.title); }
   else if (kind === "render_surface_update"){ updateRenderSurfaceCode(payload.code); }
   else if (kind === "render_surface_close"){ closeRenderSurfaceUI(); }
+  else if (kind === "chat_surface_show"){ csShow(payload); }
+  else if (kind === "chat_surface_replace"){ csReplace(payload); }
+  else if (kind === "chat_surface_update"){ csUpdate(payload); }
+  else if (kind === "chat_surface_close"){ csClose(payload.id); }
   else if (kind === "dynamic_background_set"){ applyDynamicBackground(payload.code, payload); }
   else if (kind === "dynamic_background_clear"){ clearDynamicBackground(); }
   else if (kind === "midumdocs_open"){ openMidumDoc(payload); }
   else if (kind === "midumdocs_changed"){ updateMidumDoc(payload); }
   else if (kind === "midumdocs_close"){ closeMidumDocUI(); }
+  else if (kind === "chats_changed"){
+    // Auto-delete just removed old chats in the background; refresh anything that lists them.
+    if (typeof refreshHistory === "function") refreshHistory();
+    if (typeof refreshChatsPage === "function") refreshChatsPage();
+  }
   else if (kind === "chat_title_updated"){
     // A background model call (see Api._apply_generated_title in
     // gui/app.py) finished naming this chat after the truncated fallback
@@ -12449,32 +13812,30 @@ function buildSidebar(){
   const el = document.getElementById("sidebar-inner");
   el.innerHTML = `
     <div id="sidebar-main-view">
-      <button class="ghost-btn" id="sidebar-surfaces-btn" style="width:100%;text-align:left;">${icon("image")} Render Surfaces</button>
-      <button class="ghost-btn" id="sidebar-dynbg-btn" style="width:100%;text-align:left;margin-top:6px;">${icon("sparkles")} Dynamic Backgrounds</button>
-      <div class="divider"></div>
-      <div class="hdr-row">
-        <div class="section-label">WORKSPACE</div>
-        <button class="icon-btn" style="width:26px;height:26px;font-size:11px;" id="sidebar-close">${icon("x")}</button>
+      <button class="sb-new" id="new-session-btn">${icon("plus")}<span>New chat</span></button>
+      <div class="sb-nav">
+        <button class="sb-nav-item" id="sidebar-surfaces-btn">${icon("image")}<span>Render Surfaces</span>${icon("chevron-right", "sb-chev")}</button>
+        <button class="sb-nav-item" id="sidebar-dynbg-btn">${icon("sparkles")}<span>Dynamic Backgrounds</span>${icon("chevron-right", "sb-chev")}</button>
       </div>
-      <button class="btn" id="new-session-btn">New Chat</button>
-      <select id="project-select"></select>
-      <div class="btn-row">
-        <button class="ghost-btn" id="proj-new">+ Project</button>
-        <button class="ghost-btn" id="proj-remove">${icon("trash")} Remove</button>
-        <button class="ghost-btn" id="proj-code">${icon("code")} Code</button>
+      <div class="sb-sec" id="sb-ws-sec">
+        <button class="sb-sec-h" id="sb-ws-toggle" title="Show / hide workspace"><span>WORKSPACE</span>${icon("chevron-down")}</button>
+        <div class="sb-sec-body">
+          <select id="project-select"></select>
+          <div class="sb-ws-actions">
+            <button class="ghost-btn" id="proj-new" title="Add a project folder">${icon("plus")}<span>Add</span></button>
+            <button class="ghost-btn" id="proj-remove" title="Remove this project from the list">${icon("trash")}<span>Remove</span></button>
+            <button class="ghost-btn" id="proj-code" title="Open in VS Code">${icon("code")}<span>Code</span></button>
+          </div>
+          <div id="file-list"></div>
+        </div>
       </div>
-      <div id="file-list"></div>
-      <div class="divider"></div>
-      <div class="section-label">CHAT HISTORY</div>
-      <div id="history-list"></div>
-      <div class="divider"></div>
-      <div class="hdr-row">
-        <div class="section-label">SETTINGS</div>
-        <button class="icon-btn" style="width:22px;height:22px;font-size:10px;" id="settings-toggle">${icon("settings")}</button>
+      <div class="sb-sec sb-hist">
+        <div class="sb-sec-h" style="cursor:default;"><span>CHAT HISTORY</span></div>
+        <div class="sb-search">${icon("search")}<input type="text" id="history-search" placeholder="Search chats" autocomplete="off" spellcheck="false"/></div>
+        <div id="history-list"></div>
       </div>
-      <div id="sidebar-footer">
-        <button class="ghost-btn" id="proj-term">${icon("terminal")} Terminal</button>
-        <button class="ghost-btn" id="shutdown-btn" style="color:var(--red);">${icon("power")} Shutdown</button>
+      <div class="sb-foot">
+        <button class="sb-nav-item" id="settings-toggle">${icon("settings")}<span>Settings</span>${icon("chevron-right", "sb-chev")}</button>
       </div>
     </div>
     <div id="sidebar-settings-overlay" data-page="general">
@@ -12491,6 +13852,7 @@ function buildSidebar(){
         <button data-page="appearance">${icon("sparkles")}<span>Appearance</span></button>
         <button data-page="effects">${icon("image")}<span>Background &amp; Glass</span></button>
         <button data-page="models">${icon("bot")}<span>Models</span></button>
+        <button data-page="chats">${icon("clock")}<span>Chats</span></button>
        </div>
        <div class="st-content">
       <div class="st-card" data-page="general">
@@ -12499,6 +13861,13 @@ function buildSidebar(){
         <div class="btn-row" id="settings-panel-toggle">
           <button class="ghost-btn" data-panel="Log" style="flex:1;">${icon("file-text")} Logs</button>
           <button class="ghost-btn" data-panel="Parameters" style="flex:1;">${icon("settings")} Parameters</button>
+        </div>
+      </div>
+      <div class="st-card" data-page="general">
+        <div class="st-card-h"><div class="st-card-t">Setup guide</div></div>
+        <p class="st-note">Walk through setting up your Gemini API keys (Voice mode, AI inline code suggestions and File uploads need one) and start your first chat.</p>
+        <div class="btn-row">
+          <button class="ghost-btn" id="settings-onboarding-btn" style="flex:1;" onclick="window.midumOpenOnboardingFromSettings &amp;&amp; window.midumOpenOnboardingFromSettings()">${icon("sparkles")} Run setup guide</button>
         </div>
       </div>
       <div class="st-card" data-page="appearance">
@@ -12546,8 +13915,17 @@ function buildSidebar(){
           <label class="st-sw"><input type="checkbox" id="settings-glass-enabled"/> Enabled</label>
         </div>
         <div id="glass-hint" class="st-note">Needs ambient blobs or a background image turned on.</div>
-        <div class="st-slider"><span class="st-lbl">Glass opacity</span><input type="range" id="settings-glass-opacity" min="35" max="75" value="55"/></div>
-        <label class="st-sw"><input type="checkbox" id="settings-glass-sheen-enabled" checked/> Frosted highlight</label>
+        <div class="st-slider"><span class="st-lbl">Glass opacity</span><input type="range" id="settings-glass-opacity" min="0" max="75" value="0"/></div>
+        <label class="st-sw"><input type="checkbox" id="settings-glass-sheen-enabled"/> Frosted highlight</label>
+      </div>
+      <div class="st-card" data-page="general">
+        <div class="st-card-h"><div class="st-card-t">Push-to-talk keys</div>
+          <button class="ghost-btn" id="ptt-reset-btn" style="flex:0 0 auto;height:26px;font-size:11px;padding:0 12px;">Reset defaults</button>
+        </div>
+        <p class="st-note">Hold either key or mouse button to talk. Midum connects to Gemini Live on the first press if it isn't connected yet, then only mutes the mic (not the connection) on release. Works globally, even when Midum isn't the focused window.</p>
+        <div id="ptt-deps-warning" style="font-size:10px;color:var(--red);margin-bottom:6px;display:none;"></div>
+        <div id="ptt-slot-slot1" class="ptt-slot-row"></div>
+        <div id="ptt-slot-slot2" class="ptt-slot-row" style="margin-top:6px;"></div>
       </div>
       <div class="st-card" data-page="general">
         <div class="st-card-h"><div class="st-card-t">Ambient surfaces</div>
@@ -12560,8 +13938,8 @@ function buildSidebar(){
           <button class="ghost-btn" id="settings-chat-fs-reset" style="flex:0 0 auto;height:26px;font-size:11px;padding:0 12px;" title="Reset chat text size to default">Reset</button>
         </div>
         <div class="chat-fs-row">
-          <input type="range" id="settings-chat-fs" min="10" max="32" step="0.05" value="15" aria-label="Chat text size"/>
-          <input type="number" id="settings-chat-fs-num" min="10" max="32" step="0.05" value="15.00" aria-label="Chat text size in pixels"/>
+          <input type="range" id="settings-chat-fs" min="10" max="32" step="0.05" value="14.8" aria-label="Chat text size"/>
+          <input type="number" id="settings-chat-fs-num" min="10" max="32" step="0.05" value="14.80" aria-label="Chat text size in pixels"/>
           <span class="chat-fs-unit">px</span>
         </div>
         <p class="st-note">Main chat window only (messages, tool calls, code, prompt box). Drag, type an exact value, or use the arrow keys: 0.05 px per step, Shift = 1 px.</p>
@@ -12575,6 +13953,13 @@ function buildSidebar(){
         <input list="settings-model-list" id="settings-model" style="height:34px;border-radius:16px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 12px;"/>
         <datalist id="settings-model-list"></datalist>
       </div>
+      <div class="st-card" data-page="models">
+        <div class="st-card-h"><div class="st-card-t">API keys</div></div>
+        <p class="st-note">Paste a key and press Save &mdash; Midum writes it to your secrets file for you, no manual editing. Saved keys are never shown again, only a masked preview. Leave a field empty to keep what's saved.</p>
+        <div id="apikeys-list"></div>
+        <p class="st-status" id="apikeys-status"></p>
+        <p class="st-note" id="apikeys-path" style="word-break:break-all;"></p>
+      </div>
       <div class="st-card" data-page="appearance">
         <div class="st-card-h"><div class="st-card-t">Colours</div></div>
         <div class="st-colors">
@@ -12585,6 +13970,50 @@ function buildSidebar(){
           <label class="st-color"><input type="color" id="settings-color-text"/>Text</label>
           <label class="st-color"><input type="color" id="settings-color-user_msg"/>User bubble</label>
         </div>
+      </div>
+      <div class="st-card" data-page="chats">
+        <div class="st-card-h"><div class="st-card-t">Saved chats</div></div>
+        <div class="st-stats">
+          <div class="st-stat"><b id="chats-total">&ndash;</b><span>Total</span></div>
+          <div class="st-stat"><b id="chats-pinned">&ndash;</b><span>Pinned</span></div>
+          <div class="st-stat"><b id="chats-fav">&ndash;</b><span>Favorites</span></div>
+        </div>
+      </div>
+      <div class="st-card" data-page="chats">
+        <div class="st-card-h"><div class="st-card-t">Delete by date</div></div>
+        <p class="st-note">Permanently deletes saved chats whose last activity falls in this range. Leave one side empty for an open-ended range: only &ldquo;To&rdquo; removes everything up to and including that day. Pinned and favorited chats, and chats open in a tab, are always skipped.</p>
+        <div class="st-row2">
+          <div class="st-field"><div class="st-lbl">From</div><input type="date" class="st-in" id="chats-del-from"/></div>
+          <div class="st-field"><div class="st-lbl">To</div><input type="date" class="st-in" id="chats-del-to"/></div>
+        </div>
+        <button class="ghost-btn st-danger" id="chats-del-date-btn">${icon("trash")} Delete chats&hellip;</button>
+        <p class="st-status" id="chats-status-date"></p>
+      </div>
+      <div class="st-card" data-page="chats">
+        <div class="st-card-h"><div class="st-card-t">Delete by count</div></div>
+        <p class="st-note">Counts back from your most recent chat. You'll see exactly what will be deleted before anything is removed.</p>
+        <div class="st-row2">
+          <div class="st-field"><div class="st-lbl">Which chats</div>
+            <select class="st-in" id="chats-del-which">
+              <option value="newest">The most recent</option>
+              <option value="oldest">The oldest</option>
+              <option value="keep_newest">All except the most recent</option>
+            </select></div>
+          <div class="st-field"><div class="st-lbl">How many</div><input type="number" class="st-in" id="chats-del-count" min="1" step="1" value="10"/></div>
+        </div>
+        <button class="ghost-btn st-danger" id="chats-del-count-btn">${icon("trash")} Delete chats&hellip;</button>
+        <p class="st-status" id="chats-status-count"></p>
+      </div>
+      <div class="st-card" data-page="chats">
+        <div class="st-card-h"><div class="st-card-t">Auto-delete old chats</div>
+          <label class="st-sw"><input type="checkbox" id="chats-ad-enabled"/> Enabled</label>
+        </div>
+        <p class="st-note">Automatically delete chats that haven't been used for:</p>
+        <div class="st-inline">
+          <input type="number" class="st-in" id="chats-ad-amount" min="1" max="3650" step="1" value="30" aria-label="Amount"/>
+          <select class="st-in" id="chats-ad-unit" aria-label="Unit"><option value="days">days</option><option value="weeks">weeks</option><option value="months">months</option></select>
+        </div>
+        <p class="st-note">Checked at launch and every few hours while Midum is open, based on each chat's last activity (a month counts as 30 days). Pinned and favorited chats, and chats open in a tab, are never deleted. Applies when you press Save.</p>
       </div>
       <div class="st-card" data-page="appearance">
         <div class="st-card-h"><div class="st-card-t">Blob colours</div></div>
@@ -12605,7 +14034,19 @@ function buildSidebar(){
      </div>
     </div>
   `;
-  document.getElementById("sidebar-close").onclick = toggleSidebar;
+  // Collapsible Workspace card (remembered across launches) + live chat-history search.
+  (function(){
+    const sec = document.getElementById("sb-ws-sec"), tg = document.getElementById("sb-ws-toggle");
+    if (sec && tg){
+      try { if (localStorage.getItem("midum.sb.ws.collapsed") === "1") sec.classList.add("collapsed"); } catch (e) {}
+      tg.onclick = ()=>{
+        sec.classList.toggle("collapsed");
+        try { localStorage.setItem("midum.sb.ws.collapsed", sec.classList.contains("collapsed") ? "1" : "0"); } catch (e) {}
+      };
+    }
+    const hs = document.getElementById("history-search");
+    if (hs) hs.oninput = ()=>sbRenderHistory();
+  })();
   // ── Settings popup: move to <body>, nav between pages, close on Esc / click outside ──
   (function(){
     const ov = document.getElementById("sidebar-settings-overlay");
@@ -12615,8 +14056,12 @@ function buildSidebar(){
       ov.dataset.page = p;
       ov.querySelectorAll("#settings-nav button").forEach(b=>b.classList.toggle("active", b.dataset.page === p));
       const c = ov.querySelector(".st-content"); if (c) c.scrollTop = 0;
+      if (p === "chats" && typeof refreshChatsPage === "function") refreshChatsPage();
+      if (p === "models" && typeof refreshApiKeysCard === "function") refreshApiKeysCard();
     };
     ov.querySelectorAll("#settings-nav button").forEach(b=>{ b.onclick = ()=>setPage(b.dataset.page); });
+    const _bd = document.getElementById("chats-del-date-btn");  if (_bd) _bd.onclick = ()=>chatsBulkDelete("date");
+    const _bc = document.getElementById("chats-del-count-btn"); if (_bc) _bc.onclick = ()=>chatsBulkDelete("count");
     ov.addEventListener("mousedown", (e)=>{ if (e.target === ov) ov.classList.remove("open"); });
     if (!window.__stEscBound){
       window.__stEscBound = true;
@@ -12648,7 +14093,7 @@ function buildSidebar(){
   enhanceSelect(document.getElementById("settings-provider"));
   attachLitellmPicker({ providerSelId: "settings-provider", modelInputId: "settings-model", prefix: "st" });
   document.getElementById("new-session-btn").onclick = async ()=>{
-    await api("new_session"); clearChat(); welcomeNewChat(); applyKbState(null); refreshHistory(); refreshTitlebarInfo(); buildConversationTabs();
+    const _ns = await api("new_session"); if (_ns && _ns.tab_id) state.activeTabId = _ns.tab_id; clearChat(); welcomeNewChat(); applyTabRuntime({}); applyKbState(null); refreshHistory(); refreshTitlebarInfo(); buildConversationTabs();
   };
   document.getElementById("project-select").onchange = async (e)=>{
     const info = await api("switch_project", e.target.value);
@@ -12669,17 +14114,14 @@ function buildSidebar(){
     if (r.ok) populateProjects(r.projects);
   };
   document.getElementById("proj-code").onclick = ()=>api("open_project_in_vscode");
-  document.getElementById("proj-term").onclick = ()=>api("open_project_terminal");
-  document.getElementById("shutdown-btn").onclick = async ()=>{
-    const ok = await showConfirm("Shut down Midum engine?", "Shutdown", {danger:true, okLabel:"Shutdown"});
-    if (ok) await api("shutdown");
-  };
 
   document.getElementById("settings-toggle").onclick = ()=>{
     // Settings opens as a centered popup window (glass-styled like the Workbench IDE menus), with a
     // dim scrim behind it. Close with the X, Esc, or by clicking outside the window.
     document.getElementById("sidebar-settings-overlay").classList.add("open");
     loadSettingsPanel();
+    refreshPttHotkeys();
+    if (typeof refreshApiKeysCard === "function") refreshApiKeysCard();
   };
   document.getElementById("settings-back-btn").onclick = ()=>{
     document.getElementById("sidebar-settings-overlay").classList.remove("open");
@@ -12793,6 +14235,10 @@ function buildSidebar(){
   document.getElementById("settings-glass-sheen-enabled").onchange = (e)=>{
     applyGlassSheen(e.target.checked);
   };
+  document.getElementById("ptt-reset-btn").onclick = async ()=>{
+    await api("reset_ptt_hotkeys");
+    refreshPttHotkeys();
+  };
   document.getElementById("settings-ambient-hide-capture").onchange = (e)=>{
     applyAmbientHideCapture(e.target.checked);
     // Live-apply to any open widgets now; Save persists it for next launch.
@@ -12864,7 +14310,7 @@ let _activeTheme = "dark";
 // theme's own saved colors and blobs setting instead of always showing
 // the stock/shared values.
 let _themeColors = { dark: {...DEFAULT_COLORS}, light: {...DEFAULT_COLORS} };
-let _themeBlobsEnabled = { dark: true, light: true };
+let _themeBlobsEnabled = { dark: false, light: false };
 
 // Custom savable presets, on top of the base Dark/Light toggle. Each preset
 // is a full editable-color bundle (see DEFAULT_COLORS keys) plus which base
@@ -12958,6 +14404,7 @@ function applyTheme(name){
   const root = document.documentElement.style;
   Object.entries(vars).forEach(([k,v])=> root.setProperty(`--${k}`, v));
   _activeTheme = name;
+  document.documentElement.style.setProperty("--date-cs", name === "light" ? "light" : "dark");   // native date-picker colour scheme
   // Apply this theme's saved custom-color preset on top of its base palette.
   applyColors(_themeColors[name]);
   // Likewise restore this theme's own ambient-blobs preference.
@@ -13032,7 +14479,7 @@ function applyBgImage(cfg, dataUrl){
 // Ambient blobs on/off. `_blobLayerCtl` is set once initBlobLayer() runs
 // (see boot below) and exposes pause()/resume() so the wander/cursor loops
 // actually stop doing work while hidden, not just get display:none'd.
-let _blobsEnabled = true;
+let _blobsEnabled = false;
 let _blobLayerCtl = null;
 function applyBlobsEnabled(enabled){
   _blobsEnabled = !!enabled;
@@ -13089,9 +14536,10 @@ function applyLiquidGlass(enabled){
 // as applyColors()/applyTheme() above, not a filter, so dragging the
 // slider repaints instantly with nothing left for the browser to keep
 // recomputing afterward.
-let _glassOpacity = 55;
+let _glassOpacity = 0;
 function applyGlassOpacity(pct){
-  _glassOpacity = Math.min(75, Math.max(35, Math.round(Number(pct) || 55)));
+  const n = Number(pct);
+  _glassOpacity = Math.min(75, Math.max(0, Math.round(isFinite(n) ? n : 0)));
   document.documentElement.style.setProperty("--glass-pct", _glassOpacity + "%");
   const el = document.getElementById("settings-glass-opacity");
   if (el) el.value = _glassOpacity;
@@ -13101,7 +14549,7 @@ function applyGlassOpacity(pct){
 // property, --chat-fs, that only chat-pane CSS reads (see the "Chat text size
 // + readability" block), so nothing outside the chat window changes size.
 // Precision is 0.01 px; the slider/number box use 0.05 px steps.
-const CHAT_FS_DEFAULT = 15, CHAT_FS_MIN = 10, CHAT_FS_MAX = 32;
+const CHAT_FS_DEFAULT = 14.8, CHAT_FS_MIN = 10, CHAT_FS_MAX = 32;
 let _chatFontSize = CHAT_FS_DEFAULT;
 function clampChatFontSize(v){
   const n = Number(v);
@@ -13121,7 +14569,7 @@ function applyChatFontSize(px){
 // The frosted-highlight toggle (SETTINGS → "Frosted highlight" checkbox).
 // Just flips the html.glass-no-sheen class -- see that CSS rule for what
 // it zeroes out. On by default, independent of the opacity slider.
-let _glassSheenEnabled = true;
+let _glassSheenEnabled = false;
 function applyGlassSheen(enabled){
   _glassSheenEnabled = enabled !== false;
   document.documentElement.classList.toggle("glass-no-sheen", !_glassSheenEnabled);
@@ -13243,6 +14691,158 @@ function enhanceSelect(sel){
   syncTrigger();
 }
 
+// ── Settings → Chats: bulk delete + auto-delete ───────────────────────────────────────────────────────────
+let _adLoaded = null;   // the auto-delete rule as last loaded/saved, to tell whether Save actually changes it
+const _AD_UNIT_DAYS = {days:1, weeks:7, months:30};
+function _readAutoDeleteCfg(){
+  const en = document.getElementById("chats-ad-enabled"), am = document.getElementById("chats-ad-amount"), un = document.getElementById("chats-ad-unit");
+  let amount = parseInt(am ? am.value : "30", 10);
+  if (!(amount >= 1)) amount = 1;
+  return {enabled: !!(en && en.checked), amount: Math.min(amount, 3650), unit: un ? un.value : "days"};
+}
+function _adDays(c){ return (c.amount || 0) * (_AD_UNIT_DAYS[c.unit] || 1); }
+function _applyAutoDeleteCfg(c){
+  c = c || {enabled:false, amount:30, unit:"days"};
+  _adLoaded = {enabled: !!c.enabled, amount: c.amount || 30, unit: c.unit || "days"};
+  const en = document.getElementById("chats-ad-enabled"), am = document.getElementById("chats-ad-amount"), un = document.getElementById("chats-ad-unit");
+  if (en) en.checked = _adLoaded.enabled;
+  if (am) am.value = _adLoaded.amount;
+  if (un) un.value = _adLoaded.unit;
+}
+// ── Settings > Models > API keys ───────────────────────────────────────────────────────────────────────────────────
+// Rows come from Api.get_api_keys() (masked previews only). Save/clear go through
+// Api.save_api_keys(), which writes the secrets file and hot-reloads the providers
+// that cache their key at import time.
+async function saveApiKeys(updates){
+  const st = document.getElementById("apikeys-status");
+  if (st) st.textContent = "Saving…";
+  let r;
+  try { r = await api("save_api_keys", updates); }
+  catch(e){ r = {ok:false, error:String(e)}; }
+  if (!r || !r.ok){
+    if (st) st.textContent = (r && r.error) || "Failed to save.";
+    return false;
+  }
+  let msg = "Saved.";
+  if (r.needs_restart && r.needs_restart.length) msg += " Restart Midum to apply: " + r.needs_restart.join(", ") + ".";
+  else msg += " Active now.";
+  if (st) st.textContent = msg;
+  await refreshApiKeysCard(true);
+  return true;
+}
+
+async function refreshApiKeysCard(keepStatus){
+  const box = document.getElementById("apikeys-list");
+  if (!box) return;
+  const st = document.getElementById("apikeys-status");
+  let r;
+  try { r = await api("get_api_keys"); } catch(e){ return; }
+  r = r || {};
+  const pathEl = document.getElementById("apikeys-path");
+  if (pathEl) pathEl.textContent = r.path ? "Stored in: " + r.path : "";
+  if (st && !keepStatus) st.textContent = r.ok ? "" : (r.error || "Could not read the secrets file.");
+  const typed = {};
+  box.querySelectorAll("input[data-key]").forEach(i=>{ if (i.value) typed[i.dataset.key] = i.value; });
+  box.innerHTML = "";
+  let lastGroup = null;
+  (r.fields || []).forEach(f=>{
+    if (f.group !== lastGroup){
+      lastGroup = f.group;
+      const h = document.createElement("div");
+      h.className = "st-lbl"; h.style.marginTop = "10px"; h.textContent = f.group;
+      box.appendChild(h);
+    }
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:6px;align-items:center;margin-top:4px;";
+    const lab = document.createElement("div");
+    lab.style.cssText = "flex:0 0 36%;font-size:11px;color:var(--subtext);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+    lab.textContent = f.label;
+    lab.title = f.label + (f.url ? " — get one at " + f.url : "");
+    const inp = document.createElement("input");
+    inp.type = "password"; inp.className = "st-in"; inp.dataset.key = f.key;
+    inp.autocomplete = "off"; inp.spellcheck = false;
+    inp.placeholder = f.has_value ? ("Saved " + f.masked + " — paste to replace") : "Paste key";
+    if (typed[f.key]) inp.value = typed[f.key];
+    const doSave = ()=>{
+      const v = inp.value.trim();
+      if (!v){ if (st) st.textContent = "Paste a value first."; return; }
+      saveApiKeys({[f.key]: v});
+    };
+    inp.onkeydown = (e)=>{ if (e.key === "Enter"){ e.preventDefault(); doSave(); } };
+    const sv = document.createElement("button");
+    sv.className = "ghost-btn"; sv.textContent = "Save";
+    sv.style.cssText = "flex:0 0 auto;height:30px;font-size:11px;padding:0 12px;";
+    sv.onclick = doSave;
+    row.appendChild(lab); row.appendChild(inp); row.appendChild(sv);
+    if (f.has_value){
+      const cl = document.createElement("button");
+      cl.className = "ghost-btn"; cl.textContent = "✕"; cl.title = "Remove saved key";
+      cl.style.cssText = "flex:0 0 auto;height:30px;font-size:11px;padding:0 10px;";
+      let armed = false;
+      cl.onclick = ()=>{
+        if (!armed){
+          armed = true; cl.textContent = "Sure?";
+          setTimeout(()=>{ armed = false; cl.textContent = "✕"; }, 3000);
+          return;
+        }
+        saveApiKeys({[f.key]: ""});
+      };
+      row.appendChild(cl);
+    }
+    box.appendChild(row);
+  });
+}
+
+// Fills the Saved-chats summary card. Pass the list you already have to skip a disk read (the sidebar does).
+async function refreshChatsPage(list){
+  const set = (id, v)=>{ const el = document.getElementById(id); if (el) el.textContent = v; };
+  try {
+    if (!Array.isArray(list)) list = await api("list_chats");
+    set("chats-total", list.length);
+    set("chats-pinned", list.filter(c=>c.pinned).length);
+    set("chats-fav", list.filter(c=>c.favorite).length);
+  } catch (e) {
+    ["chats-total", "chats-pinned", "chats-fav"].forEach(id=>set(id, "–"));
+  }
+}
+async function chatsBulkDelete(mode){
+  const st = document.getElementById(mode === "date" ? "chats-status-date" : "chats-status-count");
+  const say = (t)=>{ if (st) st.textContent = t || ""; };
+  let params;
+  if (mode === "date"){
+    const from = document.getElementById("chats-del-from").value, to = document.getElementById("chats-del-to").value;
+    if (!from && !to){ say("Pick at least one date."); return; }
+    if (from && to && from > to){ say("'From' must be on or before 'To'."); return; }
+    params = {from, to};
+  } else {
+    const n = parseInt(document.getElementById("chats-del-count").value, 10);
+    if (!(n >= 1)){ say("Enter a count of 1 or more."); return; }
+    params = {count: n, which: document.getElementById("chats-del-which").value};
+  }
+  say("Checking…");
+  let p;
+  try { p = await api("bulk_delete_chats", mode, params, true); } catch (e){ say(`Error: ${e}`); return; }
+  if (!p || !p.ok){ say(p && p.error ? p.error : "Something went wrong."); return; }
+  const _skips = [];
+  if (p.skipped_open) _skips.push(`${p.skipped_open} open in a tab`);
+  if (p.skipped_kept) _skips.push(`${p.skipped_kept} pinned or favorited`);
+  const skipTxt = _skips.join(" and ");
+  if (!p.count){ say(skipTxt ? `Nothing to delete (skipped: ${skipTxt}).` : "No saved chats match."); return; }
+  const more = p.more ? `\n…and ${p.more} more` : "";
+  const skip = skipTxt ? `\n\nKept safe and skipped: ${skipTxt}.` : "";
+  const ok = await showConfirm(
+    `Permanently delete ${p.count} saved chat${p.count === 1 ? "" : "s"}?\n\n${p.samples.map(s=>"• " + s).join("\n")}${more}${skip}\n\nThis can't be undone.`,
+    "Delete chats", {danger: true, okLabel: `Delete ${p.count}`});
+  if (!ok){ say(""); return; }
+  say("Deleting…");
+  let r;
+  try { r = await api("bulk_delete_chats", mode, params, false); } catch (e){ say(`Error: ${e}`); return; }
+  if (!r || !r.ok){ say(r && r.error ? r.error : "Something went wrong."); return; }
+  say(`Deleted ${r.deleted} chat${r.deleted === 1 ? "" : "s"}.`);
+  refreshChatsPage();
+  if (typeof refreshHistory === "function") refreshHistory();
+}
+
 async function loadSettingsPanel(){
   const s = await api("get_settings");
   // Populate the per-theme color + blobs caches BEFORE applying the theme,
@@ -13267,6 +14867,7 @@ async function loadSettingsPanel(){
   applyGlassSheen(s.liquid_glass_sheen_enabled !== false);
   applyChatFontSize(s.chat_font_size);
   applyAmbientHideCapture(s.ambient_hide_from_capture !== false);
+  _applyAutoDeleteCfg(s.chat_auto_delete);
   const blobsIndiv = s.blobs_individual || {};
   ["center","a","b","cursor"].forEach(key=>{
     applyBlobIndividual(key, blobsIndiv[key] !== false);
@@ -13306,7 +14907,21 @@ async function saveSettingsPanel(){
   _themeColors[_activeTheme] = colors;
   _themeBlobsEnabled[_activeTheme] = document.getElementById("settings-blobs-enabled").checked;
   const blobs_individual = {..._blobIndividualEnabled};
+  // Turning auto-delete on (or shortening its age) deletes old chats immediately on Save, so say how many first.
+  const chat_auto_delete = _readAutoDeleteCfg();
+  const _stEl = document.getElementById("settings-status");
+  if (chat_auto_delete.enabled && (!_adLoaded || !_adLoaded.enabled || _adDays(chat_auto_delete) < _adDays(_adLoaded))){
+    let pv = null;
+    try { pv = await api("bulk_delete_chats", "older_than", {days: _adDays(chat_auto_delete)}, true); } catch (e){ pv = null; }
+    if (pv && pv.ok && pv.count > 0){
+      const ok = await showConfirm(
+        `Auto-delete will remove ${pv.count} saved chat${pv.count === 1 ? "" : "s"} not used for ${chat_auto_delete.amount} ${chat_auto_delete.unit} as soon as you save.\n\nThis can't be undone.`,
+        "Turn on auto-delete?", {danger: true, okLabel: "Save and delete"});
+      if (!ok){ if (_stEl) _stEl.textContent = "Not saved — auto-delete was cancelled."; return; }
+    }
+  }
   const r = await api("save_settings", {
+    chat_auto_delete,
     provider, model, theme: _activeTheme,
     colors_dark: _themeColors.dark, colors_light: _themeColors.light,
     blobs_enabled_dark: _themeBlobsEnabled.dark, blobs_enabled_light: _themeBlobsEnabled.light,
@@ -13333,6 +14948,12 @@ async function saveSettingsPanel(){
     applyChatFontSize(r.settings.chat_font_size);
     applyAmbientHideCapture(r.settings.ambient_hide_from_capture !== false);
     if (status) status.textContent = "Saved — will be remembered next launch.";
+    _applyAutoDeleteCfg(r.settings.chat_auto_delete);
+    if (r.auto_deleted > 0){
+      if (status) status.textContent = `Saved — auto-deleted ${r.auto_deleted} old chat${r.auto_deleted === 1 ? "" : "s"}.`;
+      refreshChatsPage();
+      if (typeof refreshHistory === "function") refreshHistory();
+    }
   } else if (status) {
     status.textContent = `Error: ${r.error}`;
   }
@@ -13363,67 +14984,164 @@ function populateProjects(list, selectPath){
 function renderFileList(info){
   const box = document.getElementById("file-list");
   if (!box || !info) return;
-  let out = `${icon("folder")} ${escapeHtml(info.root)}\n`;
-  (info.files||[]).forEach(f=>{ out += `  ${icon(f.dir ? "folder" : "file")} ${escapeHtml(f.name)}\n`; });
+  const rootName = String(info.root || "").split(/[\\/]/).filter(Boolean).pop() || String(info.root || "");
+  let out = `<div class="sb-file sb-file-root" title="${escapeHtml(info.root || "")}">${icon("folder")}<span>${escapeHtml(rootName)}</span></div>`;
+  (info.files||[]).forEach(f=>{ out += `<div class="sb-file">${icon(f.dir ? "folder" : "file")}<span>${escapeHtml(f.name)}</span></div>`; });
   box.innerHTML = out;
 }
 
+// Sidebar chat history: fetch once, then filter (search box) + group by date and render.
+let _sbHistAll = [];
+function _sbGroupOf(ts){
+  const d = new Date(ts);
+  if (!ts || isNaN(d)) return "Earlier";
+  const today = new Date(); today.setHours(0,0,0,0);
+  const days = Math.floor((today - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 86400000);
+  if (days <= 0) return "Today";
+  if (days === 1) return "Yesterday";
+  if (days < 7) return "Previous 7 days";
+  return "Earlier";
+}
+function _sbStamp(ts){
+  const d = new Date(ts);
+  if (!ts || isNaN(d)) return String(ts || "").replace("T", "  ");
+  return _sbGroupOf(ts) === "Today"
+    ? d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"})
+    : d.toLocaleDateString([], {month:"short", day:"numeric"});
+}
+
 async function refreshHistory(){
-  const list = await api("list_chats");
+  const all = await api("list_chats");
+  _sbHistAll = Array.isArray(all) ? all : [];
+  sbRenderHistory();
+  if (typeof refreshChatsPage === "function") refreshChatsPage(_sbHistAll);   // keep the Settings → Chats totals live
+}
+
+// One sidebar chat row. Used for the Pinned group, the Favorites dropdown and the normal date groups, so
+// a chat looks and behaves the same wherever it appears.
+function sbChatRow(chat){
+  const card = document.createElement("div");
+  card.className = "sb-chat" + (chat.current ? " current" : "");
+  let title = chat.title || "Untitled chat";
+  if (title.length > 60) title = title.slice(0,59) + "…";
+  card.title = title;
+  const flags = (chat.pinned ? `<span class="sb-flag f-pin" title="Pinned">${icon("pin")}</span>` : "")
+             + (chat.favorite ? `<span class="sb-flag f-fav" title="Favorite">${icon("star")}</span>` : "");
+  card.innerHTML = `
+    <div class="sb-chat-main">
+      <div class="sb-chat-title">${escapeHtml(title)}</div>
+      <div class="sb-chat-ts">${escapeHtml(_sbStamp(chat.updated_at))}</div>
+    </div>
+    <div class="sb-chat-flags">${flags}</div>
+    <div class="sb-chat-actions">
+      <button class="sb-act pin${chat.pinned ? " on" : ""}" title="${chat.pinned ? "Unpin" : "Pin to top"}">${icon("pin")}</button>
+      <button class="sb-act fav${chat.favorite ? " on" : ""}" title="${chat.favorite ? "Remove from favorites" : "Add to favorites"}">${icon("star")}</button>
+      <button class="sb-act rename" title="Rename">${icon("pencil")}</button>
+      <button class="sb-act del" title="Delete">${icon("trash")}</button>
+    </div>`;
+  card.onclick = async ()=>{
+    const r = await api("open_chat_in_new_tab", chat.id);
+    if (!r.ok){ showAlert(r.error, "Error"); return; }
+    clearChat();
+    renderHistoryWindow(r.display||[]);
+    applyKbState(r.kb_state);
+    if (r.tab_id) state.activeTabId = r.tab_id;
+    applyTabRuntime({});
+    switchTab("Chat");
+    refreshHistory();
+    refreshTitlebarInfo();
+    buildConversationTabs();
+  };
+  card.querySelector(".sb-act.pin").onclick = (e)=>{ e.stopPropagation(); sbToggleFlag(chat, "pinned"); };
+  card.querySelector(".sb-act.fav").onclick = (e)=>{ e.stopPropagation(); sbToggleFlag(chat, "favorite"); };
+  card.querySelector(".rename").onclick = async (e)=>{
+    e.stopPropagation();
+    const newTitle = await showPrompt("New chat title:", "Rename Chat", title);
+    if (newTitle === null || newTitle === undefined) return;
+    const trimmed = newTitle.trim();
+    if (!trimmed || trimmed === title) return;
+    const r = await api("rename_chat", chat.id, trimmed);
+    if (!r.ok){ showAlert(r.error, "Error"); return; }
+    refreshHistory();
+    refreshTitlebarInfo();
+  };
+  card.querySelector(".del").onclick = async (e)=>{
+    e.stopPropagation();
+    const tag = chat.pinned && chat.favorite ? "pinned and a favorite" : chat.pinned ? "pinned" : chat.favorite ? "a favorite" : "";
+    const ok = await showConfirm(`Permanently delete "${title}"?` + (tag ? `\n\nThis chat is ${tag}.` : ""), "Delete Chat", {danger:true, okLabel:"Delete"});
+    if (!ok) return;
+    await api("delete_chat", chat.id);
+    if (chat.current){ clearChat(); applyKbState(null); }
+    refreshHistory();
+  };
+  return card;
+}
+
+async function sbToggleFlag(chat, flag){
+  let r;
+  try { r = await api("set_chat_flag", chat.id, flag, !chat[flag]); } catch (e){ showAlert(String(e), "Error"); return; }
+  if (!r || !r.ok){ showAlert((r && r.error) || "Couldn't update that chat.", "Error"); return; }
+  if (Array.isArray(r.chats)) _sbHistAll = r.chats;
+  sbRenderHistory();
+  if (typeof refreshChatsPage === "function") refreshChatsPage(_sbHistAll);
+}
+
+let _sbFavOpen = (()=>{ try { return localStorage.getItem("midum.sb.fav.open") === "1"; } catch (e){ return false; } })();
+
+function sbRenderHistory(){
   const box = document.getElementById("history-list");
   if (!box) return;
+  const hs = document.getElementById("history-search");
+  const q = hs ? hs.value.trim().toLowerCase() : "";
+  const matches = _sbHistAll
+    .filter(c=>!q || String(c.title || "Untitled chat").toLowerCase().includes(q))
+    .sort((a,b)=>String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+  const keepScroll = box.scrollTop;
   box.innerHTML = "";
-  if (!list.length){
-    box.innerHTML = `<div style="font-size:11px;color:var(--subtext);padding:8px;">No saved chats yet.</div>`;
+  if (!matches.length){
+    box.innerHTML = `<div class="sb-empty">${q ? "No chats match your search." : "No saved chats yet."}</div>`;
     return;
   }
-  list.forEach(chat=>{
-    const card = document.createElement("div");
-    card.className = "history-card" + (chat.current ? " current" : "");
-    card.style.cursor = "pointer";
-    let title = chat.title || "Untitled chat";
-    if (title.length > 30) title = title.slice(0,29) + "…";
-    card.innerHTML = `
-      <div style="min-width:0;flex:1;">
-        <div class="history-title">${escapeHtml(title)}</div>
-        <div class="history-ts">${(chat.updated_at||"").replace("T","  ")}</div>
-      </div>
-      <div class="history-actions">
-        <button class="mini-btn rename" title="Rename">${icon("pencil")}</button>
-        <button class="mini-btn del">${icon("trash")}</button>
-      </div>`;
-    card.onclick = async ()=>{
-      const r = await api("open_chat_in_new_tab", chat.id);
-      if (!r.ok){ showAlert(r.error, "Error"); return; }
-      clearChat();
-      renderHistoryWindow(r.display||[]);
-      applyKbState(r.kb_state);
-      switchTab("Chat");
-      refreshHistory();
-      refreshTitlebarInfo();
-      buildConversationTabs();
+  const groupHdr = (text)=>{ const h = document.createElement("div"); h.className = "sb-grp"; h.textContent = text; return h; };
+
+  // 1) Pinned chats sit at the very top.
+  const pinned = matches.filter(c=>c.pinned);
+  if (pinned.length){
+    box.appendChild(groupHdr("Pinned"));
+    pinned.forEach(c=>box.appendChild(sbChatRow(c)));
+  }
+
+  // 2) Favorites dropdown. Favorites ALSO stay in the normal list below (unless pinned, which already
+  //    lists them above) -- this is just a shortcut.
+  const favs = matches.filter(c=>c.favorite);
+  if (!q || favs.length){
+    const fh = document.createElement("button");
+    fh.className = "sb-fav-h" + (_sbFavOpen ? " open" : "");
+    fh.title = _sbFavOpen ? "Hide favorites" : "Show favorites";
+    fh.innerHTML = `${icon("star")}<span>Favorites</span><em class="sb-count">${favs.length}</em>${icon("chevron-down")}`;
+    fh.onclick = ()=>{
+      _sbFavOpen = !_sbFavOpen;
+      try { localStorage.setItem("midum.sb.fav.open", _sbFavOpen ? "1" : "0"); } catch (e) {}
+      sbRenderHistory();
     };
-    card.querySelector(".rename").onclick = async (e)=>{
-      e.stopPropagation();
-      const newTitle = await showPrompt("New chat title:", "Rename Chat", title);
-      if (newTitle === null || newTitle === undefined) return;
-      const trimmed = newTitle.trim();
-      if (!trimmed || trimmed === title) return;
-      const r = await api("rename_chat", chat.id, trimmed);
-      if (!r.ok){ showAlert(r.error, "Error"); return; }
-      refreshHistory();
-      refreshTitlebarInfo();
-    };
-    card.querySelector(".del").onclick = async (e)=>{
-      e.stopPropagation();
-      const ok = await showConfirm(`Permanently delete "${title}"?`, "Delete Chat", {danger:true, okLabel:"Delete"});
-      if (!ok) return;
-      await api("delete_chat", chat.id);
-      if (chat.current){ clearChat(); applyKbState(null); }
-      refreshHistory();
-    };
-    box.appendChild(card);
+    box.appendChild(fh);
+    if (_sbFavOpen){
+      const body = document.createElement("div");
+      body.className = "sb-fav-body";
+      if (favs.length) favs.forEach(c=>body.appendChild(sbChatRow(c)));
+      else body.innerHTML = `<div class="sb-fav-empty">No favorites yet. Hover a chat and click the star to add it here.</div>`;
+      box.appendChild(body);
+    }
+  }
+
+  // 3) Everything else, grouped by date.
+  let lastGroup = null;
+  matches.filter(c=>!c.pinned).forEach(chat=>{
+    const grp = _sbGroupOf(chat.updated_at);
+    if (grp !== lastGroup){ lastGroup = grp; box.appendChild(groupHdr(grp)); }
+    box.appendChild(sbChatRow(chat));
   });
+  box.scrollTop = keepScroll;
 }
 
 // ── Tool pane content builders -------------------------------------------
@@ -13588,6 +15306,8 @@ async function mzIcRefreshHistory(){
       clearChat();
       renderHistoryWindow(r.display||[]);
       applyKbState(r.kb_state);
+      if (r.tab_id) state.activeTabId = r.tab_id;
+      applyTabRuntime({});
       refreshHistory(); refreshTitlebarInfo(); buildConversationTabs();     // no switchTab("Chat"): the chat stays docked in the IDE
     };
     card.querySelector(".rename").onclick = async (e)=>{
@@ -13611,6 +15331,79 @@ async function mzIcRefreshHistory(){
     box.appendChild(card);
   });
 }
+// ── Long user prompts: clamp tall bubbles and offer Show more / Show less ─────────────────────────────
+// Purely visual: the bubble's DOM text is untouched, so copy / edit / regenerate still use the full prompt.
+var MZ_CLAMP_PX = 170, mzClampRaf = 0;
+function mzBubbleClampScan(){
+  mzClampRaf = 0;
+  document.querySelectorAll(".bubble.user").forEach(b=>{
+    const next = b.nextElementSibling, has = next && next.classList && next.classList.contains("bubble-more-btn");
+    if (b.querySelector("textarea")){                       // being edited: show everything, drop the toggle
+      b.classList.remove("clamped"); if (has) next.remove(); return;
+    }
+    if (b.classList.contains("clamped") || b.classList.contains("expanded")) return;
+    if (b.scrollHeight <= MZ_CLAMP_PX) return;              // short (or not laid out yet: retried on the next scan)
+    b.classList.add("clamped");
+    if (has) return;
+    const btn = document.createElement("button");
+    btn.className = "bubble-more-btn"; btn.type = "button"; btn.textContent = "Show more";
+    btn.onclick = ()=>{
+      const open = b.classList.toggle("expanded");
+      btn.textContent = open ? "Show less" : "Show more";
+    };
+    b.after(btn);
+  });
+}
+function mzBubbleClampSchedule(){ if (!mzClampRaf) mzClampRaf = requestAnimationFrame(mzBubbleClampScan); }
+(function(){
+  const start = ()=>{
+    const col = document.getElementById("chat-col");
+    if (col) new MutationObserver(mzBubbleClampSchedule).observe(col, {childList:true, subtree:true, characterData:true});
+    window.addEventListener("resize", mzBubbleClampSchedule);
+    setInterval(mzBubbleClampScan, 1500);                   // catches bubbles that were hidden / unmeasured when added
+    mzBubbleClampScan();
+  };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
+})();
+// ── Per-chat prompt drafts ─────────────────────────────────────────────────────────────────────
+// The text in the prompt box belongs to the chat being shown. A light poll saves edits (typing, but also programmatic clears
+// such as sending) to the backend under the visible chat's id; clearChat() -- run on every tab switch / new / closed / opened
+// chat -- calls draftSwap(), which stores the box for the chat we are leaving and loads the draft of the one now showing.
+var DRAFT = {chatId:null, last:"", busy:false, again:false};
+async function draftSwap(){
+  const el = document.getElementById("msg-input");
+  if (!el) return;
+  if (DRAFT.busy){ DRAFT.again = true; return; }            // a swap is in flight (rapid tab switching): run once more after it
+  DRAFT.busy = true;
+  const sentId = DRAFT.chatId, sentText = el.value;
+  let r = null;
+  try { r = await api("prompt_draft_swap", sentId, sentId === null ? null : sentText); } catch (e) { r = null; }
+  DRAFT.busy = false;
+  if (DRAFT.again){ DRAFT.again = false; draftSwap(); return; }
+  if (!r || !r.ok) return;                                  // backend not ready yet: the poll retries
+  DRAFT.chatId = r.chat_id;
+  if (sentId === null){                                     // first sync after launch
+    if (el.value.trim()){ DRAFT.last = ""; return; }        // the user already typed something: keep it, the poll saves it
+  } else if (r.chat_id === sentId){                         // same chat (re-clicked tab): nothing to swap
+    DRAFT.last = sentText; return;
+  }
+  el.value = r.text || "";
+  DRAFT.last = el.value;
+  try { autosizeMsgInput(); } catch (e) {}
+}
+function draftTick(){
+  const el = document.getElementById("msg-input");
+  if (!el) return;
+  if (DRAFT.chatId === null){ draftSwap(); return; }
+  if (DRAFT.busy) return;
+  const v = el.value;
+  if (v === DRAFT.last) return;
+  DRAFT.last = v;
+  try { Promise.resolve(api("prompt_draft_swap", DRAFT.chatId, v)).catch(()=>{}); } catch (e) {}
+}
+setInterval(draftTick, 700);
+window.addEventListener("blur", draftTick);
+window.addEventListener("pagehide", draftTick);
 // Model picker (replaces the KB button in the docked prompt box): the popup hosts the real Model tab, so every control is there.
 function mzIcModelSetup(){
   if (MZIC.modelBtn) return;
@@ -13641,7 +15434,7 @@ function mzIcModelClose(){
 function mzIcModelOpen(){
   const pop = MZIC.modelPop; if (!pop) return;
   mzIcHistClose();
-  document.getElementById("kb-popover").classList.remove("open");
+  if (typeof kbpClose === "function") kbpClose();
   // buildModelPane addresses its fields by id: make sure a stale copy in the (hidden) Model tab cannot shadow this one
   const tc = document.getElementById("tool-content");
   if (tc && tc.querySelector("#provider-select")) tc.innerHTML = "";
@@ -13674,7 +15467,7 @@ function mzIcDock(v){
   } else if (MZIC.dock){
     const chat = document.getElementById("chat-pane-wrap");
     if (chat && MZIC.home && chat.parentNode === MZIC.body){
-      const ref = (MZIC.next && MZIC.next.parentNode === MZIC.home) ? MZIC.next : document.getElementById("sidebar-pane-wrap");
+      const ref = (MZIC.next && MZIC.next.parentNode === MZIC.home) ? MZIC.next : document.getElementById("tool-pane-wrap");
       MZIC.home.insertBefore(chat, ref && ref.parentNode === MZIC.home ? ref : null);
     }
     document.documentElement.classList.remove("mz-chat-docked");
@@ -13948,9 +15741,9 @@ if (document.readyState === "loading") document.addEventListener("DOMContentLoad
 function showToolPane(name){
   const box = document.getElementById("tool-content");
   const builders = {
-    "Voice": buildVoicePane, "Log": buildLogPane, "Model": buildModelPane, "Parameters": buildParamsPane,
-    "System Core": buildSysCorePane, "Knowledge": buildKnowledgePane,
-    "Skills": buildSkillsPane, "Tools": buildToolsPane, "Shell": buildShellPane, "Flows": buildFlowsPane, "Schedule": buildSchedulePane, "MCP": buildMcpPane,
+    "Log": buildLogPane, "Parameters": buildParamsPane,
+    "Library": buildLibraryPane,
+    "Tools": buildToolsPane, "Shell": buildShellPane, "Flows": buildFlowsPane, "Schedule": buildSchedulePane, "MCP": buildMcpPane,
     "Agents": buildAgentsPane,
     "Permissions": buildPermissionsPane,
     "Surfaces": buildSurfacesPane,
@@ -14208,25 +16001,11 @@ function buildVoicePane(box){
     <select id="voice-name-select">
       ${["Puck","Charon","Kore","Fenrir","Aoede","Leda","Orus","Zephyr"].map(v=>`<option value="${v}">${v}</option>`).join("")}
     </select>
-    <div class="divider"></div>
-    <div class="hdr-row">
-      <div class="field-label" style="margin:0;">PUSH-TO-TALK HOTKEYS</div>
-      <button class="ghost-btn" id="ptt-reset-btn" style="height:22px;font-size:10px;">Reset defaults</button>
-    </div>
-    <div style="font-size:10px;color:var(--muted);margin:2px 0 8px;line-height:1.5;">
-      Hold either key/button to talk -- connects to Gemini Live automatically on first press if not already connected, then just mutes the mic (not the connection) on release. Works globally, even when Midum isn't the focused window.
-    </div>
-    <div id="ptt-deps-warning" style="font-size:10px;color:var(--red);margin-bottom:6px;display:none;"></div>
-    <div id="ptt-slot-slot1" class="ptt-slot-row"></div>
-    <div id="ptt-slot-slot2" class="ptt-slot-row" style="margin-top:6px;"></div>
+    <div style="font-size:10px;color:var(--muted);margin-top:8px;line-height:1.5;">Push-to-talk keys are configured in Settings → General.</div>
   `;
 
   document.getElementById("voice-start-btn").onclick = onVoiceStartStopClick;
   document.getElementById("voice-mute-btn").onclick = onVoiceMuteClick;
-  document.getElementById("ptt-reset-btn").onclick = async ()=>{
-    await api("reset_ptt_hotkeys");
-    refreshPttHotkeys();
-  };
 
   (async ()=>{
     const status = await api("get_voice_status");
@@ -14242,8 +16021,6 @@ function buildVoicePane(box){
     }
     handleVoiceStatus({status: voiceState.running ? "connected" : "stopped"});
   })();
-
-  refreshPttHotkeys();
 }
 
 // ── Push-to-talk hotkey config UI ─────────────────────────────────────
@@ -14427,10 +16204,6 @@ function buildModelPane(box){
         style="height:32px;flex:1;border-radius:16px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 10px;"/>
       <button class="btn" id="ctx-tokens-save" style="background:var(--accent);color:#fff;">Save</button>
     </div>
-    <div id="ctx-tokens-status" style="font-size:10px;color:var(--subtext);margin-top:6px;"></div>
-    <div style="font-size:10px;color:var(--muted);margin-top:4px;">How much context your model actually has. The summarizer uses this to know when it's approaching the limit and needs to compact older turns -- default 32000, raise it if your model supports a bigger window.</div>
-    <div class="divider"></div>
-    <div style="font-size:10px;color:var(--muted);">Local (Ollama) runs fully offline and is the default on every launch. Switching providers here only affects this running session. Want a service that isn't listed? Choose <b>LiteLLM (any provider)</b> — it covers 100+ (OpenAI, Anthropic, Mistral, xAI, DeepSeek, Azure, Bedrock, any OpenAI-compatible server…).</div>
   `;
   (async ()=>{
     const info = await api("get_providers");
@@ -14459,7 +16232,7 @@ function buildModelPane(box){
   };
 
   const ctxInput  = document.getElementById("ctx-tokens-input");
-  const ctxStatus = document.getElementById("ctx-tokens-status");
+  const ctxStatus = document.getElementById("ctx-tokens-status") || {};   // status line removed from the UI; writes below are harmless no-ops
   (async ()=>{
     const t = await api("get_context_token_limit");
     ctxInput.value = t.saved != null ? t.saved : t.effective;
@@ -14735,6 +16508,36 @@ function buildParamsPane(box){
   }
   document.getElementById("stats-refresh").onclick = load;
   load();
+}
+
+// ── Library tab ─────────────────────────────────────────────────────────
+// System Core, Knowledge and Skills used to be three separate top tabs; they
+// share one pane now with a segmented switcher on top. Each section is still
+// built by its original builder (their element ids don't overlap), the active
+// section just gets (re)mounted into #lib-body.
+let _libSection = "System Core";
+function buildLibraryPane(box){
+  const sections = [
+    ["System Core", "sparkles",  buildSysCorePane],
+    ["Knowledge",   "book-open", buildKnowledgePane],
+    ["Skills",      "layers",    buildSkillsPane],
+  ];
+  if (!sections.some(s=>s[0] === _libSection)) _libSection = sections[0][0];
+  box.innerHTML = `
+    <div class="mz-seg" id="lib-seg" style="margin-bottom:8px;flex:0 0 auto;">
+      ${sections.map(([n, ic])=>`<button type="button" data-sec="${n}">${icon(ic)}<span>${n}</span></button>`).join("")}
+    </div>
+    <div id="lib-body" style="flex:1 1 auto;min-height:0;display:flex;flex-direction:column;"></div>`;
+  const body = box.querySelector("#lib-body");
+  function mount(name){
+    _libSection = name;
+    box.querySelectorAll("#lib-seg button").forEach(b=>b.classList.toggle("active", b.dataset.sec === name));
+    body.innerHTML = "";
+    const sec = sections.find(s=>s[0] === name);
+    if (sec) sec[2](body);
+  }
+  box.querySelectorAll("#lib-seg button").forEach(b=>{ b.onclick = ()=>{ if (b.dataset.sec !== _libSection) mount(b.dataset.sec); }; });
+  mount(_libSection);
 }
 
 function buildSysCorePane(box){
@@ -16388,7 +18191,7 @@ async function showAgentAddModal(){
             <input type="checkbox" class="ag-kb-cb" data-file="${escapeHtml(f)}" id="${cbId}"/> ${escapeHtml(f)}
           </label>`;
         }).join("")
-      : `<div style="font-size:10px;color:var(--subtext);">No Knowledge Bases yet — save one from the Knowledge tab first.</div>`;
+      : `<div style="font-size:10px;color:var(--subtext);">No Knowledge Bases yet — save one from the Library tab first.</div>`;
     const skHtml = skillFiles.length
       ? skillFiles.map(f=>{
           const cbId = "ag-skcb-" + Math.random().toString(36).slice(2);
@@ -16396,7 +18199,7 @@ async function showAgentAddModal(){
             <input type="checkbox" class="ag-sk-cb" data-file="${escapeHtml(f)}" id="${cbId}"/> ${escapeHtml(f)}
           </label>`;
         }).join("")
-      : `<div style="font-size:10px;color:var(--subtext);">No Skills yet — save one from the Skills tab first.</div>`;
+      : `<div style="font-size:10px;color:var(--subtext);">No Skills yet — save one from the Library tab first.</div>`;
     const body = `
       <div class="modal-label">ROLE</div>
       <input type="text" class="modal-input" id="${roleId}" placeholder="e.g. Researcher (one word to one line)"/>
@@ -16454,7 +18257,7 @@ async function showAgentKnowledgeModal(name, currentFiles){
             <input type="checkbox" class="ag-kb-cb2" data-file="${escapeHtml(f)}" id="${cbId}" ${current.has(f) ? "checked" : ""}/> ${escapeHtml(f)}
           </label>`;
         }).join("")
-      : `<div style="font-size:10px;color:var(--subtext);">No Knowledge Bases yet — save one from the Knowledge tab first.</div>`;
+      : `<div style="font-size:10px;color:var(--subtext);">No Knowledge Bases yet — save one from the Library tab first.</div>`;
     const body = `
       <div style="font-size:10px;color:var(--subtext);margin-bottom:6px;">
         Full content of the checked Knowledge Base(s) is given to '${escapeHtml(name)}' fresh every task —
@@ -16490,7 +18293,7 @@ async function showAgentSkillsModal(name, currentFiles){
             <input type="checkbox" class="ag-sk-cb2" data-file="${escapeHtml(f)}" id="${cbId}" ${current.has(f) ? "checked" : ""}/> ${escapeHtml(f)}
           </label>`;
         }).join("")
-      : `<div style="font-size:10px;color:var(--subtext);">No Skills yet — save one from the Skills tab first.</div>`;
+      : `<div style="font-size:10px;color:var(--subtext);">No Skills yet — save one from the Library tab first.</div>`;
     const body = `
       <div style="font-size:10px;color:var(--subtext);margin-bottom:6px;">
         Full content of the checked Skill(s) is given to '${escapeHtml(name)}' fresh every task —
@@ -17027,6 +18830,8 @@ window.addEventListener("pywebviewready", async ()=>{
 </body>
 </html>
 """
+_HTML = _HTML.replace("</body>", _steps_ui.html_block() + "</body>", 1)
+_HTML = _HTML.replace("</body>", _onboarding.html_block() + "</body>", 1)
 
 
 def _configure_chromium_flags():
@@ -17074,10 +18879,12 @@ def main():
     # of the crash, and Chromium logs (renderer/GPU process deaths) go to chromium.log beside it.
     try:
         import faulthandler
-        _diag_dir = os.path.join(_PKG_ROOT, "storage")
+        _diag_dir = os.path.join(os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else _PKG_ROOT, "storage")
         os.makedirs(_diag_dir, exist_ok=True)
         _fh_file = open(os.path.join(_diag_dir, "gui_crash.log"), "a", buffering=1)
         _fh_file.write("\n=== launch %s ===\n" % datetime.datetime.now().isoformat())
+        _fh_file.write("frozen=%s exe=%s QT_API=%s QT_QPA_PLATFORM=%s\n" % (
+            getattr(sys, "frozen", False), sys.executable, os.environ.get("QT_API"), os.environ.get("QT_QPA_PLATFORM")))
         try:
             from importlib import metadata as _md
             _vers = []
@@ -17098,6 +18905,22 @@ def main():
         ).strip()
     except Exception:
         pass
+    # Record which Qt binding / Qt / Chromium build is ACTUALLY in use (not just installed).
+    try:
+        import qtpy as _qtpy
+        _info = "qtpy api=%s qt=%s" % (getattr(_qtpy, "API_NAME", "?"), getattr(_qtpy, "QT_VERSION", "?"))
+        try:
+            from qtpy import QtWebEngineCore as _qwe
+            _info += " chromium=%s" % _qwe.qWebEngineChromiumVersion()
+        except Exception as _e:
+            _info += " chromium=? (%s)" % _e
+        _fh_file.write(_info + "\n")
+        print("[midum] " + _info)
+    except Exception as _e:
+        try:
+            _fh_file.write("qtpy probe failed: %r\n" % (_e,))
+        except Exception:
+            pass
     # Fail loudly if QtWebEngine isn't actually importable, instead of
     # letting pywebview silently fall back to the broken legacy WinForms
     # renderer (which is what produces the AccessibilityObject.Bounds /
@@ -17135,6 +18958,7 @@ def main():
         )
         sys.exit(1)
 
+    _onboarding.install(Api)
     _hide_window_from_js_bridge(Api)
     api = Api()
     # Serve the UI from http://localhost:<port>/ instead of html=: an html= page has an opaque origin, which makes the IDE

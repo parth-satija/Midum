@@ -84,6 +84,8 @@ class ChatStore:
                         "title":      data.get("title") or "Untitled chat",
                         "created_at": data.get("created_at", ""),
                         "updated_at": data.get("updated_at", ""),
+                        "pinned":     bool(data.get("pinned", False)),
+                        "favorite":   bool(data.get("favorite", False)),
                     })
                 except Exception:
                     continue
@@ -100,12 +102,17 @@ class ChatStore:
              explain_page_progress: dict = None, render_surface: dict = None) -> None:
         now = datetime.datetime.now().isoformat(timespec="seconds")
         created_at = now
+        pinned = False        # carried over from the existing file so re-saving a chat never un-pins / un-favorites it
+        favorite = False
         path = self._path(chat_id)
         with self._lock:
             if os.path.exists(path):
                 try:
                     with open(path, "r", encoding="utf-8") as f:
-                        created_at = json.load(f).get("created_at", now)
+                        old = json.load(f)
+                    created_at = old.get("created_at", now)
+                    pinned = bool(old.get("pinned", False))
+                    favorite = bool(old.get("favorite", False))
                 except Exception:
                     pass
             data = {
@@ -113,6 +120,8 @@ class ChatStore:
                 "title": title or "Untitled chat",
                 "created_at": created_at,
                 "updated_at": now,
+                "pinned": pinned,
+                "favorite": favorite,
                 "history": history,
                 "display": display_log,
                 # KB Only / Explain Mode state -- lets a reopened chat resume
@@ -145,6 +154,26 @@ class ChatStore:
             path = self._path(chat_id)
             if os.path.exists(path):
                 os.remove(path)
+
+    def set_flags(self, chat_id: str, pinned=None, favorite=None) -> bool:
+        """Sets the pinned and/or favorite flag on a saved chat (None = leave as is). Deliberately does NOT
+        touch updated_at, so pinning / starring a chat never reorders it by recency. Returns False if the
+        chat has no file yet (e.g. a brand-new chat nothing has been sent in)."""
+        with self._lock:
+            path = self._path(chat_id)
+            if not os.path.exists(path):
+                return False
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if pinned is not None:
+                data["pinned"] = bool(pinned)
+            if favorite is not None:
+                data["favorite"] = bool(favorite)
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+            return True
 
     def rename(self, chat_id: str, new_title: str) -> None:
         with self._lock:

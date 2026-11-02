@@ -6,11 +6,14 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['qtpy', 'PySide6.QtWidgets', 'PySide6.QtWebEngineWidgets', 'PySide6.QtWebEngineCore', 'PySide6.QtWebChannel'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # Bundle exactly ONE Qt binding. With PyQt5 also installed, PyInstaller was collecting both
+    # PySide6 (Qt 6) and PyQt5 (Qt 5) and their runtime hooks fought over the Qt plugin/DLL paths,
+    # so the frozen exe could load the old Qt 5.15 / Chromium 87 engine (layout crammed top-left).
+    excludes=['PyQt5', 'PyQt6', 'PySide2', 'PyQtWebEngine'],
     noarchive=False,
     optimize=0,
 )
@@ -26,7 +29,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,   # UPX-compressing Qt/Chromium DLLs can corrupt them and cause crashes
     upx_exclude=[],
     runtime_tmpdir=None,
     console=True,

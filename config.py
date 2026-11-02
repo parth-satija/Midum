@@ -559,6 +559,121 @@ def ensure_secrets_file() -> bool:
         print(f"⚠️ [Secrets] Could not create {path}: {e}")
         return False
 
+
+# ── In-app API key management ─────────────────────────────────────────────────
+# Lets the GUI (Settings > Models > API keys) read key *status* and write key
+# values without the user ever opening SECRETS_FILE by hand. Only the plain
+# string fields listed here are editable this way; LITELLM_PROVIDERS keeps its
+# own editor in the Model tab, and any other keys already present in the file
+# are preserved untouched on every save.
+#   (group, secrets-file key, label, where to get it)
+SECRET_KEY_FIELDS = [
+    ("Gemini API", "GEMINI_API_KEY",   "Gemini API key",           "https://aistudio.google.com/app/apikey"),
+    ("Gemini API", "GEMINI_API_KEY_2", "Gemini fallback key 2",    ""),
+    ("Gemini API", "GEMINI_API_KEY_3", "Gemini fallback key 3",    ""),
+    ("Gemini API", "GEMINI_API_KEY_4", "Gemini fallback key 4",    ""),
+    ("Gemini API", "GEMINI_API_KEY_5", "Gemini fallback key 5",    ""),
+    ("Providers",  "OPENROUTER_API_KEY", "OpenRouter API key",      "https://openrouter.ai/keys"),
+    ("Providers",  "GROQ_API_KEY",       "Groq API key",            "https://console.groq.com/keys"),
+    ("Providers",  "OLLAMA_API_KEY",     "Ollama Cloud API key",    "https://ollama.com/settings/keys"),
+    ("Providers",  "OMNIROUTE_API_KEY",  "OmniRoute gateway key",   "http://localhost:20128/dashboard"),
+    ("Web sessions (cookies)", "GEMINI_SECURE_1PSID",    "Gemini __Secure-1PSID cookie",    ""),
+    ("Web sessions (cookies)", "GEMINI_SECURE_1PSIDTS",  "Gemini __Secure-1PSIDTS cookie",  ""),
+    ("Web sessions (cookies)", "CHATGPT_SESSION_TOKEN",  "ChatGPT session token",           ""),
+    ("Web sessions (cookies)", "CHATGPT_SESSION_TOKEN_0", "ChatGPT session token (chunk 0)", ""),
+    ("Web sessions (cookies)", "CHATGPT_SESSION_TOKEN_1", "ChatGPT session token (chunk 1)", ""),
+    ("Discord",    "DISCORD_BOT_TOKEN",  "Discord bot token",       "https://discord.com/developers/applications"),
+    ("Discord",    "DISCORD_DEFAULT_VOICE_CHANNEL_ID", "Default voice channel ID", ""),
+]
+_SECRET_KEY_NAMES = {k for _g, k, _l, _u in SECRET_KEY_FIELDS}
+
+import threading as _threading
+import copy as _copy
+_secrets_io_lock = _threading.Lock()
+
+
+def _mask_secret(value: str) -> str:
+    value = value or ""
+    if len(value) <= 8:
+        return "•" * len(value)
+    return f"{value[:3]}…{value[-4:]}"
+
+
+def get_secret_status() -> dict:
+    """Masked, GUI-safe view of which keys are set. Never returns a full value."""
+    path = os.path.abspath(SECRETS_FILE)
+    data, error = {}, None
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+            else:
+                error = "Secrets file's top level is not a JSON object."
+        except Exception as e:
+            error = f"Secrets file is not valid JSON ({e})."
+    fields = []
+    for group, key, label, url in SECRET_KEY_FIELDS:
+        raw = data.get(key, "")
+        raw = raw.strip() if isinstance(raw, str) else ""
+        fields.append({
+            "group": group, "key": key, "label": label, "url": url,
+            "has_value": bool(raw), "masked": _mask_secret(raw) if raw else "",
+        })
+    return {"ok": error is None, "error": error, "path": path, "fields": fields}
+
+
+def save_secret_values(updates: dict) -> dict:
+    """Write one or more keys into SECRETS_FILE.
+    `updates` maps secrets-file key -> new value. A non-empty string sets it,
+    an empty string clears it, and keys not in `updates` are left alone.
+    Refuses to touch a file it can't parse (so a typo'd JSON file is never
+    silently replaced), and writes atomically."""
+    if not isinstance(updates, dict) or not updates:
+        return {"ok": False, "error": "Nothing to save."}
+    clean = {}
+    for k, v in updates.items():
+        if k not in _SECRET_KEY_NAMES:
+            return {"ok": False, "error": f"Unknown key: {k}"}
+        if v is None:
+            continue
+        if not isinstance(v, str):
+            return {"ok": False, "error": f"Value for {k} must be text."}
+        v = v.strip()
+        if any(c in v for c in "\r\n\t"):
+            return {"ok": False, "error": f"Value for {k} contains line breaks or tabs -- paste just the key."}
+        clean[k] = v
+    if not clean:
+        return {"ok": False, "error": "Nothing to save."}
+    path = os.path.abspath(SECRETS_FILE)
+    try:
+        with _secrets_io_lock:
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if not isinstance(data, dict):
+                        raise ValueError("top level is not a JSON object")
+                except Exception as e:
+                    return {"ok": False, "error": f"Secrets file is not valid JSON, so I left it untouched ({e}). Fix it and try again: {path}"}
+            else:
+                data = _copy.deepcopy(SECRETS_TEMPLATE)
+            data.update(clean)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            if not _IS_WINDOWS:
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
+            os.replace(tmp, path)
+        return {"ok": True, "saved": sorted(clean.keys())}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 COMMANDS_FILE       = os.path.join(STORAGE_DIR, "commands.md")
 INSTRUCTIONS_FILE   = os.path.join(STORAGE_DIR, "instructions.md")
 PATHS_FILE          = os.path.join(STORAGE_DIR, "paths.md")

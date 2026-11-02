@@ -1,6 +1,7 @@
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
 import config
 import artifacts as _artifacts
+import step_prompting as _sp
 import providers.openrouter_backend as providers_openrouter_backend
 from config import COMMANDS_FILE, MODEL_CANVAS_H, MODEL_CANVAS_W, OPENROUTER_CONSULT_MODE, SCALE_X, SCALE_Y, STARTUP_DIR, _is_legacy_toolcall_model
 from knowledge_base import add_instruction, add_path, add_pdf_source, create_domain_knowledge, create_domain_skill, format_pdf_source_page_for_prompt, format_pdf_source_part_for_prompt, list_domain_knowledge, list_domain_skills, list_pdf_source_parts, list_pdf_sources, read_domain_knowledge, read_instructions, read_paths, set_pdf_source_headings, set_pdf_source_part_levels
@@ -18,10 +19,11 @@ from providers.litellm_backend import _litellm_chat_with_fallback
 from providers.ollama_cloud_backend import _ollama_cloud_chat_with_fallback, consult_ollama_cloud, delegate_to_ollama_cloud, list_ollama_cloud_models, set_ollama_cloud_model
 from screen_capture import capture_screen_to_ram, fallback_click_grid, fallback_click_text, fallback_find_text, type_text
 from skills import list_skills, load_skill
-from state import _abort_event, _action_loop_event, _action_loop_lock, _action_loop_state, drain_interjections, run_abortable
+from state import _abort_event, _action_loop_event, _action_loop_lock, _action_loop_state, drain_interjections, run_abortable, in_current_context as _in_current_context
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
 from tools.render_surface_tools import write_render_code, edit_render_code, close_render_surface, save_render_surface, list_saved_render_surfaces, load_render_surface, delete_saved_render_surface, webapi_fetch, stream_asset, search_assets, search_web_assets, stream_web_asset
 from tools.ambient_surface_tools import show_ambient_surface, edit_ambient_surface, move_ambient_surface, close_ambient_surface, list_ambient_surfaces, save_ambient_surface, list_saved_ambient_surfaces, load_ambient_surface, delete_saved_ambient_surface
+from tools.chat_surface_tools import show_chat_surface, edit_chat_surface, close_chat_surface, list_chat_surfaces
 from tools.dynamic_background_tools import create_dynamic_background, save_dynamic_background, edit_dynamic_background
 from permissions import enforce_tool_permission, filter_tools_schema, mcp_permission_key
 from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, execute_terminal_command_live, execute_wsl_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
@@ -1209,7 +1211,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
         # since an open-ended loop legitimately needs more steps than a single
         # ordinary turn -- still hard-capped so a runaway loop can't run forever.
         step_count += 1
-        effective_max_steps = MAX_ACTION_LOOP_STEPS if is_action_loop_active() else MAX_STEPS
+        effective_max_steps = MAX_ACTION_LOOP_STEPS if (is_action_loop_active() or _sp.turn_active()) else MAX_STEPS
         if step_count > effective_max_steps:
             msg = "[MAX STEPS REACHED] Midum exceeded the step limit for this turn."
             if is_action_loop_active():
@@ -1246,11 +1248,17 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             trimmed = _artifacts.inject_into_system(trimmed, _editor_link.prompt_block())
         except Exception as _ed_block_err:
             print(f"⚠️ [editor link prompt block failed: {_ed_block_err}]")
+        try:
+            _sp_block = _sp.prompt_block()
+            if _sp_block:
+                trimmed = _artifacts.inject_into_system(trimmed, _sp_block)
+        except Exception as _sp_block_err:
+            print(f"⚠️ [step checklist block failed: {_sp_block_err}]")
 
         # ── Run the primary model on a thread so Ctrl+Q can interrupt the wait ─
         result_q = _queue.Queue()
         t = threading.Thread(
-            target=_call_primary_model,
+            target=_in_current_context(_call_primary_model),   # carries this turn's context (pinned API key etc.) into the call thread
             args=(trimmed, result_q, force_provider, force_model),
             daemon=True
         )
@@ -1321,6 +1329,11 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                         "tool for the next step RIGHT NOW. No commentary, just the tool call."
                     )
                 })
+                continue
+
+            _sp_nudge = _sp.continuation_nudge()
+            if _sp_nudge:
+                conversation_history.append({"role": "user", "content": _sp_nudge})
                 continue
 
             if is_action_loop_active():
@@ -1420,7 +1433,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             # Suspended entirely while a continuous action loop is active --
             # open-ended loop work (e.g. "keep trying until it works") should
             # not be cut short by the same cap that protects a normal turn.
-            _EXEMPT = {"update_memory","set_current_goal","add_instruction","add_path","explore_path","write_response_memory","append_response_memory","read_response_memory"}
+            _EXEMPT = {"update_memory","set_current_goal","add_instruction","add_path","explore_path","write_response_memory","append_response_memory","read_response_memory","write_steps","complete_step"}
             _cap_hit = False
             if func_name not in _EXEMPT and not is_action_loop_active():
                 _karg = next((str(arguments[k])[:80] for k in
@@ -2030,6 +2043,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             elif func_name == "stop_action_loop":
                 tool_output = stop_action_loop(arguments.get("reason", ""))
 
+            elif func_name == "write_steps":
+                tool_output = _sp.write_steps(arguments.get("steps", []))
+
+            elif func_name == "complete_step":
+                tool_output = _sp.complete_step(arguments.get("step"), arguments.get("proof", ""))
+
             elif func_name == "start_agent":
                 tool_output = start_agent(
                     arguments.get("role", ""),
@@ -2321,6 +2340,30 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
 
             elif func_name == "delete_saved_ambient_surface":
                 tool_output = delete_saved_ambient_surface(arguments.get("name", ""))
+
+            elif func_name == "show_chat_surface":
+                tool_output = show_chat_surface(
+                    arguments.get("code", ""),
+                    surface_id=arguments.get("surface_id", ""),
+                    title=arguments.get("title", ""),
+                    height=arguments.get("height", 0),
+                    max_height=arguments.get("max_height", 0),
+                    frame=arguments.get("frame", True),
+                    background=arguments.get("background", "")
+                )
+
+            elif func_name == "edit_chat_surface":
+                tool_output = edit_chat_surface(
+                    arguments.get("old_code", ""),
+                    arguments.get("new_code", ""),
+                    surface_id=arguments.get("surface_id", "")
+                )
+
+            elif func_name == "close_chat_surface":
+                tool_output = close_chat_surface(arguments.get("surface_id", ""))
+
+            elif func_name == "list_chat_surfaces":
+                tool_output = list_chat_surfaces()
 
             elif func_name == "create_dynamic_background":
                 tool_output = create_dynamic_background(

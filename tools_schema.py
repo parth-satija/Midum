@@ -3146,6 +3146,125 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "show_chat_surface",
+            "description": (
+                "Put an interactive/visual block DIRECTLY INTO THE CHAT, right where you are in "
+                "the conversation, between your sentences -- a CHAT SURFACE. Same HTML+CSS+JS "
+                "sandbox and tool access as a Render Surface (`await midum.call(name, args)` "
+                "runs any Midum tool/MCP tool/Flow; `parent.postMessage(data, '*')` sends input "
+                "back to you as a new chat turn prefixed '[Chat Surface input: <id>]'; "
+                "`midum.close()` dismisses it), but it lives IN the transcript and is saved with "
+                "the chat. USE IT OFTEN -- whenever something is clearer seen or touched than "
+                "read: comparisons/tables, charts, timelines, checklists and progress trackers, "
+                "calculators/converters, option pickers and quick polls (buttons instead of asking "
+                "in prose), forms, previews, palettes, diagrams, status cards, flashcards, "
+                "mini-games. Default to one over a long wall of text or a markdown table of "
+                "numbers. WIDTH is fixed to the chat text column (design for a fluid ~300-730px "
+                "block). Height AUTO-FITS the content up to max_height (default 640px) unless you "
+                "pass `height`; in auto-fit mode do not use 100vh / height:100% on the root. The "
+                "page receives the app theme as CSS variables on a transparent body: use "
+                "var(--text), var(--subtext), var(--muted), var(--accent), var(--border2), "
+                "var(--surface2) for inner cards/buttons, var(--green)/var(--red)/var(--yellow), "
+                "and size text with var(--chat-fs) -- never hard-code a white/black page "
+                "background. Reusing a surface_id replaces that block in place. Prefer "
+                "edit_chat_surface for small changes. Use a Render Surface only for a big "
+                "workspace the user will stay in, an Ambient Surface only for something that must "
+                "float over another app."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "A complete, self-contained HTML document (inline <style>/<script> "
+                            "fine). Fluid width; compact; uses the theme CSS variables."
+                        )
+                    },
+                    "surface_id": {
+                        "type": "string",
+                        "description": "Optional short name (letters/digits/_/-) to refer to this block later. Reusing an id replaces that block in place. Auto-assigned if omitted."
+                    },
+                    "title": {"type": "string", "description": "Optional label shown only in list_chat_surfaces (not drawn)."},
+                    "height": {
+                        "type": "integer",
+                        "description": "Optional fixed height in CSS px (60-1400). Omit to auto-fit the content (recommended)."
+                    },
+                    "max_height": {
+                        "type": "integer",
+                        "description": "Cap for auto-fit height in CSS px (default 640). Taller content scrolls inside the block."
+                    },
+                    "frame": {
+                        "type": "boolean",
+                        "description": "Default true: thin rounded border + soft card background. False: no chrome; the content sits in the chat like text."
+                    },
+                    "background": {
+                        "type": "string",
+                        "description": "Optional CSS colour for the card behind your content, e.g. '#111827'. Default: the theme's surface colour (transparent if frame=false)."
+                    }
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_chat_surface",
+            "description": (
+                "Make a targeted edit to the HTML/CSS/JS of a Chat Surface already in the chat "
+                "without resending the whole document. old_code must be an EXACT, UNIQUE substring "
+                "of what you last wrote for that block; it is replaced with new_code and the block "
+                "re-renders in place. If it doesn't match (or matches more than once) nothing "
+                "changes and you get an error. surface_id may be omitted only when exactly one "
+                "Chat Surface is open. For a large change, call show_chat_surface again with the "
+                "same id and the full new document."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_code": {"type": "string", "description": "Exact, unique substring of the block's current code."},
+                    "new_code": {"type": "string", "description": "Replacement text."},
+                    "surface_id": {"type": "string", "description": "Which Chat Surface to edit (optional if only one is open)."}
+                },
+                "required": ["old_code", "new_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "close_chat_surface",
+            "description": (
+                "Remove a Chat Surface from the conversation and discard its code. Pass a "
+                "surface_id to close that one, 'all' to close every open Chat Surface in this "
+                "chat, or omit it to close the most recent one. Use it to stop a running "
+                "timer/animation or tidy away a block that has served its purpose. The user can "
+                "also dismiss any block with the x shown on hover."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "surface_id": {"type": "string", "description": "Id to close, 'all', or omit for the most recent."}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_chat_surfaces",
+            "description": (
+                "List every Chat Surface currently open in this chat: id, title, sizing mode, "
+                "and code size. Use it to check what is still in the conversation (the user may "
+                "have dismissed some) before editing or closing one."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_dynamic_background",
             "description": (
                 "Create a Dynamic Background: an animated backdrop for the ENTIRE Midum app, "
@@ -3520,6 +3639,42 @@ tools = [
                     "path": {"type": "string", "description": "Absolute path to unblock."}
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_steps",
+            "description": (
+                "Write your own ordered checklist for a multi-stage task (3+ distinct stages) so progress is tracked and shown to the user. "
+                "Refused with [BLOCKED] if the user already defined steps for this chat. Do NOT use for simple one-shot requests or plain Q&A."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "steps": {"type": "array", "items": {"type": "string"}, "description": "2-60 short, concrete steps in execution order."}
+                },
+                "required": ["steps"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_step",
+            "description": (
+                "Check off the NEXT unchecked step of the active STEP CHECKLIST right after you finished it. Steps must be completed in order. "
+                "When verification is on, you must first actually verify the result and pass a concrete 1-2 sentence proof. "
+                "Do not call for a step that failed or is blocked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "step": {"type": "integer", "description": "1-based step number."},
+                    "proof": {"type": "string", "description": "Concrete evidence the step is done (required when verification is on)."}
+                },
+                "required": ["step"],
             },
         },
     },

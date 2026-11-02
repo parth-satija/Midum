@@ -262,7 +262,10 @@ class VoiceSession:
             "and brief -- a sentence or two before or after acting, not a written report. "
             "Call tools directly and immediately when the user asks for an action; don't "
             "narrate at length first. If you're interrupted mid-sentence, stop and listen."
-            "\n\nWIDGETS AND PANELS: you cannot write HTML/CSS/JS yourself. To put a small "
+            "\n\nWIDGETS AND PANELS: you cannot write HTML/CSS/JS yourself. To show something "
+            "visual or interactive right in the chat (a comparison, chart, checklist, option "
+            "buttons, a calculator -- use this OFTEN, whenever seeing beats hearing), call "
+            "get_chat_surface_made. To put a small "
             "widget over the user's screen (an explanation next to something they're looking "
             "at, a timer, a checklist), call get_ambient_surface_made; to open a bigger panel "
             "(dashboard, document, chart, tool) in the Midum window, call "
@@ -515,7 +518,7 @@ class VoiceSession:
                             try:
                                 if fc.name in VOICE_BLOCKED_TOOLS:
                                     result = (f"'{fc.name}' isn't available in voice mode. Use "
-                                              f"get_ambient_surface_made / get_render_surface_made "
+                                              f"get_chat_surface_made / get_ambient_surface_made / get_render_surface_made "
                                               f"and describe what you want built.")
                                 elif fc.name in VOICE_SURFACE_TOOL_NAMES:
                                     # Code generation on the default model can take

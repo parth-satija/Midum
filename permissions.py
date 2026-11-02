@@ -54,6 +54,7 @@ _permissions_cache: dict | None = None
 # global rather than anything persisted to disk -- it must NOT survive a
 # restart, and this app only ever runs one turn at a time.
 _KB_ONLY_ACTIVE = False
+_KB_ONLY_CV = __import__("contextvars").ContextVar("midum_kb_only", default=False)
 _KB_ONLY_BLOCKED_TOOLS = {
     "search_internet", "open_search_result", "read_search_result", "open_url",
     "run_js_in_browser", "read_browser_page", "list_browser_tabs",
@@ -86,13 +87,16 @@ _KB_ONLY_BLOCKED_TOOLS = {
 
 
 def set_kb_only_mode(active: bool) -> None:
-    """Turn KB Only tool-filtering on/off for the current (single) turn."""
-    global _KB_ONLY_ACTIVE
-    _KB_ONLY_ACTIVE = bool(active)
+    """Turn KB Only tool-filtering on/off for the current (single) turn.
+
+    Concurrent tabs: the flag lives in a ContextVar, so each running turn (own thread/context) has its
+    own value and one tab's KB Only turn never filters another tab's tools. Threads that never call
+    this keep the module default (off)."""
+    _KB_ONLY_CV.set(bool(active))
 
 
 def is_kb_only_mode() -> bool:
-    return _KB_ONLY_ACTIVE
+    return bool(_KB_ONLY_CV.get())
 
 
 def _load() -> dict:
@@ -175,7 +179,7 @@ def filter_tools_schema(tools_list: list) -> list:
         if perms.get(t["function"]["name"], DEFAULT_LEVEL) != "deny"
     ]
 
-    if _KB_ONLY_ACTIVE:
+    if is_kb_only_mode():
         filtered = [t for t in filtered if t["function"]["name"] not in _KB_ONLY_BLOCKED_TOOLS]
         # Promoted MCP/Flow tools are arbitrary external integrations (many
         # are themselves internet-connected), so KB Only skips appending

@@ -65,6 +65,7 @@ GROQ_CORE_TOOL_NAMES = [
     "type_text", "wait", "say",
     "start_action_loop", "stop_action_loop",
     "ask_user_text", "ask_user_approval", "ask_user_choice", "ask_user_file_path",
+    "write_steps", "complete_step",
 ]
 GROQ_CORE_TOOL_NAMES = [n for n in GROQ_CORE_TOOL_NAMES if n in _TOOLS_BY_NAME]
 
@@ -743,24 +744,40 @@ def create_flowchart(title, steps, edges=None):
         return f"Error building flowchart: {str(e)}"
 
 
+def _response_memory_path():
+    """The scratchpad file for the turn running on this thread. With concurrent tabs each chat needs
+    its own (a shared file would let one tab's turn start wipe another tab's plan); threads with no
+    bound turn keep using the original shared file."""
+    try:
+        from state import current_ctx
+        c = current_ctx()
+        if c is not None and c.chat_id:
+            root, ext = os.path.splitext(RESPONSE_MEMORY)
+            return f"{root}.{str(c.chat_id)[:16]}{ext}"
+    except Exception:
+        pass
+    return RESPONSE_MEMORY
+
+
 def write_response_memory(content):
     """Overwrite the response scratchpad."""
-    return write_local_file(RESPONSE_MEMORY, content)
+    return write_local_file(_response_memory_path(), content)
 
 def append_response_memory(content):
     """Append a note to the response scratchpad."""
-    return append_local_file(RESPONSE_MEMORY, content)
+    return append_local_file(_response_memory_path(), content)
 
 def read_response_memory():
     """Read the current response scratchpad."""
-    if not os.path.exists(RESPONSE_MEMORY) or os.path.getsize(RESPONSE_MEMORY) == 0:
+    _p = _response_memory_path()
+    if not os.path.exists(_p) or os.path.getsize(_p) == 0:
         return "Response memory is empty."
-    return read_local_file(RESPONSE_MEMORY)
+    return read_local_file(_p)
 
 def clear_response_memory():
     """Wipe the response scratchpad. Called automatically on set_current_goal(none)."""
     try:
-        write_local_file(RESPONSE_MEMORY, "")
+        write_local_file(_response_memory_path(), "")
         print("\U0001f5d2  [Response memory cleared.]")
         return "Success: response memory cleared."
     except Exception as e:

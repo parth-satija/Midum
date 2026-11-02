@@ -2,7 +2,7 @@
 from config import MCP_SERVERS_FILE
 from config import MCP_PROMOTED_TOOLS_FILE
 from config import _MCP_SDK_AVAILABLE
-from state import _abort_event
+from state import _abort_event, current_ctx as _current_turn_ctx
 import asyncio
 import concurrent.futures
 import json
@@ -79,19 +79,24 @@ _active_mcp_calls: dict = {}   # call_id -> {"future", "server", "tool"}
 _active_mcp_calls_lock = threading.Lock()
 
 
-def abort_active_mcp_calls(server: str = None) -> int:
+def abort_active_mcp_calls(server: str = None, owner=None) -> int:
     """
     Immediately cancel every in-flight MCP tool call, optionally scoped to
     one server name (e.g. abort_active_mcp_calls("filesystem")). Safe to
     call from any thread (the GUI thread, a hotkey handler, etc.) -- it
     only ever calls .cancel() on the Futures, never awaits anything itself.
     Returns how many in-flight calls were signalled.
+
+    `owner` (a state.TurnContext) limits this to the calls started by ONE running turn -- used when
+    several conversation tabs run at once so aborting one tab never cancels another tab's calls.
     """
     with _active_mcp_calls_lock:
         targets = list(_active_mcp_calls.items())
     signalled = 0
     for call_id, info in targets:
         if server is not None and info["server"] != server:
+            continue
+        if owner is not None and info.get("owner") is not owner:
             continue
         if info["future"].cancel():
             signalled += 1
@@ -405,7 +410,7 @@ class _MCPManager:
 
         call_id = uuid.uuid4().hex
         with _active_mcp_calls_lock:
-            _active_mcp_calls[call_id] = {"future": fut, "server": name, "tool": tool_name}
+            _active_mcp_calls[call_id] = {"future": fut, "server": name, "tool": tool_name, "owner": _current_turn_ctx()}
 
         timeout = handle.config.get("call_timeout", 60)
         poll_interval = 0.15

@@ -67,12 +67,83 @@ def _advance_gemini_api_key() -> bool:
     is exhausted (429 / RESOURCE_EXHAUSTED). Returns True if there was a
     next key to switch to, False if we've run out of keys."""
     global _GEMINI_API_KEY, _GEMINI_API_KEY_INDEX
+    _pinned_ctx = _turn_ctx_with_pinned_key()
+    if _pinned_ctx is not None:
+        return _advance_pinned_key(_pinned_ctx)
     if _GEMINI_API_KEY_INDEX + 1 >= len(_GEMINI_API_KEYS):
         return False
     _GEMINI_API_KEY_INDEX += 1
     _GEMINI_API_KEY = _GEMINI_API_KEYS[_GEMINI_API_KEY_INDEX]
     print(f"   [Gemini API] Key exhausted — switching to fallback key #{_GEMINI_API_KEY_INDEX + 1}/{len(_GEMINI_API_KEYS)}")
     return True
+
+
+# ── Per-turn key pinning (concurrent conversation tabs) ──────────────────────
+# With several tabs running at once, sharing ONE active key makes them fight over a single quota. When
+# more than one Gemini key is configured, each running turn (state.TurnContext) is pinned to the
+# least-used key of the chain, so two tabs naturally land on two different keys. A 429 then moves only
+# THAT turn to another key (preferring the least-used one it hasn't tried yet) and never touches the
+# shared chain pointer other turns/threads use. Turns with no pinned key behave exactly as before.
+_KEY_USERS = {}                       # key index -> number of running turns pinned to it
+_KEY_USERS_LOCK = __import__("threading").Lock()
+
+
+def _turn_ctx_with_pinned_key():
+    try:
+        from state import current_ctx
+        c = current_ctx()
+        if c is not None and c.gemini_key_index is not None and c.gemini_key_index < len(_GEMINI_API_KEYS):
+            return c
+    except Exception:
+        pass
+    return None
+
+
+def acquire_turn_key(ctx):
+    """Pin the least-used key to `ctx`. Returns the index, or None when pinning isn't useful
+    (fewer than two keys configured)."""
+    with _KEY_USERS_LOCK:
+        n = len(_GEMINI_API_KEYS)
+        if n < 2:
+            ctx.gemini_key_index = None
+            return None
+        idx = min(range(n), key=lambda i: (_KEY_USERS.get(i, 0), 0 if i == _GEMINI_API_KEY_INDEX else 1, i))
+        _KEY_USERS[idx] = _KEY_USERS.get(idx, 0) + 1
+        ctx.gemini_key_index = idx
+        ctx.gemini_keys_tried = set()
+        return idx
+
+
+def release_turn_key(ctx):
+    with _KEY_USERS_LOCK:
+        idx = ctx.gemini_key_index
+        if idx is not None:
+            _KEY_USERS[idx] = max(0, _KEY_USERS.get(idx, 1) - 1)
+        ctx.gemini_key_index = None
+        ctx.gemini_keys_tried = set()
+
+
+def _advance_pinned_key(ctx) -> bool:
+    with _KEY_USERS_LOCK:
+        cur = ctx.gemini_key_index
+        ctx.gemini_keys_tried.add(cur)
+        candidates = [i for i in range(len(_GEMINI_API_KEYS)) if i not in ctx.gemini_keys_tried]
+        if not candidates:
+            return False
+        nxt = min(candidates, key=lambda i: (_KEY_USERS.get(i, 0), i))
+        _KEY_USERS[cur] = max(0, _KEY_USERS.get(cur, 1) - 1)
+        _KEY_USERS[nxt] = _KEY_USERS.get(nxt, 0) + 1
+        ctx.gemini_key_index = nxt
+    print(f"   [Gemini API] Key #{cur + 1} exhausted for this tab — switching it to key #{nxt + 1}/{len(_GEMINI_API_KEYS)}")
+    return True
+
+
+def _active_key():
+    """(index, key) for the calling turn: its pinned key if it has one, else the shared chain's."""
+    c = _turn_ctx_with_pinned_key()
+    if c is not None:
+        return c.gemini_key_index, _GEMINI_API_KEYS[c.gemini_key_index]
+    return _GEMINI_API_KEY_INDEX, _GEMINI_API_KEY
 
 
 _gemini_api_load_ok, _gemini_api_load_msg = _load_gemini_api()
@@ -231,7 +302,7 @@ def _gemini_api_chat(messages: list, model: str = None, tools_schema: list = Non
         payload["tools"] = tools_schema
 
     headers = {
-        "Authorization": f"Bearer {_GEMINI_API_KEY}",
+        "Authorization": f"Bearer {_active_key()[1]}",
         "Content-Type":  "application/json",
     }
 
@@ -239,7 +310,7 @@ def _gemini_api_chat(messages: list, model: str = None, tools_schema: list = Non
     attempt = 0
     while attempt <= _retries:
         try:
-            headers["Authorization"] = f"Bearer {_GEMINI_API_KEY}"
+            headers["Authorization"] = f"Bearer {_active_key()[1]}"
             resp = requests.post(
                 f"{GEMINI_API_BASE}/chat/completions",
                 headers=headers, json=payload, timeout=timeout
@@ -282,6 +353,9 @@ def _gemini_api_chat(messages: list, model: str = None, tools_schema: list = Non
             if isinstance(data, dict) and data.get("error"):
                 raise RuntimeError(f"Gemini API error: {data['error'].get('message', data['error'])}")
 
+            _c_ok = _turn_ctx_with_pinned_key()
+            if _c_ok is not None:
+                _c_ok.gemini_keys_tried = set()   # a successful call: this turn may rotate again on a later 429
             break   # success
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
@@ -350,7 +424,7 @@ def _gemini_key_at(index=None):
     """(index, key) for an explicit chain index, else the currently active key."""
     if index is not None and 0 <= index < len(_GEMINI_API_KEYS):
         return index, _GEMINI_API_KEYS[index]
-    return _GEMINI_API_KEY_INDEX, _GEMINI_API_KEY
+    return _active_key()
 
 
 def _files_error(resp) -> GeminiFilesError:

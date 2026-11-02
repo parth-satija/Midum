@@ -1,8 +1,11 @@
-"""MidumDocs -- LaTeX documents as artifacts, edited in a page editor compiled by a LOCAL LaTeX installation.
+"""MidumDocs -- LaTeX documents as artifacts, edited in a page editor compiled locally or by an online service.
 
-Compilation is fully offline: the editor POSTs the source to this module's localhost server, which runs a TeX
-distribution installed on this PC (TeX Live / MiKTeX / Tectonic: pdflatex by default) and returns the PDF.
-Set ``MIDUMDOCS_LATEX_PATH`` (file or folder) and/or ``MIDUMDOCS_LATEX_ENGINE`` in config.py to override detection.
+The editor POSTs the source to this module's localhost server, which compiles it and returns the PDF:
+  * with a TeX distribution installed on this PC (TeX Live / MiKTeX / Tectonic: pdflatex by default), fully offline; or
+  * when none is installed, on an online compiler (latex.ytotech.com, falling back to texlive.net), so users do not
+    need a multi-gigabyte TeX install. Online compiling uploads the document source to that service.
+config.py overrides: ``MIDUMDOCS_LATEX_BACKEND`` (auto | local | online), ``MIDUMDOCS_ONLINE_PROVIDER``
+(auto | ytotech | texlive.net), ``MIDUMDOCS_LATEX_PATH`` (file or folder) and ``MIDUMDOCS_LATEX_ENGINE``.
 
 A MidumDoc is an ordinary artifact of type ``latex`` (extension ``.tex``): it lives in the artifact
 store, is versioned, and the model edits it with the same tools as every other artifact
@@ -33,6 +36,8 @@ import sys
 import tempfile
 import threading
 import time
+import html as _html
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
@@ -62,8 +67,20 @@ COMPILE_TIMEOUT = 180               # seconds per compiler run
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_PASSES = 3                      # re-runs for references / table of contents
 _ENGINE_NAMES = ("pdflatex", "xelatex", "lualatex", "tectonic")
-NO_COMPILER_MSG = ("No local LaTeX compiler found. Install TeX Live (or MiKTeX), restart Midum, or set "
-                   "MIDUMDOCS_LATEX_PATH in config.py to pdflatex.exe (or the folder containing it).")
+NO_COMPILER_MSG = ("No local LaTeX compiler found, and online compiling is switched off. Install TeX Live (or MiKTeX), "
+                   "set MIDUMDOCS_LATEX_PATH in config.py to pdflatex.exe (or the folder containing it), or set "
+                   "MIDUMDOCS_LATEX_BACKEND to \"auto\" / \"online\" to compile on an online service instead.")
+
+# Online compiling (no TeX install needed). Optional config.py overrides:
+#   MIDUMDOCS_LATEX_BACKEND   auto (default: a local compiler if one exists, otherwise online) | local | online
+#   MIDUMDOCS_ONLINE_PROVIDER auto (default: try each service in turn) | ytotech | texlive.net
+# NOTE: online compiling uploads the document's source text to that third-party service. Set the backend to
+# "local" to guarantee nothing ever leaves this PC.
+BACKEND = str(getattr(config, "MIDUMDOCS_LATEX_BACKEND", "") or os.environ.get("MIDUMDOCS_LATEX_BACKEND", "") or "auto")
+ONLINE_PROVIDER = str(getattr(config, "MIDUMDOCS_ONLINE_PROVIDER", "") or "auto").strip().lower()
+ONLINE_TIMEOUT = 120                # seconds per online request
+YTOTECH_URL = "https://latex.ytotech.com/builds/sync"
+TEXLIVE_NET_URL = "https://texlive.net/cgi-bin/latexcgi"
 
 # Pinned, allow-listed third-party files. Fetched once through the local server and cached on disk, so the
 # editor page stays same-origin (pdf.js needs that for its worker).
@@ -194,17 +211,26 @@ def _find_latex():
 _engine_state = {"state": "idle", "error": ""}      # idle | ready | error  (kept for older callers)
 
 
+def _backend_mode():
+    m = BACKEND.strip().lower()
+    return m if m in ("auto", "local", "online") else "auto"
+
+
 def compiler_info():
-    exe = _find_latex()
+    mode = _backend_mode()
+    exe = _find_latex() if mode != "online" else None
     if exe:
         _engine_state.update(state="ready", error="")
-        return {"ready": True, "state": "ready", "error": "", "compiler": exe, "engine": os.path.basename(exe)}
+        return {"ready": True, "state": "ready", "error": "", "compiler": exe, "engine": os.path.basename(exe), "online": False}
+    if mode != "local":
+        _engine_state.update(state="ready", error="")
+        return {"ready": True, "state": "ready", "error": "", "compiler": "", "engine": "online", "online": True}
     _engine_state.update(state="error", error=NO_COMPILER_MSG)
-    return {"ready": False, "state": "error", "error": NO_COMPILER_MSG, "compiler": "", "engine": ""}
+    return {"ready": False, "state": "error", "error": NO_COMPILER_MSG, "compiler": "", "engine": "", "online": False}
 
 
 def engine_ready():
-    return _find_latex() is not None
+    return compiler_info()["ready"]
 
 
 def ensure_engine():
@@ -224,12 +250,114 @@ def _decode(raw):
     return (raw or b"").decode("utf-8", "replace")
 
 
+# ── online compilers ─────────────────────────────────────────────────────────────────────
+def _online_engine():
+    return LATEX_ENGINE if LATEX_ENGINE in ("pdflatex", "xelatex", "lualatex") else "pdflatex"
+
+
+def _http_post(url, data, content_type):
+    """POST and return (status, body) -- HTTP error statuses are returned, only transport failures raise."""
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": content_type, "User-Agent": "Midum-MidumDocs/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=ONLINE_TIMEOUT) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def _b64_or_text(v):
+    if not isinstance(v, str):
+        return ""
+    try:
+        return base64.b64decode(v, validate=True).decode("utf-8", "replace")
+    except Exception:
+        return v
+
+
+def _ytotech_error_text(body):
+    """Pull a readable TeX log out of latex.ytotech.com's JSON error body (logs are base64 per file)."""
+    try:
+        j = json.loads(_decode(body))
+    except ValueError:
+        return _decode(body)
+    if not isinstance(j, dict):
+        return _decode(body)
+    parts = [str(j[k]) for k in ("error", "message") if j.get(k)]
+    logs = j.get("logs")
+    if isinstance(logs, dict):
+        parts += [_b64_or_text(v) for v in logs.values()]
+    elif isinstance(logs, str):
+        parts.append(_b64_or_text(logs))
+    return "\n".join(p for p in parts if p).strip() or _decode(body)
+
+
+def _online_ytotech(src, engine):
+    """(pdf_bytes | None, log, transient). latex.ytotech.com runs latexmk, so references/TOC reruns are handled there."""
+    payload = {"compiler": engine, "resources": [{"main": True, "content": src}],
+               "options": {"response": {"log_files_on_failure": True}}}
+    code, body = _http_post(YTOTECH_URL, json.dumps(payload).encode("utf-8"), "application/json")
+    if body[:5] == b"%PDF-":
+        return body, "", False
+    return None, _ytotech_error_text(body), code >= 500 or code in (408, 429)
+
+
+def _online_texlive_net(src, engine):
+    """(pdf_bytes | None, log, transient) via texlive.net's latexcgi endpoint."""
+    boundary = "----midumdocs" + hashlib.sha1(os.urandom(16)).hexdigest()
+    fields = [("filecontents[]", src), ("filename[]", "document.tex"), ("engine", engine), ("return", "pdf")]
+    body = b"".join(("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" % (boundary, k, v)).encode("utf-8")
+                    for k, v in fields) + ("--%s--\r\n" % boundary).encode("ascii")
+    code, out = _http_post(TEXLIVE_NET_URL, body, "multipart/form-data; boundary=" + boundary)
+    if out[:5] == b"%PDF-":
+        return out, "", False
+    text = _html.unescape(re.sub(r"<[^>]+>", "", _decode(out))).strip()
+    return None, text, code >= 500 or code in (408, 429)
+
+
+def _online_providers():
+    table = {"ytotech": ("latex.ytotech.com", _online_ytotech), "texlive.net": ("texlive.net", _online_texlive_net)}
+    if ONLINE_PROVIDER in table:
+        return [table[ONLINE_PROVIDER]]
+    return [table["ytotech"], table["texlive.net"]]
+
+
+def _compile_online(src):
+    """Compile on an online service; falls through to the next one when a service is down or unreachable.
+    A real LaTeX error is returned as-is (status 1), not retried elsewhere."""
+    engine = _online_engine()
+    problems = []
+    with _compile_lock:
+        for name, fn in _online_providers():
+            try:
+                pdf, log, transient = fn(src, engine)
+            except Exception as e:
+                problems.append(f"{name}: {e}")
+                continue
+            if pdf is None and transient:
+                problems.append(f"{name}: {log[:200] or 'service unavailable'}")
+                continue
+            return {"status": 0 if pdf else 1, "log": log[-200000:] if not pdf else "",
+                    "pdf": base64.b64encode(pdf).decode("ascii") if pdf else None,
+                    "engine": f"online ({name}, {engine})", "online": True}
+    return {"status": -4, "online": True, "pdf": None, "engine": "online",
+            "log": "Online LaTeX compile failed -- check your internet connection, or install TeX Live / MiKTeX.\n" + "\n".join(problems)}
+
+
 def compile_latex(src):
-    """Compile ``src`` with the local compiler. Returns {status, log, pdf(base64 or None), engine}.
+    """Compile ``src``: with a local TeX install when there is one, otherwise on an online service (see
+    MIDUMDOCS_LATEX_BACKEND). Returns {status, log, pdf(base64 or None), engine}.
     status 0 = success; anything else = failure (the log holds the TeX errors)."""
-    exe = _find_latex()
-    if not exe:
-        return {"status": -1, "log": NO_COMPILER_MSG, "pdf": None, "engine": ""}
+    mode = _backend_mode()
+    exe = _find_latex() if mode != "online" else None
+    if exe:
+        return _compile_local(src, exe)
+    if mode != "local":
+        return _compile_online(src)
+    return {"status": -1, "log": NO_COMPILER_MSG, "pdf": None, "engine": ""}
+
+
+def _compile_local(src, exe):
     low = exe.lower()
     tectonic = "tectonic" in os.path.basename(low)
     if tectonic:
@@ -652,6 +780,54 @@ def reopen_ui():
                                  origin="generated", upload=False, sent=True)
         artifacts._init_generated(rec, "latex", "")
     return {"ok": True, "message": show(rec)}
+
+
+def _is_blank_unsaved(rec):
+    """An untouched, never-saved blank document (still exactly the new-document template)."""
+    try:
+        return (not rec.get("md_saved") and int(rec.get("version") or 0) <= 1
+                and _text(rec) == _norm(NEW_DOC_TEMPLATE))
+    except Exception:
+        return False
+
+
+def new_doc():
+    """Open a fresh, unsaved blank document (the MidumDocs tab). Autosave stays off until the user presses Save.
+    An untouched blank from this chat is reused instead of piling up empty Untitled files."""
+    chat = artifacts.get_active_chat() or ""
+    rec = None
+    for r in _all_docs():
+        if (r.get("chat_id") or "") == chat and _is_blank_unsaved(r):
+            rec = r
+            break
+    if rec is None:
+        name = _unique_name("Untitled.tex")
+        rec = artifacts.add_file(data=NEW_DOC_TEMPLATE.encode("utf-8"), name=name, chat_id=artifacts.get_active_chat(),
+                                 origin="generated", upload=False, sent=True)
+        artifacts._init_generated(rec, "latex", "")
+    return {"ok": True, "message": show(rec), "id": rec["id"]}
+
+
+def list_saved_docs():
+    """Every MidumDoc from any chat, newest first, for the MidumDocs tab's dropdown (blank untouched ones are skipped)."""
+    here = artifacts.get_active_chat() or ""
+    out = []
+    for r in _all_docs():
+        if _is_blank_unsaved(r):
+            continue
+        out.append({"id": r["id"], "name": r["name"], "title": r.get("title") or r["name"],
+                    "version": int(r.get("version") or 1), "stamp": _doc_stamp(r),
+                    "saved": bool(r.get("md_saved")), "here": (r.get("chat_id") or "") == here,
+                    "open": bool(_live["open"] and _live["id"] == r["id"])})
+    return {"ok": True, "docs": out}
+
+
+def open_saved_doc(art_id):
+    """Open an existing MidumDoc by id for editing."""
+    rec = _rec(art_id)
+    if not rec or not is_latex(rec):
+        return {"ok": False, "error": "That document no longer exists."}
+    return {"ok": True, "message": show(rec), "id": rec["id"]}
 
 
 def _unique_name(name):
@@ -1101,8 +1277,8 @@ TOOL_SCHEMAS = [
         "Create a NEW LaTeX document (a MidumDoc) and open it in the MidumDocs editor, where the user sees it compiled as real pages "
         "and can edit the source. Pass the COMPLETE .tex source as `content` (omit it for a blank article template). Stored as a normal "
         "artifact (type latex), so afterwards change it with update_artifact / rewrite_artifact -- never create it again. It is compiled "
-        "offline by the LaTeX installation on the user's PC (pdfLaTeX): use standard CTAN packages; avoid shell-escape, minted, and "
-        "anything needing external tools.",
+        "with pdfLaTeX by the LaTeX installation on the user's PC, or by an online compiler when none is installed: use standard "
+        "CTAN packages; avoid shell-escape, minted, and anything needing external tools or local files.",
         {"name": {"type": "string", "description": "File name, e.g. 'report.tex' (.tex is added if missing)."},
          "content": {"type": "string", "description": "The COMPLETE LaTeX source. Optional."},
          "title": {"type": "string", "description": "Optional human-readable title for the panel header."}},
@@ -1155,5 +1331,5 @@ PROMPT_HELP = (
     "compiled live to real pages, and it is an ordinary artifact: change it with update_artifact / rewrite_artifact and undo with\n"
     "revert_artifact. While one is open the system prompt shows the user's CURSOR and SELECTION; 'this', 'here' and 'selected' mean\n"
     "those. Use midumdoc_replace_selection / midumdoc_insert_at_cursor for them, midumdoc_state(wait_compile=true) to check that your\n"
-    "edit compiles (fix any LaTeX error it reports). It is compiled offline by the user's local LaTeX install (pdfLaTeX): stick to standard CTAN packages, no shell-escape.\n"
+    "edit compiles (fix any LaTeX error it reports). It is compiled by the user's local LaTeX install if they have one, otherwise by an online compiler (pdfLaTeX): stick to standard CTAN packages, no shell-escape, no local files.\n"
 )

@@ -10,8 +10,10 @@ from midum_mcp.tools import get_filesystem_mcp_policy, set_filesystem_mcp_allowe
 from tools.user_prompt_tools import ask_user_approval, ask_user_choice, ask_user_file_path, ask_user_text
 from tools.render_surface_tools import write_render_code, edit_render_code, close_render_surface, save_render_surface, list_saved_render_surfaces, load_render_surface, delete_saved_render_surface, webapi_fetch, stream_asset, search_assets, search_web_assets, stream_web_asset
 from tools.ambient_surface_tools import show_ambient_surface, edit_ambient_surface, move_ambient_surface, close_ambient_surface, list_ambient_surfaces, save_ambient_surface, list_saved_ambient_surfaces, load_ambient_surface, delete_saved_ambient_surface
+from tools.chat_surface_tools import show_chat_surface, edit_chat_surface, close_chat_surface, list_chat_surfaces
 from tools.dynamic_background_tools import create_dynamic_background, save_dynamic_background, edit_dynamic_background
 from tools_schema import tools
+from step_prompting import write_steps, complete_step  # voice-dispatch fallback (returns a 'text chat only' note there)
 from ui_automation import ui_navigator
 
 # --- AUTO-SPLITTER: imports added by automated pass, please review ---
@@ -46,7 +48,7 @@ from providers.openrouter_backend import _openrouter_load_msg, consult_openroute
 from providers.discord_voice import call_discord, discord_upload_file, end_discord_call, get_discord_call_status, get_discord_call_transcript, list_discord_calls, list_discord_sessions, start_discord_bot
 from screen_capture import capture_screen_to_ram, fallback_click_grid, fallback_click_text, fallback_find_text, type_text
 from skills import list_skills, load_skill
-from state import _abort_event
+from state import _abort_event, abort_all_turns as _abort_all_turns
 from system_prompt import get_system_prompt
 from tools_registry import _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, execute_wsl_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, reset_groq_loaded_tools, search_internet, write_docx_file, write_local_file, write_response_memory
 from ui_automation.linux_navigator import _PYATSPI_AVAILABLE
@@ -162,7 +164,7 @@ if __name__ == "__main__":
 
     # ── Ctrl+Q abort hotkey ────────────────────────────────────────────────────
     if _KEYBOARD_AVAILABLE:
-        _keyboard.add_hotkey("ctrl+q", lambda: _abort_event.set())
+        _keyboard.add_hotkey("ctrl+q", lambda: _abort_all_turns())
         print("⌨️  [Ctrl+Q registered — press to abort the current response]")
     else:
         print("⚠️  [keyboard package not found — Ctrl+Q abort unavailable]")

@@ -67,10 +67,14 @@ def add_all(pkg):
     hiddenimports.extend(h)
 
 
-# PyQt5 + QtWebEngine: pywebview's Qt backend renders the whole UI through it.
-# (collect_all is the approach the project already used successfully.)
+# PySide6 + QtWebEngine: pywebview's Qt backend (through qtpy) renders the whole UI with it. PySide6 is
+# deliberately NOT collect_all()'d: that would drag in every Qt module (Qt3D, Quick, Charts, ...) and
+# make the bundle enormous. PyInstaller's own PySide6 hooks, triggered by the hidden imports below,
+# collect exactly the needed Qt DLLs, plugins and the QtWebEngine process/resources.
+# (PyQt5 is NOT used any more: its Qt 5.15 ships Chromium 87, too old for this UI's CSS -- the layout
+# collapsed into the top-left corner. gui/app.py forces QT_API=pyside6 so qtpy picks the same binding.)
 for pkg in (
-    "PyQt5", "webview", "qtpy",
+    "webview", "qtpy",
     "uiautomation",            # ships native UIAutomation helper DLLs
     "discord", "nacl",         # voice: opus + libsodium
     "_sounddevice_data",       # PortAudio DLL for sounddevice
@@ -101,8 +105,8 @@ hiddenimports += [
     "anyio._backends._asyncio",
     "pynput.keyboard._win32", "pynput.mouse._win32",
     "comtypes", "comtypes.client", "win32com.client", "win32timezone", "pythoncom", "pywintypes",
-    "PyQt5.QtWebEngineWidgets", "PyQt5.QtWebEngineCore", "PyQt5.QtWebChannel",
-    "PyQt5.QtNetwork", "PyQt5.QtPrintSupport", "PyQt5.sip",
+    "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets", "PySide6.QtNetwork", "PySide6.QtPrintSupport",
+    "PySide6.QtWebEngineWidgets", "PySide6.QtWebEngineCore", "PySide6.QtWebChannel",
 ]
 hiddenimports += project_modules()
 
@@ -132,6 +136,9 @@ add_tree("gui/assets", "gui/assets")
 add_tree("gui/editor_assets", "gui/editor_assets")
 add_tree("gui/midumdocs_assets", "gui/midumdocs_assets")
 add_tree("gui/workbench", "gui/workbench")
+# Shipped defaults (e.g. the Midum Silk Waves Dynamic Background). Seeded into the
+# per-user storage dir on first launch -- see Api._seed_default_dynamic_background.
+add_tree("default_assets", "default_assets")
 add_file("gui/midum.png", "gui")
 add_file("flow_meta.json")
 add_file("Modelfile")
@@ -154,9 +161,8 @@ a = Analysis(  # noqa: F821
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[os.path.join(SPEC_DIR, "rthook_midum.py")],
-    # Only one Qt binding may be present or PyInstaller aborts; Midum falls
-    # back from PySide6 to PyQt5, so PyQt5 is the one we ship.
-    excludes=["PySide6", "PySide2", "PyQt6", "pytest", "IPython", "matplotlib",
+    # Only one Qt binding may be present or PyInstaller aborts; we ship PySide6 (modern Chromium).
+    excludes=["PyQt5", "PyQt6", "PySide2", "PyQtWebEngine", "pytest", "IPython", "matplotlib",
               # Heavy ML stacks that may be installed globally but aren't Midum dependencies;
               # PyInstaller would otherwise try to import/analyze them (torch can hard-crash).
               "torch", "torchvision", "torchaudio", "tensorflow", "keras", "triton",
