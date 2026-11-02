@@ -78,6 +78,17 @@ jobs:
           if (-not $alive) { throw "Midum.exe exited early with code $($proc.ExitCode)" }
           Write-Host "Midum.exe stayed running for 30s."
 
+      - name: Defender scan of the built app (informational)
+        # Shows in the Actions log whether Microsoft Defender flags the fresh build, before any user does.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Update-MpSignature -ErrorAction SilentlyContinue
+          $mp = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+          & $mp -Scan -ScanType 3 -File "$env:GITHUB_WORKSPACE\dist\Midum" -DisableRemediation
+          if ($LASTEXITCODE -ne 0) { throw "Defender reported a detection or scan error (exit code $LASTEXITCODE) -- see the log above." }
+          Write-Host "Defender found nothing."
+
       - name: Package zip + checksum
         shell: pwsh
         run: |

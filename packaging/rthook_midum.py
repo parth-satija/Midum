@@ -46,3 +46,29 @@ if getattr(sys, "frozen", False):
     except Exception:
         # Never let logging setup stop the app from starting.
         pass
+
+    # A windowed (console=False) exe has no console of its own, so every console program it launches
+    # (cmd, powershell, tasklist, git, node, python, winget, ...) gets a brand-new console window that
+    # flashes on screen for a split second. Make every child process hidden by default. Callers that
+    # explicitly ask for a visible console (CREATE_NEW_CONSOLE) or a detached process are left alone.
+    if sys.platform == "win32":
+        try:
+            import subprocess as _subprocess
+
+            _CREATE_NEW_CONSOLE = 0x00000010
+            _DETACHED_PROCESS = 0x00000008
+            _CREATE_NO_WINDOW = 0x08000000
+            _orig_popen_init = _subprocess.Popen.__init__
+
+            def _popen_init_no_window(self, *args, **kwargs):
+                # creationflags is the 14th positional parameter of Popen(); if it was passed
+                # positionally, don't touch the call.
+                if len(args) <= 13:
+                    flags = kwargs.get("creationflags", 0) or 0
+                    if not (flags & (_CREATE_NEW_CONSOLE | _DETACHED_PROCESS)):
+                        kwargs["creationflags"] = flags | _CREATE_NO_WINDOW
+                return _orig_popen_init(self, *args, **kwargs)
+
+            _subprocess.Popen.__init__ = _popen_init_no_window
+        except Exception:
+            pass

@@ -19022,4 +19022,28 @@ if __name__ == "__main__":
     # spawns instead of just running the one target function.
     import multiprocessing
     multiprocessing.freeze_support()
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        # A windowed (no-console) frozen build otherwise dies silently on a startup failure. Write the
+        # traceback to the log and tell the user where to find it.
+        _tb = traceback.format_exc()
+        try:
+            sys.stderr.write("\n[midum] FATAL startup error:\n" + _tb + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        if getattr(sys, "frozen", False) and sys.platform == "win32":
+            try:
+                import ctypes
+                _log_dir = os.path.join(os.environ.get("MIDUM_HOME") or os.path.join(
+                    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Midum"), "logs")
+                ctypes.windll.user32.MessageBoxW(
+                    0,
+                    "Midum failed to start.\n\n" + _tb[-1200:] + "\n\nFull log: " + os.path.join(_log_dir, "midum.log"),
+                    "Midum", 0x10)
+            except Exception:
+                pass
+        sys.exit(1)

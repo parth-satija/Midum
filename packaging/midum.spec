@@ -10,8 +10,11 @@ Output: dist/Midum/Midum.exe (+ _internal/). One-folder is deliberate:
   * it zips cleanly for the web installer
 """
 import os
+import re
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
+from PyInstaller.utils.win32.versioninfo import (FixedFileInfo, StringFileInfo, StringStruct, StringTable,
+                                                 VarFileInfo, VarStruct, VSVersionInfo)
 
 SPEC_DIR = os.path.abspath(SPECPATH)            # noqa: F821  (provided by PyInstaller)
 ROOT = os.path.dirname(SPEC_DIR)                # repo root == the midum_pkg folder
@@ -149,6 +152,37 @@ ICON = os.path.join(ROOT, "gui", "assets", "icon.ico")
 if not os.path.isfile(ICON):
     ICON = None
 
+
+def make_version_file():
+    """Embed Windows version info (company / product / version) in Midum.exe. An exe with no version
+    resource looks anonymous to SmartScreen and to heuristic AV engines; the VERSION env var is set by the
+    release workflow."""
+    raw = os.environ.get("VERSION", "0.0.0").strip().lstrip("v") or "0.0.0"
+    nums = [int(x) for x in re.findall(r"\d+", raw.split("-")[0])][:4]
+    nums += [0] * (4 - len(nums))
+    tup, dotted = tuple(nums), ".".join(str(n) for n in nums)
+    info = VSVersionInfo(
+        ffi=FixedFileInfo(filevers=tup, prodvers=tup, mask=0x3F, flags=0x0, OS=0x40004, fileType=0x1,
+                          subtype=0x0, date=(0, 0)),
+        kids=[StringFileInfo([StringTable("040904B0", [
+            StringStruct("CompanyName", "Parth Satija"),
+            StringStruct("FileDescription", "Midum"),
+            StringStruct("FileVersion", dotted),
+            StringStruct("InternalName", "Midum"),
+            StringStruct("LegalCopyright", "Copyright (c) Parth Satija"),
+            StringStruct("OriginalFilename", "Midum.exe"),
+            StringStruct("ProductName", "Midum"),
+            StringStruct("ProductVersion", raw)])]),
+              VarFileInfo([VarStruct("Translation", [1033, 1200])])])
+    os.makedirs(WORKPATH, exist_ok=True)                 # noqa: F821  (provided by PyInstaller)
+    path = os.path.join(WORKPATH, "midum_version_info.txt")  # noqa: F821
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(str(info))
+    return path
+
+
+VERSION_FILE = make_version_file()
+
 # --------------------------------------------------------------------------
 # 4. Build
 # --------------------------------------------------------------------------
@@ -189,6 +223,7 @@ exe = EXE(  # noqa: F821
     codesign_identity=None,
     entitlements_file=None,
     icon=ICON,
+    version=VERSION_FILE,
 )
 
 coll = COLLECT(  # noqa: F821
