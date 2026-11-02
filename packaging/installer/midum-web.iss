@@ -79,6 +79,7 @@ const
 var
   DownloadPage: TDownloadWizardPage;
   PayloadPath: String;
+  CurrentUrl: String;
 
 function OnDownloadProgress(const Url, FileName: String; const Progress, ProgressMax: Int64): Boolean;
 begin
@@ -168,6 +169,7 @@ begin
   try
     try
       { 1) tiny checksum file published next to the zip }
+      CurrentUrl := ChecksumUrl;
       DownloadPage.Clear;
       DownloadPage.Add(ChecksumUrl, 'payload.sha256', '');
       DownloadPage.Download;
@@ -176,6 +178,7 @@ begin
         RaiseException('Could not read the checksum for the latest Midum release.');
 
       { 2) the app itself, verified against that checksum }
+      CurrentUrl := PayloadUrl;
       DownloadPage.Clear;
       DownloadPage.Add(PayloadUrl, '{#PayloadZip}', ExpectedHash);
       DownloadPage.Download;
@@ -185,9 +188,18 @@ begin
     except
       if DownloadPage.AbortedByUser then
         Log('Download aborted by user.')
+      else if Pos('404', GetExceptionMessage) > 0 then
+        SuppressibleMsgBox(
+          'Midum could not be downloaded: the file was not found (HTTP 404).' + #13#10#13#10 +
+          CurrentUrl + #13#10#13#10 +
+          'This usually means the latest GitHub release has no ' + '{#PayloadZip}' + ' attached yet (it is still ' +
+          'building, was published as a draft/pre-release, or the repository is private). ' +
+          'Try again in a few minutes, or download the release manually from {#AppURL}/releases.',
+          mbCriticalError, MB_OK, IDOK)
       else
         SuppressibleMsgBox(
           'Midum could not be downloaded:' + #13#10#13#10 + GetExceptionMessage + #13#10#13#10 +
+          CurrentUrl + #13#10#13#10 +
           'Check your internet connection and try again, or download the release manually from {#AppURL}/releases.',
           mbCriticalError, MB_OK, IDOK);
       Result := False;
