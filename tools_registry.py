@@ -11,6 +11,7 @@ from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _gemini_webap
 from screen_capture import _do_click, _grab_full_screenshot, ocr_screen
 from tools_schema import tools
 from permissions import get_permission
+import tool_discovery as _td
 from ui_automation.linux_navigator import _run, ui_navigator
 from ui_automation.windows_uia import _TESSERACT_AVAILABLE, _UIA_AVAILABLE, _UIA_INIT_ERROR
 from ddgs import DDGS
@@ -40,47 +41,54 @@ else:
     win32gui = None
 
 # --- from main.py, section 1 ---
-# GROQ LAZY TOOL LOADING (Option A)
+# TOOL DISCOVERY -- per-model toggle (generalised from the old Groq-only lazy loading)
 # =============================================================================
-# Groq's free tier is TPM-capped (as low as 6000 tokens/minute on some
-# models). The full `tools` schema above is ~73KB / ~18k tokens on its own —
-# more than the entire budget before a single message is sent. Instead of
-# sending all ~88 tool schemas on every Groq call, we send a small CORE set
-# covering the actions Midum needs most often, plus two meta-tools
-# (list_more_tools / load_tool_by_index) that let Midum pull in any other
-# tool's full schema on demand, mirroring the existing
-# "list indexed, then load by index" pattern used for skills/paths/MCP.
+# Originally written for Groq's free tier, which is TPM-capped (as low as 6000
+# tokens/minute on some models) while the full `tools` schema is ~18k tokens on
+# its own. The same mechanism now backs a persistent, per-model "Tool
+# discovery" toggle in the Model popup (settings + per-chat state live in
+# tool_discovery.py).
 #
-# Loaded extra tools persist for the rest of the session (reset on
-# "new session") so Midum doesn't have to reload the same tool repeatedly.
+# With discovery ON for the active model, each call sends only:
+#   - the user-curated DEFAULT tools (Permissions tab -> pin icon),
+#   - promoted MCP tools + promoted Flows (appended afterwards by
+#     permissions.filter_tools_schema(), so they need no discovery hop),
+#   - tools the model loaded on demand earlier in this chat, and
+#   - two meta-tools (list_more_tools / load_tool_by_index) that let it pull
+#     any other tool's full schema in, mirroring the existing
+#     "list indexed, then load by index" pattern used for skills/paths/MCP.
+#
+# Loaded tools persist for the rest of that chat, so the model never has to
+# reload the same tool repeatedly.
 
-_TOOLS_BY_NAME = {t["function"]["name"]: t for t in tools}
+def _tools_by_name() -> dict:
+    """Live name -> schema map over the shared `tools` list. Rebuilt per call
+    (it is cheap) because other modules (artifacts, editor_link, midumdocs,
+    voiceover) append their tools to that list AFTER this module is imported,
+    so a map built once at import time would silently miss them."""
+    return {t["function"]["name"]: t for t in tools}
 
-GROQ_CORE_TOOL_NAMES = [
-    "execute_terminal_command",
-    "list_paths_indexed", "get_path",
-    "list_directory", "open_path", "find_file", "open_path_by_index",
-    "read_local_file", "write_local_file", "append_local_file",
-    "search_internet", "open_url",
-    "type_text", "wait", "say",
-    "start_action_loop", "stop_action_loop",
-    "ask_user_text", "ask_user_approval", "ask_user_choice", "ask_user_file_path",
-    "write_steps", "complete_step",
-]
-GROQ_CORE_TOOL_NAMES = [n for n in GROQ_CORE_TOOL_NAMES if n in _TOOLS_BY_NAME]
 
-_GROQ_META_TOOLS = [
+def __getattr__(name):
+    # Back-compat for the old Groq-only module globals, now computed live.
+    if name == "_TOOLS_BY_NAME":
+        return _tools_by_name()
+    if name == "GROQ_CORE_TOOL_NAMES":
+        return default_discovery_tool_names()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+_DISCOVERY_META_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "list_more_tools",
             "description": (
-                "List ALL tools NOT currently loaded, as a numbered index with a "
-                "one-line description each (e.g. GUI automation, browser DOM/CDP, "
-                "MCP servers, domain knowledge, model delegation/consulting, memory "
-                "and goal tools). The core tools already cover terminal, files, "
-                "paths, search, URLs, and user prompts — only call this when none of "
-                "those fit. Follow up with load_tool_by_index to actually load one."
+                "List every built-in tool NOT currently loaded in your context, as a "
+                "numbered index with a one-line description each (e.g. GUI automation, "
+                "browser DOM/CDP, MCP gateway tools, domain knowledge, model "
+                "delegation/consulting, memory and goal tools). Only a small default "
+                "set of tools is loaded, so call this when none of your loaded tools "
+                "fit the task. Follow up with load_tool_by_index to actually load one."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -91,8 +99,8 @@ _GROQ_META_TOOLS = [
             "name": "load_tool_by_index",
             "description": (
                 "Load a tool from the most recent list_more_tools() index so it "
-                "becomes callable on your NEXT turn. Loaded tools persist for the "
-                "rest of the session and stack — previously loaded tools stay "
+                "becomes callable on your NEXT step. Loaded tools persist for the "
+                "rest of this chat and stack — previously loaded tools stay "
                 "available."
             ),
             "parameters": {
@@ -106,27 +114,23 @@ _GROQ_META_TOOLS = [
     },
 ]
 
-# Tools loaded on-demand for the Groq provider this session.
-_groq_extra_tools: list = []
-# Numbered index cache backing the last list_more_tools() call, so
-# load_tool_by_index(N) knows what N refers to.
-_groq_more_tools_index: list = []
+def default_discovery_tool_names() -> list:
+    """Curated default tools that actually exist on this build."""
+    by_name = _tools_by_name()
+    return [n for n in _td.get_default_tools() if n in by_name]
 
 
 def list_more_tools() -> str:
-    """Return a numbered index of every tool not already loaded for Groq."""
-    global _groq_more_tools_index
-    loaded_names = set(GROQ_CORE_TOOL_NAMES) | {t["function"]["name"] for t in _groq_extra_tools}
-    remaining = [
-        n for n in _TOOLS_BY_NAME
-        if n not in loaded_names and get_permission(n) != "deny"
-    ]
-    _groq_more_tools_index = remaining
+    """Return a numbered index of every native tool not already loaded."""
+    by_name = _tools_by_name()
+    loaded = set(default_discovery_tool_names()) | set(_td.session_loaded_names())
+    remaining = [n for n in by_name if n not in loaded and get_permission(n) != "deny"]
+    _td.session_set_index(remaining)
     if not remaining:
         return "All tools are already loaded."
     lines = []
     for i, name in enumerate(remaining):
-        desc = _TOOLS_BY_NAME[name]["function"].get("description", "") or ""
+        desc = by_name[name]["function"].get("description", "") or ""
         short = desc.split(". ")[0].split("\n")[0][:110]
         lines.append(f"{i}  {name}  — {short}")
     return "\n".join(lines)
@@ -134,29 +138,63 @@ def list_more_tools() -> str:
 
 def load_tool_by_index(index: int) -> str:
     """Load a tool by index from the last list_more_tools() call."""
-    if not _groq_more_tools_index:
+    idx_list = _td.session_get_index()
+    if not idx_list:
         return "Call list_more_tools() first to see what's available."
-    if not (0 <= index < len(_groq_more_tools_index)):
-        return f"Invalid index. Valid range: 0-{len(_groq_more_tools_index) - 1}."
-    name = _groq_more_tools_index[index]
-    if any(t["function"]["name"] == name for t in _groq_extra_tools):
+    if not (0 <= index < len(idx_list)):
+        return f"Invalid index. Valid range: 0-{len(idx_list) - 1}."
+    name = idx_list[index]
+    if name not in _tools_by_name():
+        return f"'{name}' no longer exists."
+    if get_permission(name) == "deny":
+        return f"[PERMISSION DENIED] '{name}' is blocked in the Permissions tab. Do not retry it."
+    if not _td.session_load(name):
         return f"'{name}' is already loaded."
-    _groq_extra_tools.append(_TOOLS_BY_NAME[name])
     return f"Loaded '{name}'. It's now available for your next tool call."
 
 
-def reset_groq_loaded_tools():
-    """Clear session-loaded extra tools — called on 'new session'."""
-    global _groq_extra_tools, _groq_more_tools_index
-    _groq_extra_tools = []
-    _groq_more_tools_index = []
+def reset_discovery_loaded_tools():
+    """Forget tools loaded on demand in the current chat."""
+    _td.reset_session()
 
 
-def _get_groq_tools_schema() -> list:
-    """Core tool subset + anything loaded on-demand + the meta-tools, kept
-    small deliberately to fit Groq's tight TPM budget."""
-    core = [_TOOLS_BY_NAME[n] for n in GROQ_CORE_TOOL_NAMES]
-    return core + _groq_extra_tools + _GROQ_META_TOOLS
+reset_groq_loaded_tools = reset_discovery_loaded_tools  # back-compat alias
+
+
+def get_discovery_tools_schema() -> list:
+    """Default tools + anything loaded on demand this chat + the meta-tools."""
+    by_name = _tools_by_name()
+    names = default_discovery_tool_names()
+    names += [n for n in _td.session_loaded_names() if n in by_name and n not in names]
+    return [by_name[n] for n in names] + _DISCOVERY_META_TOOLS
+
+
+_get_groq_tools_schema = get_discovery_tools_schema  # back-compat alias
+
+
+def get_tools_for_model(provider=None, model=None) -> list:
+    """The tool list to hand filter_tools_schema() for this model: the full
+    `tools` list, or the reduced discovery set when the model's toggle is on."""
+    p, m = _td.resolve_model(provider, model)
+    if p in _td.TEXT_PROTOCOL_PROVIDERS or not _td.is_enabled(p, m):
+        return tools
+    return get_discovery_tools_schema()
+
+
+def discovery_prompt_block(provider=None, model=None) -> str:
+    """Ephemeral per-step system note (empty when discovery is off)."""
+    p, m = _td.resolve_model(provider, model)
+    if p in _td.TEXT_PROTOCOL_PROVIDERS or not _td.is_enabled(p, m):
+        return ""
+    return (
+        "\n\n━━━ TOOL DISCOVERY MODE ━━━\n"
+        "Only a small set of tools is loaded for you: "
+        + (", ".join(default_discovery_tool_names()) or "(none)")
+        + ", plus any promoted MCP tools / Flows (call those directly). "
+        "Any other tool is NOT callable until you load it: call list_more_tools(), "
+        "then load_tool_by_index(N); it becomes available on your next step and stays "
+        "loaded for this chat. Never guess a tool name that isn't loaded.\n"
+    )
 
 
 def open_url(url: str, browser: str = "chrome") -> str:

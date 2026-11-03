@@ -624,6 +624,22 @@ def get_secret_status() -> dict:
     return {"ok": error is None, "error": error, "path": path, "fields": fields}
 
 
+def get_secret_value(key: str) -> str:
+    """Raw saved value of one editable key ("" if unset/unreadable).
+    Backend-only: used by the Settings 'Test' buttons. Never send the result
+    to the GUI -- the page only ever receives masked previews."""
+    if key not in _SECRET_KEY_NAMES:
+        return ""
+    try:
+        with _secrets_io_lock:
+            with open(os.path.abspath(SECRETS_FILE), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        raw = data.get(key, "") if isinstance(data, dict) else ""
+        return raw.strip() if isinstance(raw, str) else ""
+    except Exception:
+        return ""
+
+
 def save_secret_values(updates: dict) -> dict:
     """Write one or more keys into SECRETS_FILE.
     `updates` maps secrets-file key -> new value. A non-empty string sets it,

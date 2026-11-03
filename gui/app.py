@@ -104,6 +104,7 @@ from gui.ambient_surface import AmbientSurfaceManager
 import config
 import main as midum
 import permissions
+import tool_discovery as _tool_discovery
 import artifacts
 import midumdocs
 from gui.editor_backend import EditorMixin
@@ -347,7 +348,7 @@ PROVIDER_OPTIONS = [
     ("Gemini (API)",    "gemini_api"),
     ("ChatGPT (Web)",   "openai_web"),
     ("Groq",            "groq"),
-    ("LiteLLM (any provider)", "litellm"),
+    ("Other", "litellm"),
 ]
 _PROVIDER_LABEL_TO_KEY = {label: key for label, key in PROVIDER_OPTIONS}
 _PROVIDER_KEY_TO_LABEL = {key: label for label, key in PROVIDER_OPTIONS}
@@ -972,6 +973,7 @@ class Api(EditorMixin, StepsMixin):
         # already gets from _on_log_line's "-> Executing: ..." interception.
         midum.set_tool_call_hook(self._handle_tool_call)
         midum.set_tool_start_hook(self._handle_tool_start)
+        midum.set_gemini_retry_hook(self._handle_gemini_retry)
 
         # Wires the persistent WSL2 shell (shell_session.py) to the Shell
         # tab -- every command run there, whether issued by the model via
@@ -1091,6 +1093,12 @@ class Api(EditorMixin, StepsMixin):
         flow_name = sched.get("flow_name")
         self._push_event("log", {"text": f"⏰ [Schedule '{sched.get('id')}'] ran flow '{flow_name}' -> {str(result)[:200]}\n"})
         self._push_event("schedule_ran", {"schedule_id": sched.get("id"), "flow_name": flow_name, "result": str(result)[:500]})
+
+    def _handle_gemini_retry(self, kind: str, payload: dict):
+        """Called by orchestration.py when a Gemini call fails and the turn is about to be
+        retried from exactly where it stopped. kind == "start" shows the red "Retrying in Ns"
+        pill (payload: seconds, attempt, max_attempts, reason); kind == "end" removes it."""
+        self._push_event("gemini_retry" if kind == "start" else "gemini_retry_end", payload or {})
 
     def _handle_tool_start(self, name: str, args: dict, agent_name: str = None):
         """Called by orchestration.py right BEFORE a tool executes, with the
@@ -1382,11 +1390,16 @@ class Api(EditorMixin, StepsMixin):
             # this tab's content to the frontend on a plain launch.
             self._push_event("tabs_restored", {"display": self._display_log, "kb_state": self._kb_state})
 
+            # The built-in Filesystem MCP is always created and connected, even on
+            # a fresh launch with no saved mcp_servers.json yet.
+            try:
+                midum.ensure_default_filesystem_server()
+            except Exception as e:
+                self._push_event("log", {"text": f"⚠️ Could not prepare the Filesystem MCP: {e}\n"})
             configs = midum._load_mcp_config()
-            if configs:
-                self._push_event("log", {"text": f"🔌 Reconnecting {len(configs)} saved MCP server(s)...\n"})
-                midum.init_mcp_servers_from_config()
-                self._push_event("mcp_changed", {})
+            self._push_event("log", {"text": f"🔌 Connecting {len(configs)} MCP server(s) (Filesystem MCP is built in)...\n"})
+            midum.init_mcp_servers_from_config()
+            self._push_event("mcp_changed", {})
 
             # Scheduler: only fires while this app is open (see scheduler.py's
             # module docstring) -- start the background tick thread now, once
@@ -1935,6 +1948,135 @@ class Api(EditorMixin, StepsMixin):
         r["applied_live"] = applied
         r["needs_restart"] = needs_restart
         return r
+
+    def test_api_key(self, key, value=None):
+        """Live-check one key from Settings > Models > API keys.
+        `value` is whatever is typed in the box (tested before saving); when
+        empty, the saved key is tested. Returns {ok, message}; never echoes the key."""
+        import urllib.request, urllib.error
+        if key not in config._SECRET_KEY_NAMES:
+            return {"ok": False, "message": f"Unknown key: {key}"}
+        typed = value.strip() if isinstance(value, str) else ""
+        val = typed or config.get_secret_value(key)
+        src = "typed key" if typed else "saved key"
+        if not val:
+            return {"ok": False, "message": "No value set -- paste one first."}
+
+        def http(url, headers=None, method="GET", body=None):
+            req = urllib.request.Request(url, data=body, method=method,
+                                         headers={"User-Agent": "Mozilla/5.0 (Midum key test)", **(headers or {})})
+            try:
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    return resp.status, resp.read(300000).decode("utf-8", "replace")
+            except urllib.error.HTTPError as e:
+                try:
+                    txt = e.read(20000).decode("utf-8", "replace")
+                except Exception:
+                    txt = ""
+                return e.code, txt
+            except Exception as e:
+                return None, str(e)
+
+        def verdict(status, body, name):
+            if status is None:
+                return {"ok": False, "message": f"Couldn't reach {name}: {body[:120]}"}
+            if 200 <= status < 300:
+                return {"ok": True, "message": f"{name} accepted the {src}."}
+            if status == 400 and "API_KEY_INVALID" in body:
+                return {"ok": False, "message": f"{name} rejected the key (invalid)."}
+            if status in (401, 403):
+                return {"ok": False, "message": f"{name} rejected the key (HTTP {status})."}
+            if status == 429:
+                return {"ok": True, "message": f"Key looks valid, but {name} is rate-limiting right now (HTTP 429)."}
+            return {"ok": False, "message": f"{name} returned HTTP {status}; couldn't confirm the key."}
+
+        bearer = {"Authorization": f"Bearer {val}"}
+        try:
+            if key.startswith("GEMINI_API_KEY"):
+                s, b = http("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1",
+                            {"x-goog-api-key": val})
+                return verdict(s, b, "Gemini API")
+            if key == "OPENROUTER_API_KEY":
+                s, b = http("https://openrouter.ai/api/v1/auth/key", bearer)
+                return verdict(s, b, "OpenRouter")
+            if key == "GROQ_API_KEY":
+                s, b = http("https://api.groq.com/openai/v1/models", bearer)
+                return verdict(s, b, "Groq")
+            if key == "OLLAMA_API_KEY":
+                s, b = http("https://ollama.com/api/tags", bearer)
+                r = verdict(s, b, "Ollama Cloud")
+                if r["ok"] and s and 200 <= s < 300:
+                    r["message"] += " (This endpoint is public, so a wrong key may not be caught.)"
+                return r
+            if key == "OMNIROUTE_API_KEY":
+                base = str(getattr(config, "OMNIROUTE_API_BASE", "http://localhost:20128/v1")).rstrip("/")
+                s, b = http(base + "/models", bearer)
+                if s is None:
+                    return {"ok": False, "message": f"Couldn't reach OmniRoute at {base} -- is the gateway running?"}
+                return verdict(s, b, "OmniRoute")
+            if key == "DISCORD_BOT_TOKEN":
+                s, b = http("https://discord.com/api/v10/users/@me", {"Authorization": f"Bot {val}"})
+                if s is not None and 200 <= s < 300:
+                    try:
+                        nm = json.loads(b).get("username", "")
+                    except Exception:
+                        nm = ""
+                    return {"ok": True, "message": f"Discord accepted the {src}" + (f" (bot: {nm})." if nm else ".")}
+                return verdict(s, b, "Discord")
+            if key == "DISCORD_DEFAULT_VOICE_CHANNEL_ID":
+                if not val.isdigit() or not (15 <= len(val) <= 21):
+                    return {"ok": False, "message": "That doesn't look like a Discord channel ID (should be 17-20 digits)."}
+                tok = config.get_secret_value("DISCORD_BOT_TOKEN")
+                if not tok:
+                    return {"ok": True, "message": "Format looks right. Add the bot token to verify the channel exists."}
+                s, b = http(f"https://discord.com/api/v10/channels/{val}", {"Authorization": f"Bot {tok}"})
+                if s is not None and 200 <= s < 300:
+                    try:
+                        d = json.loads(b)
+                        nm, ty = d.get("name", ""), d.get("type")
+                    except Exception:
+                        nm, ty = "", None
+                    note = "" if ty in (2, 13) else " (note: this is not a voice/stage channel)"
+                    return {"ok": True, "message": f"Channel found{(': ' + nm) if nm else ''}{note}."}
+                if s == 404:
+                    return {"ok": False, "message": "Discord says no channel with that ID (or the bot can't see it)."}
+                return verdict(s, b, "Discord")
+            if key in ("GEMINI_SECURE_1PSID", "GEMINI_SECURE_1PSIDTS"):
+                psid = val if key == "GEMINI_SECURE_1PSID" else config.get_secret_value("GEMINI_SECURE_1PSID")
+                psidts = val if key == "GEMINI_SECURE_1PSIDTS" else config.get_secret_value("GEMINI_SECURE_1PSIDTS")
+                if not psid:
+                    return {"ok": False, "message": "Needs the __Secure-1PSID cookie too -- set both, then test."}
+                ck = f"__Secure-1PSID={psid}" + (f"; __Secure-1PSIDTS={psidts}" if psidts else "")
+                s, b = http("https://gemini.google.com/app", {"Cookie": ck})
+                if s is None:
+                    return {"ok": False, "message": f"Couldn't reach Gemini: {b[:120]}"}
+                if 200 <= s < 300 and "SNlM0e" in b:
+                    return {"ok": True, "message": "Gemini web accepted the session cookies."}
+                return {"ok": False, "message": "Gemini didn't return a logged-in session -- the cookies are expired, incomplete, or Google blocked the check."}
+            if key.startswith("CHATGPT_SESSION_TOKEN"):
+                if key == "CHATGPT_SESSION_TOKEN":
+                    ck = f"__Secure-next-auth.session-token={val}"
+                else:
+                    c0 = val if key.endswith("_0") else config.get_secret_value("CHATGPT_SESSION_TOKEN_0")
+                    c1 = val if key.endswith("_1") else config.get_secret_value("CHATGPT_SESSION_TOKEN_1")
+                    if not (c0 and c1):
+                        return {"ok": False, "message": "Needs both chunk 0 and chunk 1 set -- set both, then test."}
+                    ck = f"__Secure-next-auth.session-token.0={c0}; __Secure-next-auth.session-token.1={c1}"
+                s, b = http("https://chatgpt.com/api/auth/session", {"Cookie": ck, "Accept": "application/json"})
+                if s is None:
+                    return {"ok": False, "message": f"Couldn't reach ChatGPT: {b[:120]}"}
+                if s in (403, 503):
+                    return {"ok": False, "message": f"ChatGPT blocked the check (HTTP {s}); can't confirm the token from here."}
+                try:
+                    d = json.loads(b)
+                except Exception:
+                    d = {}
+                if isinstance(d, dict) and (d.get("accessToken") or d.get("user")):
+                    return {"ok": True, "message": "ChatGPT accepted the session token."}
+                return {"ok": False, "message": "ChatGPT didn't return a session -- the token is expired or incomplete."}
+        except Exception as e:
+            return {"ok": False, "message": f"Test failed: {e}"}
+        return {"ok": False, "message": "No test is available for this key."}
 
     def litellm_test(self, model: str):
         return midum.providers_litellm_backend.test_connection(model)
@@ -6507,6 +6649,7 @@ class Api(EditorMixin, StepsMixin):
                 "transport": h.config.get("transport", "stdio"),
                 "tool_count": len(h.tools) if h.connected else 0,
                 "error": h.error if not h.connected else "",
+                "locked": bool(midum.is_protected_server(name)),
             })
         return {"servers": out, "sdk_available": bool(midum._MCP_SDK_AVAILABLE)}
 
@@ -6545,6 +6688,9 @@ class Api(EditorMixin, StepsMixin):
         return {"ok": True}
 
     def disconnect_mcp(self, name: str, forget: bool = False):
+        if midum.is_protected_server(name):
+            return {"ok": False, "error": "The Filesystem MCP is built in and can't be disconnected or removed."}
+
         def worker():
             result = midum.disconnect_mcp_server(name, forget=forget)
             self._push_event("log", {"text": f"⚙️ {result}\n"})
@@ -6762,7 +6908,7 @@ class Api(EditorMixin, StepsMixin):
                 "desc": desc[:200],
                 "promoted": bool(midum.is_tool_promoted(name, tdef["name"])),
             })
-        return {"ok": True, "server": name, "tools": out}
+        return {"ok": True, "server": name, "tools": out, "locked": bool(midum.is_protected_server(name))}
 
     def promote_mcp_tool(self, server: str, tool_name: str):
         result = midum.promote_mcp_tool(server, tool_name)
@@ -6782,10 +6928,12 @@ class Api(EditorMixin, StepsMixin):
         right now (not a stale snapshot).
         """
         native = []
+        _td_defaults = set(_tool_discovery.get_default_tools())
         for t in sorted(midum.tools, key=lambda t: t["function"]["name"]):
             fn = t["function"]
             desc = (fn.get("description") or "").strip().splitlines()[0] if fn.get("description") else ""
-            native.append({"key": fn["name"], "name": fn["name"], "desc": desc[:160]})
+            native.append({"key": fn["name"], "name": fn["name"], "desc": desc[:160],
+                           "discovery_default": fn["name"] in _td_defaults})
 
         mcp_groups = []
         for server_name in midum._MCP_SERVER_ORDER:
@@ -6815,6 +6963,48 @@ class Api(EditorMixin, StepsMixin):
         msg = permissions.reset_all_permissions()
         return {"ok": True, "message": msg}
 
+    # ── Tool discovery (per-model toggle + curated default tools) ──────────────────────
+    # State lives in tool_discovery.py (storage/tool_discovery.json). The model
+    # popup toggles it per provider+model; the Permissions tab curates the
+    # default tool set. Both are read live on every model call, so changes
+    # take effect on the very next step -- no restart or re-Apply needed.
+    def _td_target(self, label=None, model=None):
+        """(provider_key, model_id) for what's in the Model tab fields (same
+        normalisation as apply_model), or the active model when blank."""
+        if label:
+            provider_key = _PROVIDER_LABEL_TO_KEY.get(label, DEFAULT_PROVIDER_KEY)
+            model_id = (model or "").strip()
+            if not model_id or model_id == "(auto)":
+                model_id = "" if provider_key == "gemini_web" else _default_model_for_provider(provider_key)
+            return provider_key, model_id
+        return _tool_discovery.resolve_model()
+
+    def get_tool_discovery(self, label=None, model=None):
+        p, m = self._td_target(label, model)
+        return {
+            "enabled": _tool_discovery.is_enabled(p, m),
+            "applies": p not in _tool_discovery.TEXT_PROTOCOL_PROVIDERS,
+            "explicit": _tool_discovery.has_explicit_setting(p, m),
+            "provider": p,
+            "model": m or "(auto)",
+            "default_count": len(_tool_discovery.get_default_tools()),
+        }
+
+    def set_tool_discovery(self, enabled, label=None, model=None):
+        p, m = self._td_target(label, model)
+        msg = _tool_discovery.set_enabled(p, m, bool(enabled))
+        self._push_event("log", {"text": f"🧰 [{msg}]\n"})
+        return self.get_tool_discovery(label, model)
+
+    def get_discovery_default_tools(self):
+        return {"tools": _tool_discovery.get_default_tools()}
+
+    def set_discovery_default_tool(self, name: str, on):
+        return {"tools": _tool_discovery.set_default_tool(name, bool(on))}
+
+    def reset_discovery_default_tools(self):
+        return {"tools": _tool_discovery.reset_default_tools()}
+
     # ── Filesystem MCP approval password ────────────────────────────────
     # Backs the "ask_password" permission level (see permissions.py /
     # midum_mcp/filesystem_policy.py). Deliberately NOT reachable through
@@ -6830,6 +7020,56 @@ class Api(EditorMixin, StepsMixin):
     def remove_filesystem_password(self):
         msg = fs_policy.clear_filesystem_mcp_password()
         return {"ok": not msg.lower().startswith("error"), "message": msg}
+
+    # ── Filesystem MCP allowed folders ──────────────────────────────────────────
+    # Backs the "Allowed Folders" dropdown in the Permissions pane. The list
+    # lives in midum_mcp/filesystem_policy.py (default: Midum's own storage
+    # folder). Every change restarts the built-in Filesystem MCP so the
+    # server's own launch roots match the list.
+    def get_filesystem_allowed_folders(self):
+        roots = fs_policy.get_effective_allowed_roots()
+        default = fs_policy.get_default_filesystem_root()
+        return {
+            "folders": [
+                {"path": r, "default": os.path.normcase(r) == os.path.normcase(default)}
+                for r in roots
+            ],
+            "default": default,
+        }
+
+    def _fs_roots_changed(self, note: str):
+        def worker():
+            try:
+                ok, msg = midum.reconnect_filesystem_server()
+            except Exception as e:
+                ok, msg = False, f"Failed to restart the Filesystem MCP: {e}"
+            self._push_event("log", {"text": f"📁 {note} {msg}\n"})
+            self._push_event("mcp_changed", {})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def add_filesystem_allowed_folder(self, path: str = None):
+        """Add a folder to the allowed list. With no path, opens a native
+        folder picker (the Browse button)."""
+        if not path:
+            try:
+                result = self.window.create_file_dialog(webview.FOLDER_DIALOG)
+            except Exception:
+                result = None
+            if not result:
+                return {"ok": False, "cancelled": True, "message": "No folder selected.",
+                        **self.get_filesystem_allowed_folders()}
+            path = result[0]
+        ok, msg = fs_policy.add_allowed_root(path)
+        if ok:
+            self._fs_roots_changed(msg)
+        return {"ok": ok, "message": msg, **self.get_filesystem_allowed_folders()}
+
+    def remove_filesystem_allowed_folder(self, path: str):
+        ok, msg = fs_policy.remove_allowed_root(path)
+        if ok:
+            self._fs_roots_changed(msg)
+        return {"ok": ok, "message": msg, **self.get_filesystem_allowed_folders()}
 
     def _destroy_window_safe(self):
         """window.destroy() tears down the QWebEngineView (Chromium's Qt
@@ -7639,6 +7879,10 @@ html.liquid-glass-on.has-bg-image .perm-row,
 html.liquid-glass-on:not(.blobs-off) .perm-row,
 html.liquid-glass-on.has-bg-image .perm-opt,
 html.liquid-glass-on:not(.blobs-off) .perm-opt,
+html.liquid-glass-on.has-bg-image .perm-cat,
+html.liquid-glass-on:not(.blobs-off) .perm-cat,
+html.liquid-glass-on.has-bg-image .perm-bulk-opt,
+html.liquid-glass-on:not(.blobs-off) .perm-bulk-opt,
 html.liquid-glass-on.has-bg-image .ptt-slot-row,
 html.liquid-glass-on:not(.blobs-off) .ptt-slot-row,
 html.liquid-glass-on.has-bg-image textarea.code-area,
@@ -7677,12 +7921,39 @@ html.liquid-glass-on.has-bg-image .flowchart-wrap,
 html.liquid-glass-on:not(.blobs-off) .flowchart-wrap,
 html.liquid-glass-on.has-bg-image .perm-fs-pw-box,
 html.liquid-glass-on:not(.blobs-off) .perm-fs-pw-box,
+html.liquid-glass-on.has-bg-image .perm-fsroots-dd,
+html.liquid-glass-on:not(.blobs-off) .perm-fsroots-dd,
 html.liquid-glass-on.has-bg-image table.md-table{
   background-color:var(--glass-fill) !important;
   background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%) !important;
   border-color:var(--glass-edge) !important;
   box-shadow:inset 0 1px 0 var(--glass-edge), inset 0 -1px 0 var(--glass-edge-dim), var(--glass-glow) !important;
   transition:background-color .18s var(--ease), box-shadow .18s var(--ease), border-color .18s var(--ease);
+}
+/* Permissions pane: Filesystem MCP allowed-folders dropdown. The dropdown itself is in the glass list above;
+   these cover its inner parts (row dividers, summary hover, badge, Remove buttons) so nothing falls back to the
+   flat var(--surface)/var(--border) look while Liquid Glass is on. */
+html.liquid-glass-on.has-bg-image .perm-fsroots-item,
+html.liquid-glass-on:not(.blobs-off) .perm-fsroots-item,
+html.liquid-glass-on.has-bg-image .perm-fsroots-add,
+html.liquid-glass-on:not(.blobs-off) .perm-fsroots-add{
+  border-top-color:var(--glass-edge-dim);
+}
+html.liquid-glass-on.has-bg-image .perm-fsroots-sum:hover,
+html.liquid-glass-on:not(.blobs-off) .perm-fsroots-sum:hover{
+  background-color:var(--glass-fill-strong);
+}
+html.liquid-glass-on.has-bg-image .perm-fsroots-badge,
+html.liquid-glass-on:not(.blobs-off) .perm-fsroots-badge{
+  background-color:color-mix(in srgb, var(--accent) 22%, var(--glass-fill));
+  border-color:color-mix(in srgb, var(--accent) 70%, var(--glass-edge));
+  box-shadow:inset 0 1px 0 var(--glass-edge-dim);
+}
+html.liquid-glass-on.has-bg-image .perm-fsroots-item .mini-btn,
+html.liquid-glass-on:not(.blobs-off) .perm-fsroots-item .mini-btn{
+  background-color:var(--glass-fill-strong);
+  border:1px solid var(--glass-edge-dim);
+  box-shadow:inset 0 1px 0 var(--glass-edge-dim);
 }
 html.liquid-glass-on.has-bg-image input[type="checkbox"]:checked,
 html.liquid-glass-on:not(.blobs-off) input[type="checkbox"]:checked{
@@ -7866,7 +8137,7 @@ html.mz-chat-docked #input-box > #send-btn{order:3;margin-left:auto;}
 #mz-model-btn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
 #mz-model-btn .ic{width:14px;height:14px;flex:0 0 auto;}
 #mz-model-btn.on{background:var(--accent);color:#fff;}
-#mz-model-pop{position:absolute;bottom:calc(100% + 8px);left:0;right:0;max-height:min(580px,calc(100vh - 230px));overflow-y:auto;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.35);display:none;z-index:20;}
+#mz-model-pop{position:absolute;bottom:calc(100% + 8px);left:0;right:0;height:auto;max-height:calc(100vh - 140px);overflow-y:auto;overscroll-behavior:contain;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.35);display:none;z-index:20;}
 #mz-model-pop.open{display:block;}
 html.liquid-glass-on #mz-model-pop{background:var(--glass-fill-strong, var(--panel));-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px);}
 #mz-model-pop .mz-mp-head{display:flex;align-items:center;justify-content:space-between;font-size:12px;font-weight:600;color:var(--text);padding-bottom:8px;border-bottom:1px solid var(--border);margin-bottom:10px;}
@@ -7965,6 +8236,22 @@ html.liquid-glass-on #mz-model-pop{background:var(--glass-fill-strong, var(--pan
 .att-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;font-weight:600;line-height:1.25;}
 .att-sub{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px;opacity:.7;line-height:1.25;}
 .att-chip.err .att-sub{color:var(--red);opacity:1;}
+
+/* Gemini "not an error" retry pill: solid red normally, translucent red when glass surfaces are on */
+.row.gem-retry .bubble{background:transparent;border:0;box-shadow:none;padding:2px 0;}
+.gem-retry-note{font-size:12.5px;color:var(--muted,inherit);opacity:.9;margin:0 0 8px;line-height:1.45;}
+.gem-retry-pill{display:inline-flex;align-items:center;gap:8px;height:30px;padding:0 14px;border-radius:999px;
+  background:var(--red);color:#fff;border:1px solid var(--red);font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;}
+.gem-retry-dot{width:8px;height:8px;border-radius:50%;background:currentColor;animation:gemRetryPulse 1s ease-in-out infinite;}
+.gem-retry-cancel{margin-left:4px;height:20px;padding:0 9px;border-radius:999px;border:1px solid rgba(255,255,255,.55);
+  background:rgba(255,255,255,.18);color:inherit;font:inherit;font-size:11.5px;font-weight:600;cursor:pointer;}
+.gem-retry-cancel:hover{background:rgba(255,255,255,.32);}
+html.liquid-glass-on .gem-retry-cancel{border-color:color-mix(in srgb, var(--red) 55%, transparent);background:color-mix(in srgb, var(--red) 14%, transparent);}
+html.liquid-glass-on .gem-retry-cancel:hover{background:color-mix(in srgb, var(--red) 30%, transparent);}
+@keyframes gemRetryPulse{0%,100%{opacity:1;transform:scale(1);}50%{opacity:.35;transform:scale(.7);}}
+html.liquid-glass-on .gem-retry-pill{background:color-mix(in srgb, var(--red) 22%, transparent);
+  border-color:color-mix(in srgb, var(--red) 50%, transparent);color:var(--red);
+  -webkit-backdrop-filter:blur(12px) saturate(1.4);backdrop-filter:blur(12px) saturate(1.4);}
 .att-x{position:absolute;top:50%;right:5px;transform:translateY(-50%);width:22px;height:22px;border:none;border-radius:50%;background:transparent;color:var(--subtext);display:flex;align-items:center;justify-content:center;padding:0;}
 .att-x:hover{background:var(--border2);color:var(--text);}
 .att-x svg{width:13px;height:13px;}
@@ -7984,11 +8271,14 @@ html.liquid-glass-on #mz-model-pop{background:var(--glass-fill-strong, var(--pan
 #kb-toggle-btn{flex:0 0 auto;font-size:11px;}
 #kb-toggle-btn.active{background:var(--accent);color:#fff;}
 #kb-popover{
-  position:absolute;bottom:calc(100% + 8px);left:0;width:min(380px,100%);max-height:min(580px,calc(100vh - 230px));overflow-y:auto;
+  position:absolute;bottom:calc(100% + 8px);left:0;width:min(420px,100%);height:auto;max-height:calc(100vh - 140px);overflow-y:auto;overscroll-behavior:contain;
   background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:12px;
   box-shadow:0 8px 24px rgba(0,0,0,.35);display:none;z-index:20;font-size:12px;color:var(--text);
 }
 #kb-popover.open{display:block;}
+/* Dropdowns inside the popups (Provider etc.) open inline and push the content down instead of floating
+   inside the popup's scroll box, where the absolute list was clipped and LiteLLM's picker never showed. */
+#kb-popover .dropdown-list, #mz-model-pop .dropdown-list{position:static;margin-top:4px;max-height:min(280px,40vh);box-shadow:none;}
 /* Same translucent glass as the step-prompting panel (#steps-panel, see gui/steps_ui.py _GLASS_CSS). */
 html.liquid-glass-on #kb-popover{
   background-color:color-mix(in srgb, var(--panel) min(85%, calc(var(--glass-pct) + 15%)), transparent);
@@ -8069,6 +8359,43 @@ html.liquid-glass-on #kb-popover{
 .capability-picker-desc{font-size:10px;color:var(--subtext);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .capability-picker-count{flex:0 0 auto;font-size:10px;color:var(--subtext);background:var(--surface2);border-radius:999px;padding:1px 7px;}
 .capability-picker-empty{font-size:11px;color:var(--subtext);text-align:center;padding:14px 10px;}
+
+/* "/" and "#" pickers: same surface as the model popup (#kb-popover) -- solid panel normally, and with Glass
+   Surfaces on the same translucent fill / sheen / blur -- plus a selection highlight that is easy to see. */
+.path-picker-row:hover, .capability-picker-row:hover{background:var(--accent-faint);}
+.path-picker-row.active, .capability-picker-row.active{
+  background:color-mix(in srgb, var(--accent) 24%, transparent);
+  box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+html.liquid-glass-on.has-bg-image #path-picker,
+html.liquid-glass-on:not(.blobs-off) #path-picker,
+html.liquid-glass-on.has-bg-image #capability-picker,
+html.liquid-glass-on:not(.blobs-off) #capability-picker{
+  background-color:color-mix(in srgb, var(--panel) min(85%, calc(var(--glass-pct) + 15%)), transparent) !important;
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%);
+  border-color:var(--glass-edge) !important;
+  box-shadow:inset 0 1px 0 var(--glass-edge), 0 10px 30px rgba(0,0,0,.4) !important;
+  -webkit-backdrop-filter:blur(18px) saturate(1.25);backdrop-filter:blur(18px) saturate(1.25);
+}
+html.liquid-glass-on.has-bg-image .path-picker-row,
+html.liquid-glass-on:not(.blobs-off) .path-picker-row,
+html.liquid-glass-on.has-bg-image .capability-picker-row,
+html.liquid-glass-on:not(.blobs-off) .capability-picker-row{
+  background-color:transparent !important;box-shadow:none !important;
+}
+html.liquid-glass-on.has-bg-image .path-picker-row:hover,
+html.liquid-glass-on:not(.blobs-off) .path-picker-row:hover,
+html.liquid-glass-on.has-bg-image .capability-picker-row:hover,
+html.liquid-glass-on:not(.blobs-off) .capability-picker-row:hover{
+  background-color:color-mix(in srgb, var(--accent) 14%, transparent) !important;box-shadow:none !important;
+}
+html.liquid-glass-on.has-bg-image .path-picker-row.active,
+html.liquid-glass-on:not(.blobs-off) .path-picker-row.active,
+html.liquid-glass-on.has-bg-image .capability-picker-row.active,
+html.liquid-glass-on:not(.blobs-off) .capability-picker-row.active{
+  background-color:color-mix(in srgb, var(--accent) 30%, transparent) !important;
+  box-shadow:inset 0 0 0 1px color-mix(in srgb, var(--accent) 65%, transparent) !important;
+}
 
 /* Sidebar pane */
 #sidebar-pane-wrap{left:0;width:0;}   /* sidebar now lives on the LEFT; collapsed it tucks against the left edge */
@@ -8819,6 +9146,11 @@ table.md-table tr:nth-child(even) td{background:color-mix(in srgb, var(--surface
 .row:not(.midum) .row-label{color:var(--chat-sub);}
 .row.system .bubble,.row.error .bubble,.row.interjection .bubble{font-size:var(--cfs-md);}
 .row.system .bubble{color:var(--chat-sub);}
+/* System notices ("[Response terminated by user.]", "[Workspace context switched to: …]") as pills; glass-aware */
+.row.system .bubble{display:inline-block;max-width:100%;padding:4px 14px;border-radius:999px;background:var(--panel);
+  border:1px solid var(--border);line-height:1.45;overflow-wrap:anywhere;}
+html.liquid-glass-on .row.system .bubble{background:var(--glass-fill);border-color:var(--glass-edge-dim);
+  -webkit-backdrop-filter:blur(12px) saturate(1.3);backdrop-filter:blur(12px) saturate(1.3);box-shadow:var(--glass-glow);}
 code.inline-code{font-size:.92em;}
 pre.code-block{font-size:var(--cfs-md);line-height:1.6;}
 table.md-table{font-size:var(--cfs-lg);}
@@ -8885,12 +9217,29 @@ textarea.code-area{
 /* Permissions pane */
 .perm-search{width:100%;height:32px;border-radius:16px;border:1px solid var(--border2);
   background:var(--surface);color:var(--text);padding:0 12px;outline:none;font-size:12px;}
+/* The whole Permissions pane scrolls (the cards scroll away); only the search bar stays pinned to the top.
+   The wrapper blurs/tints whatever scrolls underneath it so rows don't show through the bar. */
+.perm-sticky{position:sticky;top:0;z-index:5;flex:0 0 auto;margin:10px -14px 0;padding:8px 14px;
+  background:color-mix(in srgb, var(--bg) 80%, transparent);
+  -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);}
+html.blobs-off:not(.has-bg-image) .perm-sticky{background:var(--panel);}
+html.liquid-glass-on.has-bg-image .perm-sticky,
+html.liquid-glass-on:not(.blobs-off) .perm-sticky{
+  background-color:var(--glass-fill-strong);
+  background-image:linear-gradient(150deg, var(--glass-sheen) 0%, var(--glass-sheen-soft) 30%, transparent 55%);
+  border-bottom:1px solid var(--glass-edge-dim);
+}
+#perm-list{flex:0 0 auto;}
+#tool-content > .perm-fs-pw-box{flex:0 0 auto;}
 .perm-group-title{font-size:10px;font-weight:700;color:var(--subtext);letter-spacing:.5px;
   margin:14px 0 6px;text-transform:uppercase;}
 .perm-group:first-child .perm-group-title{margin-top:4px;}
 .perm-row{display:flex;align-items:center;justify-content:space-between;gap:10px;
   background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:8px 10px;margin-bottom:6px;}
 .perm-info{min-width:0;flex:1;}
+.perm-pin{flex:0 0 auto;height:24px;padding:0 9px;border-radius:12px;border:1px solid var(--border2);background:transparent;color:var(--subtext);font-size:10px;font-weight:600;cursor:pointer;white-space:nowrap;}
+.perm-pin:hover{color:var(--text);}
+.perm-pin.active{background:var(--accent);border-color:var(--accent);color:#fff;}
 .perm-name{font-size:12px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .perm-desc{font-size:10px;color:var(--subtext);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .perm-seg{display:flex;flex:0 0 auto;border-radius:12px;overflow:hidden;border:1px solid var(--border2);}
@@ -8903,6 +9252,29 @@ textarea.code-area{
 .perm-opt.active[data-level="ask_password"]{background:var(--accent);color:#fff;}
 .perm-opt.active[data-level="deny"]{background:var(--red);color:#fff;}
 .perm-empty{font-size:11px;color:var(--subtext);padding:10px;text-align:center;}
+
+/* Permissions pane -- plain-language categories + legend */
+.perm-cat{background:var(--panel);border:1px solid var(--border);border-radius:14px;margin-bottom:8px;overflow:hidden;}
+.perm-cat[open]{padding-bottom:4px;}
+.perm-cat .perm-row{background:var(--surface);margin:0 8px 6px;}
+.perm-cat-head{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;padding:10px 12px;cursor:pointer;list-style:none;user-select:none;}
+.perm-cat-head::-webkit-details-marker{display:none;}
+.perm-cat-head::before{content:"\25B8";font-size:11px;color:var(--subtext);transition:transform .15s;flex:0 0 auto;}
+.perm-cat[open] > .perm-cat-head::before{transform:rotate(90deg);}
+.perm-cat-icon{font-size:18px;flex:0 0 auto;}
+.perm-cat-text{display:flex;flex-direction:column;gap:2px;flex:1;min-width:180px;}
+.perm-cat-title{font-size:12px;font-weight:700;color:var(--text);}
+.perm-cat-blurb{font-size:10px;color:var(--subtext);line-height:1.4;}
+.perm-cat-count{font-size:10px;color:var(--subtext);flex:0 0 auto;white-space:nowrap;}
+.perm-cat-count.restricted{color:var(--yellow);font-weight:600;}
+.perm-risk{display:inline-block;font-size:9px;font-weight:700;padding:1px 7px;border-radius:8px;margin-left:6px;vertical-align:middle;border:1px solid var(--border2);}
+.perm-risk.low{color:var(--green);border-color:var(--green);}
+.perm-risk.care{color:var(--yellow);border-color:var(--yellow);}
+.perm-risk.high{color:var(--red);border-color:var(--red);}
+.perm-bulk{display:flex;align-items:center;gap:6px;flex:0 0 auto;margin-left:auto;}
+.perm-bulk-label{font-size:9px;color:var(--subtext);text-transform:uppercase;letter-spacing:.4px;}
+.perm-bulk-opt{height:22px;padding:0 8px;font-size:10px;border-radius:11px;border:1px solid var(--border2);background:var(--surface);color:var(--subtext);cursor:pointer;}
+.perm-bulk-opt:hover{background:var(--surface2);color:var(--text);}
 
 /* Filesystem MCP approval-password box, shown at the top of the
    Permissions pane -- sets the credential backing the "Password" level
@@ -8918,6 +9290,19 @@ textarea.code-area{
 .perm-fs-pw-row input{flex:1;height:30px;border-radius:10px;border:1px solid var(--border2);
   background:var(--surface);color:var(--text);padding:0 10px;outline:none;font-size:12px;}
 .perm-fs-pw-hint{font-size:10px;color:var(--subtext);line-height:1.4;}
+
+/* Filesystem MCP allowed-folders dropdown (Permissions pane) */
+.perm-fsroots-dd{border:1px solid var(--border2);border-radius:10px;background:var(--surface);overflow:hidden;}
+.perm-fsroots-sum{cursor:pointer;list-style:none;user-select:none;padding:7px 10px;font-size:11px;
+  font-weight:600;color:var(--text);display:flex;align-items:center;gap:6px;}
+.perm-fsroots-sum::-webkit-details-marker{display:none;}
+.perm-fsroots-sum::before{content:"▸";font-size:11px;color:var(--subtext);transition:transform .15s;}
+.perm-fsroots-dd[open] > .perm-fsroots-sum::before{transform:rotate(90deg);}
+.perm-fsroots-item{display:flex;align-items:center;gap:8px;padding:6px 10px;border-top:1px solid var(--border2);font-size:11px;}
+.perm-fsroots-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);}
+.perm-fsroots-badge{flex:0 0 auto;font-size:9px;font-weight:700;padding:1px 7px;border-radius:8px;
+  border:1px solid var(--accent);color:var(--accent);}
+.perm-fsroots-add{padding:8px 10px;border-top:1px solid var(--border2);}
 
 /* Flows tab -- node-graph editor (Drawflow, loaded from CDN on first
    visit). Left: grouped node drawer, drag items onto the canvas. Right:
@@ -12228,6 +12613,10 @@ function animateWords(container){
 }
 
 function appendRow(tag, text, extra){
+  // A reply that is nothing but one bracketed line ("[Response terminated by user.]") is a system notice, not Midum speech.
+  if (tag === "midum" && typeof text === "string" && /^\s*\[[^\]\n]{1,300}\]\s*$/.test(text)){
+    tag = "system"; _currentMidumRow = null;
+  }
   const col = chatCol();
   const row = document.createElement("div");
   if (tag === "user"){
@@ -13457,7 +13846,7 @@ function initKbOnlyControls(){
 // log, which is re-rendered when you switch to it, so nothing is lost by dropping the live event here.
 const MZ_TAB_SCOPED_KINDS = new Set(["reply","say","system_line","error_line","tool_line","tool_call","tool_start","turn_ready",
   "ask","status","done","steps_summary","chat_surface_show","chat_surface_replace","chat_surface_update","chat_surface_close",
-  "render_surface_open","render_surface_update","render_surface_close"]);
+  "render_surface_open","render_surface_update","render_surface_close","gemini_retry","gemini_retry_end"]);
 let _mzStripTimer = 0;
 function mzTabStripRefreshSoon(){
   if (_mzStripTimer) return;
@@ -13498,6 +13887,8 @@ window.__midumEvent = function(evt){
   else if (kind === "tool_call"){ attachToolCallDetail(payload.name, payload.args, payload.result); }
   else if (kind === "tool_start"){ attachToolCallArgs(payload.name, payload.args); }
   else if (kind === "agent_tool_call"){ appendAgentToolRow(payload.agent, payload.name, payload.args, payload.result); }
+  else if (kind === "gemini_retry"){ gemRetryShow(payload); }
+  else if (kind === "gemini_retry_end"){ gemRetryClear(); }
   else if (kind === "log"){ appendLog(payload.text); }
   else if (kind === "turn_ready"){
     // Safety-net (re)attach -- covers turns whose only content came in a
@@ -13509,7 +13900,7 @@ window.__midumEvent = function(evt){
     if (_currentUserRow) attachEditButton(_currentUserRow, payload.turn_id);
     if (_currentMidumRow) attachRegenButton(_currentMidumRow, payload.turn_id);
   }
-  else if (kind === "done"){ state.thinking = false; _mdBusy(false); setActiveToolDot(null); closeToolGroup(); settleStaleToolPills(); _currentMidumRow = null; refreshTitlebarInfo(); buildConversationTabs(); }
+  else if (kind === "done"){ gemRetryClear(); state.thinking = false; _mdBusy(false); setActiveToolDot(null); closeToolGroup(); settleStaleToolPills(); _currentMidumRow = null; refreshTitlebarInfo(); buildConversationTabs(); }
   else if (kind === "projects"){ populateProjects(payload.projects, payload.active); }
   else if (kind === "ask"){ appendAsk(payload.id, payload.kind, payload.payload); }
   else if (kind === "mcp_changed"){ if (state.activeTab === "MCP") refreshMcpList(); }
@@ -13587,6 +13978,37 @@ window.__midumEvent = function(evt){
     }
   }
 };
+
+// ── Gemini "not an error" retry pill ─────────────────────────────────────────────────────────────
+// Shown while the backend waits before re-sending the SAME step after a Gemini failure.
+// The backend owns the real wait; this only animates the countdown, and gemRetryClear()
+// ("gemini_retry_end" / "done") removes it again.
+let _gemRetryRow = null, _gemRetryTimer = 0;
+function gemRetryClear(){
+  if (_gemRetryTimer){ clearInterval(_gemRetryTimer); _gemRetryTimer = 0; }
+  if (_gemRetryRow){ try { _gemRetryRow.remove(); } catch(e){} _gemRetryRow = null; }
+}
+function gemRetryShow(p){
+  gemRetryClear();
+  p = p || {};
+  const total = Math.max(1, parseInt(p.seconds, 10) || 20);
+  const reason = String(p.reason || "Gemini hit a temporary problem");
+  const row = document.createElement("div");
+  row.className = "row gem-retry";
+  row.innerHTML = '<div class="bubble"><div class="gem-retry-note"><b>This isn\u2019t an error.</b> '
+    + escapeHtml(reason) + ', so Midum will pick up from exactly where it stopped.</div>'
+    + '<div class="gem-retry-pill"><span class="gem-retry-dot"></span><span class="gem-retry-txt"></span><button type="button" class="gem-retry-cancel" title="Cancel the retry and stop this response">Cancel</button></div></div>';
+  const txt = row.querySelector(".gem-retry-txt");
+  // Cancel = exactly the Abort button: the backend sees the abort flag during its wait and ends the turn.
+  row.querySelector(".gem-retry-cancel").onclick = () => { const b = document.getElementById("abort-btn"); if (b) b.click(); gemRetryClear(); };
+  let left = total;
+  const paint = () => { txt.textContent = left > 0 ? ("Retrying in " + left + "s") : "Retrying now\u2026"; };
+  paint();
+  chatCol().appendChild(row);
+  scrollToBottom();
+  _gemRetryRow = row;
+  _gemRetryTimer = setInterval(() => { left = Math.max(0, left - 1); paint(); if (left <= 0){ clearInterval(_gemRetryTimer); _gemRetryTimer = 0; } }, 1000);
+}
 
 function appendLog(text){
   const box = document.getElementById("log-box");
@@ -13758,7 +14180,7 @@ async function showMcpToolsPane(serverName){
         </div>
         <div class="mcp-tool-actions">
           <button class="mini-btn${t.promoted ? " open" : ""}" data-act="promote" ${t.promoted ? "disabled" : ""}>Promote</button>
-          <button class="mini-btn del" data-act="demote" ${t.promoted ? "" : "disabled"}>Demote</button>
+          <button class="mini-btn del" data-act="demote" ${(t.promoted && !r.locked) ? "" : "disabled"} ${r.locked ? 'title="Filesystem MCP tools are always promoted"' : ""}>Demote</button>
         </div>
       </div>`).join("");
   }
@@ -14911,6 +15333,28 @@ async function refreshApiKeysCard(keepStatus){
     sv.style.cssText = "flex:0 0 auto;height:30px;font-size:11px;padding:0 12px;";
     sv.onclick = doSave;
     row.appendChild(lab); row.appendChild(inp); row.appendChild(sv);
+    // Test: checks the typed value if there is one (before saving), otherwise the saved key.
+    const tb = document.createElement("button");
+    tb.className = "ghost-btn"; tb.textContent = "Test"; tb.title = "Check this key against its service";
+    tb.style.cssText = "flex:0 0 auto;height:30px;font-size:11px;padding:0 12px;";
+    let tbTimer = null;
+    tb.onclick = async ()=>{
+      const typedVal = inp.value.trim();
+      if (!f.has_value && !typedVal){ if (st) st.textContent = f.label + ": paste a value first, then Test."; return; }
+      clearTimeout(tbTimer);
+      tb.disabled = true; tb.style.color = ""; tb.textContent = "Testing…";
+      let r;
+      try { r = await api("test_api_key", f.key, typedVal || null); }
+      catch(e){ r = {ok:false, message:String(e)}; }
+      r = r || {ok:false, message:"No response."};
+      tb.disabled = false;
+      tb.textContent = r.ok ? "✓ OK" : "✗ Failed";
+      tb.style.color = r.ok ? "var(--accent)" : "#e5534b";
+      tb.title = r.message || "";
+      if (st) st.textContent = f.label + ": " + (r.message || (r.ok ? "OK" : "Failed"));
+      tbTimer = setTimeout(()=>{ tb.textContent = "Test"; tb.style.color = ""; tb.title = "Check this key against its service"; }, 8000);
+    };
+    row.appendChild(tb);
     if (f.has_value){
       const cl = document.createElement("button");
       cl.className = "ghost-btn"; cl.textContent = "✕"; cl.title = "Remove saved key";
@@ -16341,6 +16785,13 @@ function buildModelPane(box){
         style="height:32px;flex:1;border-radius:16px;border:1px solid var(--border2);background:var(--surface);color:var(--text);padding:0 10px;"/>
       <button class="btn" id="ctx-tokens-save" style="background:var(--accent);color:#fff;">Save</button>
     </div>
+    <div class="divider"></div>
+    <div class="field-label">TOOL DISCOVERY</div>
+    <div class="kb-only-row" style="margin-top:4px;">
+      <input type="checkbox" id="td-toggle"/>
+      <label for="td-toggle">Discover tools on demand</label>
+    </div>
+    <div class="kb-only-hint" id="td-hint" style="margin-top:4px;"></div>
   `;
   (async ()=>{
     const info = await api("get_providers");
@@ -16349,12 +16800,14 @@ function buildModelPane(box){
     sel.value = info.current;
     document.getElementById("model-input").value = info.current_model;
     fillModelList(info.models);
+    tdRefresh();
   })();
   enhanceSelect(document.getElementById("provider-select"));
   attachLitellmPicker({ providerSelId: "provider-select", modelInputId: "model-input", prefix: "mp" });
   document.getElementById("provider-select").onchange = async (e)=>{
     const r = await api("select_provider", e.target.value);
     fillModelList(r.models); document.getElementById("model-input").value = r.default_model;
+    tdRefresh();
   };
   document.getElementById("model-refresh").onclick = async ()=>{
     const names = await api("refresh_ollama_models");
@@ -16366,7 +16819,54 @@ function buildModelPane(box){
     const status = await api("apply_model", label, model);
     document.getElementById("model-active").textContent = `Active: ${status.provider} — ${status.model}`;
     refreshTitlebarInfo();
+    tdRefresh();
   };
+
+  // ── Tool discovery toggle (persistent, per provider+model) ──────────────────────────────────
+  // Bound to whichever provider/model is currently in the fields above, so you
+  // can set it for a model before applying it. Saved immediately (no Apply
+  // needed) and read live on every model call.
+  const tdBox  = document.getElementById("td-toggle");
+  const tdHint = document.getElementById("td-hint");
+  let tdSeq = 0;
+  function tdFields(){
+    return [document.getElementById("provider-select").value,
+            document.getElementById("model-input").value];
+  }
+  function tdRender(r){
+    tdBox.checked  = !!r.enabled;
+    tdBox.disabled = !r.applies;
+    if (!r.applies){
+      tdHint.textContent = "Not applicable: this provider already discovers tools on demand.";
+    } else if (r.enabled){
+      tdHint.textContent = `On for ${r.model}: only ${r.default_count} default tools (curate them in Permissions) `
+        + `plus promoted MCP tools & Flows are sent. The model loads anything else on demand.`
+        + (r.explicit ? "" : " (On by default for this provider.)");
+    } else {
+      tdHint.textContent = `Off for ${r.model}: the full tool list is sent with every message.`;
+    }
+  }
+  async function tdRefresh(){
+    const seq = ++tdSeq;
+    let r = null;
+    try { r = await api("get_tool_discovery", ...tdFields()); } catch(e){}
+    if (seq !== tdSeq || !r) return;   // a newer refresh superseded this one
+    tdRender(r);
+  }
+  tdBox.onchange = async ()=>{
+    const want = tdBox.checked;
+    tdBox.disabled = true;
+    try {
+      tdRender(await api("set_tool_discovery", want, ...tdFields()));
+    } catch(e){
+      tdBox.checked = !want;
+    } finally {
+      tdBox.disabled = false;
+    }
+  };
+  const tdModelInput = document.getElementById("model-input");
+  tdModelInput.addEventListener("change", tdRefresh);
+  tdModelInput.addEventListener("blur", tdRefresh);
 
   const ctxInput  = document.getElementById("ctx-tokens-input");
   const ctxStatus = document.getElementById("ctx-tokens-status") || {};   // status line removed from the UI; writes below are harmless no-ops
@@ -16409,7 +16909,7 @@ function fillModelList(models){
 // always holds the composed LiteLLM id ("<service>/<model>"), so the existing
 // Apply / Save-settings code paths need no changes -- the picker just keeps
 // that hidden input in sync, and re-reads it whenever code sets its .value.
-const LITELLM_LABEL = "LiteLLM (any provider)";
+const LITELLM_LABEL = "Other";
 let _litellmCatalogPromise = null;
 function litellmCatalog(force){
   if (!_litellmCatalogPromise || force) _litellmCatalogPromise = api("litellm_catalog");
@@ -18181,8 +18681,8 @@ async function refreshMcpList(){
       </div>
       <div style="display:flex;flex-direction:column;gap:4px;">
         ${s.connected
-          ? `<button class="mini-btn" data-act="tools">Tools</button><button class="mini-btn del" data-act="disc">Disconnect</button>`
-          : `<button class="mini-btn" data-act="retry">Retry</button><button class="mini-btn del" data-act="remove">Remove</button>`}
+          ? `<button class="mini-btn" data-act="tools">Tools</button>${s.locked ? `<div class="mcp-sub" title="Built in: always connected" style="text-align:center;">🔒 Built in</div>` : `<button class="mini-btn del" data-act="disc">Disconnect</button>`}`
+          : `<button class="mini-btn" data-act="retry">Retry</button>${s.locked ? `<div class="mcp-sub" title="Built in: can't be removed" style="text-align:center;">🔒 Built in</div>` : `<button class="mini-btn del" data-act="remove">Remove</button>`}`}
       </div>`;
     const act = row.querySelector('[data-act=tools]');
     if (act) act.onclick = async ()=>{ showMcpToolsPane(s.name); };
@@ -18533,8 +19033,39 @@ async function buildPermissionsPane(box){
         <button class="ghost-btn" id="perm-fs-pw-remove" style="height:30px;font-size:11px;">Remove</button>
       </div>
     </div>
-    <input type="text" id="perm-search" placeholder="Search tools..." class="perm-search" style="margin-top:10px;"/>
-    <div id="perm-list" style="flex:1;overflow-y:auto;margin-top:8px;"></div>
+    <div class="perm-fs-pw-box" id="perm-fsroots-box">
+      <div class="perm-fs-pw-hdr">
+        <div class="perm-fs-pw-title">📁 Filesystem MCP Allowed Folders</div>
+        <div class="perm-fs-pw-status set" id="perm-fsroots-count">…</div>
+      </div>
+      <div class="perm-fs-pw-hint">The Filesystem MCP can only read or change files inside these folders. Midum's own
+        storage folder is there by default. Adding or removing a folder restarts the Filesystem MCP.</div>
+      <details class="perm-fsroots-dd" id="perm-fsroots-dd">
+        <summary class="perm-fsroots-sum">Allowed folders <span id="perm-fsroots-sumcount"></span></summary>
+        <div id="perm-fsroots-list"></div>
+        <div class="perm-fsroots-add">
+          <div class="perm-fs-pw-row">
+            <input type="text" id="perm-fsroots-input" placeholder="Paste a folder path, e.g. D:/Projects"/>
+            <button class="ghost-btn" id="perm-fsroots-add" style="height:30px;font-size:11px;">Add</button>
+            <button class="ghost-btn" id="perm-fsroots-browse" style="height:30px;font-size:11px;">Browse…</button>
+          </div>
+        </div>
+      </details>
+    </div>
+    <div class="perm-fs-pw-box" id="perm-td-box">
+      <div class="perm-fs-pw-hdr">
+        <div class="perm-fs-pw-title">🧰 Tool Discovery Defaults</div>
+        <div class="perm-fs-pw-status set" id="perm-td-count">…</div>
+      </div>
+      <div class="perm-fs-pw-hint">For any model with Tool Discovery turned on (Model popup), only the tools marked
+        "★ Default" below are sent with every message, plus promoted MCP tools and Flows. The model loads
+        anything else on demand. Click "Default" on any native tool to add or remove it.</div>
+      <div class="perm-fs-pw-row">
+        <button class="ghost-btn" id="perm-td-reset" style="height:30px;font-size:11px;">Reset to recommended</button>
+      </div>
+    </div>
+    <div class="perm-sticky"><input type="text" id="perm-search" placeholder="Search tools or categories (e.g. files, internet, Discord)..." class="perm-search"/></div>
+    <div id="perm-list" style="margin-top:8px;"></div>
   `;
   const listEl = document.getElementById("perm-list");
   let targets = await api("list_permission_targets");
@@ -18566,6 +19097,48 @@ async function buildPermissionsPane(box){
     if (res && res.message) showAlert(res.message, "Approval Password");
   };
 
+  // ── Filesystem MCP allowed-folders dropdown ──────────────────────────────────
+  const fsrListEl  = document.getElementById("perm-fsroots-list");
+  const fsrCountEl = document.getElementById("perm-fsroots-count");
+  const fsrSumEl   = document.getElementById("perm-fsroots-sumcount");
+  const fsrInputEl = document.getElementById("perm-fsroots-input");
+  function renderFsRoots(data){
+    const folders = (data && data.folders) || [];
+    fsrCountEl.textContent = folders.length + (folders.length === 1 ? " folder" : " folders");
+    fsrSumEl.textContent = "(" + folders.length + ")";
+    fsrListEl.innerHTML = folders.map(f => `
+      <div class="perm-fsroots-item" data-path="${escapeHtml(f.path)}">
+        <div class="perm-fsroots-path" title="${escapeHtml(f.path)}">${escapeHtml(f.path)}</div>
+        ${f.default ? `<span class="perm-fsroots-badge">Midum storage</span>` : ""}
+        <button class="mini-btn del" data-act="fsr-remove" ${folders.length <= 1 ? "disabled" : ""}>Remove</button>
+      </div>`).join("");
+  }
+  async function refreshFsRoots(){ renderFsRoots(await api("get_filesystem_allowed_folders")); }
+  refreshFsRoots();
+  function afterFsRootsChange(res){
+    if (res && res.folders) renderFsRoots(res);
+    if (res && !res.ok && !res.cancelled && res.message) showAlert(res.message, "Allowed Folders");
+  }
+  document.getElementById("perm-fsroots-add").onclick = async ()=>{
+    const p = fsrInputEl.value.trim();
+    if (!p){ fsrInputEl.focus(); return; }
+    const res = await api("add_filesystem_allowed_folder", p);
+    if (res && res.ok) fsrInputEl.value = "";
+    afterFsRootsChange(res);
+  };
+  fsrInputEl.onkeydown = (e)=>{ if (e.key === "Enter") document.getElementById("perm-fsroots-add").click(); };
+  document.getElementById("perm-fsroots-browse").onclick = async ()=>{
+    afterFsRootsChange(await api("add_filesystem_allowed_folder"));
+  };
+  fsrListEl.onclick = async (e)=>{
+    const btn = e.target.closest('[data-act="fsr-remove"]');
+    if (!btn || btn.disabled) return;
+    const path = btn.closest("[data-path]").dataset.path;
+    const ok = await showConfirm(`Remove '${path}' from the allowed folders? The Filesystem MCP will no longer be able to access it.`, "Remove Folder", {danger:true, okLabel:"Remove"});
+    if (!ok) return;
+    afterFsRootsChange(await api("remove_filesystem_allowed_folder", path));
+  };
+
   function levelFor(key){ return overrides[key] || "always"; }
 
   function rowHtml(entry){
@@ -18576,6 +19149,7 @@ async function buildPermissionsPane(box){
         <div class="perm-name">${escapeHtml(entry.name)}</div>
         ${entry.desc ? `<div class="perm-desc">${escapeHtml(entry.desc)}</div>` : ""}
       </div>
+      ${entry.discovery_default === undefined ? "" : `<button class="perm-pin${entry.discovery_default ? ' active' : ''}" data-key="${escapeHtml(entry.key)}" title="Keep this tool loaded for models with Tool Discovery on">${entry.discovery_default ? '★' : '☆'} Default</button>`}
       <div class="perm-seg" data-key="${escapeHtml(entry.key)}">
         <button class="perm-opt${lvl==='always'?' active':''}" data-level="always">Always</button>
         <button class="perm-opt${lvl==='ask'?' active':''}" data-level="ask">Ask</button>
@@ -18585,22 +19159,179 @@ async function buildPermissionsPane(box){
     </div>`;
   }
 
+  // ── Plain-language categories ─────────────────────────────────────────
+  // Tools are sorted into groups by name (first match wins, order matters).
+  // Anything new/unknown lands in "Other" so nothing is ever hidden.
+  const PERM_CATS = [
+    {id:"talk", icon:"💬", title:"Talking With You", risk:"low",
+     blurb:"Midum asks you questions, shows you choices, or reports its progress.",
+     re:/^(ask_user_\w+|say|write_steps|complete_step|set_current_goal)$/},
+    {id:"discord", icon:"🎮", title:"Discord", risk:"high",
+     blurb:"Lets Midum read and send Discord messages, share files, and join calls.",
+     re:/discord/},
+    {id:"settings", icon:"⚙️", title:"Connections & Settings", risk:"care",
+     blurb:"Changes which AI models Midum uses, and manages connected services and security settings.",
+     re:/mcp|_models?(_by_index)?$|native_tool/},
+    {id:"ai", icon:"🤝", title:"Asking Other AI Services", risk:"care",
+     blurb:"Lets Midum send questions or tasks to other AI services (Gemini, Groq, OpenRouter and similar). What it shares is sent outside this app.",
+     re:/^(consult_|delegate_to_)|gemini_(app|chat)/},
+    {id:"agents", icon:"🤖", title:"Helper Agents", risk:"care",
+     blurb:"Helpers that work on tasks in the background for Midum and report back.",
+     re:/agent|supervisor/},
+    {id:"code", icon:"💻", title:"Running Programs & Commands", risk:"high",
+     blurb:"Lets Midum run code and commands on your computer. This is the most powerful ability, so consider setting it to Ask.",
+     re:/^execute_/},
+    {id:"files_write", icon:"✏️", title:"Creating & Changing Files", risk:"high",
+     blurb:"Lets Midum create new files, or edit and add to existing files on your computer.",
+     re:/^(write_local_file|append_local_file|write_docx_file)$/},
+    {id:"files_read", icon:"📂", title:"Reading Files & Folders", risk:"care",
+     blurb:"Lets Midum look at files and folders on your computer. It can read them but not change them.",
+     re:/^(read_local_file|read_file_smart|read_file_chunk|read_paths|read_aggregated_text|list_directory|find_file|get_path|list_paths_indexed|add_path|open_path|open_path_by_index|search_assets|stream_asset)$|artifact/},
+    {id:"web", icon:"🌐", title:"Searching the Web", risk:"care",
+     blurb:"Lets Midum search the internet and open web pages or online data.",
+     re:/^(search_internet|open_search_result|read_search_result|open_url|webapi_fetch|search_web_assets|stream_web_asset|analyze_artifact)$/},
+    {id:"control", icon:"🖱️", title:"Controlling Your Screen, Apps & Browser", risk:"high",
+     blurb:"Lets Midum see your screen and click, type, or use apps and websites for you, like a person at your keyboard.",
+     re:/browser|^(snapshot|act|wait|type_text)$|click|ocr|fallback_|manual_|screen_share|action_loop|active_windows/},
+    {id:"memory", icon:"🧠", title:"Memory, Knowledge & Skills", risk:"low",
+     blurb:"Midum's notes, saved skills, instructions and PDF knowledge, used to remember things and work the way you like.",
+     re:/memory|knowledge|skill|instruction|pdf_source/},
+    {id:"visuals", icon:"🎨", title:"Images & On-Screen Visuals", risk:"low",
+     blurb:"Creates images, flowcharts, backgrounds and panels shown inside the app.",
+     re:/surface|render|dynamic_background|flowchart|generate_image/},
+    {id:"flows", icon:"🔁", title:"Saved Flows", risk:"care",
+     blurb:"Runs automations you built in the Flows tab.",
+     re:/(^|_)flows?$/},
+    {id:"other", icon:"📦", title:"Other Abilities", risk:"care",
+     blurb:"Abilities that could not be sorted automatically. Check each one before allowing it.",
+     re:/./}
+  ];
+  const MCP_CATS = [
+    {id:"read", icon:"🔎", title:"Looking Things Up", risk:"low",
+     blurb:"Only reads or searches information. Doesn't change anything.",
+     re:/^(read|get|list|search|find|view|fetch|query|show|describe|count|download|directory_tree|tree)/},
+    {id:"change", icon:"✏️", title:"Making Changes", risk:"high",
+     blurb:"Creates, edits, moves, sends or deletes things in this service.",
+     re:/^(write|edit|create|move|delete|remove|update|set|send|post|upload|insert|append|trash|share|copy|rename|add|block|unblock|save|run|execute)/},
+    {id:"other", icon:"📦", title:"Other Actions", risk:"care",
+     blurb:"Actions that could not be sorted automatically. Check each one before allowing it.",
+     re:/./}
+  ];
+  const RISK_LABEL = {low:"Low risk", care:"Use caution", high:"High impact"};
+  let catKeys = {};   // "scope:catId" -> [tool keys], used by Set all + the counters
+
+  function categorize(entries, cats){
+    const buckets = {};
+    entries.forEach(entry=>{
+      const cat = cats.find(c=>c.re.test(entry.name)) || cats[cats.length-1];
+      (buckets[cat.id] = buckets[cat.id] || []).push(entry);
+    });
+    return buckets;
+  }
+
+  function catSectionHtml(scope, cats, entries){
+    const buckets = categorize(entries, cats);
+    return cats.filter(c=>buckets[c.id] && buckets[c.id].length).map(cat=>{
+      const rows = buckets[cat.id];
+      const id = scope + ":" + cat.id;
+      catKeys[id] = rows.map(r=>r.key);
+      const search = (cat.title + " " + cat.blurb).toLowerCase();
+      return `<details class="perm-cat" data-cat="${id}" data-search="${escapeHtml(search)}">
+        <summary class="perm-cat-head">
+          <span class="perm-cat-icon">${cat.icon}</span>
+          <span class="perm-cat-text">
+            <span class="perm-cat-title">${escapeHtml(cat.title)}<span class="perm-risk ${cat.risk}">${RISK_LABEL[cat.risk]}</span></span>
+            <span class="perm-cat-blurb">${escapeHtml(cat.blurb)}</span>
+          </span>
+          <span class="perm-cat-count" data-count-for="${id}"></span>
+          <span class="perm-bulk" data-cat="${id}">
+            <span class="perm-bulk-label">Set all</span>
+            <button class="perm-bulk-opt" data-level="always" title="Allow every ability in this group">Always</button>
+            <button class="perm-bulk-opt" data-level="ask" title="Ask before every ability in this group">Ask</button>
+            <button class="perm-bulk-opt" data-level="ask_password" title="Ask, with password, for every ability in this group">Password</button>
+            <button class="perm-bulk-opt" data-level="deny" title="Block every ability in this group">Deny</button>
+          </span>
+        </summary>
+        ${rows.map(rowHtml).join("")}
+      </details>`;
+    }).join("");
+  }
+
+  function updateCatBadges(){
+    listEl.querySelectorAll(".perm-cat-count").forEach(el=>{
+      const keys = catKeys[el.dataset.countFor] || [];
+      const restricted = keys.filter(k=>levelFor(k) !== "always").length;
+      el.textContent = keys.length + (keys.length === 1 ? " tool" : " tools") + (restricted ? ` · ${restricted} restricted` : "");
+      el.classList.toggle("restricted", restricted > 0);
+    });
+  }
+
   function renderAll(){
-    let html = `<div class="perm-group"><div class="perm-group-title">Native Tools (${targets.native.length})</div>`;
-    html += targets.native.map(rowHtml).join("") + `</div>`;
-    targets.mcp_groups.forEach(g=>{
+    catKeys = {};
+    let html = `<div class="perm-group"><div class="perm-group-title">Built-in Abilities (${targets.native.length})</div>`;
+    html += catSectionHtml("native", PERM_CATS, targets.native) + `</div>`;
+    targets.mcp_groups.forEach((g, i)=>{
       const status = g.connected ? "connected" : "disconnected";
-      html += `<div class="perm-group"><div class="perm-group-title">MCP: ${escapeHtml(g.server)} (${status}, ${g.tools.length} tool(s))</div>`;
+      html += `<div class="perm-group"><div class="perm-group-title">Connected Service: ${escapeHtml(g.server)} (${status}, ${g.tools.length} tool(s))</div>`;
       html += g.tools.length
-        ? g.tools.map(rowHtml).join("")
+        ? catSectionHtml("mcp" + i, MCP_CATS, g.tools)
         : `<div class="perm-empty">No tools reported for this server.</div>`;
       html += `</div>`;
     });
     listEl.innerHTML = html || `<div class="perm-empty">No tools found.</div>`;
+    updateCatBadges();
   }
   renderAll();
 
+  // Tool Discovery default-tool pins: update in place (no full re-render, so the
+  // list keeps its scroll position and search filter).
+  function syncPins(names){
+    const set = new Set(names || []);
+    targets.native.forEach(n=>{ n.discovery_default = set.has(n.key); });
+    listEl.querySelectorAll(".perm-pin").forEach(b=>{
+      const on = set.has(b.dataset.key);
+      b.classList.toggle("active", on);
+      b.textContent = (on ? "★" : "☆") + " Default";
+    });
+    const c = document.getElementById("perm-td-count");
+    if (c) c.textContent = `${targets.native.filter(n=>n.discovery_default).length} default tools`;
+  }
+  syncPins(targets.native.filter(n=>n.discovery_default).map(n=>n.key));
+  document.getElementById("perm-td-reset").onclick = async ()=>{
+    const r = await api("reset_discovery_default_tools");
+    syncPins(r.tools);
+  };
+
   listEl.addEventListener("click", async (e)=>{
+    const pin = e.target.closest(".perm-pin");
+    if (pin){
+      const r = await api("set_discovery_default_tool", pin.dataset.key, !pin.classList.contains("active"));
+      syncPins(r.tools);
+      return;
+    }
+    const bulkBtn = e.target.closest(".perm-bulk-opt");
+    if (bulkBtn){
+      // Lives inside <summary>: stop the click from also toggling the group open/closed.
+      e.preventDefault(); e.stopPropagation();
+      const bulkLevel = bulkBtn.dataset.level;
+      const bulkKeys = catKeys[bulkBtn.closest(".perm-bulk").dataset.cat] || [];
+      if (!bulkKeys.length) return;
+      if (bulkLevel === "deny" && bulkKeys.length > 1){
+        const sure = await showConfirm(`Block all ${bulkKeys.length} abilities in this group? Midum will not be able to use any of them.`, "Deny Group", {danger:true, okLabel:"Deny All"});
+        if (!sure) return;
+      }
+      for (const k of bulkKeys){
+        if (bulkLevel === "always") delete overrides[k]; else overrides[k] = bulkLevel;
+        await api("set_permission", k, bulkLevel);
+      }
+      listEl.querySelectorAll(".perm-seg").forEach(s=>{
+        if (bulkKeys.includes(s.dataset.key)){
+          s.querySelectorAll(".perm-opt").forEach(b=>b.classList.toggle("active", b.dataset.level === bulkLevel));
+        }
+      });
+      updateCatBadges();
+      return;
+    }
     const btn = e.target.closest(".perm-opt");
     if (!btn) return;
     const seg = btn.closest(".perm-seg");
@@ -18608,6 +19339,7 @@ async function buildPermissionsPane(box){
     const level = btn.dataset.level;
     seg.querySelectorAll(".perm-opt").forEach(b=>b.classList.toggle("active", b===btn));
     if (level === "always") delete overrides[key]; else overrides[key] = level;
+    updateCatBadges();
     await api("set_permission", key, level);
   });
 
@@ -18615,10 +19347,18 @@ async function buildPermissionsPane(box){
     const q = e.target.value.trim().toLowerCase();
     listEl.querySelectorAll(".perm-group").forEach(group=>{
       let anyVisible = false;
-      group.querySelectorAll(".perm-row").forEach(row=>{
-        const show = !q || row.dataset.name.includes(q);
-        row.style.display = show ? "" : "none";
-        if (show) anyVisible = true;
+      group.querySelectorAll(".perm-cat").forEach(cat=>{
+        // A search that matches the category itself (e.g. "files") shows its whole group.
+        const catMatch = !!q && cat.dataset.search.includes(q);
+        let catVisible = false;
+        cat.querySelectorAll(".perm-row").forEach(row=>{
+          const show = !q || catMatch || row.dataset.name.includes(q);
+          row.style.display = show ? "" : "none";
+          if (show) catVisible = true;
+        });
+        cat.style.display = catVisible ? "" : "none";
+        if (q && catVisible) cat.open = true;
+        if (catVisible) anyVisible = true;
       });
       const emptyMsg = group.querySelector(".perm-empty");
       group.style.display = (anyVisible || (emptyMsg && !q)) ? "" : "none";

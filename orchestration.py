@@ -26,7 +26,7 @@ from tools.ambient_surface_tools import show_ambient_surface, edit_ambient_surfa
 from tools.chat_surface_tools import show_chat_surface, edit_chat_surface, close_chat_surface, list_chat_surfaces
 from tools.dynamic_background_tools import create_dynamic_background, save_dynamic_background, edit_dynamic_background
 from permissions import enforce_tool_permission, filter_tools_schema, mcp_permission_key
-from tools_registry import _get_groq_tools_schema, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, execute_terminal_command_live, execute_wsl_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
+from tools_registry import discovery_prompt_block, get_tools_for_model, _uia_unavailable_message, append_local_file, append_response_memory, clear_response_memory, click_ocr_index, click_ui_element, create_flowchart, execute_python_code, execute_terminal_command, execute_terminal_command_live, execute_wsl_command, explore_path, find_file, generate_image, get_path, list_active_windows, list_directory, list_domain_knowledge_indexed, list_domain_skills_indexed, list_more_tools, list_paths_indexed, list_skills_indexed, load_skill_by_index, load_tool_by_index, manual_inspect_app_subtree, manual_interact_with_ui, manual_scan_app_layouts, ocr_snapshot, open_path, open_path_by_index, open_search_result, open_url, read_domain_by_index, read_file_chunk, read_file_smart, read_local_file, read_response_memory, read_search_result, search_internet, write_docx_file, write_local_file, write_response_memory
 from multi_agent import start_agent, send_agent_task, get_agent_report, list_agents, stop_agent, resume_agent, forget_agent, delegate_agent_task_to_supervisor, tell_supervisor_to_inform_user, get_current_agent_name, attach_agent_knowledge, list_agent_knowledge, attach_agent_skills, list_agent_skills
 from providers.discord_voice import call_discord, discord_upload_file, end_discord_call, get_discord_call_status, get_discord_call_transcript, get_discord_chat_history, list_discord_calls, list_discord_servers, list_discord_sessions, message_discord, start_discord_bot
 from tools_schema import tools
@@ -262,6 +262,34 @@ def set_tool_start_hook(fn):
     global _tool_start_hook
     _tool_start_hook = fn
 
+# Optional hook the GUI installs to show the "this is not an error, retrying" pill when a
+# Gemini provider call fails. Called as hook(kind, payload) with kind "start" (payload:
+# seconds, attempt, max_attempts, reason) when the countdown begins and "end" when it is over.
+# None (the default) means nobody is listening (plain CLI) -- callers must guard for that.
+_gemini_retry_hook = None
+
+# Seconds shown on the countdown pill before a failed Gemini call is retried, and how many
+# retries in a row are attempted before the real error is finally surfaced (so a permanent
+# problem such as an invalid key can't loop forever).
+GEMINI_RETRY_SECONDS = 20
+GEMINI_MAX_CONSECUTIVE_RETRIES = 10
+
+def set_gemini_retry_hook(fn):
+    """Install/replace the Gemini retry-pill hook. Pass None to remove it."""
+    global _gemini_retry_hook
+    _gemini_retry_hook = fn
+
+def _short_gemini_reason(err) -> str:
+    """One friendly line describing why Gemini asked us to wait."""
+    low = str(err).lower()
+    if "429" in low or "quota" in low or "rate limit" in low or "resource_exhausted" in low:
+        return "Gemini's rate limit was reached"
+    if "503" in low or "overloaded" in low or "unavailable" in low:
+        return "Gemini is busy right now"
+    if "timeout" in low or "timed out" in low or "connection" in low:
+        return "the connection to Gemini hiccuped"
+    return "Gemini hit a temporary problem"
+
 def wait(seconds: float) -> str:
     """Pauses thread execution for the specified duration."""
     try:
@@ -397,7 +425,7 @@ _KNOWN_TOOL_NAMES = None  # lazily populated from `tools` schema, see below
 def _known_tool_names():
     global _KNOWN_TOOL_NAMES
     if _KNOWN_TOOL_NAMES is None:
-        _KNOWN_TOOL_NAMES = {t["function"]["name"] for t in tools}
+        _KNOWN_TOOL_NAMES = {t["function"]["name"] for t in tools} | {"list_more_tools", "load_tool_by_index"}
     return _KNOWN_TOOL_NAMES
 
 def _try_parse_tool_json(blob: str):
@@ -514,7 +542,7 @@ def _extract_legacy_tool_calls(content: str):
 def _call_ollama(messages, result_q):
     """Run ollama.chat on a background thread and put the result in result_q."""
     try:
-        resp = ollama.chat(model=config.MODEL_NAME, messages=messages, tools=filter_tools_schema(tools))
+        resp = ollama.chat(model=config.MODEL_NAME, messages=messages, tools=filter_tools_schema(get_tools_for_model("ollama", config.MODEL_NAME)))
 
         # ── Legacy fallback: only engages if native tool_calls is empty AND
         #    the active model is a known weak-tool-calling family. Modern
@@ -564,7 +592,7 @@ def _call_openrouter_primary(messages, result_q, model_override: str = None):
     """
     try:
         use_model = model_override or config.OPENROUTER_MODEL
-        resp = _openrouter_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(tools))
+        resp = _openrouter_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(get_tools_for_model("openrouter", use_model)))
 
         if not resp["message"].get("tool_calls"):
             raw_content = resp["message"].get("content") or ""
@@ -596,7 +624,7 @@ def _call_gemini_api_primary(messages, result_q, model_override: str = None):
     """
     try:
         use_model = model_override or config.GEMINI_API_MODEL
-        resp = _gemini_api_chat(messages, model=use_model, tools_schema=filter_tools_schema(tools))
+        resp = _gemini_api_chat(messages, model=use_model, tools_schema=filter_tools_schema(get_tools_for_model("gemini_api", use_model)))
 
         if not resp["message"].get("tool_calls"):
             raw_content = resp["message"].get("content") or ""
@@ -628,7 +656,7 @@ def _call_groq_primary(messages, result_q, model_override: str = None):
     """
     try:
         use_model = model_override or config.GROQ_MODEL
-        resp = _groq_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(_get_groq_tools_schema()))
+        resp = _groq_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(get_tools_for_model("groq", use_model)))
 
         if not resp["message"].get("tool_calls"):
             raw_content = resp["message"].get("content") or ""
@@ -659,7 +687,7 @@ def _call_litellm_primary(messages, result_q, model_override: str = None):
     """
     try:
         use_model = model_override or config.LITELLM_MODEL
-        resp = _litellm_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(tools))
+        resp = _litellm_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(get_tools_for_model("litellm", use_model)))
 
         if not resp["message"].get("tool_calls"):
             raw_content = resp["message"].get("content") or ""
@@ -691,7 +719,7 @@ def _call_ollama_cloud_primary(messages, result_q, model_override: str = None):
     """
     try:
         use_model = model_override or config.OLLAMA_CLOUD_MODEL
-        resp = _ollama_cloud_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(tools))
+        resp = _ollama_cloud_chat_with_fallback(messages, model=use_model, tools_schema=filter_tools_schema(get_tools_for_model("ollama_cloud", use_model)))
 
         if not resp["message"].get("tool_calls"):
             raw_content = resp["message"].get("content") or ""
@@ -1160,6 +1188,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
     state      = TurnState(user_request, gemini_plan=gemini_plan)
     stall_nudge_count  = 0
     MAX_STALL_NUDGES   = 3
+    gemini_retry_count = 0
 
     # Keep system messages always; slide a window over the rest
     HISTORY_WINDOW = 20
@@ -1254,6 +1283,12 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 trimmed = _artifacts.inject_into_system(trimmed, _sp_block)
         except Exception as _sp_block_err:
             print(f"⚠️ [step checklist block failed: {_sp_block_err}]")
+        try:
+            _td_block = discovery_prompt_block(force_provider, force_model)
+            if _td_block:
+                trimmed = _artifacts.inject_into_system(trimmed, _td_block)
+        except Exception as _td_block_err:
+            print(f"⚠️ [tool discovery block failed: {_td_block_err}]")
 
         # ── Run the primary model on a thread so Ctrl+Q can interrupt the wait ─
         result_q = _queue.Queue()
@@ -1272,6 +1307,38 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
             t.join(timeout=0.1)   # check abort flag every 100 ms
 
         status, payload = result_q.get()
+        if status == "err" and (force_provider or config.MODEL_PROVIDER) in ("gemini_api", "gemini_web") \
+                and gemini_retry_count < GEMINI_MAX_CONSECUTIVE_RETRIES:
+            # Any Gemini failure (rate limit, overload, connection blip...) is NOT treated as a
+            # turn-ending error. Show the "not an error" pill with a countdown, then go round the
+            # loop again: conversation_history has not been touched, so the very same step is
+            # re-sent -- the turn resumes exactly where it stopped.
+            gemini_retry_count += 1
+            _reason = _short_gemini_reason(payload)
+            print(f"   [Gemini] {payload} -- retrying in {GEMINI_RETRY_SECONDS}s "
+                  f"(attempt {gemini_retry_count}/{GEMINI_MAX_CONSECUTIVE_RETRIES})")
+            _hook = _gemini_retry_hook if say_hook is None else None   # sub-agents retry silently
+            if _hook:
+                try:
+                    _hook("start", {"seconds": GEMINI_RETRY_SECONDS, "attempt": gemini_retry_count,
+                                    "max_attempts": GEMINI_MAX_CONSECUTIVE_RETRIES, "reason": _reason})
+                except Exception:
+                    pass
+            _deadline = time.time() + GEMINI_RETRY_SECONDS
+            while time.time() < _deadline and not _abort_event.is_set():
+                time.sleep(0.1)
+            if _hook:
+                try:
+                    _hook("end", {})
+                except Exception:
+                    pass
+            if _abort_event.is_set():
+                print("\n🛑 [Response aborted by Ctrl+Q]")
+                if is_action_loop_active():
+                    stop_action_loop("aborted by user (Ctrl+Q)")
+                return "[Response terminated by user.]", turn_tool_outputs
+            step_count -= 1   # the retry must not eat into this turn's step budget
+            continue
         if status == "err":
             effective_provider = force_provider or config.MODEL_PROVIDER
             provider_name = {
@@ -1284,6 +1351,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 "openai_web": "OpenAI-web",
             }.get(effective_provider, "Ollama")
             return f"[{provider_name} error: {payload}]", turn_tool_outputs
+        gemini_retry_count = 0   # a successful call resets the consecutive-retry budget
         response   = payload
         tool_calls = response["message"].get("tool_calls")
         if tool_calls:

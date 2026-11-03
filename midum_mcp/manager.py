@@ -156,8 +156,77 @@ def _mcp_upsert_config(new_entry: dict):
 
 
 def _mcp_remove_config(name: str):
+    if name == FILESYSTEM_SERVER_NAME:
+        return  # built-in server: never forgotten
     configs = [c for c in _load_mcp_config() if c.get("name") != name]
     _save_mcp_config(configs)
+
+
+# =============================================================================
+# BUILT-IN FILESYSTEM MCP SERVER
+# =============================================================================
+#
+# The Filesystem MCP is part of Midum itself, not an optional add-on:
+#   * it is (re)created in storage/mcp_servers.json on every launch, so a fresh
+#     install connects to it by default;
+#   * all of its tools are promoted automatically, so the model can call them
+#     directly by name;
+#   * it cannot be disconnected or removed (the MCP tab hides those buttons and
+#     every backend path below refuses too);
+#   * the folders it may touch come from the user-managed "Allowed folders"
+#     list in the Permissions tab (default: Midum's own storage folder). The
+#     server is launched with exactly those folders as its roots.
+FILESYSTEM_SERVER_NAME = "filesystem"
+
+
+def is_protected_server(name) -> bool:
+    """True for servers the user may not disconnect or remove."""
+    return name == FILESYSTEM_SERVER_NAME
+
+
+def _build_filesystem_config() -> dict:
+    from midum_mcp.filesystem_policy import get_effective_allowed_roots
+    return {
+        "name": FILESYSTEM_SERVER_NAME,
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", *get_effective_allowed_roots()],
+    }
+
+
+def ensure_default_filesystem_server() -> dict:
+    """Make sure the Filesystem server entry exists in mcp_servers.json with
+    its launch roots matching the allowed-folders list. Keeps its position in
+    the file (so server indices stay stable) and any extra keys already on the
+    entry (env, call_timeout, ...). Returns the resulting config."""
+    from midum_mcp.filesystem_policy import seed_default_allowed_roots
+    seed_default_allowed_roots()
+    fresh = _build_filesystem_config()
+    configs = _load_mcp_config()
+    merged, replaced = [], False
+    for c in configs:
+        if c.get("name") == FILESYSTEM_SERVER_NAME and not replaced:
+            merged.append({**c, **fresh})
+            replaced = True
+        elif c.get("name") == FILESYSTEM_SERVER_NAME:
+            continue  # drop duplicates
+        else:
+            merged.append(c)
+    if not replaced:
+        merged.insert(0, fresh)
+    if merged != configs:
+        _save_mcp_config(merged)
+    return next(c for c in merged if c.get("name") == FILESYSTEM_SERVER_NAME)
+
+
+def reconnect_filesystem_server() -> tuple:
+    """Re-sync the config with the allowed-folders list and reconnect, so the
+    server's own launch roots match. Returns (ok, message)."""
+    cfg = ensure_default_filesystem_server()
+    ok, msg = _mcp_manager.connect(FILESYSTEM_SERVER_NAME, cfg)
+    if ok:
+        promote_all_server_tools(FILESYSTEM_SERVER_NAME)
+    return ok, msg
 
 
 # =============================================================================
@@ -233,8 +302,28 @@ def promote_mcp_tool(server: str, tool_name: str) -> str:
     return f"Promoted '{tool_name}' on '{server}' -- it will now be offered directly to the model."
 
 
+def promote_all_server_tools(server: str) -> int:
+    """Promote every tool a connected server currently exposes. Returns how
+    many were newly promoted."""
+    handle = _MCP_SERVERS.get(server)
+    if not handle or not handle.connected:
+        return 0
+    items = list(_load_promoted_tools())
+    have = {(it["server"], it["tool"]) for it in items}
+    added = 0
+    for t in handle.tools:
+        if (server, t["name"]) not in have:
+            items.append({"server": server, "tool": t["name"]})
+            added += 1
+    if added:
+        _save_promoted_tools(items)
+    return added
+
+
 def demote_mcp_tool(server: str, tool_name: str) -> str:
     """Unmark a promoted MCP tool -- it goes back to on-demand discovery only."""
+    if is_protected_server(server):
+        return f"'{tool_name}' stays promoted: the Filesystem MCP's tools are always promoted."
     items = _load_promoted_tools()
     remaining = [
         it for it in items
@@ -369,6 +458,8 @@ class _MCPManager:
             return False, f"Failed to connect to '{name}': {e}"
 
     def disconnect(self, name: str) -> str:
+        if is_protected_server(name):
+            return f"'{name}' is built in and can't be disconnected."
         handle = _MCP_SERVERS.get(name)
         if not handle:
             return f"No connected server named '{name}'."
@@ -486,6 +577,13 @@ def init_mcp_servers_from_config():
     list_mcp_servers() so Midum (or the user) can see what went wrong.
     """
     configs = _load_mcp_config()
+    # Always make sure the built-in Filesystem server is present (fresh
+    # launches included, when mcp_servers.json doesn't exist yet).
+    try:
+        ensure_default_filesystem_server()
+        configs = _load_mcp_config()
+    except Exception as e:
+        print(f"⚠️ [MCP] Could not prepare the built-in Filesystem server: {e}")
     if not configs:
         return
     if not _MCP_SDK_AVAILABLE:
@@ -499,6 +597,8 @@ def init_mcp_servers_from_config():
         ok, msg = _mcp_manager.connect(name, cfg)
         icon = "🔌" if ok else "⚠️"
         print(f"{icon} [MCP] {msg}")
+        if ok and is_protected_server(name):
+            promote_all_server_tools(name)
 
 
 def list_mcp_servers() -> str:
@@ -540,6 +640,9 @@ def connect_mcp_server(name: str, transport: str = "stdio", command: str = None,
     if not name or not name.strip():
         return "Error: a server 'name' is required."
     name = name.strip()
+    if is_protected_server(name):
+        return ("Error: 'filesystem' is Midum's built-in Filesystem MCP and is managed "
+                "by the app. Its allowed folders are set in the Permissions tab.")
 
     config = {"name": name, "transport": transport}
     if transport == "stdio":
@@ -574,6 +677,9 @@ def disconnect_mcp_server(server, forget: bool = False) -> str:
     name = _mcp_resolve_name(server)
     if name is None:
         return f"Unknown server '{server}'. Call list_mcp_servers() first."
+    if is_protected_server(name):
+        return ("The Filesystem MCP is built in and can't be disconnected or removed. "
+                "It's always connected.")
     msg = _mcp_manager.disconnect(name)
     if forget:
         _mcp_remove_config(name)

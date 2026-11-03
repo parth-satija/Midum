@@ -69,17 +69,9 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
             "  ASSISTANT: Chrome is open.\n"
         )
 
-    groq_tools_hint = (
-        "\n\n━━━ LIMITED TOOL SET (GroqCloud TPM budget) ━━━\n"
-        "To stay under Groq's per-minute token limit, you only have a CORE set of "
-        "tools loaded right now (terminal, files, paths, search, URL, user-prompt "
-        "tools). If you need something else — GUI automation, browser DOM/CDP, MCP, "
-        "domain knowledge, model delegation, memory/goal tools — call "
-        "list_more_tools() to see everything else available, then "
-        "load_tool_by_index(N) to load the one you need. It becomes callable on "
-        "your NEXT turn and stays loaded for the rest of the session.\n"
-        if provider == "groq" else ""
-    )
+    # (The old static Groq-only tool hint was removed: the per-model Tool
+    # Discovery note is now injected per step by orchestration, so it can never
+    # go stale when the model or the toggle changes mid-session.)
 
     legacy_toolcall_hint = (
         "\n- TOOL CALLS: output ONLY a single JSON object in this shape: "
@@ -430,7 +422,31 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
         "- connect_mcp_server(name, transport, ...) adds a new server and remembers it "
         "for next startup. transport='stdio' needs command(+args); "
         "transport='http'/'sse' needs url.\n"
-        "- disconnect_mcp_server(server, forget=True) removes a server for good.\n"
+        "- disconnect_mcp_server(server, forget=True) removes a server for good "
+        "(never the built-in 'filesystem' server, which is always connected).\n"
+        "\n"
+        "━━━ FILESYSTEM OPERATIONS: ALWAYS USE THE FILESYSTEM MCP ━━━\n"
+        "- The built-in 'filesystem' MCP server is ALWAYS connected and ALL of its tools are\n"
+        "  promoted, so you can call them directly by name: read_text_file, read_file,\n"
+        "  read_media_file, read_multiple_files, write_file, edit_file, create_directory,\n"
+        "  list_directory, list_directory_with_sizes, directory_tree, move_file, search_files,\n"
+        "  get_file_info, list_allowed_directories.\n"
+        "- For EVERY filesystem operation -- reading, writing, editing, creating, listing,\n"
+        "  searching, moving or inspecting files and folders -- ALWAYS use these Filesystem MCP\n"
+        "  tools. Do NOT use native file tools (read_local_file, write_local_file, find_file,\n"
+        "  the native list_directory, etc.) or terminal commands (cat, type, ls, dir,\n"
+        "  Get-Content, Set-Content, mkdir, mv ...) for file work. This rule takes precedence over\n"
+        "  the 'Browse filesystem' and 'Find file by name' rows of the CHOOSE table above.\n"
+        "- If a Filesystem MCP tool shares its name with a native tool (for example list_directory),\n"
+        "  the MCP one is NOT offered directly under that name: call it explicitly as\n"
+        "  call_mcp_tool(server='filesystem', tool_name='list_directory', arguments={...}).\n"
+        "- The server may only touch the 'Allowed folders' the user set in the Permissions tab (by\n"
+        "  default just Midum's own storage folder). Call list_allowed_directories first when unsure.\n"
+        "  If a call comes back as outside the allowed folders, tell the user and ask them to add\n"
+        "  that folder in the Permissions tab -- never route around it with another tool.\n"
+        "- The only exceptions are the ones already stated in FILES & ARTIFACTS: a file that is\n"
+        "  open in the Editor is changed with the editor_* tools, and artifacts are managed with\n"
+        "  the artifact tools.\n"
         "\n"
         "━━━ EXAMPLE FLOWS ━━━\n"
         f"{launch_example}"
@@ -464,7 +480,6 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
         "- Match the user's register: stay warm and natural in casual chat, and in voice mode keep\n"
         "  sentences easy to say aloud.\n"
         f"{legacy_toolcall_hint}"
-        f"{groq_tools_hint}"
         f"{search_guidelines_hint}"
     )
 

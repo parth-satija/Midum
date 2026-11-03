@@ -1,296 +1,87 @@
 # Midum
 
-<img width="1408" height="768" alt="image" src="https://github.com/user-attachments/assets/cbba478e-cd41-4eac-97c8-2ea2790eeaf5" />
+<img width="1408" height="768" alt="Midum" src="https://github.com/user-attachments/assets/cbba478e-cd41-4eac-97c8-2ea2790eeaf5" />
 
+**Midum is an AI assistant that doesn't just talk — it works on your computer.**
 
-Midum is an agentic framework built for local AI desktop assistance. It can help you with code, UI automation, repetitive tasks, browsing, research, file management, and more — all driven by a tool-calling AI agent that runs on **your** machine.
+Tell it what you want, by typing or by voice, and Midum does it: it opens your apps, browses the web, organizes your files, writes and edits your code and documents, and builds interactive tools on the spot. It runs on your own machine, keeps your data local, and asks before it does anything you haven't approved.
 
-<img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/4e26d709-33fc-42f8-b23b-b07d18286efa" />
+<img width="1280" height="800" alt="Midum chat" src="https://github.com/user-attachments/assets/4e26d709-33fc-42f8-b23b-b07d18286efa" />
 
+<img width="1276" height="779" alt="Midum workspace" src="https://github.com/user-attachments/assets/e4c30848-f9e4-4265-a871-8dff452e5575" />
 
-<img width="1276" height="779" alt="image" src="https://github.com/user-attachments/assets/e4c30848-f9e4-4265-a871-8dff452e5575" />
+---
+
+## What you can do with Midum
+
+### Hand off the busywork
+Ask Midum to sort a folder of files, fill in a form, pull information from a website, or work through any repetitive task on your desktop. It sees your screen, clicks and types in your applications, and shows every step it takes so you can follow along or step in.
+
+### Build and edit with an assistant that sees your work
+Midum has a built-in code editor, and a full IDE if you want one. It reads what you are working on, suggests code as you type, and proposes changes as a clear before-and-after that you approve with one key. It also writes real typeset documents (papers, reports, CVs, slides) that you can click into and edit yourself.
+
+### Get answers you can see and touch
+Instead of walls of text, Midum puts interactive blocks right in the conversation: comparison tables, charts, checklists, calculators, quick polls, flashcards. Need more room? It opens a full side panel for dashboards, tools and games. Want something that floats over your screen while you work? It can place a small widget exactly where you ask. It can even redecorate the whole app with an animated background.
+
+### Run long jobs step by step
+Give Midum a checklist and it works through it in order, ticking off each step only when it is really done — and, if you like, showing proof for each one. Pause a long task and pick it up later without losing your place.
+
+### Work in parallel
+Start background helpers that each take on their own task, on their own, while you carry on in the main chat. When they finish, their reports land back in your conversation.
+
+### Talk to it
+Speak naturally and Midum talks back, with the same abilities as typing. Hold a key to talk from any window. It can also record polished narration from a script, and even join a Discord voice channel for a live conversation.
+
+### Learn from your own material
+Drop in a PDF, a spreadsheet, a slide deck or a recording, and Midum reads it and keeps it available for the rest of the chat. Point it at a textbook and it can teach you the material part by part, answering only from the source you chose.
+
+### Automate it once, reuse it forever
+Design a workflow by connecting blocks on a canvas — no coding required — then run it on a schedule or call it from a chat. Teach Midum your preferences with reusable skills and your own knowledge libraries, and plug in outside services to extend what it can do.
+
+---
+
+## You stay in control
+
+- **Your data stays with you.** Chats, files, memory and settings are stored on your computer, and your keys are kept out of the project folder.
+- **You decide what it may do.** Set any ability to always allow, ask first, ask with a password, or deny.
+- **You approve every edit.** Changes to your code and documents are shown as a before-and-after first, and rejecting is the default.
+- **You can always step in.** Interrupt, redirect or stop a running task at any moment.
+- **Sensitive files stay private.** Midum never sends files like passwords and keys to be used for suggestions.
+
+---
+
+## Works with the AI you choose
+
+Midum isn't tied to one AI provider. Use a free local model, Google Gemini, or other leading services, switch whenever you like, and even let one model call on another for a second opinion or a sub-task. If a model runs out of quota, Midum can move on to the next one automatically.
+
+---
+
+## A workspace that fits how you work
+
+- **Tabbed conversations** — keep several chats going at once and save groups of them.
+- **Searchable history** — find, rename and reopen any past chat.
+- **Your look** — light and dark themes, custom colors, background images, glass effects and animated backgrounds.
+- **Quick commands** — type `#` to grab a file or folder, or `/` to pull in any tool, skill, workflow or knowledge library.
+- **A guided first run** — a short setup wizard gets you from download to your first chat.
+
+---
+
+## Get started
+
+**Windows (easiest):** download the latest release from the releases page, run it, and follow the setup guide. It takes you through adding a free Gemini key and starting your first chat.
+
+**Platforms:** Windows has the full feature set, Linux is supported, and macOS is partially supported.
+
+**A few features need extras:**
+- Voice, code suggestions in the editor, narration and analysis of scans, audio and video use a Google Gemini key (free keys work).
+- Typeset documents need a LaTeX installation on your computer.
+- The full IDE needs Node.js for a one-time setup.
+- Reading text on screen is improved by installing the free Tesseract tool.
+
+Everything else works without any of these.
+
+**Developers and tinkerers:** running from source, choosing providers by hand, secrets files and platform notes are in the [Developer Setup guide](docs/Developer_Setup.md).
+
+---
 
 Created by Parth Satija, maintained by Parth Satija in collaboration with Kairos Syndicate.
-
-## What Midum Can Do
-
-Midum is built around a large tool-calling loop, so it isn't limited to chatting — it can actually take action on your computer. Its capabilities include:
-
-### 🖥️ Desktop & UI Automation
-- Control your desktop through **UI Automation (UIA)** — click buttons, type into fields, navigate menus, and interact with virtually any native Windows application.
-- Scan and inspect application UI trees (`manual_scan_app_layouts`, `manual_inspect_app_subtree`) to understand what's on screen before acting.
-- Click specific UI elements directly by control ID/name (`click_ui_element`).
-- Take an automatic `snapshot` of the active window and `act` on the elements it finds, letting Midum plan a sequence of interactions.
-- List all active windows (`list_active_windows`) to figure out what's currently open.
-- Fallback vision-based control when UIA isn't reliable enough: screen snapshots, OCR-based text finding and clicking (`fallback_view_screen`, `fallback_find_text`, `fallback_click_grid`, `fallback_click_text`, `ocr_snapshot`, `click_ocr_index`).
-- Type arbitrary text into focused fields (`type_text`).
-- Global **Ctrl+Q** abort hotkey to immediately interrupt a running task.
-
-### 🌐 Browser Automation
-- Full browser page reading and interaction via **Chrome DevTools Protocol (remote debugging)** for reliable navigation, clicking, and typing on complex web pages.
-- Read the content of the current browser page (`read_browser_page`), list open tabs (`list_browser_tabs`), run arbitrary JavaScript in the page context (`run_js_in_browser`), and open new URLs (`open_url`).
-- Falls back gracefully to UIA-based control when remote debugging isn't enabled.
-- Live internet search (`search_internet`) via DuckDuckGo, with indexed result opening (`open_search_result`).
-
-### 📁 Files & Documents
-- Read and write local files directly (`read_local_file`, `write_local_file`, `append_local_file`).
-- Smart file reading for large or complex files (`read_file_smart` / `read_file_chunk`) with automatic chunking, supporting `.txt`, `.md`, `.py`, `.json`, `.csv`, `.html`, `.pdf` (via `pymupdf`), and `.docx` (via `mammoth`).
-- Generate real Word documents from Markdown-style text (`write_docx_file`, via `python-docx`).
-- Browse and search the filesystem: list directories, open files/folders, and fuzzy-find files by name (`list_directory`, `open_path`, `find_file`, `open_path_by_index`).
-
-### 🧠 Memory, Goals & Planning
-- Persistent memory that Midum can read and update across a conversation (`update_memory`).
-- Goal tracking, so Midum can set, remember, and clear an active objective (`set_current_goal`).
-- A dedicated **response scratchpad** for multi-step tasks — Midum writes a plan first, appends progress notes as it works, and reads it back to assemble a final answer (`write_response_memory`, `append_response_memory`, `read_response_memory`).
-
-### 📚 Skills & Knowledge Bases
-- Create, load, and list reusable **skills** — self-contained instructions Midum can invoke for recurring tasks (`create_domain_skill`, `load_skill`, `list_skills`, `list_domain_skills`, indexed variants included).
-- Create, read, and list custom **domain knowledge** files that act as a long-term reference library for specific topics (`create_domain_knowledge`, `read_domain_knowledge`, `list_domain_knowledge`).
-- Manage a persistent instruction set that shapes Midum's behavior (`read_instructions`, `add_instruction`).
-- Manage saved filesystem paths/shortcuts for quick access (`read_paths`, `add_path`, `get_path`, `list_paths_indexed`).
-- Indexed listing variants for skills, knowledge, and paths keep large libraries easy to browse without flooding context.
-- **PDF Sources** — register a PDF (path/title/page-count only, via PyMuPDF), then manually tag heading lines in the Knowledge tab's PDF Heading Tagger (click a line on the real rendered page, assign it a heading level H1–H6). No structure is ever auto-detected; every heading comes from a line the user personally tagged. Once tagged, pick which heading level(s) act as "part" boundaries for that source.
-- **KB Only mode** — a toggle in the chat input's Knowledge Base popover that restricts a message to only the selected PDF source(s): internet search and browsing tools are disabled for that turn, and the model is told to answer strictly from the tagged source material (or say plainly that the sources don't cover it). Selection is in-memory only and resets on restart.
-- **Explain Mode** — rides on top of KB Only. Instead of just outlining headings, it walks the selected source(s) part-by-part (using the part-boundary levels set in the Knowledge tab), giving the model the exact real text of the *current* part only, with an explicit "part N of M" header. The model is instructed to narrate it like a guided walkthrough (NotebookLM-style "Deep Dive" narration) — synthesizing into flowing explanation rather than reading line-by-line — while guaranteeing every detail in that part surfaces somewhere. Hit **▶ Start Explanation** in the KB popover to kick it off, and either say "next"/"continue" or use the **Next Part →** button to advance; progress per source is tracked server-side for the current chat.
-
-### 🤖 Multi-Model & Multi-Provider Support
-Midum isn't tied to a single model or provider — it can run its primary reasoning loop on any of the following, and can also consult or delegate sub-tasks to several of them side-by-side:
-- **Ollama** (fully local, no internet required) — now **optional**.
-- **Gemini**, directly supported via two paths:
-  - **Gemini API** — the official Google Gemini API using an API key, with native structured tool-calling.
-  - **Gemini Web** — sign-in via your Google account cookies (no API key required, no per-token metering), driven through a persistent `gemini_webapi` chat session.
-- **OpenRouter** — run any OpenRouter-hosted model (including free-tier models) as the primary brain, with automatic fallback across a configurable list of models if one is rate-limited.
-- **GroqCloud** — fast inference on models like `llama-3.3-70b-versatile` and `qwen/qwen3-32b`, with a genuine free tier and automatic model fallback.
-- **Ollama Cloud** — the same `ollama` Python client as local Ollama, just pointed at Ollama's own hosted GPUs (`https://ollama.com`) with an API key instead of a local daemon — no GPU or model download required, with native tool-calling on models like `gpt-oss:120b-cloud` and `qwen3-coder:480b-cloud`, plus automatic fallback across a configurable model list.
-- On-demand cross-consultation and delegation tools regardless of your primary provider: `consult_gemini`, `consult_gemini_api`, `consult_openrouter`, `consult_groq`, `consult_ollama_cloud`, `delegate_to_gemini_api`, `delegate_to_openrouter`, `delegate_to_groq`, `delegate_to_gemini_web`, `delegate_to_ollama_cloud`, plus tools to list and switch models per-provider on the fly (`list_openrouter_models`, `set_openrouter_model`, `list_groq_models`, `set_groq_model`, `set_gemini_api_model`, `set_gemini_web_model`, `list_ollama_cloud_models`, `set_ollama_cloud_model`, etc.).
-
-### 🔗 Flows (visual automation builder)
-The GUI's **Flows** tab is a node-graph editor (built on Drawflow) for building repeatable, shareable automations without writing any Python by hand:
-- Drag out **Start**/**End** markers, native-tool nodes (`tool::<name>`), MCP-server tool nodes (`mcp::<server>::<tool>`), and nodes that call *other* saved flows (`flow::<name>`), then wire them together to define execution order.
-- **Variable** nodes hold a named piece of data that can feed into any downstream node's parameters.
-- **Logic nodes** — `if`/`else` branching and `for-each` loops — let a flow make decisions and iterate over lists instead of only running in a straight line.
-- **AI nodes** — Prompt AI, Ask AI to Summarize, and Ask AI to Choose — let a flow call out to whichever provider is currently configured (`config.MODEL_PROVIDER`) mid-run, for one-off reasoning, summarization, or picking between options, without a full tool call.
-- Saving a flow compiles the node graph straight into a real Python function, upserted into `flow_tools.py` between name-keyed markers (safe to re-save/edit repeatedly — resaving a flow only ever touches its own marked block), with its description and graph persisted to `flow_meta.json` so it can be reloaded into the canvas later.
-- Every saved flow is automatically discoverable and callable as a tool (`list_flows_formatted` → `run_flow(name)`) — the same two-step shape as calling an MCP tool.
-- **Promoted flows** — mark a flow as promoted from the Tools tab and it gets its own always-on tool schema, callable directly by name with no discovery step, exactly like a promoted MCP tool.
-- **Scheduling** — saved flows can be scheduled to run automatically (once, on an interval, daily, or weekly) via `scheduler.py`, as long as Midum's GUI is open. Schedule *configuration* persists across restarts even though firing only happens while the app is running.
-
-### 🎙️ Voice Control (Gemini Live)
-Talk to Midum out loud and have it talk back, with full tool-calling parity with text chat:
-- Real-time, bidirectional speech-to-speech control via Google's official **Gemini Live API** (`google-genai`'s `client.aio.live.connect`) — a persistent WebSocket session, separate from every other single-shot provider, that streams your microphone audio to Gemini continuously and plays back its spoken replies as they arrive.
-- Every tool call the model makes while in voice mode runs through the exact same dispatcher as text chat and the manual tool sandbox, so voice control has 100% tool parity — files, terminal, UI automation, browser, MCP servers, everything.
-- Two independently rebindable **global push-to-talk hotkeys** (keyboard key or mouse button, including side buttons) that work no matter which window has focus — hold to stream your mic, release to mute. The very first press opens the Gemini Live connection; the connection then stays open across presses so later ones resume instantly instead of reconnecting. Bindings persist to `storage/ptt_hotkeys.json` and default to **Right Alt** and **Mouse Button 4 (Side)**.
-- Setup: `pip install google-genai sounddevice numpy pynput`, then add your `GEMINI_API_KEY` to the shared secrets file (the same key used by `MODEL_PROVIDER = "gemini_api"` — if that's already configured, voice control works with zero extra setup).
-
-### 🔌 MCP (Model Context Protocol) Support
-- Connect Midum to external MCP servers over stdio or HTTP/SSE (`connect_mcp_server`, `disconnect_mcp_server`).
-- List connected servers and their available tools (`list_mcp_servers`, `show_server_tools`).
-- Call any tool exposed by a connected MCP server directly (`call_mcp_tool`).
-- Works uniformly across every model provider — the same MCP tools are available no matter which backend is driving Midum.
-
-### 🎨 Generation Tools
-- Generate images on request (`generate_image`).
-- Generate flowcharts/diagrams (`create_flowchart`).
-
-### 🗣️ Interaction & Control
-- Midum can proactively ask you for input when it needs it: free text (`ask_user_text`), a file path (`ask_user_file_path`), explicit approval before a sensitive action (`ask_user_approval`), or a choice from a list of options (`ask_user_choice`).
-- A `say` tool for clean, direct responses back to you.
-- Tool discovery on demand — Midum can list and load additional native tools it hasn't already loaded into context (`list_native_tools`, `show_native_tool_schema`, `list_more_tools`, `load_tool_by_index`), keeping the active toolset lean for smaller/local models.
-- A `wait` tool for timed pauses mid-task.
-
-### 🖼️ Midum Control Centre (GUI)
-Running `gui.py` gives you the full **Midum Control Centre**, a desktop app (built with `customtkinter`) on top of the same agent engine, including:
-- A live chat interface with real-time activity/tool-call logging.
-- A **Model** tab to pick your provider (Ollama / OpenRouter / Gemini Web / Gemini API / Groq / Ollama Cloud) and specific model, with live model list refreshing (e.g. querying your local Ollama installation).
-- A **Parameters** tab showing live agent state: active model, current goal, workspace, Gemini research status, OCR availability, UIA availability, and turn count.
-- A **System Core** tab for managing Midum's persistent instruction set.
-- A **Knowledge** tab and dialog for creating and browsing domain knowledge files.
-- A **Skills** tab and dialog for creating and browsing domain skills.
-- A **Tools** tab for inspecting Midum's manual/native tools, and promoting/demoting saved Flows and MCP tools to always-on status.
-- An **MCP** tab for adding, viewing, and managing connected MCP servers and their tools, including a dedicated "Add MCP Server" dialog (stdio or HTTP/SSE, with command/args/env or URL/header fields) and a tool-viewer dialog.
-- A **Flows** tab: the node-graph editor described above, for visually building, saving, running, promoting, and scheduling automations (see 🔗 Flows above).
-- A **Voice** tab for enabling push-to-talk voice control, rebinding the two global hotkeys, and monitoring live connection status (see 🎙️ Voice Control above).
-- Full editing access to every underlying file Midum uses — skill files, knowledge bases, memory files, instructions, and more — directly from the GUI.
-
-This is the **recommended way to run Midum**, since it exposes everything the CLI does plus direct file editing.
-
----
-
-## Setup Instructions
-
-### Step 1
-Download the ZIP file from the releases and extract it into an empty folder, or clone the repo into an empty folder. Once extracted, `cd` into the project folder — this is a proper Python package, so all commands below should be run **from inside it**, not from a parent directory:
-```PowerShell
-cd midum_pkg
-```
-
-### Step 2
-Install the required Python libraries. The easiest way is via the included `requirements.txt`:
-```PowerShell
-pip install -r requirements.txt
-```
-If you'd rather install everything explicitly (or `requirements.txt` is ever out of date), this is the full list:
-```PowerShell
-pip install ollama pillow ddgs keyboard pymupdf mammoth python-docx rich pytesseract pywin32 uiautomation customtkinter google-genai requests mcp
-pip install -U gemini_webapi
-pip install -U browser-cookie3   # optional but recommended
-pip install sounddevice numpy pynput   # optional, needed for Voice Control (Gemini Live push-to-talk)
-```
-
-### Step 3 (Optional — Ollama)
-Ollama is now **optional**. Midum can run its primary reasoning loop directly on **Gemini** (via the official Gemini API or via `gemini_webapi` cookie sign-in) instead of a local model, so you can skip straight to Step 6 if you'd rather not run anything locally.
-
-If you *do* want a fully local, offline-capable setup, download Ollama and pull a tool-calling-capable model of your choice (older models like `qwen2.5-coder` are also supported):
-```PowerShell
-ollama pull qwen2.5-coder:7b
-```
-Then change the first line of the `Modelfile` to configure it for the model of your choice (it currently defaults to **qwen2.5-coder:7b**), and apply it by running the following **in the folder the Modelfile is located**:
-```PowerShell
-ollama create midum -f ./Modelfile
-```
-
-### Step 4
-Open `config.py` and set `MODEL_PROVIDER` to your provider of choice:
-```python
-MODEL_PROVIDER = "ollama"       # local Ollama model
-MODEL_PROVIDER = "gemini_api"   # official Gemini API (API key from aistudio.google.com)
-MODEL_PROVIDER = "gemini_web"   # Gemini via browser-cookie sign-in, no API key
-MODEL_PROVIDER = "openrouter"   # any OpenRouter-hosted model
-MODEL_PROVIDER = "groq"         # GroqCloud (free tier, fast inference)
-MODEL_PROVIDER = "ollama_cloud" # Ollama's own hosted GPUs (API key from ollama.com, no local GPU needed)
-```
-Fill in the matching model/key settings just below `MODEL_PROVIDER` for whichever provider you chose (e.g. `GEMINI_API_MODEL`, `OPENROUTER_MODEL`, `GROQ_MODEL`).
-
-### Step 5
-Create your secrets file — a local JSON file that holds your API keys (Gemini, OpenRouter, Groq, Ollama Cloud) and/or Gemini web cookies, so Midum never needs them hardcoded in `config.py`. Run this once from inside the project folder:
-```PowerShell
-python -c "import config; created = config.ensure_secrets_file(); print('Created:' if created else 'Already exists:', config.SECRETS_FILE)"
-```
-This writes a ready-to-fill-in template (every value blank) to the platform-appropriate location — `%LOCALAPPDATA%\JarvisSecrets\jarvis_secrets.json` on Windows, `~/.config/JarvisSecrets/jarvis_secrets.json` on Linux, `~/Library/Application Support/JarvisSecrets/jarvis_secrets.json` on macOS — with the following keys (this is the full, always-current template — it's generated straight from `config.SECRETS_TEMPLATE`, so it never drifts out of sync with what the code actually reads):
-```json
-{
-  "GEMINI_API_KEY": "",
-  "GEMINI_API_KEY_2": "",
-  "GEMINI_API_KEY_3": "",
-  "GEMINI_API_KEY_4": "",
-  "GEMINI_API_KEY_5": "",
-  "OPENROUTER_API_KEY": "",
-  "GROQ_API_KEY": "",
-  "OLLAMA_API_KEY": "",
-  "OMNIROUTE_API_KEY": "",
-  "GEMINI_SECURE_1PSID": "",
-  "GEMINI_SECURE_1PSIDTS": ""
-}
-```
-Open the file and fill in only the key(s) your chosen `MODEL_PROVIDER` (and any providers you plan to consult/delegate to) actually needs — every reader treats a blank value as "not configured", so it's safe to leave the rest empty:
-- `GEMINI_API_KEY` — from [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey). Used by `MODEL_PROVIDER = "gemini_api"` and Gemini API consultation.
-- `GEMINI_API_KEY_2` / `_3` / `_4` / `_5` — optional extra AI Studio keys, tried in order whenever the current one comes back quota-exhausted (HTTP 429 / RESOURCE_EXHAUSTED). Handy for stacking multiple free-tier keys; leave blank if you only have one.
-- `OPENROUTER_API_KEY` — from [openrouter.ai/keys](https://openrouter.ai/keys). Used by `MODEL_PROVIDER = "openrouter"`. *(Provider not recommended)*
-- `GROQ_API_KEY` — from [console.groq.com/keys](https://console.groq.com/keys) (free tier). Used by `MODEL_PROVIDER = "groq"`. *(Provider not recommended)*
-- `OLLAMA_API_KEY` — from [ollama.com/settings/keys](https://ollama.com/settings/keys). Used by `MODEL_PROVIDER = "ollama_cloud"`.
-- `OMNIROUTE_API_KEY` — gateway key from your OmniRoute dashboard (`http://localhost:20128/dashboard`). Used by `MODEL_PROVIDER = "omniroute"`; often optional for a purely local gateway with no auth configured, so leave blank if you haven't set one.
-- `GEMINI_SECURE_1PSID` / `GEMINI_SECURE_1PSIDTS` — browser session cookies (not an API key) for `gemini.google.com`, copied from your browser's DevTools → Application → Cookies. Both are required together, and only needed if you'd rather use your Gemini account's web session (`MODEL_PROVIDER = "gemini_web"`) than the official API.
-
-This same file is also created automatically the first time you run `main.py` or `gui.py` if it doesn't exist yet (see Step 6 below), so this step is optional — but running it explicitly here lets you fill in your keys *before* first launch instead of stopping mid-startup to go find the file.
-
-### Optional Step — OCR (Very Highly Recommended)
-Download and install Tesseract, as it enables OCR-based screen reading and clicking. Midum is completely functional without OCR — it's only used as a fallback for UI interaction.
-
-### Step 6 — Launch Midum
-- Run the **`gui.py`** script if you want to run the **Midum Control Centre**, which gives you the full functionality of Midum plus the ability to modify any underlying file (skill files, knowledge bases, memory files, etc.) directly in the app. This is the **recommended** approach.
-- Run the **`main.py`** script if you prefer the CLI tool instead. This requires an IDE if you want to modify any files yourself (or you can just tell Midum to do it).
-
-Both are run the same way, from inside the project folder:
-```PowerShell
-python gui.py
-# or
-python main.py
-```
-
----
-
-## macOS Setup Instructions
-Midum runs on macOS too, following the same Setup Instructions above with a few platform-specific swaps below. Steps not mentioned here (1, 3, 4, 6) are identical to Windows — just run the same commands in Terminal instead of PowerShell.
-
-### Step 2 (macOS) — Install Python libraries
-Install requirements the same way:
-```bash
-pip install -r requirements.txt
-```
-`requirements.txt` is already platform-conditional — Windows-only packages (`pywin32`, `uiautomation`, `comtypes`) are skipped automatically on macOS, and the macOS-only UI automation packages are installed instead:
-```bash
-pip install pyobjc-framework-ApplicationServices pyobjc-framework-Quartz
-```
-(These two are what let Midum read the accessibility tree and simulate clicks/keystrokes on macOS — they're the Mac equivalent of `uiautomation`/`pywin32` on Windows.)
-
-### Step 5 (macOS) — Secrets file location
-Same command as Step 5 above:
-```bash
-python -c "import config; created = config.ensure_secrets_file(); print('Created:' if created else 'Already exists:', config.SECRETS_FILE)"
-```
-On macOS this writes the template to `~/Library/Application Support/JarvisSecrets/jarvis_secrets.json` (the standard macOS location for per-app data, matching Linux's `~/.config` and Windows' `%LOCALAPPDATA%` equivalents), with the same full set of keys as Step 5 above:
-```json
-{
-  "GEMINI_API_KEY": "",
-  "GEMINI_API_KEY_2": "",
-  "GEMINI_API_KEY_3": "",
-  "GEMINI_API_KEY_4": "",
-  "GEMINI_API_KEY_5": "",
-  "OPENROUTER_API_KEY": "",
-  "GROQ_API_KEY": "",
-  "OLLAMA_API_KEY": "",
-  "OMNIROUTE_API_KEY": "",
-  "GEMINI_SECURE_1PSID": "",
-  "GEMINI_SECURE_1PSIDTS": ""
-}
-```
-See the key-by-key breakdown in Step 5 above for what each one is and which `MODEL_PROVIDER` needs it.
-
-### Required macOS permissions
-Grant these in **System Settings → Privacy & Security** *before* launching Midum, or UI automation and screenshots will silently fail or return blank/black results instead of raising a clear error:
-- **Accessibility** — enable your terminal app (Terminal/iTerm) or Python interpreter. Required for `click_ui_element`, `manual_scan_app_layouts`, `type_text`, and all other UI-automation tools — without it, the accessibility tree comes back empty.
-- **Screen Recording** — enable the same app. Required for `fallback_view_screen`, `ocr_snapshot`, and any other screenshot-based tool — without it, `ImageGrab.grab()` returns a black image with no error.
-
-If you package Midum into a standalone `.app` later, grant these permissions to the `.app` itself instead of the terminal.
-
-### Optional Step — OCR on macOS
-Install Tesseract via Homebrew instead of the Windows installer:
-```bash
-brew install tesseract
-```
-Midum checks `PATH` first, then falls back to checking `/opt/homebrew/bin/tesseract` (Apple Silicon) and `/usr/local/bin/tesseract` (Intel) directly — so it should be found automatically either way, even if Midum was launched from a GUI/launcher without a login shell's `PATH`.
-
----
-
-## Alternative Setup — Prebuilt Executable
-If you'd rather not install Python or any dependencies, Windows users can skip the full Setup Instructions above entirely and just:
-
-### Step 1
-Download `midum.exe` from the releases page and place it in its own empty folder (it will create `storage/` and other supporting files alongside itself on first run, so give it a dedicated folder rather than dropping it in `Downloads`).
-
-### Step 2
-Launch `midum.exe` once (double-click it, or run it from a terminal) and then close it again. On this first run it automatically creates your secrets file — the same full blank-template JSON shown in Step 5 above (every key: `GEMINI_API_KEY`, `GEMINI_API_KEY_2`–`_5`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `OLLAMA_API_KEY`, `OMNIROUTE_API_KEY`, `GEMINI_SECURE_1PSID`, `GEMINI_SECURE_1PSIDTS`) — at `%LOCALAPPDATA%\JarvisSecrets\jarvis_secrets.json`. Open that file, fill in only the key(s) your chosen provider needs (see the key-by-key breakdown in Step 5 above), and save it.
-
-Relaunch `midum.exe` and you're straight into the Midum Control Centre — no `pip install`, no Ollama, no IDE required.
-
----
-
-## Browser Support
-For reliable browser page navigation and interaction, launch your browser with **Remote Debugging** enabled.
-
-Without Remote Debugging, Midum falls back to UI Automation (UIA), which works for many tasks but may be less reliable on complex web pages.
-
-### Example (Chrome/Brave/Edge)
-On Windows, use this command (replace the path with your actual browser executable path):
-```PowerShell
-& "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe" --remote-debugging-port=9222 --remote-allow-origins=*
-```
-Midum will automatically use the debugging interface when available and fall back to UIA otherwise.
-
----
-
-## Models I Have Tested and Am Happy With
-1. `qwen2.5-coder:7b` (Ollama)
-2. `qwen3.5:4b` (Ollama)
-3. Gemini (via `gemini_api` and `gemini_web`)
-4. `llama-3.3-70b-versatile` (Groq)

@@ -118,6 +118,73 @@ def set_filesystem_allowed_roots(roots: list) -> str:
     return "Filesystem MCP folder restriction cleared -- falling back to the server's own launch roots."
 
 
+# -----------------------------------------------------------------------------
+# USER-MANAGED ALLOWED FOLDERS (Permissions tab dropdown)
+# -----------------------------------------------------------------------------
+# The Filesystem MCP server is launched with these folders as its roots (see
+# midum_mcp/manager.py -> ensure_default_filesystem_server), and every call is
+# additionally checked against them by check_folder_restriction() below.
+# Default: exactly one entry -- Midum's own storage folder. The list can never
+# be emptied, because the server needs at least one root to start.
+
+def get_default_filesystem_root() -> str:
+    """Midum's own storage folder -- the entry present by default."""
+    return os.path.normpath(STORAGE_DIR)
+
+
+def get_effective_allowed_roots() -> list:
+    """Allowed folders as a clean list; falls back to Midum's storage folder
+    if nothing is configured, so there is always at least one."""
+    roots = []
+    for r in (_load_policy().get("allowed_roots") or []):
+        if isinstance(r, str) and r.strip():
+            n = os.path.normpath(r.strip())
+            if n not in roots:
+                roots.append(n)
+    return roots or [get_default_filesystem_root()]
+
+
+def seed_default_allowed_roots() -> None:
+    """Called at startup: if no allowed folders are configured yet, add the
+    one default entry (Midum's storage folder)."""
+    policy = dict(_load_policy())
+    if not policy.get("allowed_roots"):
+        policy["allowed_roots"] = [get_default_filesystem_root()]
+        _save_policy(policy)
+
+
+def add_allowed_root(path: str):
+    """Add one folder to the allowed list. Returns (ok, message)."""
+    if not path or not str(path).strip():
+        return False, "A folder path is required."
+    norm = os.path.normpath(os.path.abspath(str(path).strip()))
+    if not os.path.isdir(norm):
+        return False, f"'{norm}' is not an existing folder."
+    roots = get_effective_allowed_roots()
+    if any(_norm(norm) == _norm(r) for r in roots):
+        return False, f"'{norm}' is already in the allowed folders."
+    policy = dict(_load_policy())
+    policy["allowed_roots"] = roots + [norm]
+    _save_policy(policy)
+    return True, f"Added '{norm}' to the allowed folders."
+
+
+def remove_allowed_root(path: str):
+    """Remove one folder from the allowed list. The last remaining entry
+    cannot be removed. Returns (ok, message)."""
+    roots = get_effective_allowed_roots()
+    target = _norm(str(path or "").strip())
+    remaining = [r for r in roots if _norm(r) != target]
+    if len(remaining) == len(roots):
+        return False, "That folder is not in the allowed list."
+    if not remaining:
+        return False, "At least one allowed folder is required, so the last one can't be removed."
+    policy = dict(_load_policy())
+    policy["allowed_roots"] = remaining
+    _save_policy(policy)
+    return True, "Removed from the allowed folders."
+
+
 def add_filesystem_blocked_subpath(path: str) -> str:
     """Block one specific sub-path even if it sits inside an allowed root
     (e.g. a .git folder, a secrets/ directory, an .env file)."""
