@@ -1,14 +1,22 @@
 # Midum
 
-<img width="1408" height="768" alt="Midum" src="https://github.com/user-attachments/assets/cbba478e-cd41-4eac-97c8-2ea2790eeaf5" />
+<img width="1200" height="713" alt="Screenshot 2026-11-04 121744" src="https://github.com/user-attachments/assets/ac4a9a3f-ed66-4b69-acae-ce12117b6d6b" />
 
 **Midum is an AI assistant that doesn't just talk — it works on your computer.**
 
 Tell it what you want, by typing or by voice, and Midum does it: it opens your apps, browses the web, organizes your files, writes and edits your code and documents, and builds interactive tools on the spot. It runs on your own machine, keeps your data local, and asks before it does anything you haven't approved.
 
-<img width="1280" height="800" alt="Midum chat" src="https://github.com/user-attachments/assets/4e26d709-33fc-42f8-b23b-b07d18286efa" />
-
-<img width="1276" height="779" alt="Midum workspace" src="https://github.com/user-attachments/assets/e4c30848-f9e4-4265-a871-8dff452e5575" />
+<img width="1280" height="800" alt="Screenshot 2026-11-04 122825" src="https://github.com/user-attachments/assets/a1350931-ae3b-40a8-89c2-8551195ffa02" />
+<img width="1280" height="800" alt="Screenshot 2026-11-04 122811" src="https://github.com/user-attachments/assets/b5e64a27-9aad-4901-b17f-0aca672b73dc" />
+<img width="1280" height="800" alt="Screenshot 2026-11-04 122753" src="https://github.com/user-attachments/assets/47b4f41a-a403-4b4c-9c18-40bd523e20c9" />
+<img width="1280" height="800" alt="Screenshot 2026-11-04 122731" src="https://github.com/user-attachments/assets/acc4c6ee-838c-49cb-b6c0-0697757fa3c9" />
+<img width="1280" height="800" alt="Screenshot 2026-11-04 122702" src="https://github.com/user-attachments/assets/94d116c6-9c31-4ed0-80c0-6211b17f3c48" />
+<img width="1280" height="800" alt="Screenshot 2026-11-04 122630" src="https://github.com/user-attachments/assets/64bde02f-963f-4045-ae69-a07a6682c0f0" />
+<img width="1280" height="800" alt="Screenshot 2026-11-04 122529" src="https://github.com/user-attachments/assets/5b8dbfb2-069e-4865-ad78-0d02bbdc06b2" />
+<img width="1200" height="713" alt="Screenshot 2026-11-04 122227" src="https://github.com/user-attachments/assets/1bd3a834-b5b8-4c3d-8f67-37e692805b6d" />
+<img width="1200" height="713" alt="Screenshot 2026-11-04 122103" src="https://github.com/user-attachments/assets/3376e7d8-c699-4bff-86a2-fc8ac018f778" />
+<img width="1200" height="713" alt="Screenshot 2026-11-04 121929" src="https://github.com/user-attachments/assets/c11d490f-0b78-408f-8a0f-169ade289286" />
+<img width="1200" height="713" alt="Screenshot 2026-11-04 121836" src="https://github.com/user-attachments/assets/c6dffbe7-2e8a-4b74-8241-e2c7c2c98294" />
 
 ---
 
@@ -74,7 +82,7 @@ Midum isn't tied to one AI provider. Use a free local model, Google Gemini, or o
 
 **A few features need extras:**
 - Voice, code suggestions in the editor, narration and analysis of scans, audio and video use a Google Gemini key (free keys work).
-- Typeset documents need a LaTeX installation on your computer.
+- Typeset documents need a LaTeX installation on your computer for offline use.
 - The full IDE needs Node.js for a one-time setup.
 - Reading text on screen is improved by installing the free Tesseract tool.
 
@@ -84,4 +92,4 @@ Everything else works without any of these.
 
 ---
 
-Created by Parth Satija, maintained by Parth Satija in collaboration with Kairos Syndicate.
+Created by Parth Satija. Email at parthsatija@icloud.com for queries or acquisition.
