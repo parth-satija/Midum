@@ -46,7 +46,16 @@ if sys.platform == "win32":
         os.environ["QT_QPA_PLATFORM"] = (_qpa + "," if _qpa else "windows:") + "dpiawareness=2"
 
 # gui/app.py -> parent: midum_pkg (package root)
-_GUI_DIR  = os.path.dirname(os.path.abspath(__file__))
+# In a PyInstaller build app.py is the entry SCRIPT, so __file__ is <bundle>/app.py (the bundle root, i.e.
+# `_internal`), NOT <bundle>/gui/app.py. Deriving the gui folder from __file__ there pointed _GUI_DIR at the
+# bundle root, so every path built from it (assets/, midum.png, ...) was wrong -- which is also what made
+# the MSIX build try to makedirs() a non-existent `_internal\assets` inside read-only WindowsApps. The spec
+# ships these files under <bundle>/gui/..., so resolve the gui folder from sys._MEIPASS when frozen.
+if getattr(sys, "frozen", False):
+    _BUNDLE_DIR = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(sys.executable))
+    _GUI_DIR = os.path.join(_BUNDLE_DIR, "gui")
+else:
+    _GUI_DIR = os.path.dirname(os.path.abspath(__file__))
 _PKG_ROOT = os.path.dirname(_GUI_DIR)
 if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
@@ -57,7 +66,14 @@ if _GUI_DIR not in sys.path:
 # multiple embedded resolutions) or icon.png here and it's picked up
 # automatically on next launch, no code changes needed.
 _ASSETS_DIR = os.path.join(_GUI_DIR, "assets")
-os.makedirs(_ASSETS_DIR, exist_ok=True)
+# Never create folders next to the code in a packaged build: an MSIX installs under
+# C:\Program Files\WindowsApps, which is read-only (WinError 5). The folder ships with the
+# app there; only create it when running from source, and never let this stop startup.
+if not getattr(sys, "frozen", False) and not os.path.isdir(_ASSETS_DIR):
+    try:
+        os.makedirs(_ASSETS_DIR, exist_ok=True)
+    except OSError:
+        pass
 _ICON_CANDIDATES = [os.path.join(_ASSETS_DIR, name) for name in ("icon.ico", "icon.png")]
 
 import threading

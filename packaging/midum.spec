@@ -225,6 +225,11 @@ a = Analysis(  # noqa: F821
     noarchive=False,
     optimize=0,
 )
+# MSIX reserves _rels folders and .rels files, so python-docx's unzipped template source
+# (docx/templates/default-docx-template/...) makes MakeAppx fail with 0x8007007b. python-docx only needs
+# the zipped default.docx at runtime, so drop the unzipped copy from the bundle.
+a.datas = [d for d in a.datas if "default-docx-template" not in str(d[0]).replace("\\", "/")]
+
 pyz = PYZ(a.pure)  # noqa: F821
 
 exe = EXE(  # noqa: F821
