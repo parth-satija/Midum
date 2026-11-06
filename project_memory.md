@@ -494,3 +494,19 @@ In calculus, a **limit** describes the behavior of a function as it
 [2026-11-06 21:11] Action completed: ### Diagnostic Report: GUI Architectural Analysis & Proofs
 
 As requested, **no edits have been made to the actual codebase code**. Below are the concr
+[2026-11-06 21:14] Action completed: ### Suggested Fix for Cause 2 (Chromium Engine Level: Occlusion Flags & Viewport Teardown Race)
+
+To completely eliminate the `evaluate_js` deadlock, t
+[2026-11-06 21:15] Action completed: I have successfully applied the fix to `gui/app.py` as requested. 
+
+### Summary of Changes:
+1. **Removed Blocking Thread Joins (`t.join(timeout=2.0)`)
+[2026-11-06 21:19] Action completed: ### Cause 3 Analysis: Flashing During Recording (Microphone Audio-Meter / Waveform High-Frequency IPC Thrashing)
+
+#### Why it flashes during recording
+[2026-11-06 21:23] Action completed: ### Cause 4 Analysis: High-Frequency Background Polling & Timer-Driven State Tickers
+
+#### What Causes It:
+In complex desktop applications like Midum,
+[2026-11-06 21:25] Action completed: I have successfully created the new branch called **`test`** and pushed it to the remote repository.
+[2026-11-06 21:27] Action completed:
