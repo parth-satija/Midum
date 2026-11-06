@@ -1049,38 +1049,29 @@ class Api(EditorMixin, StepsMixin):
     def _push_event(self, kind: str, payload: dict):
         """Push an async event to the frontend via window.evaluate_js.
 
-        Runs the actual evaluate_js call on a short-lived daemon thread and
-        waits on it with a timeout, instead of calling it directly on the
-        caller's own thread. This matters because _push_event is called from
-        background threads (the turn-execution thread, the scheduler tick
-        thread) as well as the GUI thread itself -- if evaluate_js ever
-        blocks (e.g. because the webview is mid-teardown while the titlebar
-        X is being clicked), a direct call would hang that thread forever.
-        For the turn thread specifically, that meant self._thinking never
-        got reset to False, which made _on_closing wait forever and the
-        whole app looked like it had frozen on close -- this bounds that.
+        Fires off the evaluate_js call on a short-lived daemon thread without
+        blocking or joining. This eliminates deadlocks and thread stalls during
+        rapid occlusion changes, minimization, or window teardown.
         """
-        if not self.window or self._closing:
+        if not self.window or getattr(self, "_closing", False):
             return
         try:
             _rt0 = self._rt()
             if kind == "status" and isinstance(payload, dict):
                 _rt0.status = {"text": payload.get("text", ""), "level": payload.get("level")}
-            # "tab" lets the frontend show only the events of the tab on screen (the rest are already in
-            # that tab's display log, which is re-rendered when it is switched to).
             data = json.dumps({"kind": kind, "payload": payload, "tab": _rt0.tab_id})
         except Exception:
             return
 
         def _do():
+            if not self.window or getattr(self, "_closing", False):
+                return
             try:
                 self.window.evaluate_js(f"window.__midumEvent && window.__midumEvent({data})")
             except Exception:
                 pass
 
-        t = threading.Thread(target=_do, daemon=True)
-        t.start()
-        t.join(timeout=2.0)
+        threading.Thread(target=_do, daemon=True).start()
 
     def _on_log_line(self, line: str):
         if line.startswith(_SAY_TAG):
