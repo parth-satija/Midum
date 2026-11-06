@@ -7538,7 +7538,9 @@ input[type="checkbox"]:focus-visible{
 #content{position:absolute;left:0;top:15%;width:100%;height:85%;}
 .pane-wrap{
   position:absolute;top:0;height:100%;
-  transition:left .28s var(--ease), width .28s var(--ease), opacity .2s var(--ease);
+  will-change: transform, opacity;
+  contain: layout style paint;
+  transition: transform .28s var(--ease), width .28s var(--ease), opacity .2s var(--ease);
 }
 /* -- Background image layer: a single static, full-viewport image behind
    the panes. Brightness/blur/opacity are baked into the image's pixels
