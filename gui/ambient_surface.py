@@ -67,6 +67,34 @@ _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _SAFE_COLOR_RE = re.compile(r"^[#A-Za-z0-9\s(),.%/+-]{1,80}$")
 
 
+# ── Qt profile guard ────────────────────────────────────────────────────────
+def _use_private_profile_for_child_windows() -> None:
+    """
+    Prevent the freeze/crash on the first show_ambient_surface call.
+
+    The main window is started with webview.start(private_mode=False,
+    storage_path=...). In pywebview's Qt backend EVERY BrowserView then builds
+    its own QWebEngineProfile('pywebview') with setPersistentStoragePath() on
+    that same directory. The main window already owns it, so a second profile
+    on the same locked Chromium profile dir (cookies / LevelDB / cache) hangs
+    the GUI thread and then kills the process the moment an ambient window is
+    created.
+
+    Ambient surfaces never need persistent storage (their HTML only lives in
+    memory), so make child windows use an off-the-record profile instead. This
+    is deliberately set once and left on, NOT toggled back: the BrowserView is
+    built asynchronously on the GUI thread after create_window() returns, so
+    resetting the flag would race with it. The main window already exists by
+    the time any surface is shown, so it keeps its persistent profile.
+    """
+    try:
+        state = getattr(webview, "_state", None)
+        if state is not None and not state["private_mode"]:
+            state["private_mode"] = True
+    except Exception:
+        pass
+
+
 # ── Small helpers ───────────────────────────────────────────────────────────
 def _truthy(v) -> bool:
     if isinstance(v, str):
@@ -681,6 +709,7 @@ class AmbientSurfaceManager:
                 f"with its ✕ button.")
 
     def _create_window(self, rec, shell_html):
+        _use_private_profile_for_child_windows()
         x, y, w, h = rec.rect
         kwargs = dict(
             html=shell_html,

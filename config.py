@@ -213,7 +213,7 @@ GEMINI_API_BASE  = "https://generativelanguage.googleapis.com/v1beta/openai"
 # through the exact same gui/dispatch.py:_dispatch_midum_tool used by the
 # manual tool sandbox and every other provider, so voice control has 100%
 # tool parity with text chat.
-GEMINI_LIVE_MODEL       = "gemini-3.1-flash-live-preview"   # falls back to gemini-live-2.5-flash-preview if unavailable on your key
+GEMINI_LIVE_MODEL       = "gemini-3.8-live"   # falls back to gemini-live-2.5-flash-preview if unavailable on your key
 GEMINI_LIVE_VOICE       = "Puck"    # prebuilt voice name: Puck, Charon, Kore, Fenrir, Aoede, Leda, Orus, Zephyr...
 GEMINI_LIVE_SEND_RATE   = 16000     # Hz -- mic audio sent to Gemini (fixed by the API)
 GEMINI_LIVE_RECV_RATE   = 24000     # Hz -- audio Gemini sends back (fixed by the API)
