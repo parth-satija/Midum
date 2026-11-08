@@ -52,6 +52,8 @@ _MODEL_CONTEXT_WINDOWS = {
     "kimi-k2:1t-cloud":                       128_000,
     # Gemini web
     "gemini-3-flash":                         1_000_000,
+    # Codex (ChatGPT-account models; conservative -- replaces the 32k default)
+    "codex":                                  200_000,
 }
 
 SUMMARIZE_TRIGGER_RATIO = 0.80   # summarize once usage hits 80% of the window
@@ -117,6 +119,7 @@ def _active_model_name() -> str:
         "groq":         config.GROQ_MODEL,
         "ollama_cloud": config.OLLAMA_CLOUD_MODEL,
         "litellm":      config.LITELLM_MODEL,
+        "codex":        config.CODEX_MODEL or "codex",
     }.get(provider, config.MODEL_NAME)
 
 
@@ -129,6 +132,8 @@ def get_context_window(model_name: str = None) -> int:
     model_name = model_name or _active_model_name()
     if model_name in _MODEL_CONTEXT_WINDOWS:
         return _MODEL_CONTEXT_WINDOWS[model_name]
+    if config.MODEL_PROVIDER == "codex":
+        return _MODEL_CONTEXT_WINDOWS["codex"]   # any Codex model id: don't fall to the 32k default
     # LiteLLM ships a table of context sizes for the models it supports, so
     # any provider/model picked via the LiteLLM provider gets the right
     # window automatically instead of the 32k default. Cached per model.

@@ -27,6 +27,8 @@ qtpy
 requests
 rich
 sounddevice
+soundcard
+scipy
 websocket-client
 pdfstructx
 pygments

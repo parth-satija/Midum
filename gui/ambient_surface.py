@@ -581,14 +581,28 @@ class AmbientSurfaceManager:
         kx = float(config.SCALE_X) if space == "canvas" else 1.0
         ky = float(config.SCALE_Y) if space == "canvas" else 1.0
 
+        # x / y may be a named anchor instead of a number, resolved against the
+        # REAL screen size below so the model never has to know it:
+        #   x: "left" | "center" | "right"      y: "top" | "center" | "bottom"
+        x_anchor = y_anchor = None
+        if isinstance(x, str) and x.strip().lower() in ("left", "center", "centre", "right"):
+            x_anchor, x = x.strip().lower(), None
+        if isinstance(y, str) and y.strip().lower() in ("top", "center", "centre", "bottom"):
+            y_anchor, y = y.strip().lower(), None
+
         cur = current or (None, None, None, None)
         vals = []
-        for v, name, k, c in ((x, "x", kx, cur[0]), (y, "y", ky, cur[1]),
-                              (w, "width", kx, cur[2]), (h, "height", ky, cur[3])):
+        for v, name, k, c, anch in ((x, "x", kx, cur[0], x_anchor),
+                                    (y, "y", ky, cur[1], y_anchor),
+                                    (w, "width", kx, cur[2], None),
+                                    (h, "height", ky, cur[3], None)):
             if v is None:
-                if c is None:
+                if anch is not None:
+                    vals.append(0.0)          # filled in once the size is known
+                elif c is None:
                     raise ValueError(f"'{name}' is required.")
-                vals.append(float(c))
+                else:
+                    vals.append(float(c))
             else:
                 vals.append(_num(v, name) * k)
         nx, ny, nw, nh = vals
@@ -596,10 +610,14 @@ class AmbientSurfaceManager:
         sw, sh = int(config.SCREEN_W), int(config.SCREEN_H)
         cw = int(round(max(MIN_W, min(sw, nw))))
         ch = int(round(max(MIN_H, min(sh, nh))))
+        if x_anchor is not None:
+            nx = 0 if x_anchor == "left" else (sw - cw if x_anchor == "right" else (sw - cw) / 2)
+        if y_anchor is not None:
+            ny = 0 if y_anchor == "top" else (sh - ch if y_anchor == "bottom" else (sh - ch) / 2)
         cx, cy = int(round(nx)), int(round(ny))
-        if space == "canvas":   # keep it fully on the primary screen
-            cx = max(0, min(sw - cw, cx))
-            cy = max(0, min(sh - ch, cy))
+        # keep it fully on the primary screen (both coordinate spaces)
+        cx = max(0, min(sw - cw, cx))
+        cy = max(0, min(sh - ch, cy))
         adjusted = (abs(cw - nw) > 1 or abs(ch - nh) > 1
                     or abs(cx - nx) > 1 or abs(cy - ny) > 1)
         return (cx, cy, cw, ch), adjusted
@@ -608,7 +626,9 @@ class AmbientSurfaceManager:
         cx, cy, cw, ch = self._canvas_of(rec.rect)
         x, y, w, h = rec.rect
         s = (f"canvas ({cx}, {cy}) size {cw}x{ch} "
-             f"[screen px ({x}, {y}) size {w}x{h}]")
+             f"[screen px ({x}, {y}) size {w}x{h}] -- screen is "
+             f"{int(config.SCREEN_W)}x{int(config.SCREEN_H)} px, canvas is "
+             f"{int(config.MODEL_CANVAS_W)}x{int(config.MODEL_CANVAS_H)}")
         if adjusted:
             s += " -- adjusted to fit the screen / minimum size"
         return s

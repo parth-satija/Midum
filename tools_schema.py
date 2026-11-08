@@ -1122,6 +1122,88 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "consult_codex",
+            "description": (
+                "Send a reasoning, analysis, or coding-planning task to OpenAI Codex (signed-in "
+                "ChatGPT account, no API key). Text only: the consulted model gets NO tools. "
+                "Use only when the user explicitly asks for Codex, or as a second opinion "
+                "after another consult tool failed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The full question or task. Be specific and complete."},
+                    "context": {"type": "string", "description": "Optional: relevant context (file contents, memory, prior results)."},
+                    "model": {"type": "string", "description": "Optional: override the Codex model ID for this call."}
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_to_codex",
+            "description": (
+                "Hand off an entire task to Codex as a real COWORKER: it gets FULL access to every "
+                "tool Midum has (through Midum's own permission system, never Codex's built-in "
+                "tools), works independently, then reports back a final summary to relay to the user. "
+                "\n\nThis runs in an ISOLATED conversation: the delegate sees only `task` and `context`. "
+                "Be complete and specific in both."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "The complete, self-contained task to hand off."},
+                    "context": {"type": "string", "description": "Optional: background the delegate needs."},
+                    "model": {"type": "string", "description": "Optional: override the Codex model ID for this task."},
+                    "max_steps": {"type": "integer", "description": "Optional: cap on tool-call steps before reporting back. Default 10."}
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_codex_models",
+            "description": (
+                "List the models available to the signed-in Codex account as a numbered index. "
+                "Follow up with set_codex_model_by_index(index) to switch."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_codex_model_by_index",
+            "description": "Switch the active Codex model to the entry at `index` from list_codex_models.",
+            "parameters": {
+                "type": "object",
+                "properties": {"index": {"type": "integer", "description": "Index from list_codex_models output."}},
+                "required": ["index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_codex_model",
+            "description": (
+                "Switch the active Codex model directly by exact model ID. Use list_codex_models + "
+                "set_codex_model_by_index if you don't know the ID. Takes effect immediately."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"model_id": {"type": "string", "description": "Exact Codex model ID."}},
+                "required": ["model_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "consult_omniroute",
             "description": (
                 "Send a reasoning, analysis, or research task to a model routed through "
@@ -2925,8 +3007,8 @@ tools = [
                             "rounded card."
                         )
                     },
-                    "x": {"type": "integer", "description": "Left edge of the widget (canvas coordinates by default)."},
-                    "y": {"type": "integer", "description": "Top edge of the widget (canvas coordinates by default)."},
+                    "x": {"type": ["integer", "string"], "description": "Left edge of the widget (canvas coordinates by default). Or an anchor: 'left', 'center' or 'right' to snap to that screen edge exactly (e.g. x='right' = flush against the right edge) -- use anchors for corners/edges instead of guessing the screen size."},
+                    "y": {"type": ["integer", "string"], "description": "Top edge of the widget (canvas coordinates by default). Or an anchor: 'top', 'center' or 'bottom' to snap to that screen edge exactly. x='right' + y='top' = the extreme top-right corner."},
                     "width": {"type": "integer", "description": "Widget width (canvas units by default; ~1024 = full screen width). Minimum is roughly 80x60 real pixels."},
                     "height": {"type": "integer", "description": "Widget height (canvas units by default)."},
                     "surface_id": {
@@ -3006,8 +3088,8 @@ tools = [
                 "type": "object",
                 "properties": {
                     "surface_id": {"type": "string", "description": "Which widget to move (optional if only one is open)."},
-                    "x": {"type": "integer", "description": "New left edge."},
-                    "y": {"type": "integer", "description": "New top edge."},
+                    "x": {"type": ["integer", "string"], "description": "New left edge, or an anchor: 'left' / 'center' / 'right' (snaps exactly to that screen edge)."},
+                    "y": {"type": ["integer", "string"], "description": "New top edge, or an anchor: 'top' / 'center' / 'bottom' (snaps exactly to that screen edge). x='right' + y='top' = extreme top-right corner."},
                     "width": {"type": "integer", "description": "New width."},
                     "height": {"type": "integer", "description": "New height."},
                     "duration_ms": {

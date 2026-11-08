@@ -49,6 +49,7 @@ from screen_capture import capture_screen_frame_jpeg_bytes
 from system_prompt import get_system_prompt
 from tools_schema import tools as _OPENAI_TOOLS
 import voiceover as _voiceover
+import live_notes as _live_notes
 from tools.surface_delegate_tools import (
     VOICE_BLOCKED_TOOLS, VOICE_SURFACE_TOOL_NAMES, VOICE_SURFACE_TOOL_SCHEMAS,
     call_voice_surface_tool,
@@ -126,6 +127,7 @@ def voice_dependencies_status() -> str:
 #    not a re-write. ────────────────────────────────────────────────────────
 def _build_live_tools():
     _voiceover.register_tools(_OPENAI_TOOLS)   # idempotent; makes sure the voiceover tools are offered even if orchestration hasn't been imported yet
+    _live_notes.register_tools(_OPENAI_TOOLS)  # idempotent; start_live_notes / stop_live_notes / live_notes_status
     declarations = []
     for t in _OPENAI_TOOLS:
         fn = t.get("function", {})
@@ -530,6 +532,9 @@ class VoiceSession:
                                     # model itself): run it off the event loop so the mic drain and
                                     # speaker playback tasks keep running while it works.
                                     result = (await asyncio.to_thread(_voiceover.dispatch, fc.name, args))[0]
+                                elif fc.name in _live_notes.TOOL_NAMES:
+                                    # stop_live_notes waits for the final flush: keep it off the mic/speaker event loop
+                                    result = (await asyncio.to_thread(_live_notes.dispatch, fc.name, args))[0]
                                 else:
                                     from gui.dispatch import _dispatch_midum_tool
                                     result = _dispatch_midum_tool(fc.name, args)

@@ -43,6 +43,7 @@ from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _gemini_webap
 from providers.openai_web_backend import _OPENAI_WEB_AVAILABLE, _openai_web_load_msg, _get_openai_web_bridge, delegate_to_openai_web
 from providers.gemini_live_backend import start_screen_share, stop_screen_share
 from voiceover import record_voiceover, revise_voiceover, undo_voiceover_change, play_voiceover, stop_voiceover, save_voiceover, list_voiceovers, discard_voiceover
+from live_notes import start_live_notes, stop_live_notes, live_notes_status
 from providers.groq_backend import _groq_load_msg, consult_groq, delegate_to_groq, list_groq_models, set_groq_model, set_groq_model_by_index
 from providers.ollama_cloud_backend import consult_ollama_cloud, delegate_to_ollama_cloud, list_ollama_cloud_models, set_ollama_cloud_model
 from providers.openrouter_backend import _openrouter_load_msg, consult_openrouter, delegate_to_openrouter, list_openrouter_models, set_openrouter_model, set_openrouter_model_by_index

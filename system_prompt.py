@@ -31,6 +31,8 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
         model_id = config.OMNIROUTE_MODEL
     elif provider == "litellm":
         model_id = config.LITELLM_MODEL
+    elif provider == "codex":
+        model_id = config.CODEX_MODEL or "codex"
     else:
         model_id = MODEL_NAME
     if _IS_LINUX:
@@ -67,6 +69,16 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
             "  TOOL: C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\n"
             "  ASSISTANT: {\"name\": \"execute_terminal_command\", \"arguments\": {\"command\": \"Start-Process 'C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe'\"}}\n"
             "  ASSISTANT: Chrome is open.\n"
+        )
+
+    # Codex uses native function calling through dynamic tools: no JSON-in-text
+    # few-shot examples (they'd invite text tool calls), and one explicit rule.
+    if provider == "codex":
+        launch_example = (
+            "- LAUNCHING APPS: list_paths_indexed(), then get_path(index), then "
+            "execute_terminal_command with the exact path.\n"
+            "- TOOLS: use ONLY the tools provided to you via function calling, one at a time. "
+            "You have no other tools: no built-in shell, file editing, or web search.\n"
         )
 
     # (The old static Groq-only tool hint was removed: the per-model Tool

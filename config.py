@@ -145,7 +145,20 @@ def set_startup_dir(path: str) -> str:
 #                see providers/openai_web_backend.py), so expect real
 #                latency on multi-hop tool loops, same caveat as gemini_web.
 #                See OPENAI_WEB_HOP_TIMEOUT below.
-MODEL_PROVIDER = "gemini_web"   # "ollama" | "openrouter" | "gemini_web" | "gemini_api" | "groq" | "ollama_cloud" | "omniroute" | "litellm" | "openai_web"
+# "codex"      — use OpenAI's Codex (the `codex app-server` process, signed in
+#                with a ChatGPT account -- no API key) as the PRIMARY execution
+#                brain. STATELESS: every Midum model call is one disposable,
+#                ephemeral Codex thread. Midum's own `messages` list stays the
+#                single source of truth (so context summarising, tab switching,
+#                regenerate and sub-agents all work unchanged); the backend
+#                replays it into a fresh thread, lets the model produce ONE
+#                step (a tool call or a final answer), hands that step back to
+#                Midum and throws the thread away. Midum's tools are exposed to
+#                Codex as *dynamic tools*; Codex's own shell / patch / web /
+#                MCP tools are switched off and any attempt to use one aborts
+#                the step (the "leak tripwire"). See providers/codex_backend.py
+#                and the CODEX_* settings below.
+MODEL_PROVIDER = "gemini_web"   # "ollama" | "openrouter" | "gemini_web" | "gemini_api" | "groq" | "ollama_cloud" | "omniroute" | "litellm" | "openai_web" | "codex"
 
 # ── OpenRouter model selection ────────────────────────────────────────────────
 # Used when MODEL_PROVIDER == "openrouter" (primary), and always used for
@@ -229,6 +242,30 @@ GEMINI_LIVE_CHUNK_SIZE  = 1024      # frames per mic-capture callback
 GEMINI_LIVE_SCREEN_FPS          = 1.0   # frames per second sent while sharing
 GEMINI_LIVE_SCREEN_MAX_W        = 1024  # downscale width cap (px) before JPEG encode
 GEMINI_LIVE_SCREEN_JPEG_QUALITY = 70    # JPEG quality (1-100)
+
+# ── Live Notes (live_notes.py) ──────────────────────────────────────────────────
+# Endless note-taking by a dedicated Gemini Live session that watches the screen and/or listens to the
+# computer's audio and writes into a new unsaved MidumDoc. Runs until stopped or until API quota is gone
+# (it rotates through GEMINI_API_KEY, _2.._5 from the secrets file when a key hits its quota).
+LIVENOTES_MODEL                 = ""      # "" = same as GEMINI_LIVE_MODEL
+LIVENOTES_RESPONSE_MODALITY     = "AUDIO" # "TEXT" is cheaper if your Live model allows it (auto-falls back to AUDIO)
+LIVENOTES_TICK_SECONDS          = 30      # how often the model is asked for notes while content is changing
+LIVENOTES_IDLE_TICK_SECONDS     = 300     # re-check when nothing at all is happening
+LIVENOTES_WRITE_INTERVAL        = 10      # seconds between writes into the document (notes are batched)
+LIVENOTES_SCREEN_FPS            = 1.0     # screen polls per second (unchanged frames are NOT sent)
+LIVENOTES_SCREEN_MAX_W          = 1600    # wider than voice screen-share so slide / code text stays readable
+LIVENOTES_SCREEN_JPEG_QUALITY   = 75
+LIVENOTES_SCREEN_CHANGE_THRESHOLD = 2.0   # mean 0-255 pixel difference that counts as "changed"
+LIVENOTES_SCREEN_HEARTBEAT      = 20      # send a frame at least this often while the screen is shared
+LIVENOTES_AUDIO_BACKEND         = "auto"  # auto | soundcard | pyaudiowpatch | sounddevice
+LIVENOTES_SILENCE_RMS           = 80      # int16 RMS below this is silence (not sent -> saves quota)
+LIVENOTES_SILENCE_HANG          = 2.0     # keep sending this long after speech stops
+LIVENOTES_COMPRESS_TRIGGER      = 12000   # Live context-window compression: start at this many tokens
+LIVENOTES_COMPRESS_TARGET       = 6000    # ...and shrink to about this many
+LIVENOTES_QUOTA_WAIT            = 60      # seconds to wait when every key is rate-limited
+LIVENOTES_QUOTA_GIVEUP_ROUNDS   = 5       # full waits in a row before declaring the quota exhausted
+LIVENOTES_MAX_CONSECUTIVE_ERRORS = 12     # non-quota connection failures in a row before giving up
+LIVENOTES_VERSION_WINDOW        = 600     # overwrite the newest notes version in place within this many seconds
 
 # ── GroqCloud model selection ─────────────────────────────────────────────────
 # Used when MODEL_PROVIDER == "groq" (primary), and always available for
@@ -375,6 +412,60 @@ OPENAI_WEB_TOTAL_TASK_TIMEOUT = 1800
 # a genuine new user message. Keep this exact string in sync anywhere else
 # results are formatted for OpenAI-web.
 OPENAI_WEB_TOOL_RESULT_MARKER = "[TOOL_RESULT]"
+
+# ── Codex (stateless `codex app-server` provider) settings ────────────────────
+# Used when MODEL_PROVIDER == "codex", and for consult_codex / delegate_to_codex
+# regardless of MODEL_PROVIDER. Sign-in is the ChatGPT-account flow run by the
+# Codex CLI itself (`codex login`, or the Connect button in the Model tab) --
+# there is no API key in the secrets file.
+#
+# Model IDs come from the app-server's own model/list (see list_codex_models);
+# "" means "let Codex pick the account's default".
+CODEX_MODEL            = ""
+CODEX_FALLBACK_MODELS  = []          # tried in order if the chosen model is rejected
+CODEX_BIN              = "codex"     # name on PATH, or an absolute path to the executable
+CODEX_REASONING_EFFORT = "low"       # "none" | "minimal" | "low" | "medium" | "high" | "xhigh" (what the model supports)
+
+# Timeouts (seconds)
+CODEX_STARTUP_TIMEOUT  = 45          # spawn + initialize handshake
+CODEX_REQUEST_TIMEOUT  = 30          # any single JSON-RPC request (thread/start, inject_items, ...)
+CODEX_STEP_TIMEOUT     = 300         # one whole model step (turn/start -> first tool call / answer)
+CODEX_IDLE_TIMEOUT     = 120         # max silence from the stream mid-step
+CODEX_MAX_RETRIES      = 3           # transient-error retries per step (usage limit is NEVER retried)
+
+# When Codex reports the account's usage allowance is used up, switch THAT call
+# to this provider instead of failing the turn (logged). The system prompt is
+# already Codex-flavoured (native function calling, no JSON hint), so pick a
+# native-function-calling provider. Set "" to surface the error instead.
+CODEX_FALLBACK_PROVIDER = "gemini_api"
+
+# History replay: "items" injects Responses-API function_call / function_call_output
+# items via thread/inject_items (cache-friendly, structurally faithful);
+# "text" renders tool history as plain text turns instead (the Phase-0 gate: use
+# this if the app-server rejects injected tool items).
+CODEX_HISTORY_MODE     = "items"
+# Ephemeral threads are never written to disk. If the account / build rejects
+# them, set False -- threads are then archived right after each step instead.
+CODEX_EPHEMERAL        = True
+
+# Safety stack. CODEX_DISABLE_FLAGS are passed to the app-server as `-c key=value`
+# overrides to switch OFF every native Codex capability. The exact keys vary by
+# Codex version: confirm with the Phase-0 spike (tools/codex_spike.py) and edit
+# here. The leak tripwire + startup check are what actually enforce the
+# guarantee; these flags only make a leak unlikely in the first place.
+CODEX_DISABLE_FLAGS = [
+    "features.shell_tool=false",
+    "features.unified_exec=false",
+    "features.apply_patch_freeform=false",
+    "features.view_image_tool=false",
+    "features.web_search_request=false",
+    "features.image_generation=false",
+    "web_search=\"disabled\"",
+]
+CODEX_SANDBOX          = "read-only"
+CODEX_PINNED_VERSION   = ""          # e.g. "0.130.0"; non-empty => any other `codex --version` fails closed
+CODEX_STARTUP_CHECK    = True        # one-off 'list your tools' turn; fails closed if anything but Midum's tools shows up
+CODEX_SCRATCH_DIR      = ""          # "" => <STORAGE_DIR>/codex_scratch (an empty working directory for the threads)
 
 # ── Legacy / weak native-tool-calling models ────────────────────────────────
 LEGACY_TOOLCALL_MODELS = (
@@ -769,7 +860,30 @@ def _detect_screen_resolution() -> tuple[int, int]:
             pass
         return 2560, 1600   # Retina-ish fallback — update if your resolution differs
     else:
-        return 2560, 1600   # Windows default — update if your resolution differs
+        # Windows: ask the OS for the PRIMARY monitor's real physical pixel size.
+        # GetDeviceCaps(DESKTOPHORZRES/VERTRES) ignores DPI virtualisation, so it
+        # is correct whether or not this process is DPI-aware at import time
+        # (GetSystemMetrics would return scaled-down values when it isn't).
+        try:
+            import ctypes
+            user32 = ctypes.WinDLL("user32")
+            gdi32 = ctypes.WinDLL("gdi32")
+            user32.GetDC.restype = ctypes.c_void_p
+            user32.GetDC.argtypes = [ctypes.c_void_p]
+            user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            gdi32.GetDeviceCaps.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            gdi32.GetDeviceCaps.restype = ctypes.c_int
+            hdc = user32.GetDC(None)
+            try:
+                w = gdi32.GetDeviceCaps(hdc, 118)   # DESKTOPHORZRES
+                h = gdi32.GetDeviceCaps(hdc, 117)   # DESKTOPVERTRES
+            finally:
+                user32.ReleaseDC(None, hdc)
+            if w > 0 and h > 0:
+                return int(w), int(h)
+        except Exception:
+            pass
+        return 2560, 1600   # last-resort fallback if detection fails
 
 SCREEN_W, SCREEN_H = _detect_screen_resolution()
 

@@ -68,7 +68,7 @@ DEFAULT_TOOL_NAMES = [
 ]
 
 # Providers whose models are ON by default until the user decides otherwise.
-_DEFAULT_ON_PROVIDERS = {"groq"}
+_DEFAULT_ON_PROVIDERS = {"groq", "codex"}
 
 # Providers that never receive a tools= schema: they drive Midum through a JSON
 # text convention and ALREADY discover everything on demand
@@ -95,6 +95,7 @@ def resolve_model(provider=None, model=None):
             "gemini_api":   "GEMINI_API_MODEL",
             "groq":         "GROQ_MODEL",
             "ollama_cloud": "OLLAMA_CLOUD_MODEL",
+            "codex":        "CODEX_MODEL",
             "litellm":      "LITELLM_MODEL",
         }.get(provider)
         model = getattr(config, attr, "") if attr else ""

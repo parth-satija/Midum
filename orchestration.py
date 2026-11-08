@@ -14,6 +14,7 @@ from providers.gemini_api_backend import _gemini_api_chat, consult_gemini_api, d
 from providers.gemini_reasoning import consult_gemini
 from providers.gemini_web_backend import _GEMINI_WEBAPI_AVAILABLE, _call_gemini_web_primary, _gemini_webapi_load_msg, delegate_to_gemini_web, set_gemini_web_model
 from providers.openai_web_backend import _OPENAI_WEB_AVAILABLE, _call_openai_web_primary, _openai_web_load_msg, delegate_to_openai_web
+from providers.codex_backend import consult_codex, delegate_to_codex, list_codex_models, set_codex_model, set_codex_model_by_index
 from providers.groq_backend import _groq_chat_with_fallback, consult_groq, delegate_to_groq, list_groq_models, set_groq_model, set_groq_model_by_index
 from providers.litellm_backend import _litellm_chat_with_fallback
 from providers.ollama_cloud_backend import _ollama_cloud_chat_with_fallback, consult_ollama_cloud, delegate_to_ollama_cloud, list_ollama_cloud_models, set_ollama_cloud_model
@@ -37,6 +38,8 @@ import editor_link as _editor_link
 _editor_link.register_tools(tools)   # open_file_in_editor / open_folder_in_editor + editor_workspace_tree / read_active_file / edit_active_file
 import voiceover as _voiceover
 _voiceover.register_tools(tools)   # record_voiceover / revise_voiceover / play_voiceover / save_voiceover ... (in-memory voiceover clips)
+import live_notes as _live_notes
+_live_notes.register_tools(tools)   # start_live_notes / stop_live_notes / live_notes_status (endless Gemini Live note-taking into a MidumDoc)
 from ui_automation import ui_navigator
 from ui_automation.windows_uia import _UIA_AVAILABLE
 from utils.path_resolver import resolve_file_path
@@ -123,7 +126,7 @@ def get_gemini_reasoning(user_input: str, conversation_history: list) -> str | N
     execution brain), this consult step is skipped entirely — there's no
     benefit to a strong model consulting a plan from itself.
     """
-    if config.MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq", "ollama_cloud", "litellm", "openai_web"):
+    if config.MODEL_PROVIDER in ("openrouter", "gemini_web", "gemini_api", "groq", "ollama_cloud", "litellm", "openai_web", "codex"):
         # Primary model IS OpenRouter or Gemini-web already — skip the
         # separate consult call, it would just be the same model (or the
         # same account's Gemini session) reasoning about itself twice.
@@ -762,6 +765,9 @@ def _call_primary_model(messages, result_q, provider_override: str = None, model
         _call_litellm_primary(messages, result_q, model_override=model_override)
     elif provider == "openai_web":
         _call_openai_web_primary(messages, result_q, model_override=model_override)
+    elif provider == "codex":
+        from providers.codex_backend import _call_codex_primary
+        _call_codex_primary(messages, result_q, model_override=model_override)
     else:
         _call_ollama(messages, result_q)
 
@@ -1349,6 +1355,7 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 "ollama_cloud": "Ollama Cloud",
                 "litellm": "LiteLLM",
                 "openai_web": "OpenAI-web",
+                "codex": "Codex",
             }.get(effective_provider, "Ollama")
             return f"[{provider_name} error: {payload}]", turn_tool_outputs
         gemini_retry_count = 0   # a successful call resets the consecutive-retry budget
@@ -1636,6 +1643,9 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     tool_output = run_abortable(lambda: _voiceover.dispatch(func_name, arguments)[0], timeout=600)
                 else:
                     tool_output, tool_images = _voiceover.dispatch(func_name, arguments)
+
+            elif func_name in _live_notes.TOOL_NAMES:
+                tool_output, tool_images = _live_notes.dispatch(func_name, arguments)
 
             elif func_name == "list_domain_knowledge_indexed":
                 tool_output = list_domain_knowledge_indexed()
@@ -1986,6 +1996,25 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                 tool_output = set_groq_model_by_index(int(arguments.get("index", 0)))
             elif func_name == "set_groq_model":
                 tool_output = set_groq_model(arguments.get("model_id", ""))
+            elif func_name == "consult_codex":
+                tool_output = consult_codex(
+                    arguments.get("prompt", ""),
+                    arguments.get("context", ""),
+                    arguments.get("model") or None
+                )
+            elif func_name == "delegate_to_codex":
+                tool_output = delegate_to_codex(
+                    arguments.get("task", ""),
+                    arguments.get("context", ""),
+                    arguments.get("model") or None,
+                    int(arguments.get("max_steps", 10))
+                )
+            elif func_name == "list_codex_models":
+                tool_output = list_codex_models()
+            elif func_name == "set_codex_model_by_index":
+                tool_output = set_codex_model_by_index(int(arguments.get("index", 0)))
+            elif func_name == "set_codex_model":
+                tool_output = set_codex_model(arguments.get("model_id", ""))
             elif func_name == "consult_ollama_cloud":
                 tool_output = consult_ollama_cloud(
                     arguments.get("prompt", ""),
@@ -2580,6 +2609,14 @@ def process_chat_turn(conversation_history, user_request: str = "", gemini_plan:
                     "list_groq_models":     "list_groq_models",
                     "switch_groq_model":    "set_groq_model_by_index",
                     "set_groq_model":       "set_groq_model",
+                    # Codex
+                    "codex":                "consult_codex",
+                    "ask_codex":            "consult_codex",
+                    "delegate_codex":       "delegate_to_codex",
+                    "offload_to_codex":     "delegate_to_codex",
+                    "list_codex_models":    "list_codex_models",
+                    "switch_codex_model":   "set_codex_model_by_index",
+                    "set_codex_model":      "set_codex_model",
                     # Gemini-web (primary-execution delegate, distinct from consult_gemini)
                     "delegate_gemini":      "delegate_to_gemini_web",
                     "delegate_to_gemini":   "delegate_to_gemini_web",
