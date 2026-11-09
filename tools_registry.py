@@ -186,7 +186,7 @@ def discovery_prompt_block(provider=None, model=None) -> str:
     p, m = _td.resolve_model(provider, model)
     if p in _td.TEXT_PROTOCOL_PROVIDERS or not _td.is_enabled(p, m):
         return ""
-    return (
+    block = (
         "\n\n━━━ TOOL DISCOVERY MODE ━━━\n"
         "Only a small set of tools is loaded for you: "
         + (", ".join(default_discovery_tool_names()) or "(none)")
@@ -195,6 +195,17 @@ def discovery_prompt_block(provider=None, model=None) -> str:
         "then load_tool_by_index(N); it becomes available on your next step and stays "
         "loaded for this chat. Never guess a tool name that isn't loaded.\n"
     )
+    if p == "codex":
+        block += (
+            "\nIMPORTANT — your loaded tools are only a SMALL SUBSET of what Midum can do. "
+            "Midum has many more tools (GUI automation, ambient surfaces, browser control, "
+            "documents, memory, delegation, and more) that simply aren't loaded yet.\n"
+            "RULE: if the loaded tools don't obviously fit the request, your NEXT action must be "
+            "list_more_tools() — NOT a reply. You may NEVER tell the user you can't do something, "
+            "or that you lack a tool, until you have called list_more_tools() this chat and found "
+            "nothing suitable. When something fits, load_tool_by_index(N), then use it on the next step.\n"
+        )
+    return block
 
 
 def open_url(url: str, browser: str = "chrome") -> str:

@@ -463,7 +463,7 @@ CODEX_DISABLE_FLAGS = [
     "web_search=\"disabled\"",
 ]
 CODEX_SANDBOX          = "read-only"
-CODEX_PINNED_VERSION   = ""          # e.g. "0.130.0"; non-empty => any other `codex --version` fails closed
+CODEX_PINNED_VERSION   = "0.167.0"          # e.g. "0.130.0"; non-empty => any other `codex --version` fails closed
 CODEX_STARTUP_CHECK    = True        # one-off 'list your tools' turn; fails closed if anything but Midum's tools shows up
 CODEX_SCRATCH_DIR      = ""          # "" => <STORAGE_DIR>/codex_scratch (an empty working directory for the threads)
 

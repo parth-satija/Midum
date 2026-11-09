@@ -24,6 +24,7 @@ import providers.gemini_reasoning as providers_gemini_reasoning
 import providers.gemini_web_backend as providers_gemini_web_backend
 import providers.openai_web_backend as providers_openai_web_backend
 import providers.groq_backend as providers_groq_backend
+import providers.codex_backend as providers_codex_backend
 import providers.litellm_backend as providers_litellm_backend
 import providers.openrouter_backend as providers_openrouter_backend
 from browser_cdp import _CDP_AVAILABLE, _cdp_get_tabs, act_on_browser_element, list_browser_tabs, query_gemini_app, read_browser_page, run_js_in_browser, snapshot_browser_elements
@@ -319,6 +320,15 @@ if __name__ == "__main__":
                 print(f"🛑 [MODEL_PROVIDER='openai_web' but the bridge failed to initialize: {_ow_err}]")
             else:
                 print(f"🧠 [PRIMARY MODEL: ChatGPT-web — driving Midum directly via llm_cookie_bridge]")
+    elif MODEL_PROVIDER == "codex":
+        _cx = providers_codex_backend.codex_status()
+        if not _cx["installed"]:
+            print(f"🛑 [MODEL_PROVIDER='codex' but the Codex CLI was not found: {_cx['message']}]")
+        elif not _cx["signed_in"]:
+            print(f"🛑 [MODEL_PROVIDER='codex' but Codex is not signed in — {_cx['message']}]")
+        else:
+            print(f"🧠 [PRIMARY MODEL: Codex/{config.CODEX_MODEL or 'account default'} "
+                  f"({_cx['plan'] or 'plan unknown'}) — stateless threads, Midum tools only]")
     else:
         print(f"🧠 [PRIMARY MODEL: Ollama/{MODEL_NAME} — local execution brain]")
         if OPENROUTER_CONSULT_MODE != "off" and providers_openrouter_backend._OPENROUTER_AVAILABLE:

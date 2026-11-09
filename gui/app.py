@@ -45,6 +45,21 @@ if sys.platform == "win32":
     if "dpiawareness" not in _qpa:
         os.environ["QT_QPA_PLATFORM"] = (_qpa + "," if _qpa else "windows:") + "dpiawareness=2"
 
+# Packaged (PyInstaller/MSIX) builds are launched with the working directory set to something read-only
+# such as C:\WINDOWS\system32, so any relative path (e.g. "storage") fails with WinError 5 at import time.
+# Move the cwd to the per-user data root FIRST, before any project module is imported. A relative
+# "storage" then lands in <root>\storage, the same folder config.STORAGE_DIR uses. Never block startup.
+if getattr(sys, "frozen", False):
+    try:
+        _data_root = os.environ.get("MIDUM_HOME") or os.path.join(
+            os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local"),
+            "Midum",
+        )
+        os.makedirs(os.path.join(_data_root, "storage"), exist_ok=True)
+        os.chdir(_data_root)
+    except OSError:
+        pass
+
 # gui/app.py -> parent: midum_pkg (package root)
 # In a PyInstaller build app.py is the entry SCRIPT, so __file__ is <bundle>/app.py (the bundle root, i.e.
 # `_internal`), NOT <bundle>/gui/app.py. Deriving the gui folder from __file__ there pointed _GUI_DIR at the
@@ -242,12 +257,15 @@ def _default_model_for_provider(provider_key: str) -> str:
         "ollama_cloud":  midum.config.OLLAMA_CLOUD_MODEL,
         "litellm":       midum.config.LITELLM_MODEL,
         "openai_web":    "(default)",
+        "codex":         midum.config.CODEX_MODEL or "(default)",
     }.get(provider_key, "")
 
 
 def _known_models_for_provider(provider_key: str) -> list:
     if provider_key == "openrouter":
         return list(dict.fromkeys(midum.config.OPENROUTER_FALLBACK_MODELS))
+    if provider_key == "codex":
+        return midum.providers_codex_backend.codex_known_models() or ["(default)"]
     if provider_key == "groq":
         return list(dict.fromkeys(midum.config.GROQ_FALLBACK_MODELS))
     if provider_key == "gemini_api":
@@ -364,6 +382,7 @@ PROVIDER_OPTIONS = [
     ("Gemini (API)",    "gemini_api"),
     ("ChatGPT (Web)",   "openai_web"),
     ("Groq",            "groq"),
+    ("Codex",           "codex"),
     ("Other", "litellm"),
 ]
 _PROVIDER_LABEL_TO_KEY = {label: key for label, key in PROVIDER_OPTIONS}
@@ -1863,6 +1882,8 @@ class Api(EditorMixin, StepsMixin):
             midum.config.GEMINI_API_MODEL = model_id
         elif provider_key == "groq":
             midum.config.GROQ_MODEL = model_id
+        elif provider_key == "codex":
+            midum.config.CODEX_MODEL = "" if model_id in ("", "(default)") else model_id
         elif provider_key == "ollama_cloud":
             midum.config.OLLAMA_CLOUD_MODEL = model_id
         elif provider_key == "litellm":
@@ -1893,6 +1914,19 @@ class Api(EditorMixin, StepsMixin):
 
     def litellm_provider_status(self, provider: str):
         return midum.providers_litellm_backend.provider_status(provider)
+
+    # ── Codex: sign-in status / Connect button / allowance ──────────────────────────────────
+    def codex_status(self, with_limits: bool = False):
+        return midum.providers_codex_backend.codex_status(bool(with_limits))
+
+    def codex_connect(self):
+        r = midum.providers_codex_backend.codex_login_start()
+        if r.get("ok"):
+            self._push_event("log", {"text": "🔑 [Codex: opened the ChatGPT sign-in page in your browser]\n"})
+        return r
+
+    def codex_rate_limits(self):
+        return midum.providers_codex_backend.codex_rate_limits()
 
     def litellm_save_credentials(self, provider: str, api_key=None, api_base=None):
         r = midum.providers_litellm_backend.save_provider_credentials(provider, api_key, api_base)
@@ -19765,7 +19799,7 @@ def main():
     # of the crash, and Chromium logs (renderer/GPU process deaths) go to chromium.log beside it.
     try:
         import faulthandler
-        _diag_dir = os.path.join(os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else _PKG_ROOT, "storage")
+        _diag_dir = os.path.join((globals().get("_data_root") or os.path.dirname(sys.executable)) if getattr(sys, "frozen", False) else _PKG_ROOT, "storage")
         os.makedirs(_diag_dir, exist_ok=True)
         _fh_file = open(os.path.join(_diag_dir, "gui_crash.log"), "a", buffering=1)
         _fh_file.write("\n=== launch %s ===\n" % datetime.datetime.now().isoformat())

@@ -78,7 +78,9 @@ def get_system_prompt(effective_provider: str = None, effective_model: str = Non
             "- LAUNCHING APPS: list_paths_indexed(), then get_path(index), then "
             "execute_terminal_command with the exact path.\n"
             "- TOOLS: use ONLY the tools provided to you via function calling, one at a time. "
-            "You have no other tools: no built-in shell, file editing, or web search.\n"
+            "You have no built-in shell, file editing, or web search of your own. Your loaded tools "
+            "are just a subset of Midum's: when none fit a request, call list_more_tools() and "
+            "load_tool_by_index(N) BEFORE ever saying you can't do something.\n"
         )
 
     # (The old static Groq-only tool hint was removed: the per-model Tool
