@@ -19766,6 +19766,31 @@ def _configure_chromium_flags():
     if "CalculateNativeWinOcclusion" not in disabled:
         disabled.append("CalculateNativeWinOcclusion")
     kept.append("--disable-features=" + ",".join(disabled))
+    # MSIX only: Chromium's default ANGLE backend crashes the packaged app (access violation inside
+    # QApplication.exec) while the standalone exe is fine. D3D11-on-12 is stable there and keeps GPU acceleration.
+    try:
+        import ctypes
+        _n = ctypes.c_uint32(0)
+        # 15700 = APPMODEL_ERROR_NO_PACKAGE (not running with package identity)
+        _packaged = ctypes.windll.kernel32.GetCurrentPackageFullName(ctypes.byref(_n), None) != 15700
+    except Exception:
+        _packaged = False
+    if _packaged and not any(f.startswith("--use-angle") for f in kept):
+        kept.append("--use-angle=d3d11on12")
+    # Test hook for packaged (MSIX) runs, where env vars set in a shell never reach a Start-menu launch:
+    # extra Chromium flags are read from chromium_flags.txt (e.g. one line: --disable-gpu-sandbox),
+    # first beside the exe, then in the per-user data root. Delete the file to go back to the defaults.
+    _cands = [os.path.join(os.path.dirname(sys.executable), "chromium_flags.txt")]
+    if globals().get("_data_root"):
+        _cands.append(os.path.join(globals()["_data_root"], "chromium_flags.txt"))
+    for _p in _cands:
+        try:
+            if os.path.isfile(_p):
+                with open(_p, encoding="utf-8") as _f:
+                    kept += [x for x in _f.read().split() if x.startswith("--")]
+                break
+        except OSError:
+            pass
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(kept)
 
 
@@ -19803,8 +19828,9 @@ def main():
         os.makedirs(_diag_dir, exist_ok=True)
         _fh_file = open(os.path.join(_diag_dir, "gui_crash.log"), "a", buffering=1)
         _fh_file.write("\n=== launch %s ===\n" % datetime.datetime.now().isoformat())
-        _fh_file.write("frozen=%s exe=%s QT_API=%s QT_QPA_PLATFORM=%s\n" % (
-            getattr(sys, "frozen", False), sys.executable, os.environ.get("QT_API"), os.environ.get("QT_QPA_PLATFORM")))
+        _fh_file.write("frozen=%s exe=%s QT_API=%s QT_QPA_PLATFORM=%s\nchromium_flags=%s\n" % (
+            getattr(sys, "frozen", False), sys.executable, os.environ.get("QT_API"), os.environ.get("QT_QPA_PLATFORM"),
+            os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS")))
         try:
             from importlib import metadata as _md
             _vers = []
